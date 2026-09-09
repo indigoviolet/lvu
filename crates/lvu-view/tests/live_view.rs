@@ -3,7 +3,8 @@ use lvu::{
     terminal::QueryDispatcher,
 };
 use lvu_core::{
-    Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
+    Acquisition, ChunkPosition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition,
+    SourceId, StreamKind,
 };
 use lvu_ingest::{RuntimeConfig, RuntimeState, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
@@ -1448,6 +1449,497 @@ async fn display_grouping_preserves_physical_membership_orphans_bounds_and_snaps
     let failed = wait_completion(&mut adapter, 3).await;
     assert_eq!(failed.result.unwrap_err().purpose, QueryPurpose::Grouping);
     assert_eq!(wait_page(&mut adapter, 2).await.len(), 2);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_multiline_grouping_is_conservative_exact_and_incremental() {
+    let root = TempDir::new().unwrap();
+    let input = concat!(
+        "ERROR wrapped failure\n",
+        "  indented diagnostic\n",
+        "Traceback (most recent call last):\n",
+        "  File \"worker.py\", line 7\n",
+        "ValueError: bad payload\n",
+        "2026-09-09T12:00:00Z INFO recovered\n",
+        "{\n",
+        "  \"items\": [\n",
+        "    1\n",
+        "  ]\n",
+        "}\n",
+        "stray fragment\n",
+        "  stray indentation\n",
+        "\n",
+        "goroutine 17 [running]:\n",
+        "main.main()\n",
+        "\t/tmp/main.go:42\n",
+    );
+    let (manager, handle, mut adapter) = setup(&root, input, true).await;
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let page = adapter
+                .rows()
+                .page("view", ViewportRequest { start: 0, len: 32 });
+            if page.total > 0 && page.rows.len() == page.total {
+                break page.rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 8, "{rows:#?}");
+    assert_eq!(adapter.status("view").unwrap().matched_records, 17);
+    assert_eq!(rows[0].id.sequence, 0);
+    assert!(rows[0].text.contains("2 physical lines"));
+    assert!(rows[1].text.contains("3 physical lines"));
+    assert!(rows[3].text.contains("5 physical lines"));
+    assert_eq!(rows[4].text, "stray fragment");
+    assert!(rows[5].text.contains("orphan continuation"));
+    assert_eq!(rows[6].text, "");
+    assert!(rows[7].text.contains("3 physical lines"));
+    let group_lines = rows[1]
+        .details
+        .iter()
+        .filter(|(key, _)| key.starts_with("group_line_") && key != "group_line_count")
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    assert_eq!(group_lines.len(), 3);
+    assert!(group_lines[0].contains("Traceback"));
+    assert!(group_lines[1].contains("worker.py"));
+    assert!(group_lines[2].contains("ValueError"));
+
+    let stable_go_id = rows[7].id.clone();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    writeln!(file, "\tlate.go:9").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 18).await;
+    let rows = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let rows = adapter
+                .rows()
+                .page("view", ViewportRequest { start: 0, len: 8 })
+                .rows;
+            if rows
+                .last()
+                .is_some_and(|row| row.text.contains("4 physical lines"))
+            {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(rows.last().unwrap().id, stable_go_id);
+    assert_eq!(adapter.status("view").unwrap().matched_records, 18);
+
+    let expected = rows
+        .iter()
+        .map(|row| (row.id.clone(), row.text.clone(), row.details.clone()))
+        .collect::<Vec<_>>();
+    let mut replay = request("view", 2, 2, 1, None, None);
+    replay.purpose = QueryPurpose::Grouping;
+    replay.base_constraints = grouped.constraints.clone();
+    replay.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(replay.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let replayed = wait_page(&mut adapter, 8).await;
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|row| (row.id.clone(), row.text.clone(), row.details.clone()))
+            .collect::<Vec<_>>(),
+        expected,
+        "a fresh full scan must reproduce incremental groups exactly"
+    );
+
+    // Filtering never pulls hidden physical records back into a group. A
+    // continuation whose credible head did not match remains an exact orphan.
+    let mut filtered = request("view", 3, 3, 2, Some("worker.py"), None);
+    filtered.purpose = QueryPurpose::Grouping;
+    filtered.base_constraints = replay.constraints;
+    filtered.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(filtered.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 3).await.result.is_ok());
+    let orphan = wait_page(&mut adapter, 1).await.remove(0);
+    assert!(orphan.text.contains("orphan continuation"));
+    assert_eq!(adapter.status("view").unwrap().matched_records, 1);
+
+    let mut unknown = request("view", 4, 4, 3, Some("worker.py"), None);
+    unknown.purpose = QueryPurpose::Grouping;
+    unknown.base_constraints = filtered.constraints;
+    unknown.constraints.grouping = Some("(?lvu:auto:v2)".into());
+    adapter.submit(unknown).unwrap();
+    let failure = wait_completion(&mut adapter, 4).await;
+    assert!(
+        failure
+            .result
+            .unwrap_err()
+            .message
+            .contains("unsupported automatic grouping version")
+    );
+    assert_eq!(wait_page(&mut adapter, 1).await[0].id, orphan.id);
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_grouping_uses_exact_partial_record_provenance_across_batches() {
+    let root = TempDir::new().unwrap();
+    let input = b"ERROR head 1234XUNIQUECHUNK and a long partial payload\nINFO next\n";
+    let mut runtime = line_framed_runtime_config();
+    runtime.acquisition.read_chunk_bytes = 7;
+    runtime.acquisition.maximum_record_bytes = 16;
+    runtime.batch_records = 2;
+    runtime.max_page_records = 2;
+    let (manager, _handle, mut adapter) =
+        setup_bytes_with_runtime(&root, input, false, runtime).await;
+
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rows[0].id.sequence, 0);
+    assert!(rows[0].text.contains("1 logical line"), "{rows:#?}");
+    let record_count = rows[0]
+        .details
+        .iter()
+        .find(|(key, _)| key == "group_record_count")
+        .unwrap()
+        .1
+        .parse::<usize>()
+        .unwrap();
+    assert!(record_count >= 3, "{rows:#?}");
+    assert_eq!(
+        rows[0]
+            .details
+            .iter()
+            .find(|(key, _)| key == "group_line_count")
+            .unwrap()
+            .1,
+        "1"
+    );
+    let member_sequences = rows[0]
+        .details
+        .iter()
+        .filter(|(key, _)| key.starts_with("group_line_") && key != "group_line_count")
+        .map(|(_, value)| {
+            value
+                .split_once(": ")
+                .unwrap()
+                .0
+                .rsplit_once(':')
+                .unwrap()
+                .1
+                .parse::<u64>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        member_sequences,
+        (0..u64::try_from(record_count).unwrap()).collect::<Vec<_>>()
+    );
+
+    // Matching only a middle chunk must not infer its missing Start. The
+    // unmatched physical predecessor clears retained Auto/chunk state even
+    // though the records crossed worker batches.
+    let mut filtered = request("view", 2, 2, 1, Some("UNIQUECHUNK"), None);
+    filtered.purpose = QueryPurpose::Grouping;
+    filtered.base_constraints = grouped.constraints;
+    filtered.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(filtered).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let orphan = wait_page(&mut adapter, 1).await.remove(0);
+    assert!(orphan.text.contains("orphan continuation"), "{orphan:#?}");
+    assert_eq!(adapter.status("view").unwrap().matched_records, 1);
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_partial_groups_never_cross_stream_boundaries() {
+    let root = TempDir::new().unwrap();
+    let script = concat!(
+        "printf 'ERROR stderr-start' >&2; sleep 0.05; ",
+        "printf 'ERROR stdout-start'; sleep 0.05; ",
+        "printf ' stderr-end\\n' >&2; sleep 0.05; ",
+        "printf ' stdout-end\\n'",
+    );
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager
+        .start(command_source(SourceId::new(), script))
+        .await
+        .unwrap();
+    wait_runtime(&handle, 4).await;
+    let captured = handle.read_page(0, 8, 4096).await.unwrap();
+    assert_eq!(captured.records.len(), 4, "{:#?}", captured.records);
+    assert_eq!(captured.records[0].stream, StreamKind::Stderr);
+    assert_eq!(captured.records[0].chunk, ChunkPosition::Start);
+    assert_eq!(captured.records[1].stream, StreamKind::Stdout);
+    assert_eq!(captured.records[1].chunk, ChunkPosition::Start);
+    assert_eq!(captured.records[2].stream, StreamKind::Stderr);
+    assert_eq!(captured.records[2].chunk, ChunkPosition::End);
+    assert_eq!(captured.records[3].stream, StreamKind::Stdout);
+    assert_eq!(captured.records[3].chunk, ChunkPosition::End);
+
+    let (live_config, view_config) = configs(&root);
+    let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, view_config).unwrap();
+    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_view("view", vec![handle.source_id()])
+        .unwrap();
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(grouped).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 4).await;
+    assert_eq!(rows.len(), 4, "{rows:#?}");
+    for (sequence, row) in rows.iter().enumerate() {
+        assert_eq!(row.id.sequence, sequence as u64);
+        assert_eq!(
+            row.details
+                .iter()
+                .find(|(key, _)| key == "group_record_count")
+                .map(|(_, value)| value.as_str()),
+            Some("1"),
+            "forbidden boundaries must yield exact singleton member groups: {rows:#?}"
+        );
+    }
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_partial_groups_do_not_bridge_a_filtered_physical_gap() {
+    let root = TempDir::new().unwrap();
+    let mut runtime = line_framed_runtime_config();
+    runtime.acquisition.maximum_record_bytes = 8;
+    let (manager, _handle, mut adapter) =
+        setup_bytes_with_runtime(&root, b"MATCHAAABBBBBBBBMATCH\n", false, runtime).await;
+    let mut grouped = request("view", 1, 1, 0, Some("MATCH"), None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(grouped).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(
+        rows.iter().map(|row| row.id.sequence).collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert!(rows[1].text.contains("orphan continuation"), "{rows:#?}");
+    assert!(rows.iter().all(|row| {
+        row.details
+            .iter()
+            .find(|(key, _)| key == "group_record_count")
+            .is_some_and(|(_, value)| value == "1")
+    }));
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_grouping_prioritizes_headers_and_closes_structured_payloads() {
+    let root = TempDir::new().unwrap();
+    let input = concat!(
+        "ERROR first\n",
+        "  first detail\n",
+        "  2026-09-09T12:00:00Z INFO second\n",
+        "  second detail\n",
+        "---\n",
+        "  key: value\n",
+        "  nested:\n",
+        "    child: yes\n",
+        "ordinary standalone\n",
+        "  stray indentation\n",
+        "\x1b[31m{\x1b[0m\n",
+        "  \"value\": [1, 2]\n",
+        "}\n",
+        "  stray after closure\n",
+    );
+    let (manager, handle, mut adapter) = setup(&root, input, false).await;
+    let captured = handle.read_page(0, 32, 4096).await.unwrap();
+    assert_eq!(captured.records[10].bytes.as_slice(), b"\x1b[31m{\x1b[0m");
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(grouped).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 7).await;
+    assert_eq!(rows.len(), 7, "{rows:#?}");
+    assert!(rows[0].text.contains("2 physical lines"));
+    assert!(rows[1].text.contains("2026-09-09"));
+    assert!(rows[1].text.contains("2 physical lines"));
+    assert!(rows[2].text.starts_with("---"));
+    assert!(rows[2].text.contains("4 physical lines"));
+    assert_eq!(rows[3].text, "ordinary standalone");
+    assert!(rows[4].text.contains("orphan continuation"));
+    assert!(rows[5].text.contains("3 physical lines"));
+    assert!(rows[6].text.contains("orphan continuation"));
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunked_ordinary_line_does_not_open_a_multiline_group() {
+    async fn projected(maximum_record_bytes: usize) -> Vec<lvu::DisplayRow> {
+        let root = TempDir::new().unwrap();
+        let input = b"ordinary standalone\n  stray indentation\n";
+        let mut runtime = line_framed_runtime_config();
+        runtime.acquisition.read_chunk_bytes = 7;
+        runtime.acquisition.maximum_record_bytes = maximum_record_bytes;
+        let (manager, _handle, mut adapter) =
+            setup_bytes_with_runtime(&root, input, false, runtime).await;
+        let mut grouped = request("view", 1, 1, 0, None, None);
+        grouped.purpose = QueryPurpose::Grouping;
+        grouped.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+        adapter.submit(grouped).unwrap();
+        assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+        let rows = wait_page(&mut adapter, 2).await;
+        adapter.shutdown();
+        manager.shutdown().await;
+        rows
+    }
+
+    let complete = projected(64 * 1024).await;
+    let chunked = projected(4).await;
+    assert_eq!(complete.len(), 2, "{complete:#?}");
+    assert_eq!(chunked.len(), 2, "{chunked:#?}");
+    assert_eq!(complete[0].text, "ordinary standalone");
+    assert!(chunked[0].text.contains("1 logical line"));
+    assert!(complete[1].text.contains("orphan continuation"));
+    assert!(chunked[1].text.contains("orphan continuation"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_grouping_cap_failure_preserves_accepted_membership_and_refresh() {
+    let root = TempDir::new().unwrap();
+    let long = format!("INFO {}\n", "x".repeat(3_900));
+    let input = format!("ERROR keep\n  keep detail\n{long}{long}");
+    let input_path = root.path().join("input.log");
+    fs::write(&input_path, &input).unwrap();
+    let manager =
+        SourceManager::new(root.path().join("capture"), line_framed_runtime_config()).unwrap();
+    let handle = manager
+        .start(source(SourceId::new(), &input_path, true))
+        .await
+        .unwrap();
+    wait_runtime(&handle, 4).await;
+    let (mut live_config, mut view_config) = configs(&root);
+    live_config.index_page_bytes = 32 * 1024;
+    live_config.cache_bytes = 64 * 1024;
+    view_config.page_bytes = 32 * 1024;
+    // Membership IDs fit comfortably. Retaining a display projection of both
+    // long rows does not, which deterministically exercises candidate rollback.
+    view_config.maximum_index_bytes = 5 * 1024;
+    let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, view_config).unwrap();
+    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_view("view", vec![handle.source_id()])
+        .unwrap();
+
+    let mut accepted = request("view", 1, 1, 0, Some("keep"), None);
+    accepted.purpose = QueryPurpose::Grouping;
+    accepted.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(accepted.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let accepted_row = wait_page(&mut adapter, 1).await.remove(0);
+    assert!(accepted_row.text.contains("2 physical lines"));
+
+    let mut broad = request("view", 2, 2, 1, None, None);
+    broad.purpose = QueryPurpose::Grouping;
+    broad.base_constraints = accepted.constraints.clone();
+    broad.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(broad).unwrap();
+    let failure = wait_completion(&mut adapter, 2).await;
+    assert!(
+        failure
+            .result
+            .unwrap_err()
+            .message
+            .contains("display grouping projection memory cap reached")
+    );
+    assert_eq!(wait_page(&mut adapter, 1).await[0].id, accepted_row.id);
+
+    let mut file = OpenOptions::new().append(true).open(input_path).unwrap();
+    file.write_all(b"  keep late\n").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 5).await;
+    let mut accepted_refresh = request("view", 3, 3, 1, Some("keep"), None);
+    accepted_refresh.purpose = QueryPurpose::Grouping;
+    accepted_refresh.base_constraints = accepted.constraints;
+    accepted_refresh.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(accepted_refresh).unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            if adapter.status("view").is_some_and(|status| {
+                status.state == ScanState::Ready && status.matched_records == 3
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let refreshed = wait_page(&mut adapter, 2).await;
+    assert_eq!(refreshed[0].id, accepted_row.id);
+    assert!(refreshed[0].text.contains("2 physical lines"));
+    assert!(refreshed[1].text.contains("orphan continuation"));
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_grouping_caps_tiny_partial_records_by_member_count() {
+    let root = TempDir::new().unwrap();
+    let mut input = b"ERROR ".to_vec();
+    input.extend(std::iter::repeat_n(b'x', 70));
+    input.push(b'\n');
+    let mut runtime = line_framed_runtime_config();
+    runtime.acquisition.read_chunk_bytes = 9;
+    runtime.acquisition.maximum_record_bytes = 1;
+    runtime.batch_records = 3;
+    runtime.max_page_records = 3;
+    let (manager, _handle, mut adapter) =
+        setup_bytes_with_runtime(&root, &input, false, runtime).await;
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(lvu::grouping::AUTO_GROUPING_TOKEN.into());
+    adapter.submit(grouped).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert!(rows[0].text.contains("64 physical records"), "{rows:#?}");
+    assert!(rows[0].text.contains("1 logical line"));
+    assert!(rows[1].text.contains("orphan continuation"));
+    assert!(
+        rows[1]
+            .details
+            .contains(&("group_overflow".into(), "bounded split".into()))
+    );
+    assert_eq!(adapter.status("view").unwrap().matched_records, 76);
     adapter.shutdown();
     manager.shutdown().await;
 }

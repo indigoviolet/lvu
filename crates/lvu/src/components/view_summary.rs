@@ -154,7 +154,13 @@ pub fn summary_rows(
                 SummaryRow::Enrichment => enrichment_value(state, ascii),
                 SummaryRow::Search => applied_text(&state.search.applied),
                 SummaryRow::Filter => applied_text(&state.advanced.applied),
-                SummaryRow::Grouping => applied_text(&state.grouping.applied),
+                SummaryRow::Grouping => applied_text(&state.grouping.applied).map(|value| {
+                    match crate::grouping::parse_grouping(&value) {
+                        Ok(crate::grouping::GroupingSpec::Auto) => "Auto".to_owned(),
+                        Ok(crate::grouping::GroupingSpec::Custom(_)) => value,
+                        Err(_) => "Unsupported Auto version".to_owned(),
+                    }
+                }),
                 SummaryRow::Fold => fold_value(state),
                 SummaryRow::Columns => (!state.pinned_columns.is_empty())
                     .then(|| format!("pinned: {}", state.pinned_columns.join(", "))),

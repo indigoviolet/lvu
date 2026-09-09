@@ -539,6 +539,9 @@ pub struct ViewMutationRequest {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EditorState {
     pub draft: String,
+    /// Last user-authored Custom grouping regex while the grouping draft is
+    /// temporarily showing Auto or Off. Unused by the other editors.
+    pub custom_grouping_draft: Option<String>,
     pub applied: String,
     pub error: Option<String>,
     pub pending_generation: Option<u64>,

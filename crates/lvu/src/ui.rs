@@ -1106,7 +1106,11 @@ fn render_logs<P: RowProvider>(
             let group_lines = row
                 .details
                 .iter()
-                .filter(|(key, _)| key.starts_with("group_line_"))
+                .filter(|(key, _)| {
+                    key.strip_prefix("group_line_").is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                })
                 .map(|(_, value)| value.clone())
                 .collect::<Vec<_>>();
             let is_expanded = expanded.contains(&row.id) && group_lines.len() > 1;

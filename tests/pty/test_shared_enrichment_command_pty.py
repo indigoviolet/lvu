@@ -22,20 +22,18 @@ def run(binary: pathlib.Path) -> None:
         # dialog-system.md §7.1 titles are nouns, and §7.4 replaces the
         # `Applied:` vocabulary with the shared message row.
         grouping = app.wait_for("Multiline grouping")
-        assert "Disabled" in grouping, grouping
-        assert "an empty draft turns grouping off" in grouping, grouping
+        assert "Mode Auto" in grouping, grouping
+        assert "conservative multiline detection" in grouping, grouping
         assert "Applied:" not in grouping, grouping
         # Grouping must expose Apply as an activatable action. The old "Enter Apply"
         # hint was removed with the universal-shortcut cleanup but never replaced,
         # leaving the dialog with no actions region at all. Tracked in TODO.md.
         assert "[ Apply ]" in grouping, grouping
         assert "Scroll status" not in grouping, grouping
-        # The grouping editor seeds its caret at the end of the restored draft
-        # (app.rs, before any render), so typing appends. The old expectation of
-        # a prepend was unreachable behind the failing `[ Apply ]` assertion
-        # above and never ran.
+        # Typing replaces Auto with an exact Custom regex draft; the reserved
+        # persistence token is never exposed in ordinary UI.
         app.send(b"q")
-        app.wait_for("^(\\s+|Caused by:)q")
+        app.wait_for("Mode Custom")
         app.send(b"\x1b")
         # Wait for the dialog to actually close: ESC immediately followed by a
         # printable byte is parsed as Alt-<key>, so `e` would land in the field.

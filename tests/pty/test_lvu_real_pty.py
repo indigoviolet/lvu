@@ -1813,7 +1813,7 @@ def run_multiline_grouping_story(binary: pathlib.Path) -> None:
         source.write_bytes(
             b"Error: first\xff\n"
             b"  at first.rs:10\n"
-            b"next event\n"
+            b"ERROR next event\n"
             b"  at next.rs:20\n"
         )
         arguments = ["--capture-dir", str(capture), "--file", str(source)]
@@ -1835,10 +1835,12 @@ def run_multiline_grouping_story(binary: pathlib.Path) -> None:
 
             app.send(b"\r")
             expanded = app.wait_for("at next.rs:20", timeout=5.0)
+            assert expanded.index("ERROR next event") < expanded.index("at next.rs:20")
+            assert expanded.count("at next.rs:20") == 1, expanded
             row = next(
                 index + 1
                 for index, line in enumerate(expanded.splitlines())
-                if "next event" in line
+                if "ERROR next event" in line
             )
             app.send(f"\x1b[<0;45;{row}M\x1b[<0;45;{row}m".encode())
             app.wait_until(
@@ -1862,7 +1864,7 @@ def run_multiline_grouping_story(binary: pathlib.Path) -> None:
             app.send(b"late.rs")
             app.send(b"\r")
             orphan = app.wait_for("orphan continuation", timeout=10.0)
-            assert "Error: first" not in orphan and "next event" not in orphan
+            assert "Error: first" not in orphan and "ERROR next event" not in orphan
             app.send(b"\x1b")
             app.wait_until(
                 lambda text: "Live literal substring" not in text,

@@ -213,9 +213,9 @@ fn grouping_uses_input_only_background_and_explicit_applied_state() {
     let output = screen(&buffer);
     // dialog-system.md §7.4 replaces the `Applied:` vocabulary with the shared
     // message row, and §3 gives the dialog the action row it never had.
-    assert!(output.contains("Disabled"), "{output}");
+    assert!(output.contains("Mode Auto"), "{output}");
     assert!(
-        output.contains("an empty draft turns grouping off"),
+        output.contains("conservative multiline detection"),
         "{output}"
     );
     assert!(output.contains("[ Apply ]"), "{output}");
@@ -226,13 +226,13 @@ fn grouping_uses_input_only_background_and_explicit_applied_state() {
 
     let input_y = output
         .lines()
-        .position(|line| line.contains(r"^(\s+|Caused by:)"))
+        .position(|line| line.contains("Auto — conservative"))
         .unwrap() as u16;
     let input_x = output
         .lines()
         .nth(input_y as usize)
         .unwrap()
-        .find('^')
+        .find("Auto")
         .unwrap() as u16;
     assert_eq!(buffer[(input_x, input_y)].bg, Theme::LOVE_DARK.input_bg);
     assert_eq!(

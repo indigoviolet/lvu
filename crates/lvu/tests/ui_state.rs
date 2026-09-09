@@ -5694,7 +5694,7 @@ fn grouping_editor_is_per_view_transactional_and_groups_expand_by_key_and_mouse(
     assert_eq!(app.focus, Focus::Layer);
     assert_eq!(
         app.view_state().unwrap().grouping.draft,
-        r"^(\s+|Caused by:)"
+        lvu::grouping::AUTO_GROUPING_TOKEN
     );
     app.handle(raw_key(KeyCode::Enter), &fixture);
     let request = app.take_query_requests().pop().unwrap();
@@ -5706,7 +5706,10 @@ fn grouping_editor_is_per_view_transactional_and_groups_expand_by_key_and_mouse(
         purpose: request.purpose,
         result: Ok(()),
     }));
-    assert!(!app.view_state().unwrap().grouping.applied.is_empty());
+    assert_eq!(
+        app.view_state().unwrap().grouping.applied,
+        lvu::grouping::AUTO_GROUPING_TOKEN
+    );
     app.handle(Action::NextView, &fixture);
     assert!(app.view_state().unwrap().grouping.applied.is_empty());
     app.handle(Action::PreviousView, &fixture);
@@ -5745,6 +5748,15 @@ fn grouping_editor_is_per_view_transactional_and_groups_expand_by_key_and_mouse(
     grouped_app.handle(Action::ToggleExpandedGroup, &provider);
     let expanded = render(&provider, &mut grouped_app, 100, 18);
     assert!(expanded.contains("at worker.rs:42"));
+    assert!(expanded.find("api:1: Error: boom") < expanded.find("api:2:   at worker.rs:42"));
+    assert_eq!(
+        expanded
+            .lines()
+            .filter(|line| line.contains("api:"))
+            .count(),
+        2,
+        "count metadata must not become a synthetic expanded row\n{expanded}"
+    );
     let region = grouped_app.hit_regions.log_row_indices[0].0;
     grouped_app.handle(
         Action::Mouse(mouse(

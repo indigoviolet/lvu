@@ -48,8 +48,27 @@ fn key(app: &mut App, provider: &FixtureProvider, code: KeyCode) {
     );
 }
 
+fn modified_key(app: &mut App, provider: &FixtureProvider, code: KeyCode, modifiers: KeyModifiers) {
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(code, modifiers))),
+        provider,
+    );
+}
+
 fn paste(app: &mut App, provider: &FixtureProvider, text: &str) {
     app.handle(Action::Raw(RawEvent::Paste(text.into())), provider);
+}
+
+fn click(app: &mut App, provider: &FixtureProvider, x: u16, y: u16) {
+    app.handle(
+        Action::Raw(RawEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })),
+        provider,
+    );
 }
 
 fn type_text(app: &mut App, provider: &FixtureProvider, text: &str) {
@@ -257,15 +276,70 @@ fn each_editor_keeps_its_own_scroll_caret_and_draft() {
     app.handle(Action::Open(Open::Grouping), &provider);
     assert_eq!(
         app.view_state().unwrap().grouping.draft,
-        r"^(\s+|Caused by:)",
-        "grouping opens on the rule that matches indented continuations"
+        lvu::grouping::AUTO_GROUPING_TOKEN,
+        "grouping opens in conservative Auto mode"
     );
+    for code in [KeyCode::Home, KeyCode::Left, KeyCode::End] {
+        key(&mut app, &provider, code);
+        assert_eq!(
+            app.view_state().unwrap().grouping.draft,
+            lvu::grouping::AUTO_GROUPING_TOKEN
+        );
+    }
+    modified_key(
+        &mut app,
+        &provider,
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL,
+    );
+    assert!(app.view_state().unwrap().grouping.draft.is_empty());
+
+    // The existing segmented mode control reaches Auto, Custom and Off in
+    // either direction; no reserved persistence token is exposed or edited.
+    key(&mut app, &provider, KeyCode::Tab);
+    key(&mut app, &provider, KeyCode::Right);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::AUTO_GROUPING_TOKEN
+    );
+    assert!(!screen(&draw(&provider, &mut app, 100, 30)).contains("(?lvu:auto:"));
+    key(&mut app, &provider, KeyCode::Right);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        r"^(\s+|Caused by:)"
+    );
+    key(&mut app, &provider, KeyCode::Left);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::AUTO_GROUPING_TOKEN
+    );
+    key(&mut app, &provider, KeyCode::BackTab);
     // The caret is the bank's and per draft, so moving it in one editor does
     // not disturb another's.
-    key(&mut app, &provider, KeyCode::Left);
-    type_text(&mut app, &provider, "!");
-    assert!(app.view_state().unwrap().grouping.draft.ends_with("!)"));
+    paste(&mut app, &provider, "!");
+    assert_eq!(app.view_state().unwrap().grouping.draft, "!");
     assert_eq!(app.search_state().unwrap().draft, "needle");
+
+    // Clicking an already-selected Custom mode is idempotent, and temporary
+    // Auto/Off choices retain this view's exact custom draft without applying
+    // any of them.
+    draw(&provider, &mut app, 100, 30);
+    let modes = app.layers.grouping.tab_rects().to_vec();
+    let applied = app.view_state().unwrap().grouping.applied.clone();
+    click(&mut app, &provider, modes[1].x + 1, modes[1].y);
+    assert_eq!(app.view_state().unwrap().grouping.draft, "!");
+    click(&mut app, &provider, modes[0].x + 1, modes[0].y);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::AUTO_GROUPING_TOKEN
+    );
+    click(&mut app, &provider, modes[1].x + 1, modes[1].y);
+    assert_eq!(app.view_state().unwrap().grouping.draft, "!");
+    click(&mut app, &provider, modes[2].x + 1, modes[2].y);
+    assert!(app.view_state().unwrap().grouping.draft.is_empty());
+    click(&mut app, &provider, modes[1].x + 1, modes[1].y);
+    assert_eq!(app.view_state().unwrap().grouping.draft, "!");
+    assert_eq!(app.view_state().unwrap().grouping.applied, applied);
     key(&mut app, &provider, KeyCode::Esc);
 
     // Reopening restores the draft and the caret it was left at.

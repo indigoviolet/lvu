@@ -70,6 +70,8 @@ const FILTER_TABS: [QueryPurpose; 2] = [QueryPurpose::Search, QueryPurpose::Adva
 /// letters do once the field no longer has the keys. The shell resolves them
 /// through `action_labels`, the same way it presses a button.
 const FILTER_TAB_LABELS: [&str; 2] = ["&Search", "&Advanced"];
+const GROUPING_MODE_LABELS: [&str; 3] = ["Auto", "Custom", "Off"];
+const DEFAULT_CUSTOM_GROUPING: &str = r"^(\s+|Caused by:)";
 
 /// Everything the Filter dialog lets a mnemonic press, in `action_labels`
 /// order: the two buttons, then the two segments (as View lists its mode
@@ -277,12 +279,33 @@ impl EditorDialog {
             return Outcome::Ignored;
         };
         let target = self.target(&view_id);
+        if self.purpose == QueryPurpose::Grouping && value == crate::grouping::AUTO_GROUPING_TOKEN {
+            match command {
+                EditCommand::Insert(_) => {
+                    value.clear();
+                    ctx.cursors.reset(target.clone(), "");
+                }
+                EditCommand::Backspace | EditCommand::KillToEndOfLine => {
+                    return self.set_grouping_mode(2, true, ctx);
+                }
+                _ => {
+                    ctx.cursors.reset(target, "");
+                    return Outcome::Consumed;
+                }
+            }
+        }
         let mut cursor = ctx.cursors.get_or_end(target.clone(), &value);
         let outcome = edit(&mut value, &mut cursor, command, self.policy());
         ctx.cursors.store(target, cursor);
         if outcome.changed {
             if let Some(editor) = ctx.views.editor_mut(&view_id, self.purpose) {
                 editor.draft = value;
+                if self.purpose == QueryPurpose::Grouping
+                    && !editor.draft.is_empty()
+                    && editor.draft != crate::grouping::AUTO_GROUPING_TOKEN
+                {
+                    editor.custom_grouping_draft = Some(editor.draft.clone());
+                }
             }
             ctx.views.touch(&view_id);
             // A changed draft invalidates the popup it was offered against.
@@ -376,12 +399,62 @@ impl EditorDialog {
         Outcome::Consumed
     }
 
-    fn move_tab(&mut self, delta: i32) -> Outcome {
+    fn move_tab(&mut self, delta: i32, ctx: &mut Ctx<'_>) -> Outcome {
+        if self.purpose == QueryPurpose::Grouping {
+            let current = self
+                .draft(ctx)
+                .map_or(2, |(_, draft)| grouping_mode(&draft));
+            let next =
+                (current as i32 + delta).rem_euclid(GROUPING_MODE_LABELS.len() as i32) as usize;
+            return self.set_grouping_mode(next, false, ctx);
+        }
         let Some(index) = FILTER_TABS.iter().position(|tab| *tab == self.purpose) else {
             return Outcome::Consumed;
         };
         let next = (index as i32 + delta).rem_euclid(FILTER_TABS.len() as i32) as usize;
         self.switch_tab(FILTER_TABS[next], false)
+    }
+
+    fn set_grouping_mode(&mut self, mode: usize, to_field: bool, ctx: &mut Ctx<'_>) -> Outcome {
+        if self.purpose != QueryPurpose::Grouping {
+            return Outcome::Ignored;
+        }
+        let Some(view_id) = ctx.views.active_id().map(str::to_owned) else {
+            return Outcome::Consumed;
+        };
+        let current = ctx
+            .views
+            .editor(&view_id, QueryPurpose::Grouping)
+            .map_or(2, |editor| grouping_mode(&editor.draft));
+        if current == mode {
+            if to_field {
+                self.focus = EditorFocus::Field;
+            }
+            return Outcome::Consumed;
+        }
+        let remembered_custom = ctx
+            .views
+            .editor(&view_id, QueryPurpose::Grouping)
+            .and_then(|editor| editor.custom_grouping_draft.clone());
+        let value = match mode {
+            0 => crate::grouping::AUTO_GROUPING_TOKEN.to_owned(),
+            1 => remembered_custom.unwrap_or_else(|| DEFAULT_CUSTOM_GROUPING.to_owned()),
+            _ => String::new(),
+        };
+        if let Some(editor) = ctx.views.editor_mut(&view_id, QueryPurpose::Grouping) {
+            if current == 1 {
+                editor.custom_grouping_draft = Some(editor.draft.clone());
+            }
+            editor.draft.clone_from(&value);
+            editor.error = None;
+        }
+        ctx.cursors.reset(self.target(&view_id), &value);
+        self.completion = None;
+        if to_field {
+            self.focus = EditorFocus::Field;
+        }
+        ctx.views.touch(&view_id);
+        Outcome::Consumed
     }
 
     /// The completion popup's kind, when it is still the one offered for the
@@ -415,7 +488,7 @@ impl EditorDialog {
             stops.push(FocusStop::Completion(EditorCompletionKind::Field));
             stops.push(FocusStop::Completion(EditorCompletionKind::SampledValue));
         }
-        if self.tabbed {
+        if self.tabbed || self.purpose == QueryPurpose::Grouping {
             stops.push(FocusStop::Tabs);
         }
         if !self.tabbed || self.scroll_limit > 0 {
@@ -582,8 +655,8 @@ impl EditorDialog {
             KeyCode::BackTab => self.cycle_focus(false, ctx),
             KeyCode::Up => self.vertical(-1, ctx),
             KeyCode::Down => self.vertical(1, ctx),
-            KeyCode::Left if self.focus == EditorFocus::Tabs => self.move_tab(-1),
-            KeyCode::Right if self.focus == EditorFocus::Tabs => self.move_tab(1),
+            KeyCode::Left if self.focus == EditorFocus::Tabs => self.move_tab(-1, ctx),
+            KeyCode::Right if self.focus == EditorFocus::Tabs => self.move_tab(1, ctx),
             KeyCode::Left if self.text_editing() && self.completion.is_none() => {
                 self.text(EditCommand::MoveLeft, ctx)
             }
@@ -643,9 +716,10 @@ impl EditorDialog {
         match hit {
             Some(EditorHit::Apply) => self.submit(ctx),
             Some(EditorHit::Clear) => self.clear(ctx),
-            Some(EditorHit::Tab(index)) => FILTER_TABS
+            Some(EditorHit::Tab(index)) if self.tabbed => FILTER_TABS
                 .get(index)
                 .map_or(Outcome::Consumed, |purpose| self.switch_tab(*purpose, true)),
+            Some(EditorHit::Tab(index)) => self.set_grouping_mode(index, true, ctx),
             _ => Outcome::Consumed,
         }
     }
@@ -659,6 +733,16 @@ impl Default for EditorDialog {
 
 fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
+}
+
+fn grouping_mode(draft: &str) -> usize {
+    if draft == crate::grouping::AUTO_GROUPING_TOKEN {
+        0
+    } else if draft.is_empty() {
+        2
+    } else {
+        1
+    }
 }
 
 /// One line of an applied value for the title: newlines and runs of blanks
@@ -703,15 +787,14 @@ impl Component for EditorDialog {
         if let Some(tab) = tab {
             let _ = self.switch_tab(tab, true);
         }
-        // §12.3: an unset grouping rule opens on the one that matches the
-        // common indented-continuation shape rather than on an empty field.
+        // §12.3: an unset grouping rule opens in conservative Auto mode.
         if self.purpose == QueryPurpose::Grouping
             && let Some(view_id) = ctx.views.active_id().map(str::to_owned)
             && let Some(editor) = ctx.views.editor_mut(&view_id, QueryPurpose::Grouping)
             && editor.draft.is_empty()
             && editor.applied.is_empty()
         {
-            editor.draft = r"^(\s+|Caused by:)".into();
+            editor.draft = crate::grouping::AUTO_GROUPING_TOKEN.into();
         }
     }
 
@@ -923,9 +1006,21 @@ impl EditorDialog {
                 "an empty draft turns grouping off".to_owned(),
             )
         } else {
-            (MessageState::Applied, editor.applied.clone())
+            (
+                MessageState::Applied,
+                crate::grouping::grouping_label(&editor.applied)
+                    .unwrap_or("Custom")
+                    .to_owned(),
+            )
         };
-        let help = "Continuation lines match this regex over raw bytes; grouping is display only.";
+        let auto = editor.draft == crate::grouping::AUTO_GROUPING_TOKEN;
+        let help = if auto {
+            "Mode Auto · type to replace it with a Custom raw-byte regex · Backspace selects Off."
+        } else if editor.draft.is_empty() {
+            "Mode Off · type a raw-byte regex for Custom grouping. Grouping is display only."
+        } else {
+            "Mode Custom · continuation lines match this regex over raw bytes; clear it for Off."
+        };
         // §3: the action row is part of the anatomy, not an afterthought. Without
         // it this dialog rendered no way to apply at all and relied on the user
         // knowing that Enter works.
@@ -933,7 +1028,7 @@ impl EditorDialog {
 
         let preview_rows = u16::try_from(GROUPING_PREVIEW.len()).unwrap_or(2);
         let content = DialogContent {
-            header: 0,
+            header: 1,
             // input row, gap, preview pane heading, preview rows
             body: 3u16.saturating_add(preview_rows),
             message: message_rows(&sentence, width),
@@ -951,12 +1046,31 @@ impl EditorDialog {
         surface.popup = regions.popup;
         surface.interior = regions.interior;
         self.geometry.body = regions.body;
+        let active_mode = grouping_mode(&editor.draft);
+        let focused_mode = (self.focus == EditorFocus::Tabs).then_some(active_mode);
+        let modes = render_segmented_control(
+            frame,
+            regions.header,
+            &GROUPING_MODE_LABELS,
+            active_mode,
+            focused_mode,
+            theme,
+        );
         if regions.body.width == 0 || regions.body.height == 0 {
-            return (surface, Vec::new(), actions, diagnostics);
+            return (surface, modes, actions, diagnostics);
         }
 
         let field = Rect::new(regions.body.x, regions.body.y, regions.body.width, 1);
-        if self.text_editing() {
+        if auto {
+            InputSurface {
+                style: styles.input,
+            }
+            .render(field, frame.buffer_mut());
+            frame.render_widget(
+                Paragraph::new("Auto — conservative multiline detection").style(styles.input),
+                field,
+            );
+        } else if self.text_editing() {
             surface.caret = place_input_cursor_at(frame, field, 0, 0, &editor.draft, cursor, theme);
         } else {
             InputSurface {
@@ -1014,7 +1128,7 @@ impl EditorDialog {
             .into_iter()
             .map(|(_, rect)| rect)
             .collect();
-        (surface, Vec::new(), actions, diagnostics)
+        (surface, modes, actions, diagnostics)
     }
 
     /// §12.1 Filter: the `Search │ Advanced` control, one field, one message

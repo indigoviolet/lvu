@@ -422,21 +422,71 @@ impl SourceTimeBounds {
 struct GroupRange {
     start: usize,
     len: usize,
-    bytes: usize,
+    logical_lines: usize,
+    payload_bytes: usize,
     stream: lvu_core::StreamKind,
     orphan: bool,
     split: bool,
     oversized: bool,
+    auto_open: bool,
+    auto_structured: bool,
+    auto_structure_depth: u16,
+    partial_open: bool,
+    partial_truncated: bool,
+    structure_truncated: bool,
+    partial_prefix: Vec<u8>,
+    structure_prefix: Vec<u8>,
+    acquisition_id: [u8; 16],
+    last_chunk: lvu_core::ChunkPosition,
+    first_capture_nanos: i64,
+    last_capture_nanos: i64,
     projection: Arc<Vec<DisplayRow>>,
 }
 
 const MAX_GROUP_LINES: usize = 64;
-const MAX_GROUP_BYTES: usize = 64 * 1024;
+const MAX_GROUP_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_GROUP_REGEX_BYTES: usize = 16 * 1024;
 const MAX_GROUP_REGEX_COMPILED_BYTES: usize = 1024 * 1024;
 const MAX_GROUP_REGEX_NESTING: u32 = 64;
 const MAX_GROUP_LINE_DISPLAY_BYTES: usize = 4 * 1024;
 const MAX_GROUP_LINE_PROJECTION_BYTES: usize = 8 * 1024;
+const MAX_AUTO_GROUP_SPAN_NANOS: i64 = 30_000_000_000;
+
+fn auto_group_within_span(
+    first_capture_nanos: i64,
+    last_capture_nanos: i64,
+    captured_at_unix_nanos: i64,
+) -> bool {
+    let from_head = captured_at_unix_nanos
+        .checked_sub(first_capture_nanos)
+        .is_some_and(|elapsed| (0..=MAX_AUTO_GROUP_SPAN_NANOS).contains(&elapsed));
+    let from_previous = captured_at_unix_nanos
+        .checked_sub(last_capture_nanos)
+        .is_some_and(|elapsed| elapsed >= 0);
+    from_head && from_previous
+}
+
+fn group_state_bytes(group: &GroupRange) -> u64 {
+    group_base_state_bytes()
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(group.partial_prefix.capacity()).unwrap_or(u64::MAX))
+        .saturating_add(u64::try_from(group.structure_prefix.capacity()).unwrap_or(u64::MAX))
+}
+
+fn group_base_state_bytes() -> Result<u64, std::num::TryFromIntError> {
+    u64::try_from(std::mem::size_of::<GroupRange>())
+}
+
+fn extended_auto_prefix(existing: &[u8], bytes: &[u8]) -> (Vec<u8>, bool) {
+    const MAX_PREFIX_BYTES: usize = 512;
+    let additional = bytes
+        .len()
+        .min(MAX_PREFIX_BYTES.saturating_sub(existing.len()));
+    let mut extended = Vec::with_capacity(existing.len().saturating_add(additional));
+    extended.extend_from_slice(existing);
+    extended.extend_from_slice(&bytes[..additional]);
+    (extended, additional < bytes.len())
+}
 
 #[derive(Clone)]
 struct EvaluationBatch {
@@ -865,9 +915,12 @@ fn display_projection_bytes(row: &DisplayRow) -> u64 {
 }
 
 fn group_projection_bytes(group: &GroupRange) -> u64 {
-    group.projection.iter().fold(64_u64, |total, row| {
-        total.saturating_add(display_projection_bytes(row))
-    })
+    group
+        .projection
+        .iter()
+        .fold(group_state_bytes(group), |total, row| {
+            total.saturating_add(display_projection_bytes(row))
+        })
 }
 
 #[derive(Clone)]
@@ -2278,6 +2331,7 @@ impl NativeViewRows {
                             group.orphan,
                             group.split,
                             group.oversized,
+                            group.logical_lines,
                         ));
                     }
                 } else {
@@ -2710,6 +2764,7 @@ impl RowProvider for NativeViewRows {
                         group.orphan,
                         group.split,
                         group.oversized,
+                        group.logical_lines,
                     ))
                 } else {
                     membership_index(membership, id)?;
@@ -4715,7 +4770,12 @@ fn run_query(
             let mut previous_physical_matched = last_sequence
                 .zip(sequences.last().copied())
                 .is_some_and(|(last, matched)| last == matched);
+            let mut previous_sequence = last_sequence;
             for (position, record) in records.iter().enumerate() {
+                let physically_adjacent = previous_sequence.is_some_and(|previous| {
+                    previous.checked_add(1) == Some(record.record_id.sequence)
+                });
+                previous_sequence = Some(record.record_id.sequence);
                 while matched_ids
                     .get(matched_cursor)
                     .is_some_and(|id| id.sequence < record.record_id.sequence)
@@ -4727,6 +4787,20 @@ fn run_query(
                     .is_some_and(|id| id.sequence == record.record_id.sequence)
                 {
                     previous_physical_matched = false;
+                    if grouping_rule
+                        .as_ref()
+                        .is_some_and(ContinuationRule::is_auto)
+                        && let Some(group) = groups.last_mut()
+                    {
+                        // Auto classifier state may survive an incremental
+                        // refresh, but never an unmatched physical record.
+                        // Otherwise a filtered-out head/chunk could be bridged
+                        // by a later continuation in this or a later batch.
+                        group.auto_open = false;
+                        group.auto_structured = false;
+                        group.auto_structure_depth = 0;
+                        group.partial_open = false;
+                    }
                     continue;
                 }
                 matched_cursor += 1;
@@ -4778,24 +4852,241 @@ fn run_query(
                         );
                         return;
                     }
-                    let continuation = rule.matches(&record.bytes);
+                    let prior = groups.last();
+                    let auto_open = prior.is_some_and(|group| group.auto_open);
+                    let possible_chunk_continuation = prior.is_some_and(|group| {
+                        group.partial_open
+                            && group.acquisition_id == *record.acquisition_id.as_bytes()
+                            && matches!(
+                                (group.last_chunk, record.chunk),
+                                (
+                                    lvu_core::ChunkPosition::Start
+                                        | lvu_core::ChunkPosition::Continue,
+                                    lvu_core::ChunkPosition::Continue
+                                        | lvu_core::ChunkPosition::End
+                                )
+                            )
+                    });
+                    let auto_line = rule.auto_line(&record.bytes, auto_open);
+                    let continuation = rule.custom_matches(&record.bytes).unwrap_or_else(|| {
+                        matches!(
+                            record.chunk,
+                            lvu_core::ChunkPosition::Continue | lvu_core::ChunkPosition::End
+                        ) || auto_line == Some(AutoLine::Continuation)
+                    });
+                    let credible_start = rule.custom_matches(&record.bytes).is_some()
+                        || auto_line == Some(AutoLine::Start);
                     let same_stream = groups
                         .last()
                         .is_some_and(|group| group.stream == record.stream);
+                    let same_acquisition = !rule.is_auto()
+                        || groups.last().is_some_and(|group| {
+                            group.acquisition_id == *record.acquisition_id.as_bytes()
+                        });
+                    let within_time = !rule.is_auto()
+                        || groups.last().is_none_or(|group| {
+                            auto_group_within_span(
+                                group.first_capture_nanos,
+                                group.last_capture_nanos,
+                                record.captured_at_unix_nanos,
+                            )
+                        });
+                    let chunk_continuation = possible_chunk_continuation
+                        && previous_physical_matched
+                        && physically_adjacent
+                        && same_stream
+                        && same_acquisition
+                        && within_time;
+                    let chunk_provenance = !rule.is_auto()
+                        || !matches!(
+                            record.chunk,
+                            lvu_core::ChunkPosition::Continue | lvu_core::ChunkPosition::End
+                        )
+                        || chunk_continuation;
                     let can_extend = continuation
                         && previous_physical_matched
+                        && physically_adjacent
                         && same_stream
+                        && same_acquisition
+                        && within_time
+                        && chunk_provenance
+                        && groups
+                            .last()
+                            .is_some_and(|group| group.auto_open || chunk_continuation)
                         && groups.last().is_some_and(|group| {
                             group.len < MAX_GROUP_LINES
-                                && group.bytes.saturating_add(record.bytes.len()) <= MAX_GROUP_BYTES
+                                && group.payload_bytes.saturating_add(record.bytes.len())
+                                    <= MAX_GROUP_PAYLOAD_BYTES
                         });
                     if can_extend {
+                        let (
+                            next_partial_prefix,
+                            next_partial_truncated,
+                            next_structure_prefix,
+                            next_structure_truncated,
+                            prefix_capacity_growth,
+                        ) = if rule.is_auto() {
+                            let group = groups.last().expect("checked group");
+                            let (next_partial, partial_truncated) = if chunk_continuation {
+                                extended_auto_prefix(&group.partial_prefix, &record.bytes)
+                            } else if matches!(record.chunk, lvu_core::ChunkPosition::Start) {
+                                extended_auto_prefix(&[], &record.bytes)
+                            } else {
+                                (group.partial_prefix.clone(), group.partial_truncated)
+                            };
+                            let (next_structure, structure_truncated) = if group.auto_structured {
+                                if matches!(record.chunk, lvu_core::ChunkPosition::Complete) {
+                                    let (prefix, truncated) = extended_auto_prefix(
+                                        &group.structure_prefix,
+                                        &record.bytes,
+                                    );
+                                    (prefix, group.structure_truncated || truncated)
+                                } else if matches!(record.chunk, lvu_core::ChunkPosition::End) {
+                                    let (prefix, truncated) = extended_auto_prefix(
+                                        &group.structure_prefix,
+                                        &next_partial,
+                                    );
+                                    (prefix, group.structure_truncated || truncated)
+                                } else {
+                                    (group.structure_prefix.clone(), group.structure_truncated)
+                                }
+                            } else {
+                                (group.structure_prefix.clone(), group.structure_truncated)
+                            };
+                            let old_capacity = group
+                                .partial_prefix
+                                .capacity()
+                                .saturating_add(group.structure_prefix.capacity());
+                            let new_capacity = next_partial
+                                .capacity()
+                                .saturating_add(next_structure.capacity());
+                            (
+                                next_partial,
+                                group.partial_truncated || partial_truncated,
+                                next_structure,
+                                structure_truncated,
+                                new_capacity.saturating_sub(old_capacity),
+                            )
+                        } else {
+                            (Vec::new(), false, Vec::new(), false, 0)
+                        };
+                        if !reservation
+                            .add(u64::try_from(prefix_capacity_growth).unwrap_or(u64::MAX))
+                        {
+                            fail(
+                                tx,
+                                &request,
+                                &cancelled,
+                                QueryPurpose::Grouping,
+                                "display grouping classifier state memory cap reached; previous view preserved",
+                                true,
+                            );
+                            return;
+                        }
                         let group = groups.last_mut().expect("checked group");
                         group.len += 1;
-                        group.bytes = group.bytes.saturating_add(record.bytes.len());
+                        if !rule.is_auto()
+                            || matches!(
+                                record.chunk,
+                                lvu_core::ChunkPosition::Complete | lvu_core::ChunkPosition::Start
+                            )
+                        {
+                            group.logical_lines = group.logical_lines.saturating_add(1);
+                        }
+                        group.payload_bytes =
+                            group.payload_bytes.saturating_add(record.bytes.len());
+                        group.last_chunk = record.chunk;
+                        group.last_capture_nanos = record.captured_at_unix_nanos;
+                        if rule.is_auto() {
+                            group.partial_prefix = next_partial_prefix;
+                            group.partial_truncated = next_partial_truncated;
+                            group.structure_prefix = next_structure_prefix;
+                            group.structure_truncated = next_structure_truncated;
+                            if matches!(record.chunk, lvu_core::ChunkPosition::Start) {
+                                group.partial_open = true;
+                            }
+                        }
+                        if rule.is_auto() && matches!(record.chunk, lvu_core::ChunkPosition::End) {
+                            group.partial_open = false;
+                            let completed = if group.partial_truncated {
+                                AutoLine::Ambiguous
+                            } else {
+                                classify_auto_line(&group.partial_prefix, false)
+                            };
+                            if !group.auto_structured {
+                                group.auto_structured = completed == AutoLine::Start
+                                    && is_auto_structured_start(&group.partial_prefix);
+                                if group.auto_structured {
+                                    let structure_prefix = group.partial_prefix.clone();
+                                    let capacity_growth = structure_prefix
+                                        .capacity()
+                                        .saturating_sub(group.structure_prefix.capacity());
+                                    if !reservation
+                                        .add(u64::try_from(capacity_growth).unwrap_or(u64::MAX))
+                                    {
+                                        fail(
+                                            tx,
+                                            &request,
+                                            &cancelled,
+                                            QueryPurpose::Grouping,
+                                            "display grouping classifier state memory cap reached; previous view preserved",
+                                            true,
+                                        );
+                                        return;
+                                    }
+                                    group.structure_prefix = structure_prefix;
+                                    group.structure_truncated = group.partial_truncated;
+                                }
+                            }
+                            group.partial_prefix.clear();
+                            group.partial_truncated = false;
+                            group.auto_structure_depth = if group.auto_structured {
+                                structured_depth(&group.structure_prefix).unwrap_or(1)
+                            } else {
+                                0
+                            };
+                            group.auto_open = !group.structure_truncated
+                                && completed == AutoLine::Start
+                                && (!group.auto_structured || group.auto_structure_depth > 0);
+                        } else if rule.is_auto() && group.auto_structured {
+                            group.auto_structure_depth =
+                                structured_depth(&group.structure_prefix).unwrap_or(1);
+                            group.auto_open =
+                                !group.structure_truncated && group.auto_structure_depth > 0;
+                        }
                         Arc::make_mut(&mut group.projection).push(projection);
                     } else {
-                        if !reservation.add(64) {
+                        let partial_open = rule.is_auto()
+                            && (matches!(record.chunk, lvu_core::ChunkPosition::Start)
+                                || chunk_continuation);
+                        let auto_structured = rule.is_auto()
+                            && matches!(record.chunk, lvu_core::ChunkPosition::Complete)
+                            && auto_line == Some(AutoLine::Start)
+                            && is_auto_structured_start(&record.bytes);
+                        let (partial_prefix, partial_truncated) = if partial_open {
+                            extended_auto_prefix(&[], &record.bytes)
+                        } else {
+                            (Vec::new(), false)
+                        };
+                        let (structure_prefix, structure_truncated) = if auto_structured {
+                            extended_auto_prefix(&[], &record.bytes)
+                        } else {
+                            (Vec::new(), false)
+                        };
+                        let auto_structure_depth = if auto_structured {
+                            structured_depth(&structure_prefix).unwrap_or(1)
+                        } else {
+                            0
+                        };
+                        let state_bytes = group_base_state_bytes()
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(
+                                u64::try_from(partial_prefix.capacity()).unwrap_or(u64::MAX),
+                            )
+                            .saturating_add(
+                                u64::try_from(structure_prefix.capacity()).unwrap_or(u64::MAX),
+                            );
+                        if !reservation.add(state_bytes) {
                             fail(
                                 tx,
                                 &request,
@@ -4809,11 +5100,41 @@ fn run_query(
                         groups.push(GroupRange {
                             start: sequence_index,
                             len: 1,
-                            bytes: record.bytes.len(),
+                            logical_lines: 1,
+                            payload_bytes: record.bytes.len(),
                             stream: record.stream,
                             orphan: continuation,
-                            split: continuation && previous_physical_matched && same_stream,
-                            oversized: record.bytes.len() > MAX_GROUP_BYTES,
+                            split: continuation
+                                && previous_physical_matched
+                                && physically_adjacent
+                                && same_stream
+                                && same_acquisition
+                                && (rule.custom_matches(&record.bytes).is_some()
+                                    || auto_open
+                                    || chunk_continuation),
+                            oversized: record.bytes.len() > MAX_GROUP_PAYLOAD_BYTES,
+                            auto_open: (credible_start
+                                || (continuation
+                                    && previous_physical_matched
+                                    && physically_adjacent
+                                    && same_stream
+                                    && same_acquisition
+                                    && within_time
+                                    && auto_open))
+                                && !partial_truncated
+                                && !structure_truncated
+                                && (!auto_structured || auto_structure_depth > 0),
+                            auto_structured,
+                            auto_structure_depth,
+                            partial_open,
+                            partial_truncated,
+                            structure_truncated,
+                            partial_prefix,
+                            structure_prefix,
+                            acquisition_id: *record.acquisition_id.as_bytes(),
+                            last_chunk: record.chunk,
+                            first_capture_nanos: record.captured_at_unix_nanos,
+                            last_capture_nanos: record.captured_at_unix_nanos,
                             projection: Arc::new(vec![projection]),
                         });
                     }
@@ -5258,6 +5579,7 @@ struct DisplayGroup {
     orphan: bool,
     split: bool,
     oversized: bool,
+    logical_lines: usize,
     projection: Arc<Vec<DisplayRow>>,
 }
 
@@ -5356,6 +5678,7 @@ fn membership_groups(membership: &Membership, start: usize, len: usize) -> Vec<D
                 orphan: group.orphan,
                 split: group.split,
                 oversized: group.oversized,
+                logical_lines: group.logical_lines,
                 projection: Arc::clone(&group.projection),
             })
         })
@@ -5396,15 +5719,18 @@ fn project_group(
     orphan: bool,
     split: bool,
     oversized: bool,
+    logical_lines: usize,
 ) -> DisplayRow {
     let mut head = members.remove(0);
-    let line_count = members.len() + 1;
+    let record_count = members.len() + 1;
     head.details.push((
         "grouping".into(),
         "display-only; physical records unchanged".into(),
     ));
     head.details
-        .push(("group_line_count".into(), line_count.to_string()));
+        .push(("group_line_count".into(), logical_lines.to_string()));
+    head.details
+        .push(("group_record_count".into(), record_count.to_string()));
     if orphan {
         head.details
             .push(("group_boundary".into(), "orphan continuation".into()));
@@ -5417,7 +5743,7 @@ fn project_group(
         head.details.push((
             "group_oversized_record".into(),
             format!(
-                "leading physical record exceeds the {MAX_GROUP_BYTES}-byte soft group limit; preserved alone"
+                "leading physical record exceeds the {MAX_GROUP_PAYLOAD_BYTES}-byte payload soft group limit; preserved alone"
             ),
         ));
     }
@@ -5432,13 +5758,25 @@ fn project_group(
             format!("{}: {}", member.id, member.text),
         ));
     }
-    if line_count > 1 || orphan {
+    if record_count > 1 || orphan {
         let label = if orphan {
             "orphan continuation"
+        } else if record_count != logical_lines {
+            "physical records"
         } else {
             "physical lines"
         };
-        head.text = format!("{}  [{} {label}]", head.text, line_count);
+        head.text = if record_count != logical_lines && !orphan {
+            format!(
+                "{}  [{} {label} / {} logical {}]",
+                head.text,
+                record_count,
+                logical_lines,
+                if logical_lines == 1 { "line" } else { "lines" }
+            )
+        } else {
+            format!("{}  [{} {label}]", head.text, record_count)
+        };
     }
     head
 }
@@ -5477,10 +5815,28 @@ fn definitions_match(left: &lvu::QueryConstraints, right: &lvu::QueryConstraints
 }
 
 #[derive(Clone)]
-struct ContinuationRule(regex::bytes::Regex);
+enum ContinuationRule {
+    Auto,
+    Custom(regex::bytes::Regex),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoLine {
+    Start,
+    Continuation,
+    Ambiguous,
+}
 
 impl ContinuationRule {
+    fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
     fn parse(source: &str) -> Result<Self, String> {
+        match lvu::grouping::parse_grouping(source)? {
+            lvu::grouping::GroupingSpec::Auto => return Ok(Self::Auto),
+            lvu::grouping::GroupingSpec::Custom(_) => {}
+        }
         if source.len() > MAX_GROUP_REGEX_BYTES {
             return Err(format!(
                 "display grouping regex exceeds the {MAX_GROUP_REGEX_BYTES}-byte source limit"
@@ -5490,13 +5846,166 @@ impl ContinuationRule {
             .size_limit(MAX_GROUP_REGEX_COMPILED_BYTES)
             .nest_limit(MAX_GROUP_REGEX_NESTING)
             .build()
-            .map(Self)
+            .map(Self::Custom)
             .map_err(|error| format!("invalid display grouping regex: {error}"))
     }
 
-    fn matches(&self, bytes: &[u8]) -> bool {
-        self.0.is_match(bytes)
+    fn custom_matches(&self, bytes: &[u8]) -> Option<bool> {
+        match self {
+            Self::Auto => None,
+            Self::Custom(regex) => Some(regex.is_match(bytes)),
+        }
     }
+
+    fn auto_line(&self, bytes: &[u8], open: bool) -> Option<AutoLine> {
+        matches!(self, Self::Auto).then(|| classify_auto_line(bytes, open))
+    }
+}
+
+fn classify_auto_line(bytes: &[u8], open: bool) -> AutoLine {
+    // Classification observes, but never rewrites, original bytes. Limit the
+    // lexical prefix so a huge physical record cannot turn grouping into an
+    // unbounded presentation scan.
+    let prefix = auto_lexical_prefix(bytes);
+    // ANSI is not removed or copied into derived data. For start recognition
+    // only, step over leading CSI styling so a coloured timestamp/level has
+    // the same classification as its uncoloured form. Complete display text
+    // is still cleaned solely by `lvu::ansi::without_ansi` in the renderer.
+    let text = String::from_utf8_lossy(prefix);
+    let trimmed = text.trim_matches(['\r', '\n']);
+    let leading = trimmed.trim_start_matches([' ', '\t']);
+    let lower = leading.to_ascii_lowercase();
+
+    let bytes = leading.as_bytes();
+    let iso_timestamp = bytes.len() >= 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit);
+    let level = [
+        "trace", "debug", "info", "warn", "warning", "error", "fatal", "critical",
+    ]
+    .iter()
+    .any(|level| {
+        lower.starts_with(level)
+            && lower[level.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| !next.is_ascii_alphanumeric())
+    });
+    let known_head = lower.starts_with("traceback (most recent call last):")
+        || lower.starts_with("exception in thread ")
+        || lower.starts_with("goroutine ")
+        || lower.starts_with("panic:");
+
+    // A source-shaped event header wins even when upstream pretty-printing
+    // indented it. Generic indentation is only continuation evidence after
+    // credible starts have been excluded.
+    if iso_timestamp || level || known_head {
+        return AutoLine::Start;
+    }
+
+    if leading.is_empty() {
+        return if open {
+            AutoLine::Continuation
+        } else {
+            AutoLine::Ambiguous
+        };
+    }
+    if trimmed.len() != leading.len()
+        || lower.starts_with("at ")
+        || lower.starts_with("caused by:")
+        || lower.starts_with("suppressed:")
+        || (lower.starts_with("...") && lower.ends_with(" more"))
+        || (open && matches!(leading.as_bytes().first(), Some(b'}' | b']' | b')')))
+        || (open
+            && ["file \"", "runtime error:"]
+                .iter()
+                .any(|marker| lower.starts_with(marker)))
+        || (open
+            && lower
+                .split_once(':')
+                .is_some_and(|(kind, _)| kind.ends_with("error") || kind.ends_with("exception")))
+        || (open && leading.ends_with(')') && leading.contains('.') && !leading.contains(' '))
+    {
+        return AutoLine::Continuation;
+    }
+
+    let structured =
+        trimmed.len() == leading.len() && (leading.starts_with('{') || leading.starts_with('['));
+    let yaml_document =
+        trimmed.len() == leading.len() && (leading == "---" || lower.starts_with("%yaml "));
+    if structured || yaml_document {
+        AutoLine::Start
+    } else {
+        AutoLine::Ambiguous
+    }
+}
+
+fn auto_lexical_prefix(bytes: &[u8]) -> &[u8] {
+    let prefix = &bytes[..bytes.len().min(512)];
+    let mut offset = 0;
+    while prefix.get(offset..offset + 2) == Some(b"\x1b[") {
+        offset += 2;
+        while let Some(byte) = prefix.get(offset) {
+            offset += 1;
+            if (0x40..=0x7e).contains(byte) {
+                break;
+            }
+        }
+    }
+    &prefix[offset..]
+}
+
+fn is_auto_structured_start(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(auto_lexical_prefix(bytes));
+    let trimmed = text.trim_matches(['\r', '\n']);
+    let leading = trimmed.trim_start_matches([' ', '\t']);
+    trimmed.len() == leading.len() && matches!(leading.as_bytes().first(), Some(b'{' | b'['))
+}
+
+/// Bounded JSON-like bracket balance for presentation state. Quotes and
+/// escapes are observed so braces in strings do not keep a completed payload
+/// open. `None` means the lexical prefix ended in an incomplete string/escape;
+/// callers conservatively keep the group open until more physical input.
+fn structured_depth(bytes: &[u8]) -> Option<u16> {
+    let mut depth = 0u16;
+    let mut quoted = false;
+    let mut escaped = false;
+    let bytes = &bytes[..bytes.len().min(512)];
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if !quoted && byte == b'\x1b' && bytes.get(index + 1) == Some(&b'[') {
+            index += 2;
+            while let Some(parameter) = bytes.get(index) {
+                index += 1;
+                if (0x40..=0x7e).contains(parameter) {
+                    break;
+                }
+            }
+            continue;
+        }
+        index += 1;
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'{' | b'[' => depth = depth.saturating_add(1),
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    (!quoted && !escaped).then_some(depth)
 }
 
 /// One correlation lookup: resolve the frozen record's typed value, then
@@ -5842,10 +6351,12 @@ mod grouping_tests {
     fn rust_regex_semantics_and_complexity_limits_are_enforced() {
         let rule = ContinuationRule::parse(r"^(?:[[:space:]]+|Caused\s+by:|\[continued\]\s{1,3})")
             .unwrap();
-        assert!(rule.matches(b"  at frame"));
-        assert!(rule.matches(b"Caused   by: disk"));
-        assert!(rule.matches(b"[continued] \xff"));
-        assert!(!rule.matches(b"ordinary event"));
+        assert_eq!(rule.custom_matches(b"  at frame"), Some(true));
+        assert_eq!(rule.custom_matches(b"Caused   by: disk"), Some(true));
+        assert_eq!(rule.custom_matches(b"[continued] \xff"), Some(true));
+        assert_eq!(rule.custom_matches(b"ordinary event"), Some(false));
+        let auto_token = std::hint::black_box(lvu::grouping::AUTO_GROUPING_TOKEN);
+        assert!(regex::bytes::Regex::new(auto_token).is_err());
         assert!(ContinuationRule::parse(r"(?=lookaround)").is_err());
         assert!(ContinuationRule::parse(r"^(a)\1$").is_err());
 
@@ -5855,16 +6366,102 @@ mod grouping_tests {
     }
 
     #[test]
+    fn automatic_grouping_is_conservative_across_common_multiline_shapes() {
+        for start in [
+            b"2026-09-09T12:00:00Z ERROR failed".as_slice(),
+            b"ERROR request failed",
+            b"Traceback (most recent call last):",
+            b"Exception in thread \"main\" java.lang.IllegalStateException",
+            b"goroutine 17 [running]:",
+            b"{",
+            b"---",
+            b"  2026-09-09T12:00:00Z INFO indented but new",
+            b"  ERROR indented but new",
+            b"\x1b[31mERROR coloured\x1b[0m",
+        ] {
+            assert_eq!(
+                classify_auto_line(start, false),
+                AutoLine::Start,
+                "{start:?}"
+            );
+        }
+        for continuation in [
+            b"  wrapped message".as_slice(),
+            b"\tat main.go:42",
+            b"Caused by: java.io.IOException",
+            b"Suppressed: secondary",
+            b"ValueError: bad payload",
+            b"}",
+            b"",
+            b"  invalid \xff",
+        ] {
+            assert_eq!(
+                classify_auto_line(continuation, true),
+                AutoLine::Continuation,
+                "{continuation:?}"
+            );
+        }
+        for stray in [b"ordinary standalone".as_slice(), b"", b"ValueError: stray"] {
+            assert_eq!(
+                classify_auto_line(stray, false),
+                AutoLine::Ambiguous,
+                "{stray:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_group_span_is_fixed_to_persisted_head_capture_time() {
+        let first = 1_700_000_000_000_000_000;
+        assert!(auto_group_within_span(first, first, first));
+        assert!(auto_group_within_span(
+            first,
+            first,
+            first + MAX_AUTO_GROUP_SPAN_NANOS
+        ));
+        assert!(!auto_group_within_span(
+            first,
+            first,
+            first + MAX_AUTO_GROUP_SPAN_NANOS + 1
+        ));
+        assert!(!auto_group_within_span(first, first, first - 1));
+        assert!(!auto_group_within_span(first, first + 100, first + 50));
+        assert!(!auto_group_within_span(i64::MIN, i64::MIN, i64::MAX));
+    }
+
+    #[test]
+    fn structured_depth_ignores_quoted_braces_and_observes_top_level_close() {
+        assert_eq!(structured_depth(br#"{"text":"}"}"#), Some(0));
+        assert_eq!(structured_depth(br#"{"items":[1,2]}"#), Some(0));
+        assert_eq!(structured_depth(b"\x1b[31m{\x1b[0m}\n"), Some(0));
+        assert_eq!(structured_depth(br#"{"items":["#), Some(2));
+        assert_eq!(structured_depth(br#"{"unterminated"#), None);
+    }
+
+    #[test]
     fn group_index_uses_ordered_boundaries_for_large_memberships() {
         let groups = (0..10_000)
             .map(|index| GroupRange {
                 start: index * 3,
                 len: 3,
-                bytes: 0,
+                logical_lines: 3,
+                payload_bytes: 0,
                 stream: lvu_core::StreamKind::File,
                 orphan: false,
                 split: false,
                 oversized: false,
+                auto_open: true,
+                auto_structured: false,
+                auto_structure_depth: 0,
+                partial_open: false,
+                partial_truncated: false,
+                structure_truncated: false,
+                partial_prefix: Vec::new(),
+                structure_prefix: Vec::new(),
+                acquisition_id: [0; 16],
+                last_chunk: lvu_core::ChunkPosition::Complete,
+                first_capture_nanos: 0,
+                last_capture_nanos: 0,
                 projection: Arc::new(Vec::new()),
             })
             .collect::<Appended<_>>();

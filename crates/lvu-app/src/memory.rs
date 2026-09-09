@@ -1691,6 +1691,35 @@ mod tests {
     }
 
     #[test]
+    fn automatic_grouping_token_round_trips_without_changing_custom_storage() {
+        let temp = TempDir::new().unwrap();
+        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let view_id = ViewId::new();
+        let mut value = request(1, definition(), view_id, "accepted");
+        value.state.applied_grouping = lvu::grouping::AUTO_GROUPING_TOKEN.into();
+        value.state.grouping_draft = lvu::grouping::AUTO_GROUPING_TOKEN.into();
+        worker.save(Box::new(value)).unwrap();
+        assert!(worker.flush(Duration::from_secs(1)).1.is_ok());
+
+        let stored = WorkspaceStore::open(temp.path())
+            .unwrap()
+            .get_view(view_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.presentation.applied_grouping.as_deref(),
+            Some(lvu::grouping::AUTO_GROUPING_TOKEN)
+        );
+        let restored = super::restored(stored);
+        assert_eq!(
+            restored.applied_grouping,
+            lvu::grouping::AUTO_GROUPING_TOKEN
+        );
+        assert_eq!(restored.grouping_draft, lvu::grouping::AUTO_GROUPING_TOKEN);
+        worker.stop();
+    }
+
+    #[test]
     fn rolling_capture_policy_round_trips_without_persisting_resolved_bounds() {
         let temp = TempDir::new().unwrap();
         let worker = MemoryWorker::start(temp.path().to_path_buf());

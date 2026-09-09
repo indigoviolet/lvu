@@ -9,6 +9,7 @@ pub mod dialog_controls;
 pub mod dialog_layout;
 pub mod field_stats;
 pub mod fixture;
+pub mod grouping;
 pub mod highlight;
 pub mod horizontal;
 mod input;
