@@ -4,9 +4,10 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
-## v0.1.3 — prepared for release
+## v0.1.3 — 2026-09-09
 
-Publication follows exact-source acceptance and all four native archives.
+[Published release](https://github.com/indigoviolet/lvu/releases/tag/v0.1.3),
+from `8ca75d0`, with all four native archives and the updated Homebrew tap.
 
 ### Features
 

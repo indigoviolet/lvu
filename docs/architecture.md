@@ -1,8 +1,8 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.2` (2026-09-09) is the current public release. Subsequent status/FOLLOW
-changes are integrated for the next version. Releases use only the vX.Y.Z scheme.
+`v0.1.3` (2026-09-09) is the current public release, including unified grouping
+and status/FOLLOW changes. Releases use only the vX.Y.Z scheme.
 Historical build numbers below date when behavior arrived; they are not a separate
 release channel.
 

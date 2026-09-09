@@ -6,7 +6,7 @@ app crate version and lockfile version must agree. Push the specific version tag
 rather than all local tags, and never move an existing version tag.
 See [versions](versions.md) for local installation and retention.
 
-**State: `v0.1.2` is tagged and published, with all four archives and the updated tap.** Steps 1-4
+**State: `v0.1.3` is tagged and published, with all four archives and the updated tap.** Steps 1-4
 retain the historical `v0.1.0` command examples; substitute the version being
 released rather than recreating a published tag.
 A reader arriving now starts at [step 5, cutting the next

@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.2**. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.3**. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -16,25 +16,13 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 | --- | --- |
 | **Working** | Make “give me a UTC timestamp column” and “give me a severity column” assistance shortcuts that propose ordinary enrichment definitions for review; let each view select the output columns for time/severity roles. Replace the separate automatic recognition/normalization paths. Capture time remains acquisition metadata. |
 | **Working** | Compose live union views from existing views across sources, merged in selected timestamp order, with ordinary downstream filters and grouping. Preserve original record identities and capture ownership; define overlap, missing-time and dependency/revision behavior. |
-| **Working** | Unify Grouping with Run and Filter modes over enrichment outputs: consecutive equal keys, or non-null event starts with all intervening records collapsed. Move pattern definition out of grouping, preserve exact key equality and legacy saved meaning. Integrated; final v0.1.3 acceptance is running. |
 | **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
 | **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
 | **Working** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no performance or full-soak pass is claimed yet. |
 
 ## Accepted for the next release
 
-Integrated after v0.1.2; outside the immutable v0.1.2 tag and installed runtime.
-
-| Status | Work |
-| --- | --- |
-| **Ready** | Source assistance proposes up to eight distinct reviewed sources; Apply reports partial failures, retains all-failed reviews for retry and never runs sources before confirmation. |
-| **Ready** | Separate bounded journal page requests from capture scheduling, preserving reciprocal progress, writer closure and cancelled-read bounds. The cold-query performance investigation remains open. |
-| **Ready** | Batch queued autosaves with per-entry rollback and durable acknowledgement ordering; full slow-volume shutdown acceptance remains open. |
-| **Ready** | Missing enrichment/filter columns report actionable batch-scoped diagnostics; rejected drafts preserve the last accepted rows and live refresh. |
-| **Ready** | A requested window exceeding the display-cache byte limit retains its drawable prefix; blank indexed rows show loading. The broader 512 MB viewport/soak investigation remains open. |
-| **Ready** | Status prioritizes actionable notices, event-time diagnostics, row ranges and visible return/help controls; wide/combining text fits and optional indicators give way as whole segments. |
-| **Ready** | FOLLOW draws the newest servable window while preserving true-tail selection. HISTORY keeps its requested destination separate from retained displayed rows, retries without another keypress, and reports the actual range. |
-| **Ready** | Pending raw-context location is visible in narrow status lines: the protected prefix says `locating #N` until the chase resolves or reports its bounded failure. Full origin context remains optional when space fits. |
+No unreleased changes are integrated yet. Reviewed column roles await integration.
 
 ## Upcoming backlog
 

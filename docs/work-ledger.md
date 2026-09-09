@@ -2036,3 +2036,34 @@ grouping, repair4 Fields mnemonics, repair5 summary. The large 60k fixture sampl
 through transitions and verifies count restoration; no volume-soak claim follows.
 Sol independently cleared the test repairs. Matrix failure output is now printed
 in full into the durable gate log. A fresh exact-commit final gate follows.
+
+
+## 2026-09-09 — v0.1.3 published and archive activated
+
+Exact source `8ca75d0074aa85964f5d493d88d1be3a48fcc0f4` passed the isolated
+final gate: 1349 Rust tests passed (7 ignored), workspace clippy clean, bridge
+105/105, and PTY matrix 75/75. Preserved acceptance is
+`primary-astra-scratch/release-gate-8ca75d0074aa-6f4ad43dbd68449f8ba75d866ea174f2/accepted.json`
+on the build volume. Its source, script, log and preserved binary hashes were
+independently reviewed consistent. Earlier failed gates remain preserved.
+
+Annotated immutable tag `v0.1.3` has object
+`4a0cac74c1af0c7fb38397ae2a9dea5b2f5fba2c` and peels to that source. GitHub run
+34411091946 passed all four native jobs and publish. Distribution checks passed
+73/73; archive files match SHA256SUMS and API digest/size. Tap `67359d3` was pushed
+after exact-tag rendering, style and strict audit.
+
+The installer at SHA256
+`9f3442e6bc682cff4f769c3cba9172cbec555ae61792f285fc7f52f377e99603`
+passed independent review after draft lookup was rebound to both release ID and
+tag. Under the shared lock it verified provenance, exact clean source, bundled
+helper/bridge, full-tree manifest and six actual PTY suites from outside the
+checkout. It activated `versions/v0.1.3`; records are
+`versions/records/v0.1.3.json` and `v0.1.3.tree.json`. Installer log:
+`muse-v013-distribution/v013-delivery/installer-run.log` on the build volume.
+The install record correctly records draft=true at installation time; publication
+followed at 22:58:15 UTC, release ID 385891552. Primary independently verified
+public isDraft=false and `versions/latest` => `v0.1.3`.
+
+The full volume soak remains unaccepted. Roles candidate `ae449fd` is reviewed
+READY but not integrated; union remains in progress. Neither is in v0.1.3.
