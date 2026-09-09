@@ -49,6 +49,15 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   persistence and shutdown deadline failures even in serial tests. Check root
   free space first, set TMPDIR for the gate, and remove only that gate's created
   fixture tree on exit. Keep build targets and caches on the large volume.
+  The default Rust wrapper `scripts/sccache.sh` gives compiler/server processes
+  persistent TMPDIR under SCCACHE_DIR/tmp; test processes retain the gate's
+  disposable TMPDIR. Use that wrapper for manual sccache server commands too.
+  A shared server inherits its starter's TMPDIR and can outlive a fixture root;
+  never start it directly inside a disposable fixture environment. If using a
+  caller-exported RUSTC_WRAPPER, preserve this separation yourself. Coordinate
+  shared cache restarts between builds, normally under the validation lock.
+  A running test with caching disabled does not use the daemon; restart during
+  that test only after confirming no compiler is active and other builders hold.
   The fixture creator writes `.lvu-test-reproducer` at the disposable root;
   never point this cleanup at a user capture or retained proof tree.
   For abandoned roots, janitor disposal still requires its normal guards.

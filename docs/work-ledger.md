@@ -1090,3 +1090,27 @@ the same primary initializer error; builds and matrix were not run. The
 optimized guard measured 5.64–6.89M records per CPU-second versus 4.77M with
 the fast path disabled. Its revised floor is 5.2M, replacing the earlier 6M
 floor after the observed 5.64M enabled result. Full integration remains pending.
+
+## 2026-09-09 — full primary gate and shared compiler scratch repair
+
+On unchanged `d85807e`, the corrected local-fixture gate passed workspace Rust
+tests, workspace/all-target clippy, formatting, bridge typecheck, 87 bridge
+tests and bridge build. The matrix ran after both builds and passed 68/70;
+real-source and Settings suites failed. Their failures remain unresolved;
+the matrix's abbreviated output does not establish their causes. Log:
+`primary-sol-ordering-fix-gate.log` on the build volume.
+
+After that gate removed its disposable fixture root, W28 compilation failed
+because shared sccache still had TMPDIR=/tmp/lvu-primary-gate-h82ndp_o in its
+server environment. Primary confirmed that environment directly. Added
+`scripts/sccache.sh` as the default Rust wrapper, preserving explicit caller
+overrides, to keep compiler/server temporary files under SCCACHE_DIR/tmp while
+test processes retain disposable /tmp fixtures. Manual preflight cache access
+also uses this wrapper. Shell syntax and argument/exit/environment isolation
+checks pass. Server repair was coordinated with W24/W28 holding and W25 past
+compilation in a soak with RUSTC_WRAPPER empty; no compiler was active.
+The old server stopped cleanly; the replacement's environment names persistent
+volume scratch. Two real Rust library compilations passed through the wrapper,
+including after removing the smoke check's own caller TMPDIR. Synthetic files
+were cleaned up and no other gate fixture was recreated. Repair log:
+`primary-sol-sccache-repair.log` on the build volume.
