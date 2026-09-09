@@ -3,19 +3,24 @@
 //! Exercised against `crates/lvu-view/src/union.rs` by path include, so no
 //! shared module or manifest changes are needed before the primary assigns
 //! the registration hooks. Identity-level tests assert the deterministic
-//! merge contract; typed tests execute real Polars (`union_typed_frames`)
-//! and assert extracted typed values — never string comparisons or truncated
-//! projections.
+//! merge contract; typed tests execute real Polars and assert extracted typed
+//! values — never string comparisons or truncated projections. The frozen
+//! tests pin the authoritative entry point: typed JSON values plus native
+//! dtype evidence from the frozen accepted evaluation, NOT the
+//! `Membership.derived` display map (truncated strings).
 
 #[path = "../src/union.rs"]
 #[allow(dead_code)]
 mod union;
 
 use polars::prelude::*;
+use std::collections::BTreeMap;
 use union::{
-    INPUT_COLUMN, MergedUnionRow, StoredUnionInput, StoredUnionShape, UnionError, UnionInputRow,
-    UnionInputSnapshot, UnionRecordId, detect_union_cycle, merge_union_rows, union_input_stale,
-    union_typed_frames, validate_union_spec,
+    INPUT_COLUMN, MergedUnionRow, SEQUENCE_COLUMN, SOURCE_ID_COLUMN, StoredUnionInput,
+    StoredUnionShape, UNION_TS_COLUMN, UnionError, UnionFrozenInput, UnionFrozenRow, UnionInputRow,
+    UnionInputSnapshot, UnionRecordId, detect_union_cycle, frozen_identity_snapshot,
+    merge_union_rows, union_frozen_inputs, union_input_stale, union_typed_frames,
+    validate_union_spec,
 };
 
 fn row(source: &str, sequence: u64, timestamp_nanos: Option<i64>) -> UnionInputRow {
@@ -400,4 +405,227 @@ fn stored_shape_round_trips_additively() {
     let future: StoredUnionShape =
         serde_json::from_str(r#"{"inputs":[],"union_v99":{"x":1}}"#).unwrap();
     assert!(future.inputs.is_empty());
+}
+
+fn frozen_row(
+    source: &str,
+    sequence: u64,
+    timestamp_nanos: Option<i64>,
+    fields: &[(&str, serde_json::Value)],
+) -> UnionFrozenRow {
+    UnionFrozenRow {
+        source_id: source.into(),
+        sequence,
+        timestamp_nanos,
+        fields: fields
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    }
+}
+
+fn frozen_input(view_id: &str, revision: u64, rows: Vec<UnionFrozenRow>) -> UnionFrozenInput {
+    UnionFrozenInput {
+        view_id: view_id.into(),
+        applied_revision: revision,
+        applied_generation: 1,
+        timestamp_column: "ts".into(),
+        rows,
+    }
+}
+
+#[test]
+fn frozen_values_keep_dtype_and_full_length() {
+    use serde_json::json;
+    // The display map would truncate this to its byte bound and stringify the
+    // numbers; the frozen path must preserve both exactly.
+    let long = "x".repeat(600);
+    let api = frozen_input(
+        "view-api",
+        3,
+        vec![
+            frozen_row(
+                "api",
+                1,
+                Some(30),
+                &[("n", json!(1000)), ("msg", json!(long))],
+            ),
+            frozen_row(
+                "api",
+                2,
+                Some(10),
+                &[("n", json!(9)), ("msg", json!("short"))],
+            ),
+        ],
+    );
+    let worker = frozen_input(
+        "view-worker",
+        5,
+        vec![frozen_row(
+            "worker",
+            1,
+            Some(20),
+            &[("n", json!(80)), ("obj", json!({"a": [1, 2]}))],
+        )],
+    );
+    let merged = union_frozen_inputs("union", &[api, worker]).unwrap();
+    assert_eq!(merged.height(), 3);
+    assert_eq!(merged.column("n").unwrap().dtype(), &DataType::Int64);
+    // ts order: 10 (n=9), 20 (n=80), 30 (n=1000).
+    let values: Vec<i64> = (0..3)
+        .map(|i| i64_opt_at(&merged, "n", i).unwrap())
+        .collect();
+    assert_eq!(values, vec![9, 80, 1000]);
+    assert_eq!(str_at(&merged, "msg", 2).len(), 600);
+    // Structured values survive verbatim as JSON text, never dropped.
+    let decoded: serde_json::Value = serde_json::from_str(&str_at(&merged, "obj", 1)).unwrap();
+    assert_eq!(decoded, json!({"a": [1, 2]}));
+    // A typed Polars filter over the union sees numbers, not text: n > 10
+    // matches 80 and 1000, where a lexical comparison would also match "9".
+    let filtered = merged
+        .lazy()
+        .filter(col("n").gt(lit(10)))
+        .collect()
+        .unwrap();
+    assert_eq!(filtered.height(), 2);
+}
+
+#[test]
+fn frozen_int_float_mix_rejects_like_the_precise_path() {
+    use serde_json::json;
+    let first = frozen_input(
+        "view-a",
+        1,
+        vec![frozen_row("a", 1, Some(1), &[("v", json!(7))])],
+    );
+    let second = frozen_input(
+        "view-b",
+        1,
+        vec![frozen_row("b", 1, Some(2), &[("v", json!(7.5))])],
+    );
+    let error = union_frozen_inputs("union", &[first, second]).unwrap_err();
+    assert!(matches!(error, UnionError::Engine { .. }), "{error:?}");
+}
+
+#[test]
+fn frozen_missing_and_all_null_fields_arrive_as_null() {
+    use serde_json::json;
+    let first = frozen_input(
+        "view-a",
+        1,
+        vec![
+            frozen_row("a", 1, Some(1), &[("n", json!(1)), ("ghost", json!(null))]),
+            frozen_row("a", 2, Some(2), &[("ghost", json!(null))]),
+        ],
+    );
+    let second = frozen_input(
+        "view-b",
+        1,
+        vec![frozen_row("b", 1, Some(3), &[("n", json!(2))])],
+    );
+    let merged = union_frozen_inputs("union", &[first, second]).unwrap();
+    assert_eq!(merged.height(), 3);
+    // `n` is absent on a/2: null, not an error and not a zero.
+    assert_eq!(i64_opt_at(&merged, "n", 1), None);
+    // `ghost` is null everywhere in its only input: typeless, so it rides
+    // along only if another input types it — here it is simply absent.
+    assert!(merged.column("ghost").is_err());
+}
+
+#[test]
+fn frozen_empty_input_contributes_nothing_but_schema() {
+    use serde_json::json;
+    let empty = frozen_input("view-a", 2, vec![]);
+    let full = frozen_input(
+        "view-b",
+        1,
+        vec![frozen_row("b", 1, Some(5), &[("n", json!(1))])],
+    );
+    let merged = union_frozen_inputs("union", &[empty, full]).unwrap();
+    assert_eq!(merged.height(), 1);
+    assert_eq!(u64_at(&merged, SEQUENCE_COLUMN, 0), 1);
+    assert_eq!(str_at(&merged, SOURCE_ID_COLUMN, 0), "b");
+}
+
+#[test]
+fn frozen_identity_snapshot_feeds_the_same_merge() {
+    use serde_json::json;
+    let api = frozen_input(
+        "view-api",
+        3,
+        vec![
+            frozen_row("api", 1, Some(30), &[("n", json!(1))]),
+            frozen_row("api", 2, None, &[("n", json!(2))]),
+        ],
+    );
+    let worker = frozen_input(
+        "view-worker",
+        5,
+        vec![
+            frozen_row("worker", 1, Some(20), &[("n", json!(3))]),
+            // Overlapping identity with a disagreeing projection: first input wins.
+            frozen_row("api", 1, Some(10), &[("n", json!(99))]),
+        ],
+    );
+    let snapshots = [
+        frozen_identity_snapshot(&api),
+        frozen_identity_snapshot(&worker),
+    ];
+    assert_eq!(snapshots[0].accepted_revision, 3);
+    let merged = merge_union_rows(&snapshots).unwrap();
+    // worker/1 (20), api/1 once at its FIRST-input time (30), api/2 null last.
+    assert_eq!(
+        order(&merged),
+        vec![
+            ("worker".to_owned(), 1),
+            ("api".to_owned(), 1),
+            ("api".to_owned(), 2),
+        ]
+    );
+    assert_eq!(merged[1].input, 0);
+    assert_eq!(merged[1].timestamp_nanos, Some(30));
+    // And the typed entry agrees on membership: one row per surviving identity.
+    let typed = union_frozen_inputs("union", &[api, worker]).unwrap();
+    assert_eq!(typed.height(), 3);
+    assert_eq!(i64_opt_at(&typed, UNION_TS_COLUMN, 1), Some(30));
+}
+
+#[test]
+fn frozen_entry_rejects_self_reference_and_protected_fields() {
+    use serde_json::json;
+    let mine = frozen_input(
+        "union",
+        1,
+        vec![frozen_row("a", 1, Some(1), &[("n", json!(1))])],
+    );
+    let other = frozen_input(
+        "view-b",
+        1,
+        vec![frozen_row("b", 1, Some(2), &[("n", json!(2))])],
+    );
+    assert_eq!(
+        union_frozen_inputs("union", &[mine, other]).unwrap_err(),
+        UnionError::SelfReference {
+            view_id: "union".into()
+        }
+    );
+    let smuggled = frozen_input(
+        "view-a",
+        1,
+        vec![frozen_row(
+            "a",
+            1,
+            Some(1),
+            &[("_lvu_union_input", json!(0))],
+        )],
+    );
+    let clean = frozen_input(
+        "view-b",
+        1,
+        vec![frozen_row("b", 1, Some(2), &[("n", json!(2))])],
+    );
+    assert!(matches!(
+        union_frozen_inputs("union", &[smuggled, clean]).unwrap_err(),
+        UnionError::ProtectedColumn { .. }
+    ));
 }

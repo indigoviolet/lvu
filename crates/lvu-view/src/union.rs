@@ -18,10 +18,23 @@
 //!   row keeps its stable `(source_id, sequence)` identity, which is also what
 //!   raw context, bookmarks and correlation keep addressing.
 //! * Enrichment is the sole mechanism for pattern/key/time extraction. The
-//!   union consumes the inputs' accepted typed columns (in particular the
-//!   timestamp column the inputs' time basis resolved) and performs no parsing
-//!   of its own. Source-specific schema differences are normalized by ordinary
-//!   upstream enrichment; fields absent on one side arrive as null.
+//!   union consumes the inputs' ACCEPTED TYPED evaluation — the frozen replay
+//!   seam (`NativeViewAdapter::freeze_input` in `export.rs`, visited through
+//!   `FrozenInput::visit` exactly like the command path in
+//!   `lvu-app/src/command_snapshot.rs`) — and performs no parsing of its own.
+//!   Source-specific schema differences are normalized by ordinary upstream
+//!   enrichment; fields absent on one side arrive as null.
+//!
+//! * FORBIDDEN INPUT: `Membership.derived` (`lib.rs`) is a display projection,
+//!   not enrichment output. `lvu-query::scalar_projection` (`engine.rs`)
+//!   renders every typed value to a `String` AND truncates it to a byte bound,
+//!   and `with_enrichment` (roles-agent owned) serves those strings to rows.
+//!   Unioning, sorting or filtering those strings would compare truncated text
+//!   ("1000" sorts before "9"; a 600-byte value arrives cut) and mistake one
+//!   input's rendering for another's values. No API in this module accepts a
+//!   display map: typed entry is `UnionFrozenInput` (JSON values plus native
+//!   dtype evidence, mirroring `FrozenInputRow`), and merge keys come from the
+//!   same frozen accepted basis evaluation — never from the derived map.
 //! * The union reads each input's UNFOLDED physical membership. Presentation
 //!   collapse (folding/grouping) of an input is never copied into the union;
 //!   the union has its own folding/grouping downstream like any other view.
@@ -49,40 +62,70 @@
 //! same exemption `merge_order` in `lib.rs` already operates under: the engine
 //! produces keys, this layer arranges rows already in hand.
 //!
-//! PROPOSED HOOKS (primary-owned; do not apply without assignment):
+//! PROPOSED HOOKS — exact minimal ownership (primary assigns; none applied):
 //!
-//! 1. `crates/lvu-view/src/lib.rs`, next to the other `pub mod` lines:
-//!      `pub mod union;`
-//!    plus a re-export of the validated surface:
-//!      `pub use union::{UnionError, UnionInputSnapshot, UnionInputRow,`
-//!      `  MergedUnionRow, UnionRecordId, StoredUnionShape, MAX_UNION_INPUTS,`
-//!      `  MAX_UNION_ROWS, INPUT_COLUMN, validate_union_spec,`
-//!      `  detect_union_cycle, merge_union_rows, union_typed_frames};`
-//! 2. Adapter registration (primary designs with the grouping/source owners):
-//!    a `UnionRegistration { inputs: Vec<(ViewId, accepted_revision)> }`
-//!    beside `ViewRegistration`, a `register_union_view` sibling of
-//!    `register_view`, and a worker path that reuses the existing
-//!    revision/base-constraint fencing with a union purpose. The worker reads
-//!    inputs through `rows().unfolded_page`, never through folded pages.
-//! 3. `crates/lvu/src/app.rs`: a `QueryPurpose::Union` variant (touches the
-//!    terminal dispatch and the fork logic; coordinate with W22 grouping and
-//!    the source-assistance owner), and union input state on the derived view.
-//! 4. Persistence: `StoredUnionShape` below is shaped for an additive
-//!    `presentation_json.union` key with `#[serde(default)]`, following the
-//!    `color_rules` precedent in `contracts.md` — no `DB_SCHEMA_VERSION` bump.
-//!    An older binary drops the key on save; that trade is documented, not
-//!    hidden. Remembered union inputs must never launch commands on restore.
-//! 5. Export/archive (`export.rs`, primary-owned): a union snapshot freezes
-//!    input view IDs, their accepted revisions and each input's capture
-//!    high-watermarks, and replays input batch boundaries the way accepted
-//!    enrichment boundaries are replayed today, so part sizing cannot change
-//!    typed interpretation when inputs advance independently.
+//! Non-touch regions for this feature: W22 owns the grouping sections of
+//! `lib.rs` (folding policy, `ContinuationRule`, group publication); the
+//! roles agent owns new role helpers and the narrow `with_enrichment` seam
+//! (`lib.rs:3447-3468`); `merge_order`/`extends` are read-only references.
+//!
+//! H1. `crates/lvu-view/src/lib.rs` module line (beside `pub mod folding;`):
+//!       `pub mod union;`
+//!     plus re-export:
+//!       `pub use union::{UnionError, UnionInputSnapshot, UnionInputRow,`
+//!       `  MergedUnionRow, UnionRecordId, UnionFrozenInput, UnionFrozenRow,`
+//!       `  StoredUnionShape, MAX_UNION_INPUTS, MAX_UNION_ROWS, INPUT_COLUMN,`
+//!       `  UNION_TS_COLUMN, SEQUENCE_COLUMN, SOURCE_ID_COLUMN,`
+//!       `  validate_union_spec, detect_union_cycle, merge_union_rows,`
+//!       `  frozen_identity_snapshot, union_frozen_inputs, union_typed_frames,`
+//!       `  union_input_stale};`
+//! H2. Registration: a `UnionRegistration { inputs: Vec<StoredUnionInput> }`
+//!     beside `ViewRegistration` (`lib.rs:351-354`), a `register_union_view`
+//!     sibling of `register_view` (`lib.rs:1543-1623`), and a
+//!     `union_inputs(view_id)` accessor beside `view_sources`
+//!     (`lib.rs:2051-2058`). No grouping/role/fold state is touched.
+//! H3. Dispatch: the union worker from the NEW file
+//!     `crates/lvu-view/src/union_worker.rs` (this assignment's owned path),
+//!     driven through a narrow seam in `submit_query` (`lib.rs:2060-2130`):
+//!     a union candidate carries `QueryPurpose::Union` (new variant in
+//!     `lvu/src/app.rs:904-909`; coordinate terminal dispatch/fork with W22)
+//!     and fences on input `(view_id, accepted_revision)` pairs exactly like
+//!     a base-constraint fence. Per input the worker calls the EXISTING
+//!     public `freeze_input` (`export.rs:462-468`) with union-sized
+//!     `FrozenInputLimits`, maps each visited `FrozenInputRow` 1:1 into
+//!     `UnionFrozenRow` (identity from `row.record.record_id`, timestamp from
+//!     the input's accepted basis evaluation for that record, values from
+//!     `row.fields`), then calls `union_frozen_inputs`. No `export.rs`
+//!     change is needed; no `Membership.derived` read is permitted.
+//! H4. Publication contract (primary region): the union publishes an ordinary
+//!     `Membership` — per-source surviving `(sequence, time)` vectors for raw
+//!     resolution through the existing `raw` provider, `order` in union ts
+//!     order, `evaluation_batches` replayable per input — so downstream
+//!     filter/grouping/folding/export treat it like any view. The union reads
+//!     inputs through `rows().unfolded_page` identity sets, never folded pages
+//!     and never display strings.
+//! H5. `crates/lvu/src/app.rs`: union draft/accepted state on the derived
+//!     view (input IDs + fenced revisions, mirroring `exact_field` as
+//!     accepted-state-or-nothing); source-assistance owner keeps main.rs
+//!     source methods/agent UI.
+//! H6. Persistence (autosave owner): `StoredUnionShape` as an additive
+//!     `presentation_json.union` key with `#[serde(default)]` (the
+//!     `color_rules` precedent in `contracts.md`) — no `DB_SCHEMA_VERSION`
+//!     bump; restore re-resolves input IDs and never launches commands.
+//! H7. Archive review (primary): union snapshots freeze input view IDs, their
+//!     accepted revisions and per-source high-watermarks (`FrozenInputSummary`
+//!     carries all three); independent input advances create new immutable
+//!     boundaries rather than mutating a published manifest.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Canonical identity columns, re-exported so the union worker and tests name
+/// exactly the columns the engine reads — never a near-miss spelling.
+pub use lvu_query::{SEQUENCE_COLUMN, SOURCE_ID_COLUMN};
 
 /// How many accepted input views one union may reference.
 ///
@@ -112,6 +155,14 @@ pub const MAX_UNION_VIEW_ID_BYTES: usize = 256;
 /// raw context and tiebreak audits; bounded to one `u32` per row.
 pub const INPUT_COLUMN: &str = "_lvu_union_input";
 
+/// Internal timestamp column of worker-built frozen frames.
+///
+/// `i64` unix nanos with null for missing, mirroring the accepted basis
+/// evaluation — never a display rendering. The export replay (`input_row` in
+/// `export.rs`) already skips every `_lvu_*` column, so this name can neither
+/// arrive from frozen fields nor leak into snapshots.
+pub const UNION_TS_COLUMN: &str = "_lvu_union_ts";
+
 /// Stable record identity shared with the rest of the product.
 ///
 /// Maps 1:1 onto `lvu::RowId` and `lvu_core::RecordId` (source identity plus
@@ -137,12 +188,68 @@ impl UnionRecordId {
 ///
 /// `timestamp_nanos` is the input's accepted typed time for this record in its
 /// union basis (event/extracted/selected time as `i64` unix nanos, or capture
-/// nanos under the capture basis). `None` is a missing/unreadable value in
-/// that basis — never an error, never a reason to drop the record.
+/// nanos under the capture basis), taken from the same frozen accepted basis
+/// evaluation the typed values come from — never from the `Membership.derived`
+/// display map. `None` is a missing/unreadable value in that basis — never an
+/// error, never a reason to drop the record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnionInputRow {
     pub id: UnionRecordId,
     pub timestamp_nanos: Option<i64>,
+}
+
+/// One frozen typed row of a union input: the worker's 1:1 mapping of a
+/// `FrozenInputRow` visited through `FrozenInput::visit`.
+///
+/// * identity comes from `row.record.record_id` (stable capture identity);
+/// * `timestamp_nanos` comes from the input's accepted basis evaluation for
+///   that record (the frozen summary's `time_basis` names which);
+/// * `fields` is `row.fields` verbatim: TYPED `serde_json::Value`s with native
+///   dtype evidence in the sibling `field_types` map — the same encoding the
+///   command path consumes (`command_snapshot::prepare`). Display strings
+///   cannot enter here by construction: there is no field for them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnionFrozenRow {
+    pub source_id: String,
+    pub sequence: u64,
+    pub timestamp_nanos: Option<i64>,
+    pub fields: BTreeMap<String, serde_json::Value>,
+}
+
+/// One input view's frozen accepted evaluation that a union candidate merges.
+///
+/// The worker builds one of these per input with `freeze_input` (fenced on
+/// the input's applied revision and generation, candidates and later arrivals
+/// excluded) and bounded `FrozenInputLimits`; the whole candidate is then a
+/// pure function of these values. `timestamp_column` names the accepted basis
+/// column the timestamps were evaluated under, for diagnostics only — the
+/// merge reads `timestamp_nanos`, not a name lookup.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnionFrozenInput {
+    pub view_id: String,
+    pub applied_revision: u64,
+    pub applied_generation: u64,
+    pub timestamp_column: String,
+    pub rows: Vec<UnionFrozenRow>,
+}
+
+/// The identity-plus-timestamp view of a frozen input for [`merge_union_rows`].
+///
+/// Drops values and keeps merge keys, so there is exactly one ordering
+/// implementation no matter which entry point a caller uses.
+pub fn frozen_identity_snapshot(input: &UnionFrozenInput) -> UnionInputSnapshot {
+    UnionInputSnapshot {
+        view_id: input.view_id.clone(),
+        accepted_revision: input.applied_revision,
+        rows: input
+            .rows
+            .iter()
+            .map(|row| UnionInputRow {
+                id: UnionRecordId::new(row.source_id.clone(), row.sequence),
+                timestamp_nanos: row.timestamp_nanos,
+            })
+            .collect(),
+    }
 }
 
 /// The accepted state of one input view that a union candidate fences on.
@@ -364,14 +471,246 @@ pub fn union_input_stale(fenced_revision: u64, current_accepted_revision: u64) -
     fenced_revision != current_accepted_revision
 }
 
+/// Union frozen accepted evaluations in timestamp order: the worker-facing
+/// entry point.
+///
+/// Each input is the worker's `freeze_input` output mapped 1:1 into
+/// [`UnionFrozenInput`] (see its docs for the exact field mapping). This
+/// function decodes every input's TYPED json values back into a Polars frame
+/// — the inverse of the frozen `json_value` encoding (`export.rs`), so an
+/// `Int64` 1000 stays an `Int64` 1000 and a 600-byte string stays 600 bytes —
+/// then delegates the merge itself to [`union_typed_frames`]. Decoding rules:
+///
+/// * bool/whole-number/float/string/null decode to their Polars scalar dtype;
+///   missing fields decode as null (diagonal concat fills them);
+/// * a column mixing whole numbers and floats is rejected (the
+///   `precise_json_value_for_field` precedent in `export.rs` refuses the same
+///   potentially lossy coercion): normalize upstream in enrichment;
+/// * whole numbers that do not fit `i64` use `UInt64` when every value is
+///   non-negative, else the candidate is rejected rather than wrapped;
+/// * arrays and objects encode as compact JSON text (`String` dtype): content
+///   is preserved verbatim and round-trippable, never dropped, and never
+///   mistaken for a scalar by the sort;
+/// * an all-null column decodes as `Null` and sorts last with the missing
+///   timestamps.
+///
+/// Identity (`_lvu_source_id`, `_lvu_sequence` — the engine's canonical
+/// columns from `lvu-query`) and the internal timestamp column
+/// ([`UNION_TS_COLUMN`) are built from the frozen identity and basis
+/// evaluation, never from value fields. A frozen field colliding with any of
+/// those names is rejected: enrichment can never produce a `_lvu_*` field
+/// (protected names), so a collision means a corrupt handoff, not user data.
+pub fn union_frozen_inputs(
+    union_view_id: &str,
+    inputs: &[UnionFrozenInput],
+) -> Result<DataFrame, UnionError> {
+    let ids: Vec<&str> = inputs.iter().map(|input| input.view_id.as_str()).collect();
+    validate_union_spec(union_view_id, &ids)?;
+    let total: usize = inputs.iter().map(|input| input.rows.len()).sum();
+    if total > MAX_UNION_ROWS {
+        return Err(UnionError::RowLimit {
+            rows: total,
+            maximum: MAX_UNION_ROWS,
+        });
+    }
+    let mut frames = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        frames.push(frozen_frame(input)?);
+    }
+    union_typed_frames(frames, UNION_TS_COLUMN, SOURCE_ID_COLUMN, SEQUENCE_COLUMN)
+}
+
+/// Decode one frozen input into a typed frame with canonical identity columns.
+fn frozen_frame(input: &UnionFrozenInput) -> Result<DataFrame, UnionError> {
+    for row in &input.rows {
+        for name in row.fields.keys() {
+            if name == INPUT_COLUMN || name == UNION_TS_COLUMN {
+                return Err(UnionError::ProtectedColumn { name: name.clone() });
+            }
+        }
+    }
+    let mut columns = Vec::with_capacity(3);
+    columns.push(Column::new(
+        SOURCE_ID_COLUMN.into(),
+        input
+            .rows
+            .iter()
+            .map(|row| row.source_id.clone())
+            .collect::<Vec<_>>(),
+    ));
+    columns.push(Column::new(
+        SEQUENCE_COLUMN.into(),
+        input
+            .rows
+            .iter()
+            .map(|row| row.sequence)
+            .collect::<Vec<_>>(),
+    ));
+    columns.push(Column::new(
+        UNION_TS_COLUMN.into(),
+        input
+            .rows
+            .iter()
+            .map(|row| row.timestamp_nanos)
+            .collect::<Vec<_>>(),
+    ));
+    // One dtype per field across all rows of this input; absent fields are
+    // simply missing here and arrive as null through diagonal concat, as do
+    // fields whose every value is null (they carry no type information).
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for row in &input.rows {
+        names.extend(row.fields.keys().map(String::as_str));
+    }
+    for name in names {
+        if let Some(column) = decode_union_field(&input.view_id, name, &input.rows)? {
+            columns.push(column);
+        }
+    }
+    // An empty input still contributes its (empty) identity columns so the
+    // diagonal concat keeps a stable schema and the sort keys always exist.
+    DataFrame::new_infer_height(columns).map_err(|error| UnionError::Engine {
+        reason: error.to_string(),
+    })
+}
+
+/// Decode one field's typed JSON values into a single Polars column.
+///
+/// See [`union_frozen_inputs`] for the rules. `Null` decodes alongside every
+/// dtype as validity, never as a dtype of its own: a field whose every value
+/// is null yields `None` and arrives through diagonal concat from whichever
+/// input actually knows its type.
+fn decode_union_field(
+    view_id: &str,
+    name: &str,
+    rows: &[UnionFrozenRow],
+) -> Result<Option<Column>, UnionError> {
+    use serde_json::Value as Json;
+    let reject = |reason: String| UnionError::Engine {
+        reason: format!("union input '{view_id}' field '{name}': {reason}"),
+    };
+    let mut has_bool = false;
+    let mut has_int = false;
+    let mut has_float = false;
+    let mut has_string = false;
+    let mut has_nested = false;
+    let mut has_value = false;
+    for row in rows {
+        match row.fields.get(name) {
+            None | Some(Json::Null) => {}
+            Some(Json::Bool(_)) => {
+                has_bool = true;
+                has_value = true;
+            }
+            Some(Json::Number(number)) => {
+                has_value = true;
+                if number.is_f64() {
+                    has_float = true;
+                } else {
+                    has_int = true;
+                }
+            }
+            Some(Json::String(_)) => {
+                has_string = true;
+                has_value = true;
+            }
+            Some(Json::Array(_)) | Some(Json::Object(_)) => {
+                has_nested = true;
+                has_value = true;
+            }
+        }
+    }
+    if !has_value {
+        return Ok(None);
+    }
+    let kinds = [has_bool, has_int, has_float, has_string, has_nested]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if kinds > 1 {
+        // Mixed scalar kinds — including the whole-number/float coercion the
+        // precise frozen path refuses — are a schema conflict for the union,
+        // not a coercion: the candidate is rejected and normalization stays
+        // upstream in enrichment.
+        return Err(reject("conflicting value kinds across records".into()));
+    }
+    let get = |index: usize| rows[index].fields.get(name);
+    if has_bool {
+        return Ok(Some(Column::new(
+            name.into(),
+            (0..rows.len())
+                .map(|index| get(index).and_then(Json::as_bool))
+                .collect::<Vec<_>>(),
+        )));
+    }
+    if has_int {
+        // Whole numbers prefer `Int64`; values outside it use `UInt64` when
+        // every value is non-negative, and otherwise reject rather than wrap.
+        let ints: Vec<Option<i64>> = (0..rows.len())
+            .map(|index| get(index).and_then(Json::as_i64))
+            .collect();
+        let present = ints.iter().flatten().count();
+        let values = rows
+            .iter()
+            .filter_map(|row| row.fields.get(name))
+            .filter(|value| !value.is_null())
+            .count();
+        if present == values {
+            return Ok(Some(Column::new(name.into(), ints)));
+        }
+        let uints: Vec<Option<u64>> = (0..rows.len())
+            .map(|index| get(index).and_then(Json::as_u64))
+            .collect();
+        if uints.iter().flatten().count() == values {
+            return Ok(Some(Column::new(name.into(), uints)));
+        }
+        return Err(reject("whole numbers fit neither Int64 nor UInt64".into()));
+    }
+    if has_float {
+        return Ok(Some(Column::new(
+            name.into(),
+            (0..rows.len())
+                .map(|index| get(index).and_then(Json::as_f64))
+                .collect::<Vec<_>>(),
+        )));
+    }
+    if has_string {
+        return Ok(Some(Column::new(
+            name.into(),
+            (0..rows.len())
+                .map(|index| get(index).and_then(Json::as_str).map(str::to_owned))
+                .collect::<Vec<_>>(),
+        )));
+    }
+    if has_nested {
+        return Ok(Some(Column::new(
+            name.into(),
+            (0..rows.len())
+                .map(|index| {
+                    get(index)
+                        .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "null".into()))
+                })
+                .collect::<Vec<_>>(),
+        )));
+    }
+    Ok(None)
+}
+
 /// Union accepted typed frames in timestamp order with Polars doing the value
 /// compute.
 ///
 /// Each frame is one input view's accepted typed output: its ordinary columns
 /// plus `source_column` (string source identity), `sequence_column` (`u64`
 /// physical sequence) and the accepted `timestamp_column` (`i64` unix nanos,
-/// null where the basis had no value). Frames may have different column sets:
-/// diagonal concatenation keeps every column and fills absent fields with
+/// null where the basis had no value).
+///
+/// PRODUCTION CALLERS MUST BUILD THESE FRAMES FROM FROZEN ACCEPTED EVALUATION
+/// (see [`union_frozen_inputs`], the one blessed constructor): frames
+/// projected out of the `Membership.derived` display map are truncated,
+/// type-erased strings and are rejected by contract — this function trusts a
+/// dtype fidelity it cannot verify, so the provenance fence lives at
+/// construction.
+///
+/// Frames may have different column sets: diagonal concatenation keeps every column and fills absent fields with
 /// null, which is how "retain raw missing fields as null where semantically
 /// known" is executed rather than asserted. A column present with conflicting
 /// dtypes across inputs is a Polars schema error, surfaced here as
