@@ -14,10 +14,10 @@ pub use export::*;
 pub use union::{
     INPUT_COLUMN, MAX_UNION_BYTES, MAX_UNION_INPUTS, MAX_UNION_ROWS, MergedUnionRow,
     SEQUENCE_COLUMN, SOURCE_ID_COLUMN, StoredUnionInput, StoredUnionShape, UNION_TS_COLUMN,
-    UnionCandidateSpec, UnionCompletion, UnionError, UnionFrozenInput, UnionFrozenRow,
-    UnionInputRow, UnionInputSnapshot, UnionLimits, detect_union_cycle, frozen_identity_snapshot,
-    merge_union_rows, union_frozen_inputs, union_input_stale, union_typed_frames,
-    validate_union_spec,
+    UnionCandidateSpec, UnionCompletion, UnionError, UnionFilterSpec, UnionFrozenInput,
+    UnionFrozenRow, UnionInputRow, UnionInputSnapshot, UnionLimits, apply_union_filter,
+    detect_union_cycle, frozen_identity_snapshot, merge_union_rows, union_frozen_inputs,
+    union_input_stale, union_typed_frames, validate_union_spec,
 };
 
 mod appended;

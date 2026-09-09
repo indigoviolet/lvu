@@ -16,6 +16,10 @@ pub mod parquet;
 pub mod regex_enrichment;
 pub mod state;
 pub mod time_field;
+/// Timestamp-ordered union of accepted typed frames (union-views worktree).
+/// Kept distinct from any grouping helper: this merges whole frames across
+/// views, grouping never does.
+pub mod union;
 pub mod validate;
 
 pub use adapter::*;
@@ -26,4 +30,5 @@ pub use parquet::*;
 pub use regex_enrichment::*;
 pub use state::*;
 pub use time_field::*;
+pub use union::union_sorted_frames;
 pub use validate::*;

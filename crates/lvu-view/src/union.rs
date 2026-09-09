@@ -107,19 +107,15 @@ use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use lvu_query::TextSearch;
 /// Typed union compute lives in the engine (AGENTS.md: the query engine
 /// computes): diagonal concat, stable-identity dedup and the total timestamp
-/// ordering all execute in `lvu-query`, and this module holds only the
-/// spec/contract layer. Single source file, included here by path until the
-/// coordinated `pub mod union;` export lands in `lvu-query/src/lib.rs`, at
-/// which point this include is replaced by `use lvu_query::union::...` with
-/// no logic change — never two sort/dedup implementations.
-#[path = "../../lvu-query/src/union.rs"]
-mod query_union;
+/// ordering all execute in `lvu_query::union` through the proper module
+/// boundary. This module holds only the spec/contract layer.
 
 /// Canonical identity columns, re-exported so the union worker and tests name
 /// exactly the columns the engine reads — never a near-miss spelling.
-pub use lvu_query::{SEQUENCE_COLUMN, SOURCE_ID_COLUMN};
+pub use lvu_query::{RAW_COLUMN, SEQUENCE_COLUMN, SOURCE_ID_COLUMN, union_sorted_frames};
 
 /// How many accepted input views one union may reference.
 ///
@@ -209,7 +205,11 @@ pub struct UnionInputRow {
 /// * `fields` is `row.fields` verbatim: TYPED `serde_json::Value`s;
 /// * `field_types` is `row.field_types` verbatim: the native dtype evidence
 ///   (`format!("{:?}")` spellings) that makes each value's type authoritative
-///   instead of inferred. Display strings cannot enter here by construction:
+///   instead of inferred;
+/// * `raw` is the record's text for search evaluation
+///   (`String::from_utf8_lossy` of the captured bytes — the same search-text
+///   semantics the engine's own `raw` column carries, never authoritative
+///   storage). Display strings cannot enter the TYPED fields by construction:
 ///   there is no field for them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnionFrozenRow {
@@ -217,6 +217,7 @@ pub struct UnionFrozenRow {
     pub timestamp_nanos: Option<i64>,
     pub fields: BTreeMap<String, serde_json::Value>,
     pub field_types: BTreeMap<String, String>,
+    pub raw: String,
 }
 
 /// One input view's frozen accepted evaluation that a union candidate merges.
@@ -236,6 +237,53 @@ pub struct UnionFrozenInput {
     pub rows: Vec<UnionFrozenRow>,
 }
 
+/// The union view's own filter, applied over the merged stream.
+///
+/// Today this is the search box's own language only (literal, `field: value`,
+/// `/regex/flags`): the worker compiles it with `TextSearch::parse` and no
+/// Python host, exactly like an ordinary view's text search, and filters the
+/// merged frame AFTER first-input dedup so precedence survives filtering.
+/// Empty means no constraint. Advanced (`pl.`) filters, enrichment steps and
+/// time windows over unions are explicitly rejected upstream — never silently
+/// dropped — with follow-up seams named in the module hooks.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UnionFilterSpec {
+    #[serde(default)]
+    pub search: String,
+}
+
+/// Apply a union's own filter to its merged frame (see [`UnionFilterSpec`]).
+///
+/// Pure and order-preserving: filtering after dedup keeps first-input
+/// precedence (a record represented by a non-matching projection does not
+/// match through another input's projection). A search naming an absent
+/// column matches nothing, exactly like the ordinary engine path, whose
+/// missing-column expression is `lit(false)`.
+pub fn apply_union_filter(
+    frame: DataFrame,
+    filter: &UnionFilterSpec,
+) -> Result<DataFrame, UnionError> {
+    if filter.search.is_empty() {
+        return Ok(frame);
+    }
+    if TextSearch::is_polars(&filter.search) {
+        return Err(UnionError::Engine {
+            reason: "advanced (pl.) filters are not supported over unions yet; filter the input views instead".into(),
+        });
+    }
+    let search = TextSearch::parse(filter.search.clone(), None)
+        .map_err(|error| UnionError::Engine { reason: error })?;
+    let Some(predicate) = search.expression(&frame) else {
+        return Ok(frame);
+    };
+    frame
+        .lazy()
+        .filter(predicate)
+        .collect()
+        .map_err(|error| UnionError::Engine {
+            reason: error.to_string(),
+        })
+}
 /// The identity-plus-timestamp view of a frozen input for [`merge_union_rows`].
 ///
 /// Drops values and keeps merge keys, so there is exactly one ordering
@@ -282,13 +330,15 @@ pub struct MergedUnionRow {
 ///
 /// Intended as a `presentation_json.union` key with `#[serde(default)]` on the
 /// reading side (the `color_rules` precedent): no schema bump, unknown fields
-/// ignored, an older binary reading a newer row sees no union. Only view IDs
-/// and accepted revisions persist — never commands, which must not relaunch on
-/// restore.
+/// ignored, an older binary reading a newer row sees no union. Only view IDs,
+/// accepted revisions/generations and the union's own search text persist —
+/// never commands, which must not relaunch on restore.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoredUnionShape {
     #[serde(default)]
     pub inputs: Vec<StoredUnionInput>,
+    #[serde(default)]
+    pub filter: UnionFilterSpec,
 }
 
 /// One persisted union input reference: the input view ID plus the accepted
@@ -309,15 +359,16 @@ pub struct StoredUnionInput {
 }
 
 /// A submitted-but-unpublished union candidate: the union view ID, the union
-/// revision it will publish, the submission generation, and the fenced input
-/// revisions. Shared by the dialog, the controller and the worker — one shape,
-/// defined once.
+/// revision it will publish, the submission generation, the fenced inputs,
+/// and the union's own search filter. Shared by the dialog, the controller
+/// and the worker — one shape, defined once.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnionCandidateSpec {
     pub union_view_id: String,
     pub union_revision: u64,
     pub generation: u64,
     pub inputs: Vec<StoredUnionInput>,
+    pub filter: UnionFilterSpec,
 }
 
 /// A finished union job for the composition tick to collect.
@@ -493,7 +544,7 @@ pub fn detect_union_cycle(
 ///
 /// This is the identity-level CONTRACT: cheap, pure, and dependency-free, used
 /// for pre-freeze planning and pinned by tests. Production ORDER OF RECORD is
-/// the engine's [`union_sorted_frames`](query_union::union_sorted_frames)
+/// the engine's `lvu_query::union_sorted_frames`
 /// output; convergence between the two on identical data is asserted in tests,
 /// and any divergence is a bug in one of them — there is still exactly one
 /// compute implementation.
@@ -568,7 +619,7 @@ pub fn union_input_stale(fenced_revision: u64, current_accepted_revision: u64) -
 /// the inverse of the frozen `json_value` encoding (`export.rs`), so an
 /// `Int64` 1000 stays an `Int64` 1000 and a 600-byte string stays 600 bytes —
 /// then delegates the merge itself to [`union_typed_frames`], which executes
-/// the engine's [`union_sorted_frames`](query_union::union_sorted_frames).
+/// the engine's `lvu_query::union_sorted_frames`.
 /// Decoding rules:
 ///
 /// * the declared native dtype decides the column dtype, never JSON-kind
@@ -636,15 +687,21 @@ pub fn union_frozen_inputs(
 }
 
 /// Decode one frozen input into a typed frame with canonical identity columns.
+///
+/// Besides identity and timestamp columns this builds the `raw` search-text
+/// column (`RAW_COLUMN`) from each row's captured text, so the union's own
+/// text search evaluates the same text the engine searches. Like every other
+/// value column it is bounded by the merge budgets, never authoritative
+/// storage, and never a display projection smuggled into typed fields.
 fn frozen_frame(input: &UnionFrozenInput) -> Result<DataFrame, UnionError> {
     for row in &input.rows {
         for name in row.fields.keys() {
-            if name == INPUT_COLUMN || name == UNION_TS_COLUMN {
+            if name == INPUT_COLUMN || name == UNION_TS_COLUMN || name == RAW_COLUMN {
                 return Err(UnionError::ProtectedColumn { name: name.clone() });
             }
         }
     }
-    let mut columns = Vec::with_capacity(3);
+    let mut columns = Vec::with_capacity(4);
     columns.push(Column::new(
         SOURCE_ID_COLUMN.into(),
         input
@@ -667,6 +724,14 @@ fn frozen_frame(input: &UnionFrozenInput) -> Result<DataFrame, UnionError> {
             .rows
             .iter()
             .map(|row| row.timestamp_nanos)
+            .collect::<Vec<_>>(),
+    ));
+    columns.push(Column::new(
+        RAW_COLUMN.into(),
+        input
+            .rows
+            .iter()
+            .map(|row| row.raw.clone())
             .collect::<Vec<_>>(),
     ));
     // One dtype per field across all rows of this input, under the authority
@@ -709,9 +774,10 @@ fn frozen_frame(input: &UnionFrozenInput) -> Result<DataFrame, UnionError> {
 /// so the schema survives and `is_null` filters keep working. Only a `Null`
 /// declaration (genuinely unknown type) contributes no column.
 ///
-/// Supported declarations: `Boolean`, all `Int*`/`UInt*` widths (values
-/// range-checked, never wrapped), `Float32` (round-trip-checked widening to
-/// `Float64`, which is value-identical), `Float64`, `String`.
+/// Supported declarations: `Boolean`, all `Int*`/`UInt*` widths (direct
+/// numbers plus the precise replay's lossless `{"kind","decimal"}` wrappers,
+/// values range-checked, never wrapped), `Float32` (round-trip-checked
+/// widening to `Float64`, which is value-identical), `Float64`, `String`.
 /// Explicitly rejected with [`UnionError::UnsupportedValue`] (values stay
 /// semantically identical or the candidate fails; nothing is silently
 /// coerced): temporal (`Date`, `Datetime(..)`, `Duration(..)`, `Time`),
@@ -874,6 +940,34 @@ fn present_count(rows: &[UnionFrozenRow], name: &str) -> usize {
         .count()
 }
 
+/// Lossless whole numbers from frozen JSON: direct numbers plus the precise
+/// replay's `{"kind","decimal"}` wrappers for integers outside JSON's exact
+/// range. Floats never qualify, whatever their magnitude.
+enum FrozenInt {
+    Signed(i64),
+    Unsigned(u64),
+}
+
+fn frozen_int(value: &serde_json::Value) -> Option<FrozenInt> {
+    use serde_json::Value as Json;
+    match value {
+        Json::Number(number) => number
+            .as_i64()
+            .map(FrozenInt::Signed)
+            .or_else(|| number.as_u64().map(FrozenInt::Unsigned)),
+        Json::Object(map) if map.len() == 2 => {
+            let kind = map.get("kind")?.as_str()?;
+            let decimal = map.get("decimal")?.as_str()?;
+            match kind {
+                "i64" => decimal.parse::<i64>().ok().map(FrozenInt::Signed),
+                "u64" => decimal.parse::<u64>().ok().map(FrozenInt::Unsigned),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Decode under an authoritative declared dtype (see [`union_frozen_inputs`]).
 ///
 /// Values must conform exactly; all-null decodes as typed nulls so the schema
@@ -959,14 +1053,17 @@ fn decode_typed_field(
             for index in 0..rows.len() {
                 match get(index) {
                     None | Some(Json::Null) => out.push(None),
-                    Some(Json::Number(number)) => {
-                        let value = number.as_i64().ok_or_else(|| {
-                            reject(format!("declared {dtype} but found {number}"))
-                        })?;
+                    Some(value) => {
+                        // Direct numbers and precise lossless wrappers alike;
+                        // an unsigned magnitude under a signed declaration is
+                        // corruption, never a wrap.
+                        let value = match frozen_int(value) {
+                            Some(FrozenInt::Signed(value)) => value,
+                            _ => {
+                                return Err(reject(format!("declared {dtype} but found {value}")));
+                            }
+                        };
                         out.push(Some(value));
-                    }
-                    Some(other) => {
-                        return Err(reject(format!("declared {dtype} but found {other}")));
                     }
                 }
             }
@@ -995,16 +1092,21 @@ fn decode_typed_field(
             for index in 0..rows.len() {
                 match get(index) {
                     None | Some(Json::Null) => out.push(None),
-                    Some(Json::Number(number)) => {
-                        // `as_u64` fails negatives and non-integers alike:
-                        // neither wraps nor coerces into an unsigned column.
-                        let value = number.as_u64().ok_or_else(|| {
-                            reject(format!("declared {dtype} but found {number}"))
-                        })?;
+                    Some(value) => {
+                        // Negatives fail here rather than wrapping; floats
+                        // never qualify as whole numbers.
+                        let value = match frozen_int(value) {
+                            Some(FrozenInt::Unsigned(value)) => value,
+                            Some(FrozenInt::Signed(value)) => {
+                                u64::try_from(value).map_err(|_| {
+                                    reject(format!("declared {dtype} but found negative {value}"))
+                                })?
+                            }
+                            None => {
+                                return Err(reject(format!("declared {dtype} but found {value}")));
+                            }
+                        };
                         out.push(Some(value));
-                    }
-                    Some(other) => {
-                        return Err(reject(format!("declared {dtype} but found {other}")));
                     }
                 }
             }
@@ -1052,7 +1154,7 @@ fn decode_typed_field(
 /// The merge itself — tagging, diagonal concat, stable-identity dedup with
 /// first keep, and the total `(timestamp, input, sequence, source)` sort with
 /// nulls last — executes in
-/// [`union_sorted_frames`](query_union::union_sorted_frames). The output
+/// `lvu_query::union_sorted_frames`. The output
 /// retains [`INPUT_COLUMN`] as per-row provenance.
 pub fn union_typed_frames(
     frames: Vec<DataFrame>,
@@ -1114,7 +1216,7 @@ pub fn union_typed_frames(
             }
         }
     }
-    query_union::union_sorted_frames(
+    union_sorted_frames(
         frames,
         timestamp_column,
         source_column,

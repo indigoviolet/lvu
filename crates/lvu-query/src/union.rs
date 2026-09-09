@@ -1,12 +1,14 @@
 //! Union of accepted typed frames in deterministic timestamp order.
 //!
-//! Ownership: Muse union-views assignment (new file). The query engine
-//! computes; the app names and presents (AGENTS.md): diagonal concatenation,
-//! stable-identity deduplication and the total timestamp ordering all execute
-//! here in Polars, and `lvu-view` holds only the spec/contract layer on top.
-//! Until the coordinated `pub mod union;` export lands in `lib.rs`, the view
-//! crate includes this file by path (`#[path]`), so one source file is the
-//! only implementation — never two sort/dedup copies.
+//! Ownership: union-views worktree (new file, exported from `lib.rs`).
+//! Kept distinct from any grouping helper by construction: this merges whole
+//! accepted frames across views (concat, identity dedup, total ordering),
+//! grouping folds adjacent rows within one view and never does any of these.
+//!
+//! The query engine computes; the app names and presents (AGENTS.md):
+//! diagonal concatenation, stable-identity deduplication and the total
+//! timestamp ordering all execute here in Polars, and `lvu-view` holds only
+//! the spec/contract layer on top.
 //!
 //! Pipeline, in order:
 //! 1. Tag each frame with `input_column` (its input position). Frames already

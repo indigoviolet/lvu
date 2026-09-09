@@ -9,7 +9,7 @@
 #[allow(dead_code)]
 mod union_controller;
 
-use lvu_view::union::{StoredUnionInput, StoredUnionShape, UnionCandidateSpec};
+use lvu_view::union::{StoredUnionInput, StoredUnionShape, UnionCandidateSpec, UnionFilterSpec};
 use std::collections::HashMap;
 use union_controller::{UnionController, UnionControllerError};
 
@@ -38,6 +38,7 @@ fn candidate(view: &str, revision: u64, inputs: &[(&str, u64, u64)]) -> UnionCan
                 applied_generation: *generation,
             })
             .collect(),
+        filter: UnionFilterSpec::default(),
     }
 }
 
@@ -174,6 +175,7 @@ fn restore_rehydrates_inputs_without_launching_anything() {
                     applied_generation: 1,
                 },
             ],
+            filter: UnionFilterSpec::default(),
         },
     );
     // Restore installs a known baseline: an input at its stored revision is
@@ -198,11 +200,12 @@ fn stored_shape_is_the_single_view_definition() {
             accepted_revision: 3,
             applied_generation: 1,
         }],
+        filter: UnionFilterSpec::default(),
     };
     let json = serde_json::to_string(&stored).unwrap();
     assert_eq!(
         json,
-        r#"{"inputs":[{"view_id":"view-a","accepted_revision":3,"applied_generation":1}]}"#
+        r#"{"inputs":[{"view_id":"view-a","accepted_revision":3,"applied_generation":1}],"filter":{"search":""}}"#
     );
     let legacy: StoredUnionShape =
         serde_json::from_str(r#"{"inputs":[{"view_id":"view-a","accepted_revision":3}]}"#).unwrap();

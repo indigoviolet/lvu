@@ -290,7 +290,12 @@ impl TextSearch {
     pub fn text(&self) -> &str {
         &self.text
     }
-    fn expression(&self, frame: &DataFrame) -> Option<Expr> {
+    /// The predicate this search contributes over `frame`, if any. `None`
+    /// means no constraint (empty search). A field the frame does not carry
+    /// yields a never-matching predicate, exactly as in batch execution.
+    /// Union views evaluate their own text search through this, the same
+    /// compiled predicate ordinary views use — never a second matcher.
+    pub fn expression(&self, frame: &DataFrame) -> Option<Expr> {
         if self
             .field
             .as_ref()

@@ -14,7 +14,9 @@ use lvu::{
 use lvu_core::{Acquisition, SourceDefinition, SourceId};
 use lvu_ingest::{RuntimeConfig, RuntimeState, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
-use lvu_view::{NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, ViewConfig};
+use lvu_view::{
+    NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec, ViewConfig,
+};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
@@ -215,6 +217,17 @@ fn candidate(
     api_revision: u64,
     worker_revision: u64,
 ) -> UnionCandidateSpec {
+    candidate_filtered(revision, api, worker, api_revision, worker_revision, "")
+}
+
+fn candidate_filtered(
+    revision: u64,
+    api: &SourceHandle,
+    worker: &SourceHandle,
+    api_revision: u64,
+    worker_revision: u64,
+    search: &str,
+) -> UnionCandidateSpec {
     UnionCandidateSpec {
         union_view_id: "union".into(),
         union_revision: revision,
@@ -231,6 +244,9 @@ fn candidate(
                 applied_generation: worker.progress().generation,
             },
         ],
+        filter: UnionFilterSpec {
+            search: search.into(),
+        },
     }
 }
 
@@ -274,6 +290,7 @@ async fn union_publishes_both_sources_in_ts_order() {
                     union_revision: 1,
                     generation: 1,
                     inputs: vec![],
+                    filter: UnionFilterSpec::default(),
                 },
                 &|_| None,
             )
@@ -344,6 +361,33 @@ async fn union_refreshes_when_an_input_advances() {
         texts.iter().any(|text| text.contains("\"n\":99")),
         "the appended record is in the refreshed union"
     );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn union_applies_its_own_text_search() {
+    let (_root, manager, api, worker, mut adapter) = setup().await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    adapter
+        .submit_union_candidate(
+            candidate_filtered(1, &api, &worker, 1, 1, "worker"),
+            &|_| None,
+        )
+        .unwrap();
+    let completion = wait_union(&mut adapter, 1).expect("a completion");
+    assert_eq!(completion.error, None);
+    let texts = union_texts(&mut adapter);
+    assert_eq!(texts.len(), 6);
+    assert!(
+        texts.iter().all(|text| text.contains("\"worker\"")),
+        "only worker rows survive the union search, in ts order"
+    );
+    let mut sorted = texts.clone();
+    sorted.sort();
+    assert_eq!(texts, sorted);
     adapter.shutdown();
     manager.shutdown().await;
 }

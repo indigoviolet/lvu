@@ -46,7 +46,7 @@
 use super::export::{FrozenInput, FrozenInputError, FrozenInputLimits};
 use super::union::{
     StoredUnionInput, UnionCandidateSpec, UnionCompletion, UnionFrozenInput, UnionFrozenRow,
-    UnionLimits, detect_union_cycle, union_frozen_inputs, validate_union_spec,
+    UnionLimits, apply_union_filter, detect_union_cycle, union_frozen_inputs, validate_union_spec,
 };
 use super::{
     Appended, Membership, MemoryBudget, NO_BASIS_TIME, Published, Reservation, SEQUENCE_BYTES,
@@ -568,6 +568,10 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
         .collect();
     let merged = union_frozen_inputs(&ctx.spec.union_view_id, &frozen_refs, &ctx.limits)
         .map_err(|error| error.to_string())?;
+    // The union's own search filter runs here, after first-input dedup so
+    // precedence survives filtering, and before publication so counts,
+    // order and ranks all describe the filtered stream.
+    let merged = apply_union_filter(merged, &ctx.spec.filter).map_err(|error| error.to_string())?;
     publish_union(ctx, frozen_inputs, merged)
 }
 
@@ -642,11 +646,27 @@ fn visit_union_input(
     let mut rows: Vec<UnionFrozenRow> = Vec::new();
     let mut bytes: u64 = 0;
     let stats = frozen
-        .visit(&cancel, |batch| {
+        .visit_precise(&cancel, |batch| {
             if cancel.load(Ordering::Acquire) {
                 return Err("union superseded".into());
             }
             for row in &batch.rows {
+                // Precise replay records whole-value omissions instead of
+                // failing on them. An omitted field is usually a structured
+                // value with no native union encoding: letting it vanish
+                // into nulls would silently change the column, so the
+                // candidate fails explicitly naming field and native type.
+                if let Some((field, reason)) = row.omitted_fields.iter().next() {
+                    let dtype = row
+                        .field_types
+                        .get(field)
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".into());
+                    return Err(format!(
+                        "union input '{}' field '{field}' omitted by precise replay (native {dtype}): {reason}",
+                        input.view_id
+                    ));
+                }
                 let timestamp_nanos = match &time_source {
                     TimeSource::Membership(map) => *map
                         .get(&(
@@ -671,6 +691,7 @@ fn visit_union_input(
                     timestamp_nanos,
                     fields: row.fields.clone(),
                     field_types: row.field_types.clone(),
+                    raw: String::from_utf8_lossy(&row.record.bytes).into_owned(),
                 });
             }
             if (rows.len() as u64) > *remaining_rows {

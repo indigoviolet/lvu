@@ -523,6 +523,7 @@ fn prepare_context(
         limits.replay(),
         cancel,
         true,
+        true,
         &mut |batch: FrozenInputBatch| {
             for row in batch.rows {
                 observe_schema(
@@ -554,6 +555,7 @@ fn prepare_context(
             frozen,
             remaining_replay_limits(limits, count_stats)?,
             cancel,
+            true,
             true,
             &mut |batch: FrozenInputBatch| {
                 for row in batch.rows {

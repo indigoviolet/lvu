@@ -132,7 +132,28 @@ impl FrozenInput {
         cancel: &AtomicBool,
         mut visitor: impl FnMut(FrozenInputBatch) -> Result<(), String>,
     ) -> Result<FrozenInputStats, FrozenInputError> {
-        visit_frozen_input(&self.frozen, self.limits, cancel, false, &mut visitor)
+        visit_frozen_input(
+            &self.frozen,
+            self.limits,
+            cancel,
+            false,
+            false,
+            &mut visitor,
+        )
+    }
+
+    /// Precise replay for consumers that need native dtype evidence: every
+    /// visited row carries `field_types` for each field, at the cost of
+    /// recording whole-value omissions instead of failing on them. Unlike the
+    /// assistance sampling path this never includes source context: only
+    /// membership-selected records are visited, so counts stay exact. Added
+    /// for union merges, which decode typed values under dtype authority.
+    pub fn visit_precise(
+        &self,
+        cancel: &AtomicBool,
+        mut visitor: impl FnMut(FrozenInputBatch) -> Result<(), String>,
+    ) -> Result<FrozenInputStats, FrozenInputError> {
+        visit_frozen_input(&self.frozen, self.limits, cancel, false, true, &mut visitor)
     }
 }
 
@@ -786,6 +807,7 @@ fn visit_frozen_input(
     limits: FrozenInputLimits,
     cancel: &AtomicBool,
     source_context_for_empty_matches: bool,
+    precise_values: bool,
     visitor: &mut impl FnMut(FrozenInputBatch) -> Result<(), String>,
 ) -> Result<FrozenInputStats, FrozenInputError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -939,7 +961,7 @@ fn visit_frozen_input(
                         record,
                         &enriched.enriched_rows,
                         index,
-                        source_context_for_empty_matches,
+                        precise_values,
                         &enrichment_names,
                     )
                 })
