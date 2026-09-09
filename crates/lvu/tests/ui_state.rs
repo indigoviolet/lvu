@@ -10303,6 +10303,7 @@ fn the_grouping_dialog_opens_from_either_multiline_key_and_the_palette() {
 #[test]
 fn choosing_a_key_column_is_what_the_view_asks_its_provider_for() {
     let (provider, mut app) = folding_app();
+    app.views.active_mut().unwrap().fold_enabled = true; // Restored legacy presentation.
     render(&provider, &mut app, 100, 28);
     assert_eq!(provider.request.borrow().key_column, None);
 
@@ -10416,6 +10417,7 @@ fn folding_picker_never_offers_the_pattern_row() {
 #[test]
 fn minimum_run_scope_and_normalisation_reach_the_provider() {
     let (provider, mut app) = folding_app();
+    app.views.active_mut().unwrap().fold_enabled = true; // Restored legacy presentation.
     app.handle(Action::Open(Open::Folding), &provider);
 
     folding_focus(&mut app, &provider, FoldingControl::MinimumRun);
@@ -10528,7 +10530,7 @@ fn a_cancelled_generated_column_never_changes_the_fold_key() {
     app.handle(Action::Open(Open::Folding), &provider);
     folding_focus(&mut app, &provider, FoldingControl::KeyColumn);
     app.handle(raw_key(KeyCode::Enter), &provider);
-    for _ in 0..3 {
+    for _ in 0..2 {
         app.handle(raw_key(KeyCode::Down), &provider);
     }
     app.handle(raw_key(KeyCode::Enter), &provider);

@@ -247,6 +247,7 @@ def main() -> int:
     for name, output in failures:
         tail = [line for line in output.splitlines() if "Error" in line or "assert" in line]
         print(f"  {name}: {tail[-1][:140] if tail else 'see log'}")
+        print(f"--- {name}: complete failure output ---\n{output}")
     return 1 if failures else 0
 
 

@@ -2017,3 +2017,22 @@ through grouping and ungrouping completion, rather than only after completion.
 The exact clean integration commit will now run the reviewed isolated final gate.
 No v0.1.3 tag or archive acceptance is claimed by this entry. Roles and union
 remain separate work in progress outside this release.
+
+The first isolated gate at 0e9ab4c caught an unknown Run-version parser fallthrough.
+The reserved Run/Filter namespaces now reject unsupported versions before legacy
+regex handling; independent review cleared the fix. Workspace tests then exposed
+stale legacy-route assertions and an index-lock fixture acquisition race. Tests
+now await Grouping completion, explicitly enable restored legacy fixtures, and
+acquire the fixture index lock before measuring the unchanged retry window.
+The complete repair workspace run passed (grouping-repair-gate-3.log), followed
+by workspace clippy and bridge105 (grouping-repair-ui-gate.log).
+
+The first integrated PTY matrix passed 69/75. Preserved focused transcripts show
+stale singular-source request, retired folding labels, text-first expansion,
+uncollapsed selection, and hidden narrow-status expectations. Corrected stories
+use accepted enrichment keys and actual grouping counts. All six failed suites
+now pass focused reruns: repair2 real-source/Run, repair3 field-exploration/large
+grouping, repair4 Fields mnemonics, repair5 summary. The large 60k fixture samples
+through transitions and verifies count restoration; no volume-soak claim follows.
+Sol independently cleared the test repairs. Matrix failure output is now printed
+in full into the durable gate log. A fresh exact-commit final gate follows.

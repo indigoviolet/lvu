@@ -100,7 +100,10 @@ pub fn parse_grouping(source: &str) -> Result<GroupingSpec<'_>, String> {
             column: parse_column(FILTER_NAMESPACE, source)?,
         });
     }
-    if source.starts_with(START_NAMESPACE) {
+    if source.starts_with(START_NAMESPACE)
+        || source.starts_with("(?lvu:run:")
+        || source.starts_with("(?lvu:filter:")
+    {
         return Err(
             "unsupported grouping rule version; reopen Grouping and pick the column again"
                 .to_owned(),

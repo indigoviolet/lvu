@@ -14,7 +14,7 @@ import re
 import sys
 import tempfile
 
-from test_enrichment_chain_pty import stop
+from test_enrichment_chain_pty import stop, open_step_editor, paste, close_editor
 from test_lvu_pty import PtyApp
 
 
@@ -116,9 +116,20 @@ def run(binary):
             app.wait_until(lambda text: "Value · " not in text and "level  module" in text,
                            "the module column is pinned")
 
-            open_palette(app, "fold repeated", "Fold repeated events")
-            # Eight identical retries fold into one run, counted under it.
-            app.wait_until(lambda text: "×8 events" in text, "folding is on", timeout=20)
+            open_step_editor(app)
+            paste(app, "run_key = pl.col('msg')")
+            app.send(b"\r")
+            app.wait_until(lambda text: "Applied" in text, "run key applied", timeout=20)
+            close_editor(app)
+            open_palette(app, "grouping", "Grouping")
+            app.wait_for("Multiline grouping")
+            paste(app, "run_key")
+            app.wait_for("(?lvu:run:v1:column:run_key)")
+            app.send(b"\r")
+            app.wait_until(lambda text: "Applied" in text, "grouping applied", timeout=20)
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Multiline grouping" not in text,
+                           "grouping closed")
 
             # --- 80x24: the stack reads back what was applied ----------------
             app.send(b"V")
@@ -128,11 +139,11 @@ def run(binary):
             assert summary_row(summary, "Time").endswith("—"), summary
             assert summary_row(summary, "Search") == "Search     · login retry", summary
             # 60 columns: the row truncates with an ellipsis, never mid-glyph.
-            fold = summary_row(summary, "Fold")
-            assert fold.startswith("Fold       · by Message pattern · adjacent · min 3") and fold.endswith("…"), summary
+            assert "run_key" in summary_row(summary, "Grouping"), summary
+            assert summary_row(summary, "Fold").endswith("—"), summary
             assert summary_row(summary, "Columns") == "Columns    · pinned: module", summary
             assert summary_row(summary, "Readiness") == "Readiness  · ready", summary
-            assert "3 of 8 operations applied" in summary, summary
+            assert "4 of 8 operations applied" in summary, summary
             assert "1 of 11" in summary, summary
 
             # Enter on the Search row opens Search with the literal applied.

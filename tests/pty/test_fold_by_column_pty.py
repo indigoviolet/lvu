@@ -127,7 +127,7 @@ def run(binary):
             app.send(b"g")
             app.send(b"\r")
             expanded = app.wait_until(
-                lambda text: "svc=shipper" not in text
+                lambda text: text.count("svc=ship") == len(WORDS)
                 and text.count("svc=inde") == 1,
                 "the run expands into its own rows", timeout=15)
             assert "retry con" in expanded, expanded

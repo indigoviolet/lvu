@@ -161,8 +161,17 @@ def run_large_view_never_blanks(binary, tooling):
                     time.sleep(0.02)
                 raise AssertionError(f"{description} did not complete:\n{app.text()}")
 
+            baseline_total = int(seen.split("/")[-1])
+            def visible_total(text):
+                value = counter(text)
+                return int(value.split("/")[-1]) if value else None
+
+            # At 80 columns optional status tokens are omitted. The accepted
+            # presentation count is observable: null separator rows join the
+            # preceding start, so the count drops without filtering records.
             observe_transition(
-                lambda text: "grouping:display-only" in text,
+                lambda text: visible_total(text) is not None
+                and visible_total(text) < baseline_total,
                 "grouping recompute")
 
             # Clearing the rule ungroups the flood: the pane stays populated
@@ -181,7 +190,7 @@ def run_large_view_never_blanks(binary, tooling):
             app.send(b"\r")
             app.send(b"\x1b")
             observe_transition(
-                lambda text: "grouping:display-only" not in text
+                lambda text: visible_total(text) == baseline_total
                 and len(viewport_rows(text)) >= 15,
                 "ungrouping recompute")
             stop(app)
@@ -288,6 +297,10 @@ def run(binary):
             expanded = app.wait_until(lambda text: text.count("retry connect to") > 5,
                                       "the run expands", timeout=10)
             assert f"/{FLOOD + 4}" in expanded, expanded
+
+            app.send(b"\r")
+            app.wait_until(lambda text: text.count("retry connect to") == 1,
+                           "collapsed again", timeout=10)
 
             # A filter matches exactly what it matched before: grouping changes
             # presentation, never membership.

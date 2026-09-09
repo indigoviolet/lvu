@@ -1454,7 +1454,7 @@ for line in sys.stdin:
         session_count += 1
         result = {"session_id": "source-definition-session-" + str(session_count)}
     elif method == "request_proposal":
-        assert request["kind"] == "source"
+        assert request["kind"] == "sources"
         manifest = pathlib.Path(request["context"]["manifest_path"])
         assert manifest.is_absolute() and manifest.is_file()
         assert request["context"]["dataset_paths"] == []
