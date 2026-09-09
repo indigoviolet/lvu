@@ -17,7 +17,7 @@ export class CliLifecycle {
 
   constructor(
     readonly bridge: Bridge,
-    input: Readable,
+    readonly input: Readable,
     readonly output: Writable,
     readonly limits: ServerLimits,
     readonly diagnostic: (message: string) => void,
@@ -69,7 +69,17 @@ export class CliLifecycle {
   }
 
   async #start(): Promise<JsonlServer | null> {
-    await this.bridge.start();
+    try {
+      await this.bridge.start();
+    } catch (error) {
+      // No server can consume protocol input after startup fails. Release the
+      // owned pipe so Node can exit and the host can report the connection
+      // diagnostic instead of leaving its pending requests waiting on stdin.
+      this.input.unpipe(this.#stagedInput);
+      this.input.destroy();
+      this.#stagedInput.destroy();
+      throw error;
+    }
     // An EOF already queued by pipe teardown must win over publishing the
     // server as ready. Promise continuations run before stream events, so
     // checking immediately after bridge.start() misses that shutdown intent.

@@ -1351,3 +1351,13 @@ unaffected binary fresh. Force rebuilding the demo from unchanged source content
 will refresh its real build provenance; no binary timestamp will be fabricated.
 The following policy edits are documentation-only. Matrix acceptance follows on
 the final source commit, without repeating unchanged Rust/bridge checks.
+
+The matrix on d1d84ff ran and passed 70/71; the daemon-unreachable diagnostic
+failed and reproduced alone. The new startup stdin staging kept Node alive after
+connection failure, so the host never received process EOF and Ask stayed pending.
+CliLifecycle now releases its owned input and staged stream on startup failure,
+preserving the original connection error. Typecheck, 96/96 bridge tests and the
+actual bridge-diagnostics PTY pass after correction; no timeout was increased.
+Logs: primary-v0.1.2-final-matrix.log, primary-v012-bridge-diagnostic.log and
+primary-v012-bridge-diagnostic-fixed.log. Full corrected matrix follows; unchanged
+Rust retains the 1,245-pass/seven-ignored gate evidence above.

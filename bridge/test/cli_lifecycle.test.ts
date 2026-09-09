@@ -157,7 +157,7 @@ describe("CLI startup lifecycle", () => {
     h.input.destroy();
   });
 
-  it("propagates startup failure after closing the backend", async () => {
+  it("propagates startup failure and releases open stdin after closing the backend", async () => {
     const h = fixture();
     const connect = deferred<void>();
     h.backend.connectResult = connect;
@@ -165,5 +165,6 @@ describe("CLI startup lifecycle", () => {
     connect.reject(new Error("connect failed"));
     await expect(starting).rejects.toThrow("connect failed");
     expect(h.backend.closeCalls).toBe(1);
+    expect(h.input.destroyed).toBe(true);
   });
 });
