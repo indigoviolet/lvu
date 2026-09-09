@@ -1149,3 +1149,25 @@ and capture accounting through actual append/commit before final amendment.
 W14 is tracing assistance shutdown; W13 is reproducing the two remaining
 primary PTY failures with exact binaries and full transcripts. No preview is
 accepted from this evidence.
+
+## 2026-09-09 — shutdown diagnostic follow-up
+
+W22's revised status `1baf29b` and FOLLOW `a356243` remain unintegrated;
+earlier targeted failures were corrected but the final gate stopped at disk
+preflight. Review confirms served-row identities now determine the anchor and
+tail selection. Remaining status review covers the raw-context return shortcut
+beside long actions and event-time clauses following another diagnostic.
+
+W14 is implementing bounded teardown for bridge startup before Node registers
+EOF handlers, including a deterministic delayed-start child. Memory flush is
+being diagnosed separately: its 500ms budget follows assistance teardown, and
+both W25 exits failed memory flushing while only one reported bridge failure.
+No causal dependence between those failures is established.
+
+Primary added bounded worker-phase snapshots and pending/inflight counts to
+memory-flush errors, distinguishing final-save submission, flush queue admission
+and flush acknowledgement. A full command queue at deadline previously reported
+"disconnected" even while connected; it now reports the admission timeout.
+The budget and persistence behavior are unchanged. New tests exercise actual
+save durability through saturated command/event queues and both timeout stages.
+Formatting and diff checks pass; focused Rust/clippy validation is pending.

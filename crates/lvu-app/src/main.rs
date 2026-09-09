@@ -4115,7 +4115,12 @@ impl Composition {
                 self.poll_memory(app, adapter);
                 self.queue_memory_saves(app, true);
                 if std::time::Instant::now() >= deadline {
-                    return Err("memory autosave flush deadline exceeded".into());
+                    return Err(format!(
+                        "memory autosave flush deadline exceeded (submitting final saves; pending={}, inflight={}, worker: {})",
+                        self.memory_pending.len(),
+                        self.memory_inflight.len(),
+                        self.memory.phase(),
+                    ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -4125,13 +4130,24 @@ impl Composition {
             for event in events {
                 self.handle_memory_event(app, adapter, event);
             }
-            result?;
+            result.map_err(|error| {
+                format!(
+                    "{error}; pending={}, inflight={}",
+                    self.memory_pending.len(),
+                    self.memory_inflight.len(),
+                )
+            })?;
             self.queue_memory_saves(app, true);
             if self.memory_pending.is_empty() && self.memory_inflight.is_empty() {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                return Err("memory autosave acknowledgements incomplete".into());
+                return Err(format!(
+                    "memory autosave acknowledgements incomplete (pending={}, inflight={}, worker: {})",
+                    self.memory_pending.len(),
+                    self.memory_inflight.len(),
+                    self.memory.phase(),
+                ));
             }
         }
     }

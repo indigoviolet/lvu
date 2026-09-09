@@ -1,7 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
-    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -98,6 +102,7 @@ pub struct MemoryWorker {
     tx: SyncSender<Command>,
     rx: Receiver<Event>,
     _join: thread::JoinHandle<()>,
+    phase: Arc<AtomicU8>,
 }
 impl MemoryWorker {
     pub fn start(root: PathBuf) -> Self {
@@ -111,11 +116,14 @@ impl MemoryWorker {
     ) -> Self {
         let (tx, commands) = mpsc::sync_channel(command_capacity);
         let (events, rx) = mpsc::sync_channel(event_capacity);
-        let join = thread::spawn(move || worker(root, commands, events));
+        let phase = Arc::new(AtomicU8::new(0));
+        let worker_phase = Arc::clone(&phase);
+        let join = thread::spawn(move || worker(root, commands, events, worker_phase));
         Self {
             tx,
             rx,
             _join: join,
+            phase,
         }
     }
     pub fn load(&self, definition: SourceDefinition, view_id: ViewId) -> Result<(), String> {
@@ -202,6 +210,27 @@ impl MemoryWorker {
     pub fn poll(&self) -> Option<Event> {
         self.rx.try_recv().ok()
     }
+
+    /// A bounded diagnostic snapshot, never a completion or durability signal.
+    pub fn phase(&self) -> &'static str {
+        match self.phase.load(Ordering::Relaxed) {
+            0 => "opening workspace",
+            1 => "waiting for command",
+            2 => "loading workspace state",
+            3 => "persisting view",
+            4 => "delivering save result",
+            5 => "processing workspace command",
+            6 => "acknowledging flush",
+            _ => "stopped",
+        }
+    }
+
+    fn flush_timeout(&self, stage: &str) -> String {
+        format!(
+            "memory autosave flush deadline exceeded ({stage}; worker: {})",
+            self.phase()
+        )
+    }
     pub fn flush(&self, timeout: Duration) -> (Vec<Event>, Result<(), String>) {
         let (tx, rx) = mpsc::sync_channel(0);
         let deadline = std::time::Instant::now() + timeout;
@@ -217,7 +246,12 @@ impl MemoryWorker {
                     }
                     thread::sleep(Duration::from_millis(2));
                 }
-                Err(_) => return (events, Err("memory worker disconnected".into())),
+                Err(TrySendError::Full(_)) => {
+                    return (events, Err(self.flush_timeout("waiting to enqueue flush")));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return (events, Err("memory worker disconnected".into()));
+                }
             }
         }
         loop {
@@ -238,7 +272,7 @@ impl MemoryWorker {
                 Err(mpsc::TryRecvError::Empty) => {
                     return (
                         events,
-                        Err("memory autosave flush deadline exceeded".into()),
+                        Err(self.flush_timeout("waiting for flush acknowledgement")),
                     );
                 }
             }
@@ -255,11 +289,17 @@ fn queue_error<T>(error: TrySendError<T>) -> String {
     }
 }
 
-fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>) {
+fn worker(
+    root: PathBuf,
+    commands: Receiver<Command>,
+    events: SyncSender<Event>,
+    phase: Arc<AtomicU8>,
+) {
     let mut store = match WorkspaceStore::open(root) {
         Ok(store) => store,
         Err(error) => {
             let _ = events.send(Event::Fatal(format!("memory unavailable: {error}")));
+            phase.store(7, Ordering::Relaxed);
             return;
         }
     };
@@ -267,7 +307,18 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
     let mut newest: HashMap<ViewId, u64> = HashMap::new();
     let mut failed: HashMap<ViewId, String> = HashMap::new();
     let mut recipe_failure: Option<String> = None;
+    phase.store(1, Ordering::Relaxed);
     while let Ok(command) = commands.recv() {
+        phase.store(
+            match &command {
+                Command::Load(..) => 2,
+                Command::Save(..) => 3,
+                Command::Flush(..) => 6,
+                Command::Stop => 7,
+                _ => 5,
+            },
+            Ordering::Relaxed,
+        );
         match command {
             Command::Load(definition, view_id) => {
                 let definition = *definition;
@@ -343,6 +394,7 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                     .get(&request.view_id)
                     .is_some_and(|seen| *seen >= request.sequence)
                 {
+                    phase.store(4, Ordering::Relaxed);
                     if events
                         .send(Event::Saved(
                             request.definition.id,
@@ -353,6 +405,7 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                     {
                         break;
                     }
+                    phase.store(1, Ordering::Relaxed);
                     continue;
                 }
                 let expected = versions.get(&request.view_id).copied();
@@ -373,6 +426,7 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                 } else {
                     store.save_source_and_view(&metadata, &view, expected)
                 };
+                phase.store(4, Ordering::Relaxed);
                 match result {
                     Ok(version) => {
                         newest.insert(request.view_id, request.sequence);
@@ -581,7 +635,9 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
             }
             Command::Stop => break,
         }
+        phase.store(1, Ordering::Relaxed);
     }
+    phase.store(7, Ordering::Relaxed);
 }
 fn source_metadata(definition: SourceDefinition) -> SourceMetadata {
     let command = match &definition.acquisition {
@@ -1323,6 +1379,7 @@ mod tests {
             tx,
             rx,
             _join: join,
+            phase: Arc::new(AtomicU8::new(1)),
         };
         let definition = definition();
         let start = Instant::now();
@@ -1361,7 +1418,8 @@ mod tests {
         let (commands_tx, commands_rx) = mpsc::sync_channel(0);
         let (events_tx, events_rx) = mpsc::sync_channel(0);
         let root = temp.path().to_path_buf();
-        let join = thread::spawn(move || worker(root, commands_rx, events_tx));
+        let join =
+            thread::spawn(move || worker(root, commands_rx, events_tx, Arc::new(AtomicU8::new(0))));
 
         // The completed command rendezvous proves the worker received Recent.
         // It then blocks on the zero-capacity event rendezvous while a scoped
@@ -1394,6 +1452,70 @@ mod tests {
         ));
         commands_tx.send(Command::Stop).unwrap();
         join.join().unwrap();
+    }
+
+    #[test]
+    fn flush_drains_a_saturated_event_and_command_queue_before_acknowledging() {
+        let temp = TempDir::new().unwrap();
+        let (commands_tx, commands_rx) = mpsc::sync_channel(1);
+        let (events_tx, events_rx) = mpsc::sync_channel(0);
+        let phase = Arc::new(AtomicU8::new(0));
+        let worker_phase = Arc::clone(&phase);
+        let root = temp.path().to_path_buf();
+        let join = thread::spawn(move || worker(root, commands_rx, events_tx, worker_phase));
+        let definition = definition();
+        let id = ViewId::new();
+
+        // Receiving Recent frees the only command slot. The worker cannot
+        // finish it until flush receives its event, so Save then fills that
+        // slot deterministically, without relying on scheduling or sleeps.
+        commands_tx.send(Command::Recent).unwrap();
+        commands_tx
+            .send(Command::Save(Box::new(request(1, definition, id, "final"))))
+            .unwrap();
+        let worker = MemoryWorker {
+            tx: commands_tx,
+            rx: events_rx,
+            _join: join,
+            phase,
+        };
+        let (events, result) = worker.flush(Duration::from_secs(2));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(matches!(events.first(), Some(Event::Recent(_))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Saved(_, saved, 1) if *saved == id))
+        );
+        let store = WorkspaceStore::open(temp.path()).unwrap();
+        assert_eq!(store.get_view(id).unwrap().unwrap().applied_search, "final");
+        worker.stop();
+        worker._join.join().unwrap();
+    }
+
+    #[test]
+    fn expired_flush_distinguishes_queue_admission_from_acknowledgement() {
+        let (tx, commands) = mpsc::sync_channel(1);
+        let (_events, rx) = mpsc::sync_channel(1);
+        tx.try_send(Command::Recent).unwrap();
+        let worker = MemoryWorker {
+            tx,
+            rx,
+            _join: thread::spawn(|| {}),
+            phase: Arc::new(AtomicU8::new(1)),
+        };
+        let error = worker.flush(Duration::ZERO).1.unwrap_err();
+        assert!(error.contains("waiting to enqueue flush"), "{error}");
+        assert!(!error.contains("disconnected"), "{error}");
+        assert!(matches!(commands.try_recv(), Ok(Command::Recent)));
+        let error = worker.flush(Duration::ZERO).1.unwrap_err();
+        assert!(
+            error.contains("waiting for flush acknowledgement"),
+            "{error}"
+        );
+        assert!(error.contains("worker: waiting for command"), "{error}");
+        assert!(matches!(commands.try_recv(), Ok(Command::Flush(_))));
+        worker._join.join().unwrap();
     }
 
     #[test]
