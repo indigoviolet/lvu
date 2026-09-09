@@ -9462,13 +9462,24 @@ fn an_unfinished_fold_reports_what_it_has_not_reached() {
 /// The log pane's own row containing `needle`, from the event column onwards.
 /// Assertions about the gutter have to be about this and not the whole screen,
 /// which also carries the sources pane and the pane borders.
+fn event_column(screen: &str) -> usize {
+    let header = screen
+        .lines()
+        .find(|line| line.contains("time") && line.contains("level") && line.contains("event"))
+        .expect("log column header");
+    header[..header.find("event").unwrap()].chars().count()
+}
+
 fn event_cell(screen: &str, needle: &str) -> String {
     let line = screen
         .lines()
         .find(|line| line.contains(needle))
         .unwrap_or_else(|| panic!("no row containing {needle:?} in\n{screen}"));
-    let level = line.find("INFO").map_or(0, |at| at + "INFO".len());
-    line[level..].trim_end_matches(['│', ' ']).to_owned()
+    line.chars()
+        .skip(event_column(screen))
+        .collect::<String>()
+        .trim_end_matches(['│', ' '])
+        .to_owned()
 }
 
 /// A fold has to read as a fold. Collapsed, the entry showed its first member's
@@ -9514,8 +9525,9 @@ fn an_expanded_run_is_bracketed_from_its_first_member_to_its_last() {
         .lines()
         .filter(|line| line.contains("retry connect"))
         .filter_map(|line| {
-            let level = line.find("INFO")? + "INFO".len();
-            line[level..].trim_start().chars().next()
+            line.chars()
+                .skip(event_column(&expanded))
+                .find(|ch| !ch.is_whitespace())
         })
         .collect();
     assert_eq!(gutters, vec!['┌', '│', '└'], "{expanded}");
@@ -9552,8 +9564,9 @@ fn the_fold_gutter_has_an_ascii_form() {
         .lines()
         .filter(|line| line.contains("retry connect"))
         .filter_map(|line| {
-            let level = line.find("INFO")? + "INFO".len();
-            line[level..].trim_start().chars().next()
+            line.chars()
+                .skip(event_column(&expanded))
+                .find(|ch| !ch.is_whitespace())
         })
         .collect();
     assert_eq!(gutters, vec!['+', '|', '+'], "{expanded}");

@@ -1259,19 +1259,18 @@ async fn event_time_filters_full_records_without_capture_fallback_and_exports_ba
     assert!(rows[0].text.contains("utc"));
     assert!(rows[1].text.contains("offset"));
     assert!(rows[2].text.contains("numeric"));
-    assert!(
-        rows.iter()
-            .all(|row| row.details.iter().any(|(key, value)| {
-                key == "event_time_utc" && value == "2026-09-05T12:30:45.000000000Z"
-            }))
-    );
-    // The unit is reported, not silently folded into the offset case.
-    assert!(
-        rows[2]
-            .details
+    // The accepted basis publishes authoritative nanoseconds. Display projection
+    // no longer runs a second recognition pass or adds guessed event-time details.
+    assert!(rows.iter().all(|row| {
+        row.details
             .iter()
-            .any(|(key, value)| { key == "event_time_note" && value.contains("epoch seconds") })
-    );
+            .any(|(key, value)| key == "basis_nanos" && value == "1788611445000000000")
+    }));
+    assert!(rows.iter().all(|row| {
+        row.details
+            .iter()
+            .all(|(key, _)| !key.starts_with("event_time_"))
+    }));
     // `2026-09-05 12:30:45` carries no timezone. Read as UTC it would land
     // exactly inside this window, so its absence is what proves the zone is
     // still rejected rather than assumed. Membership and the diagnostic agree:
