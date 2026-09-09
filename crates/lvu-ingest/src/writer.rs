@@ -24,13 +24,6 @@ pub(crate) enum WriterMessage {
         event: CaptureEvent,
         _permit: OwnedSemaphorePermit,
     },
-    Page {
-        offset: u64,
-        max_records: usize,
-        max_bytes: usize,
-        reply: oneshot::Sender<Result<JournalPage, RuntimeError>>,
-        _permit: OwnedSemaphorePermit,
-    },
     Finish {
         state: RuntimeState,
         discarded_bytes: u64,
@@ -39,8 +32,35 @@ pub(crate) enum WriterMessage {
     },
 }
 
+/// A bounded journal page read for live indexing and query workers.
+///
+/// Page reads never append, reorder capture events among themselves, change
+/// append durability, or move the file cursor, which still advances only
+/// behind the commit that covers it. They carry no capture payload, so they
+/// need no writer-queue slot: the per-source page gate already bounds them to
+/// one outstanding request, and the page channel below bounds them to one
+/// queued message.
+///
+/// The gate permit travels inside the request until service or drop, rather
+/// than staying with the calling future: a caller cancelled after sending
+/// must not free the gate while its request is still queued or being served,
+/// or a replacement caller could pass and break the one-outstanding bound.
+pub(crate) struct PageRequest {
+    pub offset: u64,
+    pub max_records: usize,
+    pub max_bytes: usize,
+    pub reply: oneshot::Sender<Result<JournalPage, RuntimeError>>,
+    pub _permit: OwnedSemaphorePermit,
+}
+
+/// At most one outstanding page per source (enforced by the page gate), so a
+/// capacity of one never blocks a sender and the writer's inbound stays
+/// bounded at `writer_queue_capacity` events plus this single page.
+const PAGE_CHANNEL_CAPACITY: usize = 1;
+
 pub(crate) struct WriterInit {
     pub sender: tokio::sync::mpsc::Sender<WriterMessage>,
+    pub page_sender: tokio::sync::mpsc::Sender<PageRequest>,
     pub slots: Arc<Semaphore>,
     pub task: tokio::task::JoinHandle<()>,
     pub resume: Option<FileCaptureResume>,
@@ -100,7 +120,8 @@ pub(crate) async fn spawn_writer(
     let _ = progress.send(initial.clone());
 
     let capacity = config.writer_queue_capacity.saturating_add(1);
-    let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+    let (sender, event_receiver) = tokio::sync::mpsc::channel(capacity);
+    let (page_sender, page_receiver) = tokio::sync::mpsc::channel(PAGE_CHANNEL_CAPACITY);
     let slots = Arc::new(Semaphore::new(config.writer_queue_capacity));
     let resume = file_cursor
         .as_ref()
@@ -127,7 +148,7 @@ pub(crate) async fn spawn_writer(
             progress: progress.clone(),
             file_cursor,
         };
-        let outcome = run_writer(state, config, receiver, runtime);
+        let outcome = run_writer(state, config, event_receiver, page_receiver, runtime);
         lvu_core::journal::trace::record(|| {
             format!(
                 "run_writer RETURN source={source_id:?} ok={}",
@@ -145,6 +166,7 @@ pub(crate) async fn spawn_writer(
     });
     Ok(WriterInit {
         sender,
+        page_sender,
         slots,
         task,
         resume,
@@ -271,7 +293,7 @@ impl WriterState {
 
     /// Adds one capture-only interval. Page reads share this writer thread but
     /// belong to live indexing/query work, so callers deliberately start a new
-    /// interval around each message and mark `WriterMessage::Page` uncharged.
+    /// interval around each message and mark page service uncharged.
     fn note_cpu(&mut self, cpu: &lvu_core::ThreadCpu, capture_work: bool) {
         self.current.writer_cpu_nanos = accumulated_capture_cpu(
             self.current.writer_cpu_nanos,
@@ -289,103 +311,252 @@ fn accumulated_capture_cpu(total: u64, capture_work: bool, elapsed: u64) -> u64 
     }
 }
 
+/// What the writer wait woke for.
+///
+/// Pages have their own bounded channel so a flooded capture queue cannot
+/// refuse a page admission, and the two sides strictly alternate while both
+/// have work queued: a page reads committed records the writer has already
+/// published, never appends, and never moves the file cursor, so serving it
+/// between capture batches does not reorder capture events among themselves,
+/// change what becomes durable, or unveil uncommitted tail to callers that
+/// page from the published progress. Alternation is the reciprocal half of
+/// the same guarantee: a page gate bounds occupancy to one outstanding page,
+/// which bounds how many pages can be queued but not how often they arrive,
+/// so pages always winning would let sustained paging stall capture.
+/// Alternating keeps bounded progress for both sides: a page waits for at most
+/// the batch in progress, and a capture batch waits for at most the page in
+/// progress. This addresses the scheduling half of the journal/page-read TODO
+/// row; what it does to any volume-backed query number is for a bounded
+/// experiment to say, not claimed here.
+enum Wake {
+    Page(PageRequest),
+    Event(WriterMessage),
+    Timeout,
+    EventsClosed,
+    Closed,
+}
+
+/// Takes whatever is already queued without blocking.
+///
+/// When both channels already hold work, `prefer_pages` decides which is
+/// served first and the caller flips it after every service, which is what
+/// alternates the two sides under sustained load: the page needs no queued
+/// capture tail, and the queued capture keeps its arrival order for the batch
+/// that follows. When only one side has work it is served regardless of the
+/// flag, so neither side idles. While the event channel is closed abnormally
+/// only queued events are taken: queued pages fall back to read-only reads
+/// once the writer below returns, which see everything the close path below
+/// commits first.
+fn take_queued(
+    events: &mut tokio::sync::mpsc::Receiver<WriterMessage>,
+    pages: &mut tokio::sync::mpsc::Receiver<PageRequest>,
+    prefer_pages: bool,
+) -> Option<Wake> {
+    if prefer_pages {
+        if let Ok(page) = pages.try_recv() {
+            return Some(Wake::Page(page));
+        }
+        if let Ok(event) = events.try_recv() {
+            return Some(Wake::Event(event));
+        }
+    } else {
+        if let Ok(event) = events.try_recv() {
+            return Some(Wake::Event(event));
+        }
+        if let Ok(page) = pages.try_recv() {
+            return Some(Wake::Page(page));
+        }
+    }
+    None
+}
+
 /// Waits for the next writer message, bounded by the commit deadline.
 ///
 /// The writer is a blocking thread, so it cannot await; `block_on` here is safe
-/// because this is not a runtime worker. `None` means the wait ended without a
-/// message: either the deadline passed, or the channel closed. The caller
-/// distinguishes the two by asking whether anything is still outstanding.
-fn receive(
+/// because this is not a runtime worker. `Timeout` means the deadline passed
+/// with nothing arriving. The caller only waits here when nothing is queued,
+/// so at most one side can close while waiting: `EventsClosed` means the event
+/// channel closed first and the caller drains and terminates, while `Closed`
+/// means both are gone. The fixed page-first tie-break only decides messages
+/// arriving at the same instant; whichever side it wakes, the caller's flag
+/// still flips, so the next queued turn goes to the other side.
+fn blocking_wait(
     runtime: &tokio::runtime::Handle,
-    receiver: &mut tokio::sync::mpsc::Receiver<WriterMessage>,
+    events: &mut tokio::sync::mpsc::Receiver<WriterMessage>,
+    pages: &mut tokio::sync::mpsc::Receiver<PageRequest>,
     deadline: Option<std::time::Duration>,
-) -> Option<WriterMessage> {
-    match deadline {
-        None => receiver.blocking_recv(),
-        Some(remaining) => runtime
-            .block_on(async { tokio::time::timeout(remaining, receiver.recv()).await })
-            .ok()
-            .flatten(),
-    }
+) -> Wake {
+    runtime.block_on(async {
+        let wait = async {
+            tokio::select! {
+                biased;
+                page = pages.recv() => match page {
+                    Some(page) => Wake::Page(page),
+                    // Pages closed: events only from here.
+                    None => match events.recv().await {
+                        Some(event) => Wake::Event(event),
+                        None => Wake::Closed,
+                    },
+                },
+                event = events.recv() => match event {
+                    Some(event) => Wake::Event(event),
+                    // Events closed mid-wait: the caller serves what is queued
+                    // and then terminates instead of waiting on pages.
+                    None => Wake::EventsClosed,
+                },
+            }
+        };
+        match deadline {
+            None => wait.await,
+            Some(remaining) => match tokio::time::timeout(remaining, wait).await {
+                Ok(wake) => wake,
+                Err(_) => Wake::Timeout,
+            },
+        }
+    })
 }
 
 fn run_writer(
     mut state: WriterState,
     config: RuntimeConfig,
-    mut receiver: tokio::sync::mpsc::Receiver<WriterMessage>,
+    mut events: tokio::sync::mpsc::Receiver<WriterMessage>,
+    mut pages: tokio::sync::mpsc::Receiver<PageRequest>,
     runtime: tokio::runtime::Handle,
 ) -> Result<(), RuntimeError> {
     let mut batch = Vec::with_capacity(config.batch_records);
+    // Pages start preferred so a page queued behind capture at startup is
+    // still served between batches rather than behind the whole queue.
+    let mut prefer_pages = true;
     // The time half of group commit has to hold when nothing is arriving: a
     // tail that goes quiet must still become durable, and the cursor it is
     // holding must still be written. So the wait for the next message is
     // bounded by the commit deadline whenever there is anything outstanding,
     // and unbounded when there is not.
     loop {
-        let Some(message) = receive(&runtime, &mut receiver, state.commit.deadline()) else {
-            if state.commit.outstanding() {
-                let writer_cpu = lvu_core::ThreadCpu::start();
-                state.commit()?;
-                state.note_cpu(&writer_cpu, true);
-                state.publish();
-                continue;
-            }
+        // A closed and drained event channel ends the writer even while page
+        // senders are retained: no Finish can arrive anymore. This check runs
+        // before page service on every turn, so a continuously replenished
+        // page fast path can never hide the closure and stall the writer
+        // join (and the source lifecycle it gates) forever. Queued events —
+        // including any queued Finish — keep the buffer non-empty, so they
+        // are drained in order first and a pending Finish still terminates
+        // cleanly; queued pages were served alongside them by the fast path
+        // below. Pages sent from here race our return and fall back to
+        // read-only reads over everything committed below. Both predicates
+        // are monotonic once observed together: with no senders left, nothing
+        // can enqueue anymore.
+        if events.is_closed() && events.is_empty() {
             break;
-        };
-        let mut writer_cpu = lvu_core::ThreadCpu::start();
-        match message {
-            WriterMessage::Event {
-                event: CaptureEvent::Records(records),
-                ..
-            } => {
-                let source_id = state.current.source_id;
-                state.current.handovers += 1;
-                state.current.reader_cpu_nanos = state.current.reader_cpu_nanos.saturating_add(
-                    records
-                        .iter()
-                        .map(|record| record.reader_cpu_nanos)
-                        .sum::<u64>(),
-                );
-                batch.extend(records.into_iter().map(|record| record.into_raw(source_id)));
-                while batch.len() < config.batch_records {
-                    match receiver.try_recv() {
-                        Ok(WriterMessage::Event {
+        }
+        // An overdue group commit outranks everything queued. The fast path
+        // below would otherwise serve continuous paging forever without ever
+        // reaching the deadline wait, leaving appended records undurable past
+        // their time bound. Count-based commits still happen in the batch
+        // path; this only fires once the time bound has actually expired.
+        if state.commit.due() {
+            let writer_cpu = lvu_core::ThreadCpu::start();
+            state.commit()?;
+            state.note_cpu(&writer_cpu, true);
+            state.publish();
+        }
+        if let Some(wake) = take_queued(&mut events, &mut pages, prefer_pages) {
+            match wake {
+                Wake::Page(page) => {
+                    let writer_cpu = lvu_core::ThreadCpu::start();
+                    serve_page(&mut state, page, &config, &writer_cpu);
+                    // Yield the next queued turn to capture: sustained paging
+                    // must not stall appends.
+                    prefer_pages = false;
+                    continue;
+                }
+                Wake::Event(message) => {
+                    let mut writer_cpu = lvu_core::ThreadCpu::start();
+                    match message {
+                        WriterMessage::Event {
                             event: CaptureEvent::Records(records),
                             ..
-                        }) => {
-                            state.current.handovers += 1;
-                            state.current.reader_cpu_nanos =
-                                state.current.reader_cpu_nanos.saturating_add(
-                                    records
-                                        .iter()
-                                        .map(|record| record.reader_cpu_nanos)
-                                        .sum::<u64>(),
-                                );
-                            batch.extend(
-                                records.into_iter().map(|record| record.into_raw(source_id)),
-                            );
+                        } => {
+                            if append_records(
+                                &mut state,
+                                &mut events,
+                                &mut batch,
+                                &config,
+                                records,
+                                &mut writer_cpu,
+                            )? {
+                                return Ok(());
+                            }
                         }
-                        Ok(other) => {
-                            append_batch(&mut state, &mut batch, &config, &writer_cpu)?;
-                            writer_cpu = lvu_core::ThreadCpu::start();
+                        other => {
                             if handle_non_record(&mut state, other, &config, &writer_cpu)? {
                                 return Ok(());
                             }
-                            break;
                         }
-                        Err(_) => break,
                     }
+                    // Yield the next queued turn to reads: queued capture
+                    // keeps its arrival order, but a waiting page goes next.
+                    prefer_pages = true;
+                    continue;
                 }
-                append_batch(&mut state, &mut batch, &config, &writer_cpu)?;
-            }
-            other => {
-                if handle_non_record(&mut state, other, &config, &writer_cpu)? {
-                    return Ok(());
+                Wake::Timeout | Wake::EventsClosed | Wake::Closed => {
+                    unreachable!("take_queued serves queued work only")
                 }
             }
         }
+        // Nothing queued. An event channel observed closed above already broke
+        // out; reaching here means it is still open, so waiting is safe.
+        match blocking_wait(&runtime, &mut events, &mut pages, state.commit.deadline()) {
+            Wake::Closed => break,
+            Wake::EventsClosed => {
+                // Loops back to the closed-and-drained check above, which now
+                // terminates since the event side proved drained.
+                continue;
+            }
+            Wake::Timeout => {
+                if state.commit.outstanding() {
+                    let writer_cpu = lvu_core::ThreadCpu::start();
+                    state.commit()?;
+                    state.note_cpu(&writer_cpu, true);
+                    state.publish();
+                }
+                continue;
+            }
+            Wake::Page(page) => {
+                let writer_cpu = lvu_core::ThreadCpu::start();
+                serve_page(&mut state, page, &config, &writer_cpu);
+                prefer_pages = false;
+                continue;
+            }
+            Wake::Event(message) => {
+                let mut writer_cpu = lvu_core::ThreadCpu::start();
+                match message {
+                    WriterMessage::Event {
+                        event: CaptureEvent::Records(records),
+                        ..
+                    } => {
+                        if append_records(
+                            &mut state,
+                            &mut events,
+                            &mut batch,
+                            &config,
+                            records,
+                            &mut writer_cpu,
+                        )? {
+                            return Ok(());
+                        }
+                    }
+                    other => {
+                        if handle_non_record(&mut state, other, &config, &writer_cpu)? {
+                            return Ok(());
+                        }
+                    }
+                }
+                prefer_pages = true;
+                continue;
+            }
+        }
     }
-    // The channel closed without a Finish: commit what is held, then say so.
+    // The channels closed without a Finish: commit what is held, then say so.
     let writer_cpu = lvu_core::ThreadCpu::start();
     state.commit()?;
     state.note_cpu(&writer_cpu, true);
@@ -399,6 +570,61 @@ fn run_writer(
     })?;
     state.publish();
     Ok(())
+}
+
+/// Batches one capture handover with whatever record events are already queued
+/// on the event channel, preserving their arrival order, then appends once.
+///
+/// Only the event channel is drained here: pages arriving mid-batch wait in
+/// their own channel for the batch in progress, never for every batch already
+/// queued. Non-record events still split the batch so checkpoints keep the
+/// journal offset of the records that preceded them. Returns true when a
+/// terminal Finish was consumed and the writer must return.
+fn append_records(
+    state: &mut WriterState,
+    events: &mut tokio::sync::mpsc::Receiver<WriterMessage>,
+    batch: &mut Vec<RawRecord>,
+    config: &RuntimeConfig,
+    records: Vec<lvu_core::acquisition::CapturedRecord>,
+    writer_cpu: &mut lvu_core::ThreadCpu,
+) -> Result<bool, RuntimeError> {
+    let source_id = state.current.source_id;
+    state.current.handovers += 1;
+    state.current.reader_cpu_nanos = state.current.reader_cpu_nanos.saturating_add(
+        records
+            .iter()
+            .map(|record| record.reader_cpu_nanos)
+            .sum::<u64>(),
+    );
+    batch.extend(records.into_iter().map(|record| record.into_raw(source_id)));
+    while batch.len() < config.batch_records {
+        match events.try_recv() {
+            Ok(WriterMessage::Event {
+                event: CaptureEvent::Records(records),
+                ..
+            }) => {
+                state.current.handovers += 1;
+                state.current.reader_cpu_nanos = state.current.reader_cpu_nanos.saturating_add(
+                    records
+                        .iter()
+                        .map(|record| record.reader_cpu_nanos)
+                        .sum::<u64>(),
+                );
+                batch.extend(records.into_iter().map(|record| record.into_raw(source_id)));
+            }
+            Ok(other) => {
+                append_batch(state, batch, config, writer_cpu)?;
+                *writer_cpu = lvu_core::ThreadCpu::start();
+                if handle_non_record(state, other, config, writer_cpu)? {
+                    return Ok(true);
+                }
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    append_batch(state, batch, config, writer_cpu)?;
+    Ok(false)
 }
 
 fn append_batch(
@@ -468,7 +694,7 @@ fn append_batch(
 fn handle_non_record(
     state: &mut WriterState,
     message: WriterMessage,
-    config: &RuntimeConfig,
+    _config: &RuntimeConfig,
     cpu: &lvu_core::ThreadCpu,
 ) -> Result<bool, RuntimeError> {
     match message {
@@ -537,27 +763,6 @@ fn handle_non_record(
             state.publish();
             Ok(false)
         }
-        WriterMessage::Page {
-            offset,
-            max_records,
-            max_bytes,
-            reply,
-            ..
-        } => {
-            let result = state
-                .journal
-                .read_page(
-                    offset,
-                    max_records.min(config.max_page_records),
-                    max_bytes.min(config.max_page_bytes),
-                )
-                .map_err(RuntimeError::from);
-            // The journal is shared with live indexing, but its page service
-            // is not capture work and must not move the capture-only counter.
-            state.note_cpu(cpu, false);
-            let _ = reply.send(result);
-            Ok(false)
-        }
         WriterMessage::Finish {
             state: requested,
             discarded_bytes,
@@ -585,6 +790,37 @@ fn handle_non_record(
             Ok(successful)
         }
     }
+}
+
+/// Serves one page read from the writer-owned journal.
+///
+/// The journal is shared with live indexing, but its page service is not
+/// capture work and must not move the capture-only counter.
+fn serve_page(
+    state: &mut WriterState,
+    page: PageRequest,
+    config: &RuntimeConfig,
+    cpu: &lvu_core::ThreadCpu,
+) {
+    let PageRequest {
+        offset,
+        max_records,
+        max_bytes,
+        reply,
+        // Held through service: the gate stays acquired until this request is
+        // answered, and releases with it if the writer goes away first.
+        _permit,
+    } = page;
+    let result = state
+        .journal
+        .read_page(
+            offset,
+            max_records.min(config.max_page_records),
+            max_bytes.min(config.max_page_bytes),
+        )
+        .map_err(RuntimeError::from);
+    state.note_cpu(cpu, false);
+    let _ = reply.send(result);
 }
 
 fn finish_writer(
@@ -896,24 +1132,22 @@ mod cpu_accounting_tests {
             file_cursor: None,
             commit: Commit::new(&config),
         };
-        let permit = Arc::new(Semaphore::new(1))
-            .try_acquire_owned()
-            .expect("page permit");
         let (reply, receive) = oneshot::channel();
         let page_cpu = lvu_core::ThreadCpu::start();
-        handle_non_record(
+        serve_page(
             &mut state,
-            WriterMessage::Page {
+            PageRequest {
                 offset: 0,
                 max_records: 1,
                 max_bytes: 1024,
                 reply,
-                _permit: permit,
+                _permit: Arc::new(Semaphore::new(1))
+                    .try_acquire_owned()
+                    .expect("page permit"),
             },
             &config,
             &page_cpu,
-        )
-        .expect("page service");
+        );
         assert!(receive.blocking_recv().expect("page reply").is_ok());
         assert_eq!(state.current.writer_cpu_nanos, 123);
 
@@ -938,5 +1172,632 @@ mod cpu_accounting_tests {
         if thread_cpu_nanos().is_some() {
             assert!(state.current.writer_cpu_nanos > 123);
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    //! Ordering proof for the split page/event schedule, without any
+    //! wall-clock oracle.
+    //!
+    //! Every test below stages its whole input in bounded channels *before*
+    //! the writer thread starts, so what the writer sees first is fixed and no
+    //! assertion measures time. Generous timeouts guard against a hang only;
+    //! none of them decides pass or fail. `writer_delay` stays zero throughout:
+    //! nothing here needs the writer to be slow, because the schedule, not the
+    //! speed, is under test.
+    //!
+    //! On the old single shared queue these same stages serve strictly FIFO,
+    //! so the overtake assertions fail there by construction while the
+    //! preservation assertions (order, bytes, boundaries, durability) hold on
+    //! both: reordering pages before queued capture must never reorder capture
+    //! itself.
+
+    use super::*;
+    use lvu_core::{ChunkPosition, JournalReader, RecordBytes, StreamKind};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    fn captured(tag: &str, acquisition_id: Uuid) -> lvu_core::acquisition::CapturedRecord {
+        lvu_core::acquisition::CapturedRecord {
+            captured_at_unix_nanos: 1,
+            stream: StreamKind::File,
+            bytes: RecordBytes::from(tag.as_bytes()),
+            delimiter: RecordBytes::from(b"\n"),
+            acquisition_id,
+            chunk: ChunkPosition::Complete,
+            reader_cpu_nanos: 0,
+        }
+    }
+
+    fn event(
+        slots: &Arc<Semaphore>,
+        records: Vec<lvu_core::acquisition::CapturedRecord>,
+    ) -> WriterMessage {
+        WriterMessage::Event {
+            event: CaptureEvent::Records(records),
+            _permit: slots
+                .clone()
+                .try_acquire_owned()
+                .expect("test event permit"),
+        }
+    }
+
+    /// Builds a page request holding its own gate permit, exactly as
+    /// `SourceHandle::read_page` admits one: the permit travels with the
+    /// request so cancelling the caller cannot free the gate early.
+    fn test_page(
+        gate: &Arc<Semaphore>,
+        offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> (
+        PageRequest,
+        oneshot::Receiver<Result<JournalPage, RuntimeError>>,
+    ) {
+        let (reply, received) = oneshot::channel();
+        let request = PageRequest {
+            offset,
+            max_records,
+            max_bytes,
+            reply,
+            _permit: gate.clone().try_acquire_owned().expect("test page permit"),
+        };
+        (request, received)
+    }
+
+    struct Fixture {
+        // Owns the temporary root: dropping it would delete the journal and
+        // catalog under test, so the field is lifetime, not data.
+        #[allow(dead_code)]
+        directory: tempfile::TempDir,
+        journal_path: PathBuf,
+        catalog_path: PathBuf,
+        source_id: SourceId,
+        progress_rx: watch::Receiver<SourceProgress>,
+        state: Option<WriterState>,
+        config: RuntimeConfig,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self::with_sync_interval(Duration::from_secs(3600))
+        }
+
+        fn with_sync_interval(sync_interval: Duration) -> Self {
+            let directory = tempfile::tempdir().expect("temporary writer root");
+            let journal_path = directory.path().join("capture.journal");
+            let catalog_path = directory.path().join("catalog.sqlite3");
+            let source_id = SourceId::new();
+            let (journal, _) = Journal::open(&journal_path, source_id).expect("journal");
+            let catalog = Catalog::open(&catalog_path).expect("catalog");
+            let current = SourceProgress {
+                source_id,
+                generation: 1,
+                state: RuntimeState::Running,
+                records: 0,
+                high_watermark: None,
+                journal_bytes: 0,
+                synced_records: 0,
+                syncs: 0,
+                handovers: 0,
+                writer_cpu_nanos: 0,
+                reader_cpu_nanos: 0,
+                boundaries: 0,
+                exit_code: None,
+                discarded_bytes: 0,
+                discarded_bytes_known: true,
+                last_error: None,
+            };
+            let (progress_tx, progress_rx) = watch::channel(current.clone());
+            let config = RuntimeConfig {
+                sync_every_records: u64::MAX,
+                sync_interval,
+                batch_records: 1,
+                ..RuntimeConfig::default()
+            };
+            let state = WriterState {
+                journal,
+                catalog,
+                current,
+                progress: progress_tx,
+                file_cursor: None,
+                commit: Commit::new(&config),
+            };
+            Self {
+                directory,
+                journal_path,
+                catalog_path,
+                source_id,
+                progress_rx,
+                state: Some(state),
+                config,
+            }
+        }
+
+        fn replay(&self) -> Vec<u8> {
+            let mut reader =
+                JournalReader::open(&self.journal_path, self.source_id).expect("reader");
+            let mut offset = 0;
+            let mut replayed = Vec::new();
+            loop {
+                let page = reader
+                    .read_page(offset, 64, 1024 * 1024)
+                    .expect("replay page");
+                for record in &page.records {
+                    replayed.extend_from_slice(&record.bytes);
+                    replayed.extend_from_slice(&record.delimiter);
+                }
+                if page.end_of_journal {
+                    return replayed;
+                }
+                offset = page.next_offset;
+            }
+        }
+    }
+
+    async fn finish(
+        event_tx: &tokio::sync::mpsc::Sender<WriterMessage>,
+    ) -> Result<(), RuntimeError> {
+        let (reply, receive) = oneshot::channel();
+        event_tx
+            .send(WriterMessage::Finish {
+                state: RuntimeState::Stopped,
+                discarded_bytes: 0,
+                discarded_bytes_known: true,
+                reply,
+            })
+            .await
+            .expect("finish sent");
+        receive.await.expect("finish reply")?;
+        Ok(())
+    }
+
+    /// A page staged behind queued capture is served before that capture,
+    /// while capture itself keeps its arrival order, boundaries, bytes and
+    /// durability. FIFO service would append everything first, so the page
+    /// would carry all six records instead of none.
+    #[tokio::test]
+    async fn queued_page_overtakes_queued_batches_without_reordering_capture() {
+        let mut fixture = Fixture::new();
+        let slots = Arc::new(Semaphore::new(16));
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
+        let (page_tx, page_rx) = tokio::sync::mpsc::channel(4);
+        let acquisition_id = Uuid::new_v4();
+        let body = |tag: &str| captured(tag, acquisition_id);
+
+        // Staged before the writer exists: E1, a boundary, E2, E3, then the
+        // page. Both channels are non-empty at the writer's first wait, so the
+        // initial page preference decides deterministically.
+        event_tx
+            .send(event(&slots, vec![body("e1a"), body("e1b")]))
+            .await
+            .expect("E1 staged");
+        event_tx
+            .send(WriterMessage::Event {
+                event: CaptureEvent::Boundary {
+                    acquisition_id,
+                    reason: BoundaryReason::Started,
+                },
+                _permit: slots.clone().try_acquire_owned().expect("boundary permit"),
+            })
+            .await
+            .expect("boundary staged");
+        event_tx
+            .send(event(&slots, vec![body("e2a"), body("e2b")]))
+            .await
+            .expect("E2 staged");
+        event_tx
+            .send(event(&slots, vec![body("e3a"), body("e3b")]))
+            .await
+            .expect("E3 staged");
+        let gate = Arc::new(Semaphore::new(8));
+        let (page_request, page_received) = test_page(&gate, 0, 100, 1024 * 1024);
+        page_tx.send(page_request).await.expect("page staged");
+
+        let runtime = tokio::runtime::Handle::current();
+        let state = fixture.state.take().expect("writer state");
+        let config = fixture.config.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            run_writer(state, config, event_rx, page_rx, runtime)
+        });
+
+        // The page overtook every queued batch: nothing was committed when it
+        // was staged, and the writer serves it before appending any of them.
+        let page = tokio::time::timeout(Duration::from_secs(30), page_received)
+            .await
+            .expect("page answered")
+            .expect("page reply")
+            .expect("page read");
+        assert!(
+            page.records.is_empty(),
+            "queued page must read the committed prefix, not the queued tail"
+        );
+
+        finish(&event_tx).await.expect("clean stop");
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("writer joined")
+            .expect("writer task")
+            .expect("writer ok");
+
+        let progress = fixture.progress_rx.borrow().clone();
+        assert_eq!(progress.records, 6);
+        assert_eq!(progress.handovers, 3);
+        assert_eq!(progress.boundaries, 1);
+        assert_eq!(progress.synced_records, 6);
+        assert_eq!(
+            fixture.replay(),
+            b"e1a\ne1b\ne2a\ne2b\ne3a\ne3b\n".as_slice(),
+            "capture order and bytes survive the overtake"
+        );
+    }
+
+    /// Sustained pages cannot stall capture: with an event and two pages
+    /// staged, service alternates page, event, page. Page monopolization would
+    /// serve both pages before the event, leaving the second page empty.
+    #[tokio::test]
+    async fn sustained_pages_alternate_with_capture_so_both_progress() {
+        let mut fixture = Fixture::new();
+        let slots = Arc::new(Semaphore::new(16));
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
+        let (page_tx, page_rx) = tokio::sync::mpsc::channel(4);
+        let acquisition_id = Uuid::new_v4();
+
+        event_tx
+            .send(event(
+                &slots,
+                vec![
+                    captured("e1a", acquisition_id),
+                    captured("e1b", acquisition_id),
+                ],
+            ))
+            .await
+            .expect("event staged");
+        let gate = Arc::new(Semaphore::new(8));
+        let (first_request, first_received) = test_page(&gate, 0, 10, 1024 * 1024);
+        page_tx
+            .send(first_request)
+            .await
+            .expect("first page staged");
+        let (second_request, second_received) = test_page(&gate, 0, 10, 1024 * 1024);
+        page_tx
+            .send(second_request)
+            .await
+            .expect("second page staged");
+
+        let runtime = tokio::runtime::Handle::current();
+        let state = fixture.state.take().expect("writer state");
+        let config = fixture.config.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            run_writer(state, config, event_rx, page_rx, runtime)
+        });
+
+        // First the waiting page. Its content proves the order: the reply
+        // carries what the journal held when the page was served, so an empty
+        // page means it ran before any append regardless of how the threads
+        // race afterwards.
+        let first = tokio::time::timeout(Duration::from_secs(30), first_received)
+            .await
+            .expect("first page answered")
+            .expect("page reply")
+            .expect("page read");
+        assert!(first.records.is_empty());
+
+        // Then the queued capture before the second page: the event was not
+        // starved behind two pages.
+        let second = tokio::time::timeout(Duration::from_secs(30), second_received)
+            .await
+            .expect("second page answered")
+            .expect("page reply")
+            .expect("page read");
+        assert_eq!(second.records.len(), 2);
+        assert_eq!(second.records[0].bytes.as_slice(), b"e1a".as_slice());
+
+        finish(&event_tx).await.expect("clean stop");
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("writer joined")
+            .expect("writer task")
+            .expect("writer ok");
+        assert_eq!(fixture.progress_rx.borrow().records, 2);
+        assert_eq!(
+            fixture.replay(),
+            b"e1a\ne1b\n".as_slice(),
+            "capture order and bytes survive alternation"
+        );
+    }
+
+    /// A pending page never blocks termination: with a page and a Finish
+    /// staged together, the writer answers the page and still returns, and the
+    /// journal stays readable through the read-only path afterwards.
+    #[tokio::test]
+    async fn pending_page_does_not_block_finish_and_stays_readable() {
+        let mut fixture = Fixture::new();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
+        let (page_tx, page_rx) = tokio::sync::mpsc::channel(4);
+        let gate = Arc::new(Semaphore::new(8));
+
+        let (page_request, page_received) = test_page(&gate, 0, 10, 1024 * 1024);
+        page_tx.send(page_request).await.expect("page staged");
+        let (finish_reply, finish_received) = oneshot::channel();
+        event_tx
+            .send(WriterMessage::Finish {
+                state: RuntimeState::Stopped,
+                discarded_bytes: 0,
+                discarded_bytes_known: true,
+                reply: finish_reply,
+            })
+            .await
+            .expect("finish staged");
+
+        let runtime = tokio::runtime::Handle::current();
+        let state = fixture.state.take().expect("writer state");
+        let config = fixture.config.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            run_writer(state, config, event_rx, page_rx, runtime)
+        });
+
+        let page = tokio::time::timeout(Duration::from_secs(30), page_received)
+            .await
+            .expect("page answered")
+            .expect("page reply")
+            .expect("page read");
+        assert!(page.records.is_empty());
+        tokio::time::timeout(Duration::from_secs(30), finish_received)
+            .await
+            .expect("finish answered")
+            .expect("finish reply")
+            .expect("finish ok");
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("writer joined")
+            .expect("writer task")
+            .expect("writer ok");
+
+        // Post-close reads use the read-only journal path, as the manager's
+        // fallback does once the writer is gone.
+        let mut reader =
+            JournalReader::open(&fixture.journal_path, fixture.source_id).expect("reader");
+        let page = reader
+            .read_page(0, 10, 1024 * 1024)
+            .expect("post-close read");
+        assert!(page.records.is_empty());
+        assert!(page.end_of_journal);
+    }
+
+    /// An overdue time commit fires before queued page service, not after the
+    /// pages drain. The fast path would otherwise serve paging forever without
+    /// ever reaching the deadline wait, leaving appended records undurable
+    /// past their time bound.
+    ///
+    /// No assertion measures time and no flood is needed: the test backdates
+    /// the commit clock past the interval with a record outstanding before the
+    /// writer starts, so the very first loop turn is deterministically overdue
+    /// and the verdict (synced progress already published when the first page
+    /// resolves) is pure order. Without the loop-top priority the page would
+    /// resolve first with nothing synced.
+    #[tokio::test]
+    async fn overdue_time_commit_precedes_queued_page_service() {
+        let mut fixture = Fixture::with_sync_interval(Duration::from_secs(60));
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
+        let (page_tx, page_rx) = tokio::sync::mpsc::channel(4);
+        let acquisition_id = Uuid::new_v4();
+
+        // One outstanding record appended synchronously up front: the batch
+        // path cannot commit it because the interval is fresh, so exactly one
+        // durable commit is owed from here on.
+        let mut state = fixture.state.take().expect("writer state");
+        let mut batch = vec![captured("x", acquisition_id).into_raw(fixture.source_id)];
+        let cpu = lvu_core::ThreadCpu::start();
+        append_batch(&mut state, &mut batch, &fixture.config, &cpu)
+            .expect("stage outstanding record");
+        assert!(batch.is_empty());
+        assert_eq!(state.current.records, 1);
+        assert_eq!(state.current.synced_records, 0);
+        // Backdate past the interval: deterministically overdue before spawn.
+        // The 61-second backdate needs a host clock older than a minute, which
+        // any machine running a test suite satisfies; nothing here measures
+        // how long anything takes.
+        state.commit.last = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(61))
+            .expect("backdate within clock range");
+
+        let gate = Arc::new(Semaphore::new(8));
+        let (page_request, page_received) = test_page(&gate, 0, 1, 1024);
+        page_tx.send(page_request).await.expect("page staged");
+
+        let runtime = tokio::runtime::Handle::current();
+        let config = fixture.config.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            run_writer(state, config, event_rx, page_rx, runtime)
+        });
+
+        // The commit published before the page was served: single-threaded
+        // program order on the writer, observed here through the reply that
+        // can only arrive afterwards.
+        let page = tokio::time::timeout(Duration::from_secs(30), page_received)
+            .await
+            .expect("page answered")
+            .expect("page reply")
+            .expect("page read");
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].bytes.as_slice(), b"x".as_slice());
+        let progress = fixture.progress_rx.borrow().clone();
+        assert_eq!(progress.syncs, 1);
+        assert_eq!(progress.synced_records, 1);
+
+        finish(&event_tx).await.expect("clean stop");
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("writer joined")
+            .expect("writer task")
+            .expect("writer ok");
+        assert_eq!(fixture.replay(), b"x\n".as_slice());
+    }
+
+    /// An unexpected event-channel close terminates the writer instead of
+    /// waiting on retained page senders, after draining queued capture.
+    /// Pages sent later fail fast to the manager's read-only fallback over
+    /// everything committed here.
+    #[tokio::test]
+    async fn unexpected_event_close_terminates_after_draining_queued_capture() {
+        let mut fixture = Fixture::new();
+        let slots = Arc::new(Semaphore::new(16));
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
+        let (page_tx, page_rx) = tokio::sync::mpsc::channel(4);
+        let acquisition_id = Uuid::new_v4();
+
+        event_tx
+            .send(event(&slots, vec![captured("e1a", acquisition_id)]))
+            .await
+            .expect("event staged");
+        let gate = Arc::new(Semaphore::new(8));
+        let (page_request, page_received) = test_page(&gate, 0, 10, 1024 * 1024);
+        page_tx.send(page_request).await.expect("page staged");
+        // Abnormal end: no Finish will ever arrive, while the page sender is
+        // retained as live handles would retain it.
+        drop(event_tx);
+
+        let runtime = tokio::runtime::Handle::current();
+        let state = fixture.state.take().expect("writer state");
+        let config = fixture.config.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            run_writer(state, config, event_rx, page_rx, runtime)
+        });
+
+        // The queued page is still answered from the committed prefix.
+        let page = tokio::time::timeout(Duration::from_secs(30), page_received)
+            .await
+            .expect("page answered")
+            .expect("page reply")
+            .expect("page read");
+        assert!(page.records.is_empty());
+        // Then the writer terminates instead of waiting on the retained page
+        // sender: this join would hang under wait-on-pages-forever semantics.
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("writer joined")
+            .expect("writer task")
+            .expect("writer ok");
+
+        let progress = fixture.progress_rx.borrow().clone();
+        assert_eq!(progress.records, 1);
+        assert_eq!(progress.synced_records, 1);
+        assert_eq!(progress.state, RuntimeState::Incomplete);
+        assert_eq!(fixture.replay(), b"e1a\n".as_slice());
+
+        // Later pages fail fast instead of hanging: the manager maps this to
+        // its read-only journal fallback.
+        let gate = Arc::new(Semaphore::new(8));
+        let (late_request, _) = test_page(&gate, 0, 10, 1024);
+        assert!(
+            page_tx.send(late_request).await.is_err(),
+            "pages sent after close must fail fast to the fallback, not hang"
+        );
+    }
+
+    /// A Finish queued before the event channel closed still terminates
+    /// normally: draining takes queued events first, so the close break below
+    /// never discards a pending Finish as an Incomplete.
+    #[tokio::test]
+    async fn queued_finish_under_closed_events_still_stops_cleanly() {
+        let mut fixture = Fixture::new();
+        let slots = Arc::new(Semaphore::new(16));
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
+        let (page_tx, page_rx) = tokio::sync::mpsc::channel(4);
+        let acquisition_id = Uuid::new_v4();
+
+        event_tx
+            .send(event(&slots, vec![captured("e1a", acquisition_id)]))
+            .await
+            .expect("event staged");
+        let gate = Arc::new(Semaphore::new(8));
+        let (page_request, page_received) = test_page(&gate, 0, 10, 1024 * 1024);
+        page_tx.send(page_request).await.expect("page staged");
+        let (finish_reply, finish_received) = oneshot::channel();
+        event_tx
+            .send(WriterMessage::Finish {
+                state: RuntimeState::Stopped,
+                discarded_bytes: 0,
+                discarded_bytes_known: true,
+                reply: finish_reply,
+            })
+            .await
+            .expect("finish staged");
+        drop(event_tx);
+
+        let runtime = tokio::runtime::Handle::current();
+        let state = fixture.state.take().expect("writer state");
+        let config = fixture.config.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            run_writer(state, config, event_rx, page_rx, runtime)
+        });
+
+        // Alternation serves the queued page, then the queued event, then the
+        // queued Finish — in that order, all before any close break.
+        let page = tokio::time::timeout(Duration::from_secs(30), page_received)
+            .await
+            .expect("page answered")
+            .expect("page reply")
+            .expect("page read");
+        assert!(page.records.is_empty());
+        tokio::time::timeout(Duration::from_secs(30), finish_received)
+            .await
+            .expect("finish answered")
+            .expect("finish reply")
+            .expect("finish ok");
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("writer joined")
+            .expect("writer task")
+            .expect("writer ok");
+
+        let progress = fixture.progress_rx.borrow().clone();
+        assert_eq!(progress.records, 1);
+        assert_eq!(progress.synced_records, 1);
+        assert_eq!(fixture.replay(), b"e1a\n".as_slice());
+        // The queued Finish took the normal terminal path, not the close
+        // path: the catalog records a clean stop, never an incomplete.
+        // (Terminal publication itself stays with the supervisor, so progress
+        // state is not the signal here.)
+        let catalog = std::fs::read_to_string(&fixture.catalog_path).expect("catalog");
+        assert!(
+            catalog.contains("\"event\":\"stopped\""),
+            "queued Finish must record a clean stop: {catalog}"
+        );
+        assert!(
+            !catalog.contains("incomplete"),
+            "queued Finish must not take the close path: {catalog}"
+        );
+    }
+
+    /// Cancelling a caller after its page is queued must not free the gate:
+    /// the queued request carries its own permit, so a replacement caller
+    /// cannot pass until the orphan is consumed or dropped. With the permit
+    /// owned by the caller instead, dropping the cancelled future would
+    /// release the gate while the orphan still occupies the channel.
+    #[tokio::test]
+    async fn cancelled_caller_does_not_free_the_gate_for_a_replacement() {
+        let gate = Arc::new(Semaphore::new(1));
+        // Never consumed: the request stays queued, exactly the state a
+        // cancelled-while-queued caller leaves behind.
+        let (page_tx, page_rx) = tokio::sync::mpsc::channel::<PageRequest>(4);
+        // First caller admits exactly as read_page does, then is cancelled:
+        // its reply handle and future are dropped with the request queued.
+        let (request, reply) = test_page(&gate, 0, 1, 1024);
+        drop(reply);
+        page_tx.send(request).await.expect("orphan queued");
+        // A replacement caller must not pass while the orphan is queued.
+        assert!(
+            gate.clone().try_acquire_owned().is_err(),
+            "gate must stay held by the queued orphan after its caller is gone"
+        );
+        // Once the orphan is consumed or dropped, the gate frees.
+        drop(page_rx);
+        assert!(
+            gate.clone().try_acquire_owned().is_ok(),
+            "gate must free with the orphan"
+        );
     }
 }

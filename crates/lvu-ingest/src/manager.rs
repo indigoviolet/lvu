@@ -2,7 +2,7 @@ use crate::{
     catalog::{Catalog, CatalogEvent, SourceMetadata, next_generation, write_metadata},
     cursor,
     history::{SourceHistory, spawn_history},
-    writer::{FileCursorSetup, StartupCancellation, WriterMessage, spawn_writer},
+    writer::{FileCursorSetup, PageRequest, StartupCancellation, WriterMessage, spawn_writer},
 };
 use fs2::FileExt;
 use lvu_core::{
@@ -100,6 +100,10 @@ impl Default for RuntimeConfig {
             // 4.5 MiB retained backing), making the combined bound less than
             // 29.8125 MiB; the
             // live cache keeps only owned, byte-charged display projections.
+            // Page reads carry no capture payload and take no writer-queue
+            // slot: the page gate bounds them to one outstanding request on
+            // their own unit-capacity channel, so a flooded capture queue
+            // cannot refuse a page admission.
             writer_queue_capacity: 8,
             batch_records: 64,
             // ~400 KB of a typical log line at 102 bytes, which keeps the
@@ -546,6 +550,7 @@ impl SourceManager {
                 })
                 .await??;
                 drop(writer.sender);
+                drop(writer.page_sender);
                 let _ = writer.task.await;
                 return Err(error);
             }
@@ -563,8 +568,7 @@ impl SourceManager {
             source_id,
             journal_path,
             control: control_tx,
-            writer: writer.sender.clone(),
-            writer_slots: writer.slots.clone(),
+            page_sender: writer.page_sender.clone(),
             progress: progress_rx,
             history: history_rx,
             page_gate: page_gate.clone(),
@@ -701,8 +705,7 @@ pub struct SourceHandle {
     source_id: SourceId,
     journal_path: PathBuf,
     control: mpsc::Sender<Control>,
-    writer: mpsc::Sender<WriterMessage>,
-    writer_slots: Arc<Semaphore>,
+    page_sender: mpsc::Sender<PageRequest>,
     progress: watch::Receiver<SourceProgress>,
     history: watch::Receiver<Arc<SourceHistory>>,
     page_gate: Arc<Semaphore>,
@@ -756,28 +759,33 @@ impl SourceHandle {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<JournalPage, RuntimeError> {
-        let _permit = self
+        // One outstanding page per source: the gate bounds page traffic without
+        // letting capture's own queue slots decide whether a query may ask.
+        // Capture events keep their writer-queue slots; pages carry no capture
+        // payload and need none, so a flooded capture queue cannot refuse a
+        // page admission. The permit travels inside the request until service
+        // or drop, so cancelling this future after sending cannot free the
+        // gate while the request is still queued or being served. The writer
+        // serves the page between append batches, so it waits for at most the
+        // batch in progress, and alternates with capture while both stay
+        // queued, so sustained paging cannot stall appends either.
+        let permit = self
             .page_gate
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| RuntimeError::Closed)?;
         let (reply, receive) = oneshot::channel();
         let bounded_records = max_records.min(self.max_page_records);
         let bounded_bytes = max_bytes.min(self.max_page_bytes);
-        let writer_permit = self
-            .writer_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| RuntimeError::Closed)?;
         if self
-            .writer
-            .send(WriterMessage::Page {
+            .page_sender
+            .send(PageRequest {
                 offset,
                 max_records: bounded_records,
                 max_bytes: bounded_bytes,
                 reply,
-                _permit: writer_permit,
+                _permit: permit,
             })
             .await
             .is_ok()
@@ -785,21 +793,106 @@ impl SourceHandle {
             match receive.await {
                 Ok(result) => return result,
                 Err(_) => {
-                    // The writer may accept this page immediately before a
-                    // terminal storage/error transition drops its queue.
-                    // Once that owner is gone, the read-only journal path is
-                    // the authoritative bounded fallback.
+                    // The writer took this request and died with its permit
+                    // before answering. Fall through for a freshly permitted
+                    // fallback read below.
                 }
             }
         }
+        // Either failure drops the request with its permit — the send error
+        // carries the message back and the reply error means the writer did —
+        // so this future holds no permit here by construction (the `permit`
+        // binding above was moved into the send and cannot be named again),
+        // and acquiring the fallback permit cannot deadlock against itself.
+        // The fallback permit moves into the blocking closure and is held
+        // through service or drop, so cancelling this future mid-read still
+        // leaves exactly one active read per source: the detached thread
+        // keeps its guard until the read finishes.
+        let fallback_permit = self
+            .page_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
         let path = self.journal_path.clone();
         let source_id = self.source_id;
         tokio::task::spawn_blocking(move || {
+            let _guard = fallback_permit;
+            #[cfg(test)]
+            fallback_probe::rendezvous(&source_id);
             JournalReader::open(path, source_id)?
                 .read_page(offset, bounded_records, bounded_bytes)
                 .map_err(RuntimeError::from)
         })
         .await?
+    }
+}
+
+/// Test-only rendezvous for fallback reads. Production builds compile it out
+/// entirely; with nothing registered the probe returns immediately, so every
+/// other test behaves exactly as production. Registration is scoped per
+/// source, and every test uses a fresh source identity, so parallel tests
+/// never meet at the same barrier.
+#[cfg(test)]
+pub(crate) mod fallback_probe {
+    use lvu_core::SourceId;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Barrier, Mutex, OnceLock};
+
+    struct Probe {
+        entered: Arc<Barrier>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    fn registry() -> &'static Mutex<HashMap<SourceId, Arc<Probe>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<SourceId, Arc<Probe>>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm the rendezvous for one source: the next fallback read to arrive
+    /// parks inside its blocking closure until the test arrives and releases
+    /// it. Returns the barrier the test waits on and the release sender.
+    /// Later reads find the release taken and proceed unimpeded.
+    pub(crate) fn arm(source: SourceId) -> (Arc<Barrier>, std::sync::mpsc::Sender<()>) {
+        let entered = Arc::new(Barrier::new(2));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        registry().lock().expect("probe registry poisoned").insert(
+            source,
+            Arc::new(Probe {
+                entered: entered.clone(),
+                release: Mutex::new(Some(release_rx)),
+            }),
+        );
+        (entered, release_tx)
+    }
+
+    /// Withdraw the rendezvous, e.g. at test end. A leaked registration only
+    /// affects its own fresh source identity, never another test.
+    pub(crate) fn disarm(source: &SourceId) {
+        registry()
+            .lock()
+            .expect("probe registry poisoned")
+            .remove(source);
+    }
+
+    /// Park a fallback read until its test rendezvouses and releases it. The
+    /// registry lock is never held across the wait; the release is taken under
+    /// it so exactly one read parks per arming.
+    pub(crate) fn rendezvous(source: &SourceId) {
+        let (entered, release) = {
+            let registry = registry().lock().expect("probe registry poisoned");
+            match registry.get(source) {
+                None => return,
+                Some(probe) => (
+                    probe.entered.clone(),
+                    probe.release.lock().expect("probe release poisoned").take(),
+                ),
+            }
+        };
+        if let Some(release) = release {
+            entered.wait();
+            let _ = release.recv();
+        }
     }
 }
 
@@ -1242,5 +1335,103 @@ mod lease_tests {
         let next = File::open(path).unwrap();
         FileExt::try_lock_exclusive(&next).unwrap();
         drop(inherited);
+    }
+}
+
+#[cfg(test)]
+mod fallback_guard_tests {
+    //! The fallback read holds the gate through service or drop.
+    //!
+    //! Cancelling a caller mid-read must not free the gate early (the
+    //! detached thread keeps its guard), and the acquire/drop/reacquire dance
+    //! must never self-deadlock: a reacquire attempted while still holding
+    //! the failed request's permit would hang against the unit-capacity gate.
+    //! Every verdict below is barrier- or content-ordered; timeouts guard
+    //! against hangs only, which is exactly what a deadlock would look like.
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_fallback_read_stays_guarded_and_later_reads_complete() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.log");
+        let mut fixture = String::new();
+        for index in 0..10 {
+            fixture.push_str(&format!("row-{index:02}\n"));
+        }
+        std::fs::write(&input, fixture.as_bytes()).unwrap();
+        let source_id = SourceId::new();
+        let manager =
+            SourceManager::new(root.path().join("capture"), RuntimeConfig::default()).unwrap();
+        let handle = manager
+            .start(SourceDefinition {
+                schema_version: 1,
+                id: source_id,
+                name: "fallback guard".into(),
+                acquisition: Acquisition::File {
+                    path: input.clone(),
+                    follow: false,
+                },
+                identity_hints: BTreeMap::new(),
+                retention: None,
+            })
+            .await
+            .unwrap();
+        // Barrier, not timing: the terminal state is published only after the
+        // supervisor joins the writer, so the page channel is deterministically
+        // closed and every read below takes the fallback path.
+        let mut progress = handle.subscribe();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if progress.borrow_and_update().state.is_terminal() {
+                    return;
+                }
+                progress.changed().await.expect("progress channel");
+            }
+        })
+        .await
+        .expect("source stopped without hanging");
+        assert_eq!(handle.progress().state, RuntimeState::Stopped);
+
+        // Arm the rendezvous: the next fallback read parks inside its blocking
+        // closure, past the point where it acquired its guard.
+        let (entered, release) = fallback_probe::arm(source_id);
+        let reader = handle.clone();
+        let parked = tokio::spawn(async move { reader.read_page(0, 3, 4096).await });
+        // The blocking rendezvous must not run on a runtime worker.
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .expect("rendezvous");
+        // The parked read provably holds its guard here. Cancel its caller and
+        // wait until the cancellation is processed: the detached thread stays
+        // parked holding the guard.
+        parked.abort();
+        let aborted = parked
+            .await
+            .expect_err("abort must cancel the parked caller");
+        assert!(aborted.is_cancelled());
+        // A replacement caller must not pass while the detached guard lives.
+        // Without the fallback-held guard this succeeds and the test fails:
+        // the bound becomes deterministic cancellation evidence, not a
+        // structural claim.
+        assert!(
+            handle.page_gate.clone().try_acquire_owned().is_err(),
+            "gate must stay held by the detached parked read after its caller is gone"
+        );
+        // Free the parked thread so it completes detached and releases. The
+        // release sender is owned by this scope, so even a panic above drops
+        // it and unblocks the parked thread via a recv error instead of
+        // leaking a blocked thread.
+        release.send(()).expect("release parked read");
+        // The next read must complete correctly: no deadlock from the
+        // acquire/drop dance, no corruption from the cancelled predecessor.
+        let page = tokio::time::timeout(Duration::from_secs(60), handle.read_page(0, 3, 4096))
+            .await
+            .expect("second read completes, not deadlocked")
+            .expect("page read");
+        assert_eq!(page.records.len(), 3);
+        assert_eq!(page.records[0].bytes.as_slice(), b"row-00".as_slice());
+        assert_eq!(page.records[2].bytes.as_slice(), b"row-02".as_slice());
+        fallback_probe::disarm(&source_id);
     }
 }

@@ -1889,3 +1889,17 @@ Primary autosave gate at d6efbd3 passed batch6/6, app memory21/21, formatting
 and app/memory all-target clippy. Log and exact script are retained at
 primary-astra-scratch/autosave-integrated-gate.{log,py}; shared lock released
 and marked fixtures removed. No full slow-volume acceptance is implied.
+
+
+## 2026-09-09 — journal scheduling and fallback bounds integrated
+
+Integrated 9fdb975. Sol reviewed the 5f93d01 runtime without findings after
+closure, queued-request permit and direct-fallback permit corrections. Primary
+checked the final test-only delta: abort is awaited, the private gate remains
+unavailable while detached I/O is parked, and owned-channel drop releases the
+probe on failure. Exact final focused test, clippy and fmt pass; identical
+product tree 5f93d01 passed 48 tests (lib10/runtime37/scheduling1). Earlier
+45c0e3b full-suite evidence is 61 pass/1 ignored, not an exact-final full-suite
+claim. Logs are retained in lvu-muse-journal-gate.log. Primary integrated
+ingest validation follows. No 12.921-second causal explanation, performance
+improvement or full soak acceptance is claimed.

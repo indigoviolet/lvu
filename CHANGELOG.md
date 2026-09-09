@@ -25,6 +25,10 @@ but does not satisfy that requirement.
 
 ### Fixes
 
+- Page reads and capture batches take turns without occupying each other’s
+  queue slots. Writer closure and overdue commits retain priority; fallback
+  reads stay bounded even when their callers cancel.
+
 - Batch queued view saves into one transaction, with per-view rollback and
   acknowledgements only after durable completion. Shutdown deadlines are
   unchanged; the full slow-volume soak remains unresolved.
