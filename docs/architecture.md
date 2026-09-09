@@ -64,6 +64,12 @@ identity per attachment and cannot be restarted without a new reader.
 The journal owns exact bytes, delimiters, invalid UTF-8, capture timestamps and
 physical identities. Display strings and parsed/derived fields are projections.
 A record is addressed by source ID and sequence, not viewport position or time.
+Locally integrated acquisition uses immutable `RecordBytes` ranges sharing each
+bounded read allocation; journal decoding shares one compact encoded-frame
+backing. Cloning a record preserves its byte range without copying payloads.
+Default per-source capture and serialized journal-page retained payload backings
+are bounded below 29.8125 MiB. This excludes record headers, output vectors,
+transient allocations and other managed caches; it is not an RSS limit.
 Acquisition generations and journal identity also fence caches and worker results.
 Disposable V3 row indexes bind the journal acquisition identity, source,
 generation and page geometry so different capture roots cannot reuse stale data.
@@ -92,8 +98,10 @@ payloads both count toward admission. Incremental work resumes from in-session
 source offsets/sequence checkpoints to a fixed high-watermark. Historical scans
 must not chase continuously arriving input. Checkpoints are not persisted yet.
 
-Merged views order records by explicit source position, then physical sequence.
-They do not sort/interleave by event time. Source-list edits publish atomically
+Merged views on capture basis order records by explicit source position, then
+physical sequence. Event, extracted and selected-column bases interleave by
+their chosen timestamps, with provider-reported ordering limitations.
+Source-list edits publish atomically
 with query membership. Restart restoration waits for explicitly opened sources;
 remembered commands are never started as a side effect of restoring a view.
 

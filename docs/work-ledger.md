@@ -1171,3 +1171,35 @@ and flush acknowledgement. A full command queue at deadline previously reported
 The budget and persistence behavior are unchanged. New tests exercise actual
 save durability through saturated command/event queues and both timeout stages.
 Formatting and diff checks pass; focused Rust/clippy validation is pending.
+
+## 2026-09-09 — disk recovery, wrapped PTY assertions and capture integration
+
+Disk preflight blocked W22/W24/W28 and the primary memory diagnostic gate before
+new compilation. Normal janitor and stale-flags dry-run found no reclaimable
+artifacts. Primary inspected the completed W23/W26 Cargo targets, confirmed no
+live process references, and dry-ran Cargo cleanup. Under the shared lock,
+`cargo clean --profile dev` removed only those two debug profiles (3.6 and
+2.0 GiB). Other target-root metadata/tmp, source worktrees, reports, captures,
+previews and release assets were retained. Free space rose by 5,813,936,128
+bytes to 11,027,509,248; disk preflight passes. Evidence:
+`primary-sol-finished-target-cleanup.log` on the build volume. Workers were
+notified to resume their remaining validation.
+
+W13 preserved the exact d85807e primary app (SHA-256
+`cfa4822c89f33824e2a9920be70ba9e9b51d4bb448878f8c756b5b066b8fe8fe`).
+With unchanged tests, NO_COLOR unset and local /dev/sda1 fixtures, long TMPDIR
+names reproduced both remaining PTY failures; a short TMPDIR made both pass.
+The real-source test required contiguous "not installed or not on PATH" despite
+visible line wrapping. Settings required a contiguous absolute path despite its
+wrapping within settings.toml. This controlled comparison establishes path-length
+sensitive assertions for these two failures, rather than product/load/timeout
+causes. Full logs and binary: `primary-sol-scratch/w13-d85807e-diagnostic/`.
+W13 is correcting the assertions while preserving full remedy/path checks.
+
+Integrated W25 amended `bb48da8` as `9744a89`. Its strengthened tests now
+derive near-boundary metrics from raw recordings and follow real page service
+with actual append/commit. Primary formatting, diff checks and all ten Python
+soak fixtures pass. Combined Rust validation remains pending; the earlier
+primary memory gate stopped at disk preflight and ran no Rust tests. Latest
+W25 cold-query and shutdown failures remain open. W22 status/FOLLOW are now
+`36e1d77`/`14bf9a5` on `34baf29`, still awaiting final corrected validation.
