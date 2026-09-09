@@ -28,6 +28,48 @@ from test_lvu_pty import PtyApp as _HarnessPtyApp
 _STORY_XDG: dict[str, str] = {}
 
 
+def dialog_text(screen: str, title: str) -> str:
+    """Visible text inside one dialog, excluding borders and background panes."""
+    lines = screen.splitlines()
+    marker = f"┌ {title}"
+    dialogs = []
+    for index, header in enumerate(lines):
+        if marker not in header:
+            continue
+        left = header.index(marker)
+        right = header.find("┐", left)
+        if right < 0:
+            return ""
+        interior = []
+        for line in lines[index + 1:]:
+            if len(line) > left and line[left] == "└":
+                break
+            interior.append(line[left + 1:right].replace("│", " "))
+        dialogs.append("\n".join(interior))
+    return "\n<FRAME>\n".join(dialogs)
+
+
+def contains_wrapped_words(screen: str, title: str, expected: str) -> bool:
+    """Match full prose while treating terminal wrapping as whitespace."""
+    return expected in " ".join(dialog_text(screen, title).split())
+
+
+def assert_wrapped_remedy_matcher() -> None:
+    wrapped = """┌ Ask 🧠 ──────────────────────┐
+│ not installed                 │
+│ or not on PATH                │
+│ mise install node@26.8.1      │
+└───────────────────────────────┘"""
+    assert contains_wrapped_words(wrapped, "Ask 🧠", "not installed or not on PATH")
+    assert not contains_wrapped_words(wrapped, "Ask 🧠", "install npm@26.8.1")
+    missing_remedy = wrapped.replace("mise install node@26.8.1", "")
+    assert not contains_wrapped_words(
+        missing_remedy, "Ask 🧠", "mise install node@26.8.1"
+    )
+    wrong = wrapped.replace("or not on PATH", "but available on PATH")
+    assert not contains_wrapped_words(wrong, "Ask 🧠", "not installed or not on PATH")
+
+
 def cycle_to(app, predicate, description: str, key: bytes = b"]", limit: int = 6):
     """Step through views with `[`/`]` until one satisfies `predicate`.
 
@@ -1337,10 +1379,14 @@ for line in sys.stdin:
             # what failed, which program, and how to install it. Investigation
             # and Source still box their state into one clipped row.
             offline.wait_until(
-                lambda text: "could not be started" in text
-                and "missing-bridge" in text
-                and "not installed or not on PATH" in text
-                and "mise install node@26.8.1" in text,
+                lambda text: contains_wrapped_words(text, "Ask 🧠", "could not be started")
+                and contains_wrapped_words(text, "Ask 🧠", "missing-bridge")
+                and contains_wrapped_words(
+                    text, "Ask 🧠", "not installed or not on PATH"
+                )
+                and contains_wrapped_words(
+                    text, "Ask 🧠", "mise install node@26.8.1"
+                ),
                 "the launcher, not lvu, is named as missing, with its remedy",
                 timeout=8.0,
             )
@@ -1968,4 +2014,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    assert_wrapped_remedy_matcher()
     main()

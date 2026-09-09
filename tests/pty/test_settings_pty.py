@@ -12,6 +12,44 @@ LOVE_DARK_FOCUS = b"\x1b[1m\x1b[38;2;35;20;25;48;2;255;167;151m"
 FRAME_END = b"\x1b[?2026l"
 
 
+def dialog_text(screen: str, title: str) -> str:
+    """Visible text inside one dialog, excluding borders and background panes."""
+    lines = screen.splitlines()
+    marker = f"┌ {title}"
+    dialogs = []
+    for index, header in enumerate(lines):
+        if marker not in header:
+            continue
+        left = header.index(marker)
+        right = header.find("┐", left)
+        if right < 0:
+            return ""
+        interior = []
+        for line in lines[index + 1:]:
+            if len(line) > left and line[left] == "└":
+                break
+            interior.append(line[left + 1:right].replace("│", " "))
+        dialogs.append("\n".join(interior))
+    return "\n<FRAME>\n".join(dialogs)
+
+
+def contains_wrapped_exact(screen: str, title: str, expected: str) -> bool:
+    """Match a full whitespace-free value split only by terminal wrapping."""
+    return expected in "".join(dialog_text(screen, title).split())
+
+
+def assert_wrapped_path_matcher() -> None:
+    expected = "/tmp/a/config/lvu/settings.toml"
+    wrapped = """┌ Settings ─────────────────────────┐
+│ Settings: /tmp/a/config/lvu/se│
+│ ttings.toml                    │
+└──────────────────────────────────────┘"""
+    assert contains_wrapped_exact(wrapped, "Settings", expected)
+    assert not contains_wrapped_exact(wrapped, "Settings", expected + ".wrong")
+    wrong = wrapped.replace("ttings.toml", "ttings-other.toml")
+    assert not contains_wrapped_exact(wrong, "Settings", expected)
+
+
 def stop(app: PtyApp, transcript: pathlib.Path) -> None:
     try:
         if app.process.poll() is None:
@@ -52,7 +90,7 @@ def scroll_pane_until(app: PtyApp, needle: str) -> str:
     """Walk the focused pane down, waiting for each frame the user would see."""
     seen = app.text()
     for _ in range(24):
-        if needle in seen:
+        if contains_wrapped_exact(seen, "Settings", needle):
             return seen
         before = app.text()
         app.send(b"\x1b[B")
@@ -181,8 +219,10 @@ def run(binary: pathlib.Path) -> None:
         second.wait_for("[ More ]")
         focus_more(second)
         paths = scroll_pane_until(second, str(root / "cache" / "lvu"))
-        assert str(path) in paths, paths
-        assert str(root / "cache" / "lvu") in paths, paths
+        assert contains_wrapped_exact(paths, "Settings", str(path)), paths
+        assert contains_wrapped_exact(
+            paths, "Settings", str(root / "cache" / "lvu")
+        ), paths
     finally:
         stop(second, evidence / "pointer-restart.ansi")
         temporary.cleanup()
@@ -239,7 +279,9 @@ def run(binary: pathlib.Path) -> None:
         keyboard_restart.wait_for("[ More ]")
         focus_more(keyboard_restart)
         restarted = scroll_pane_until(keyboard_restart, str(keyboard_path))
-        assert str(keyboard_path) in restarted, restarted
+        assert contains_wrapped_exact(
+            restarted, "Settings", str(keyboard_path)
+        ), restarted
         assert "love-dark" in restarted, restarted
     finally:
         stop(keyboard_restart, evidence / "keyboard-restart.ansi")
@@ -247,5 +289,6 @@ def run(binary: pathlib.Path) -> None:
 
 
 if __name__ == "__main__":
+    assert_wrapped_path_matcher()
     run(pathlib.Path(sys.argv[1]).resolve())
     print("Settings PTY passed: XDG TOML save, live theme preview, restart restore")
