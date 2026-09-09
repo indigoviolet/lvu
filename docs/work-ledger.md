@@ -1698,3 +1698,13 @@ column wording and later-stage ordering diagnostics; targeted view/PTY evidence
 is still pending. Journal candidate 443fdae needs its expired-commit regression
 to establish an explicitly overdue initial state, replacing the remaining
 100,000-page hardware-speed assumption. Neither candidate is integrated yet.
+
+
+The user then explicitly confirmed implementation of their version *on top of
+existing enrichment*. Final scope is selection of an accepted enrichment output
+column: non-null starts an event, null continues it. Recognition logic belongs
+in the enrichment editor; Grouping does not need a second expression editor.
+W22 is authorized to implement immediately through the existing typed projection,
+with explicit failed/pending handling, and normal grouping UX replacing heuristic
+recognition. Legacy persisted settings retain their meaning. app memory.rs is
+excluded from W22 ownership; existing persistence plus separate tests suffice.
