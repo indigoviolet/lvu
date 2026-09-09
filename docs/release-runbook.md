@@ -283,6 +283,10 @@ brew install uv node     # or: mise use -g uv node
 `v0.1.2` was completed on 2026-09-09. `0.1.3` is the version now in
 preparation below; use another number only when a different version is intended.
 
+For v0.1.3, publication requires all four native archives and their checksums
+to pass verification, as explicitly requested for this release. The historical
+partial-release procedure above is not the acceptance policy for v0.1.3.
+
 ```sh
 git status --short --branch # use the reviewed integration/release checkout
 # bump `version` in crates/lvu-app/Cargo.toml to 0.1.3
