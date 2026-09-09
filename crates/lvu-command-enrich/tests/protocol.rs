@@ -190,7 +190,9 @@ fn delivery_fixture(temp: &TempDir) -> std::path::PathBuf {
         &path,
         r#"import json,os,sys,time
 mode,marker,pid_path=sys.argv[1:]
-open(pid_path,'w').write(str(os.getpid()))
+pid_temporary=pid_path+'.pending.'+str(os.getpid())
+with open(pid_temporary,'w') as pid_file: pid_file.write(str(os.getpid()))
+os.replace(pid_temporary,pid_path)
 batch=None; rows=[]
 for line in sys.stdin:
  request=json.loads(line)
