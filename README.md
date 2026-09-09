@@ -142,4 +142,4 @@ Start with:
   resolution and the release sequence.
 - [`docs/development.md`](docs/development.md) — building and testing.
 
-Known gaps are listed in [`TODO.md`](TODO.md).
+Known gaps are listed in [`TODO.md`](TODO.md); what each version shipped is in [`CHANGELOG.md`](CHANGELOG.md).

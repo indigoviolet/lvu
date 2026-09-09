@@ -315,6 +315,14 @@ mise WARN newer ... release 0.1.1 (released ..., eligible ...) ignored by
   minimum_release_age (24h); no eligible release found
 ```
 
+## Changelog
+
+Keep [`CHANGELOG.md`](../CHANGELOG.md) current as accepted changes land:
+add them under `Unreleased` in the Features / Fixes / Breaking changes
+groups. At release, move that section under the exact version heading and
+date, and carry the same categories into the published release notes.
+Ongoing proposals stay in [`TODO.md`](../TODO.md), never as shipped claims.
+
 ## What is not automated, and why
 
 - **Undrafting the release** is manual. The workflow publishes a draft so a

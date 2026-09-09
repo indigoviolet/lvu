@@ -1503,3 +1503,25 @@ retaining this primary as supervisor. The configured profile passed a read-only
 repository/command smoke test. Sol W22 holds all further work; future fixes and
 validation route to Muse. The TODO/changelog implementation is assigned to a
 dedicated Muse worktree; primary retains review, integration and publication.
+
+## 2026-09-09 — active work plan and version changelog
+
+Muse Spark implementation `1328b6c` reorganized TODO into ongoing work, accepted
+next-release changes and upcoming investigations. All eleven previously
+unfinished items remain, plus the accepted pending raw-context notice. Completed
+historical rows moved to docs/todo-history.md with their relocated ledger link;
+primary verified the archived section is otherwise unchanged.
+
+CHANGELOG.md records Unreleased and v0.1.0–v0.1.2 under Features, Fixes and
+Breaking changes. Primary compared GitHub publication notes/dates and relevant
+tag history; v0.1.1 explicitly records default resume and the retired p shortcut.
+Review removed unproven version attribution and a downgrade-safety inference.
+Multiline remains ongoing rather than an accepted changelog feature, and the
+volume-backed soak limitation stays explicit. README/versions link the changelog;
+the release runbook now requires updating it when accepted changes land and
+moving Unreleased entries into the actual version at publication.
+
+Validation: 23 local Markdown links resolve; historical archive comparison,
+active-row inventory (one Working, three Ready, eight Open), four categorized
+changelog sections and diff whitespace checks pass. Documentation only; no
+Rust/PTY build, release tag or installed-version change.

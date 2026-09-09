@@ -9,6 +9,8 @@ published 2026-09-09 at 03:02:47 UTC from `207b95f`. All four native archives
 passed release verification. The local installation is the official x86_64 Linux
 musl archive, SHA-256 `7d68e047972e81fa3b057f8ed9e2bdd4dffc5cfe007bf745428645eda14c2cbd`;
 its bundled resources and actual terminal behavior passed acceptance.
+What each version shipped is recorded in
+[CHANGELOG.md](../CHANGELOG.md).
 
 The volume-backed full soak remains unaccepted: cold-query latency and memory
 autosave-flush shutdown failures remain unresolved. Status/FOLLOW corrections
