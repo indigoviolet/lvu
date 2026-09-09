@@ -4,6 +4,15 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## Unreleased
+
+- Severity and timestamp roles use reviewed enrichment columns. Fields can assign
+  either role; assistance can propose a severity or UTC timestamp column through
+  the ordinary enrichment review flow. Canonical ready severity values supply
+  styling. Timestamp display uses the accepted time basis and configured zone;
+  pending or invalid derived values show a placeholder. Roles persist across
+  restart. Normal row projection no longer guesses severity or event timestamps.
+
 ## v0.1.3 — 2026-09-09
 
 [Published release](https://github.com/indigoviolet/lvu/releases/tag/v0.1.3),

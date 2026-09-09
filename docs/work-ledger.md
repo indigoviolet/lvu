@@ -2082,3 +2082,19 @@ Assistance shortcut intent follows accepted candidate ownership and persistence.
 Worker evidence and review are preserved under `roles-ae449fd-*` and
 `roles-ae449fd-delta-review.md` on the build volume. The integrated tree still
 requires its own Rust, bridge and full PTY acceptance; no release includes it yet.
+
+
+Column roles integrated acceptance completed at
+`06bd07ae7f078122ab8f3242b834ab4314969111`. Runtime source is unchanged from
+`88cc6e1`, which passed 1386 Rust tests (7 ignored), workspace clippy, and bridge
+105/105. Its first matrix passed 75/77; the preserved transcripts identify stale
+Ask-title and implicit INFO readiness expectations. Two PTY-only repairs retain
+workflow assertions and prevent teardown from masking the save-feedback failure.
+Both focused reruns and the full matrix passed 77/77 with unchanged binary hashes.
+Evidence: `primary-astra-scratch/integration-gate-88cc6e1ad417-9353eddd957e4a75a0de93d9cb646fe5/commands.log`
+and `integration-gate-06bd07ae7f07-0dda6d10b0b346da825c103d7d395f8e/accepted.json`.
+
+Prior integrated test failures and the one test-helper compile correction are
+preserved in dc483d1/f9b3e18/0db5150 gate logs. Sol cleared the resolved Fields and
+group projection seams and the Rust fixture repairs. Column roles are Ready for
+the next release; they are not part of the published v0.1.3 archive.

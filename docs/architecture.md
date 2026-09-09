@@ -12,6 +12,17 @@ for binary-specific acceptance. The [implementation plan](implementation-plan.md
 is the broader design/roadmap and contains historical proposed layouts. Actual
 module names and executable code take precedence over those proposals.
 
+Column roles are integrated after v0.1.3 and accepted for the next release.
+View presentation stores selected severity/timestamp output names. The view worker
+publishes separate derived declaration, ready and error markers for ordinary and
+grouped projections. The renderer consumes canonical ready severity values and
+accepted basis nanoseconds for timestamp display, respecting the configured zone.
+Removed outputs cannot regain role authority from a same-named raw field. Normal
+raw projection does not perform implicit severity or event-time recognition;
+explicit legacy Event-basis evaluation remains a compatibility path. Assistance
+shortcuts use ordinary reviewed enrichments, with intent transferred to the
+candidate and consumed only by the accepted completion.
+
 ## Component map
 
 | Component | Responsibility and starting points |

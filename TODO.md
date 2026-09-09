@@ -14,7 +14,6 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 
 | Status | Work |
 | --- | --- |
-| **Working** | Make “give me a UTC timestamp column” and “give me a severity column” assistance shortcuts that propose ordinary enrichment definitions for review; let each view select the output columns for time/severity roles. Replace the separate automatic recognition/normalization paths. Capture time remains acquisition metadata. |
 | **Working** | Compose live union views from existing views across sources, merged in selected timestamp order, with ordinary downstream filters and grouping. Preserve original record identities and capture ownership; define overlap, missing-time and dependency/revision behavior. |
 | **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
 | **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
@@ -22,8 +21,11 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 
 ## Accepted for the next release
 
-Column roles are integrated for validation; they remain Working until the
-integrated acceptance gate passes.
+Integrated after v0.1.3; outside its immutable tag and installed runtime.
+
+| Status | Work |
+| --- | --- |
+| **Ready** | Make “give me a UTC timestamp column” and “give me a severity column” assistance shortcuts that propose ordinary enrichment definitions for review; let each view select the output columns for time/severity roles. Replace the separate automatic recognition/normalization paths. Capture time remains acquisition metadata. |
 
 ## Upcoming backlog
 
