@@ -193,7 +193,7 @@ struct Inner {
     closed: AtomicBool,
     writer: Mutex<Option<SyncSender<Vec<u8>>>>,
     child: Mutex<Option<(u64, Child)>>,
-    workers: Mutex<Vec<(u64, thread::JoinHandle<()>)>>,
+    workers: Mutex<Vec<(u64, &'static str, thread::JoinHandle<()>)>>,
     lifecycle: Mutex<()>,
     pending: Mutex<HashMap<String, Pending>>,
     events_tx: SyncSender<BridgeEvent>,
@@ -601,22 +601,26 @@ fn launch_generation(inner: &Arc<Inner>) -> Result<(), HostError> {
     let weak = Arc::downgrade(inner);
     workers.push((
         generation,
+        "stdin writer",
         thread::spawn(move || writer_loop(stdin, writer_rx, weak, generation)),
     ));
     let weak = Arc::downgrade(inner);
     let max_line = inner.config.max_line_bytes;
     workers.push((
         generation,
+        "stdout reader",
         thread::spawn(move || stdout_loop(stdout, weak, generation, max_line)),
     ));
     let weak = Arc::downgrade(inner);
     workers.push((
         generation,
+        "stderr reader",
         thread::spawn(move || stderr_loop(stderr, weak, generation)),
     ));
     let weak = Arc::downgrade(inner);
     workers.push((
         generation,
+        "timeout monitor",
         thread::spawn(move || timeout_loop(weak, generation)),
     ));
     Ok(())
@@ -956,11 +960,11 @@ fn terminate_child(inner: &Arc<Inner>, child: Option<Child>, generation: u64) {
                     let reaper = thread::spawn(move || {
                         let _ = child.wait();
                     });
-                    inner
-                        .workers
-                        .lock()
-                        .expect("workers lock")
-                        .push((generation, reaper));
+                    inner.workers.lock().expect("workers lock").push((
+                        generation,
+                        "child reaper",
+                        reaper,
+                    ));
                     break;
                 }
             }
@@ -975,8 +979,15 @@ fn finish_child_gracefully(
     deadline: Instant,
 ) {
     let Some(mut child) = child else { return };
+    // Pipe readers still need to observe EOF and be scheduled after the child
+    // exits. Keep that work inside the existing total timeout instead of
+    // allowing child reaping to consume the workers' entire deadline.
+    let worker_reserve = inner.config.shutdown_timeout / 8;
+    let child_deadline = deadline.checked_sub(worker_reserve).unwrap_or(deadline);
     let reserve = inner.config.shutdown_timeout / 4;
-    let graceful_deadline = deadline.checked_sub(reserve).unwrap_or(deadline);
+    let graceful_deadline = child_deadline
+        .checked_sub(reserve)
+        .unwrap_or(child_deadline);
     loop {
         match owned_leader_exited(&mut child) {
             Ok(true) => {
@@ -997,17 +1008,17 @@ fn finish_child_gracefully(
     loop {
         match child.try_wait() {
             Ok(Some(_)) | Err(_) => return,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+            Ok(None) if Instant::now() < child_deadline => thread::sleep(Duration::from_millis(2)),
             Ok(None) => {
                 record_diagnostic(inner, "bridge child reap exceeded shutdown deadline".into());
                 let reaper = thread::spawn(move || {
                     let _ = child.wait();
                 });
-                inner
-                    .workers
-                    .lock()
-                    .expect("workers lock")
-                    .push((generation, reaper));
+                inner.workers.lock().expect("workers lock").push((
+                    generation,
+                    "child reaper",
+                    reaper,
+                ));
                 return;
             }
         }
@@ -1082,13 +1093,13 @@ fn join_retired_workers_until(
             }
         }
     }
-    while owned.iter().any(|(_, worker)| !worker.is_finished()) && Instant::now() < deadline {
+    while owned.iter().any(|(_, _, worker)| !worker.is_finished()) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(2));
     }
     let mut incomplete = Vec::new();
     for worker in owned {
-        if worker.1.is_finished() {
-            let _ = worker.1.join();
+        if worker.2.is_finished() {
+            let _ = worker.2.join();
         } else {
             incomplete.push(worker);
         }
@@ -1097,12 +1108,20 @@ fn join_retired_workers_until(
         Ok(())
     } else {
         let count = incomplete.len();
+        let names = incomplete
+            .iter()
+            .map(|(_, name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
         inner
             .workers
             .lock()
             .expect("workers lock")
             .extend(incomplete);
-        let message = format!("{count} bridge worker thread(s) exceeded shutdown deadline");
+        let message = format!(
+            "{} bridge worker thread(s) exceeded shutdown deadline: {names}",
+            count
+        );
         record_diagnostic(inner, message.clone());
         Err(HostError::Io(message))
     }
@@ -2063,6 +2082,56 @@ rm bridge.lock
         assert!(!temp.path().join("bridge.lock").exists());
         let pid = fs::read_to_string(temp.path().join("child.pid")).unwrap();
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn no_request_shutdown_during_delayed_startup_reaps_child_and_pipe_workers() {
+        let script = r#"
+printf '%s' $$ > child.pid
+: > ready
+# Model the Node CLI awaiting bridge.start() before it installs an stdin
+# consumer. Shutdown must not spend the full host budget on this phase and
+# then strand the three pipe workers.
+sleep 2
+while IFS= read -r line; do :; done
+"#;
+        let (temp, host) = fake(script, Duration::from_secs(1));
+        wait_for_fixture_file(&temp.path().join("ready"));
+        let pid = fs::read_to_string(temp.path().join("child.pid")).unwrap();
+        let started = Instant::now();
+        host.shutdown().unwrap();
+        assert!(started.elapsed() <= Duration::from_millis(600));
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(host.inner.workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shutdown_diagnostic_names_the_unfinished_worker_phase() {
+        let (_temp, host) = fake(LOOP, Duration::from_secs(1));
+        let generation = host.inner.generation.load(Ordering::Acquire);
+        let (release, held) = mpsc::channel();
+        let (started, ready) = mpsc::sync_channel(0);
+        host.inner.workers.lock().unwrap().push((
+            generation,
+            "phase probe",
+            thread::spawn(move || {
+                started.send(()).unwrap();
+                held.recv().unwrap();
+            }),
+        ));
+        ready.recv().unwrap();
+        let error = join_retired_workers_until(
+            &host.inner,
+            generation,
+            Instant::now() + Duration::from_millis(5),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, HostError::Io(message) if message.contains("phase probe")),
+            "{error:?}"
+        );
+        release.send(()).unwrap();
+        host.shutdown().unwrap();
     }
 
     #[test]

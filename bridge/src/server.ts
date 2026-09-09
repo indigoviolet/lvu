@@ -10,12 +10,18 @@ export class JsonlServer {
   #drainingOversize = false;
   #accepting = true;
   #stopping: Promise<void> | null = null;
+  readonly #inputSettled: Promise<void>;
+  readonly #stopSettled: Promise<void>;
+  #resolveInputSettled!: () => void;
+  #resolveStopSettled!: () => void;
   readonly #inFlight = new Map<string, { request: BridgeRequest; promise: Promise<void> }>();
   #normalInFlight = 0;
   #cancelInFlight = 0;
   readonly #writer: BoundedWriter;
 
   constructor(readonly bridge: Bridge, readonly input: Readable, output: Writable, readonly limits: ServerLimits, readonly diagnostic: (message: string) => void = () => {}) {
+    this.#inputSettled = new Promise((resolve) => { this.#resolveInputSettled = resolve; });
+    this.#stopSettled = new Promise((resolve) => { this.#resolveStopSettled = resolve; });
     this.#writer = new BoundedWriter(output, input, limits.maxQueuedOutputBytes, (error) => { this.diagnostic(error.message); void this.stop(); });
   }
 
@@ -24,12 +30,31 @@ export class JsonlServer {
     this.input.once("end", () => {
       if (!this.#drainingOversize && this.#line.length > 0) this.#dispatchLine(this.#line);
       this.#line = Buffer.alloc(0);
+      this.#resolveInputSettled();
       void this.stop();
     });
-    this.input.once("error", (error) => { this.diagnostic(`stdin failed: ${error.message}`); void this.stop(); });
+    this.input.once("error", (error) => {
+      this.diagnostic(`stdin failed: ${error.message}`);
+      this.#resolveInputSettled();
+      void this.stop();
+    });
   }
 
   send(message: Record<string, unknown>): void { this.#writer.send(message); }
+
+  whenStopped(): Promise<void> { return this.#stopSettled; }
+
+  /**
+   * Upstream reached EOF. Override writer backpressure long enough to admit
+   * the already-bounded staged input, then let normal stop bound output drain.
+   * If an input/output failure has already stopped the server, that completed
+   * stop wins the race so callers cannot wait forever for an unreachable end.
+   */
+  async finishInput(): Promise<void> {
+    if (this.#stopping === null) this.#writer.finishInput();
+    await Promise.race([this.#inputSettled, this.#stopSettled]);
+    await this.stop();
+  }
 
   async stop(): Promise<void> {
     if (this.#stopping !== null) return this.#stopping;
@@ -47,7 +72,7 @@ export class JsonlServer {
       ]);
       await this.bridge.close().catch((error) => this.diagnostic(`bridge shutdown failed: ${String(error)}`));
       await this.#writer.stop(this.limits.shutdownDrainTimeoutMs);
-    })();
+    })().finally(() => this.#resolveStopSettled());
     return this.#stopping;
   }
 
@@ -100,6 +125,7 @@ class BoundedWriter {
   #blocked = false;
   #failed = false;
   #stopped = false;
+  #finishingInput = false;
   #flushWaiters: Array<() => void> = [];
   readonly #onDrain = () => { this.#blocked = false; this.#drain(); };
   readonly #onError = (error: Error) => this.#abort(error);
@@ -116,6 +142,7 @@ class BoundedWriter {
     this.#queue.push({ text, bytes });
     this.#queuedBytes += bytes;
   }
+  finishInput(): void { this.#finishingInput = true; this.input.resume(); }
   async stop(timeoutMs: number): Promise<void> {
     if (this.#stopped) return;
     this.#stopped = true;
@@ -131,7 +158,12 @@ class BoundedWriter {
     this.#resolveFlush();
   }
   #flush(): Promise<void> { if ((!this.#blocked && this.#queue.length === 0) || this.#failed) return Promise.resolve(); return new Promise((resolve) => this.#flushWaiters.push(resolve)); }
-  #write(text: string): void { if (!this.output.write(text)) { this.#blocked = true; this.input.pause(); } }
+  #write(text: string): void {
+    if (!this.output.write(text)) {
+      this.#blocked = true;
+      if (!this.#finishingInput) this.input.pause();
+    }
+  }
   #drain(): void {
     while (!this.#blocked && this.#queue.length > 0) {
       const item = this.#queue.shift()!;

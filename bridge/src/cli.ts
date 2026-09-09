@@ -2,6 +2,7 @@
 import { Bridge } from "./bridge.js";
 import { SdkBackend } from "./backend.js";
 import { JsonlServer } from "./server.js";
+import { CliLifecycle } from "./cli_lifecycle.js";
 import { OwnedSessionLedger } from "./owned_sessions.js";
 
 const backend = new SdkBackend({
@@ -32,22 +33,33 @@ const bridge = new Bridge(backend, (message) => send(message), {
   maxProposalBytes: numberEnv("LVU_PASEO_MAX_PROPOSAL_BYTES", 262_144),
   maxEventBytes: numberEnv("LVU_PASEO_MAX_EVENT_BYTES", 262_144),
 }, ownedRoot === undefined ? null : new OwnedSessionLedger(ownedRoot));
+const lifecycle = new CliLifecycle(
+  bridge,
+  process.stdin,
+  process.stdout,
+  serverLimits,
+  (message) => process.stderr.write(`${message}\n`),
+  (ready) => {
+    server = ready;
+    send = (message) => ready.send(message);
+    for (const message of startupOutput.splice(0)) send(message);
+  },
+);
+const stopForSignal = () => void lifecycle.shutdown().then(
+  () => process.exit(0),
+  () => process.exit(0),
+);
+process.once("SIGINT", stopForSignal);
+process.once("SIGTERM", stopForSignal);
 
 try {
-  await bridge.start();
-  server = new JsonlServer(bridge, process.stdin, process.stdout, serverLimits, (message) => process.stderr.write(`${message}\n`));
-  send = (message) => server!.send(message);
-  for (const message of startupOutput.splice(0)) send(message);
-  server.start();
+  server = await lifecycle.start();
+  if (server !== null) await lifecycle.settleInput();
 } catch (error) {
   process.stderr.write(`bridge connection failed: ${String(error)}\n`);
   process.exitCode = 1;
   await bridge.close().catch(() => {});
 }
-
-async function shutdown(): Promise<void> { await server?.stop(); }
-process.once("SIGINT", () => void shutdown().finally(() => process.exit(0)));
-process.once("SIGTERM", () => void shutdown().finally(() => process.exit(0)));
 
 function numberEnv(name: string, fallback: number): number {
   const value = Number(process.env[name] ?? fallback);
