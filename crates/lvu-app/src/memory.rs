@@ -953,6 +953,22 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 .take(256)
                 .collect(),
             exact_field: request.state.exact_field.clone(),
+            union: request
+                .state
+                .union
+                .clone()
+                .map(|union| lvu_memory::StoredUnion {
+                    inputs: union
+                        .inputs
+                        .into_iter()
+                        .map(|input| lvu_memory::StoredUnionInput {
+                            view_id: input.view_id,
+                            accepted_revision: input.accepted_revision,
+                            applied_generation: input.applied_generation,
+                        })
+                        .collect(),
+                    filter: union.filter,
+                }),
             applied_enrichment: request
                 .state
                 .applied_enrichments
@@ -1333,6 +1349,18 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
             .map(|id| lvu::RowId::new(id.source_id.0.to_string(), id.sequence))
             .collect(),
         exact_field: value.presentation.exact_field,
+        union: value.presentation.union.map(|union| lvu::PersistentUnion {
+            inputs: union
+                .inputs
+                .into_iter()
+                .map(|input| lvu::PersistentUnionInput {
+                    view_id: input.view_id,
+                    accepted_revision: input.accepted_revision,
+                    applied_generation: input.applied_generation,
+                })
+                .collect(),
+            filter: union.filter,
+        }),
         applied_enrichment: applied_enrichments
             .last()
             .map_or_else(String::new, |stage| stage.source.clone()),

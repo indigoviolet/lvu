@@ -15,7 +15,8 @@ use lvu_core::{Acquisition, SourceDefinition, SourceId};
 use lvu_ingest::{RuntimeConfig, RuntimeState, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
 use lvu_view::{
-    NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec, ViewConfig,
+    NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec, UnionTestBarrier,
+    ViewConfig,
 };
 use std::{
     collections::BTreeMap,
@@ -220,6 +221,20 @@ fn candidate(
     candidate_filtered(revision, api, worker, api_revision, worker_revision, "")
 }
 
+fn candidate_with_generation(
+    revision: u64,
+    generation: u64,
+    api: &SourceHandle,
+    worker: &SourceHandle,
+    api_revision: u64,
+    worker_revision: u64,
+) -> UnionCandidateSpec {
+    let mut candidate =
+        candidate_filtered(revision, api, worker, api_revision, worker_revision, "");
+    candidate.generation = generation;
+    candidate
+}
+
 fn candidate_filtered(
     revision: u64,
     api: &SourceHandle,
@@ -246,6 +261,7 @@ fn candidate_filtered(
         ],
         filter: UnionFilterSpec {
             search: search.into(),
+            exact_key: None,
         },
     }
 }
@@ -388,6 +404,196 @@ async fn union_applies_its_own_text_search() {
     let mut sorted = texts.clone();
     sorted.sort();
     assert_eq!(texts, sorted);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn union_completion_reports_the_candidate_generation() {
+    // The completion must carry the caller's submission generation (here 7),
+    // not the adapter's private per-union worker ordinal (here 1): routing
+    // on the wrong one discards valid results or attributes them wrongly.
+    let (_root, manager, api, worker, mut adapter) = setup().await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    adapter
+        .submit_union_candidate(
+            candidate_with_generation(1, 7, &api, &worker, 1, 1),
+            &|_| None,
+        )
+        .unwrap();
+    let completion = wait_union(&mut adapter, 1).expect("a completion");
+    assert_eq!(completion.error, None);
+    assert_eq!(completion.generation, 7);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn union_rejects_input_advanced_between_freeze_and_publish() {
+    // Deterministic interleaving through the test barrier: the union freezes
+    // both inputs, the test then advances input A WITHOUT a new query
+    // revision (a live append plus the ordinary incremental refresh), and
+    // only then releases the worker. Revision and generation fences still
+    // match, so only the per-source high-watermark fence can catch this —
+    // publishing would omit the newly accepted row as current.
+    let (root, manager, api, worker, mut adapter) = setup().await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    let (frozen_tx, frozen_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    adapter
+        .arm_union_test_barrier(
+            "union",
+            UnionTestBarrier {
+                frozen: frozen_tx,
+                release: release_rx,
+            },
+        )
+        .unwrap();
+    adapter
+        .submit_union_candidate(candidate(1, &api, &worker, 1, 1), &|_| None)
+        .unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        adapter.drain_updates(64);
+        if frozen_rx.try_recv().is_ok() {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "union never reached the barrier"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Live append; the ordinary incremental refresh publishes it at the SAME
+    // accepted revision the union fenced on.
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("api.log"))
+        .unwrap();
+    writeln!(
+        file,
+        "{{\"ts\":\"2026-03-04T05:05:00Z\",\"svc\":\"api\",\"n\":99}}"
+    )
+    .unwrap();
+    file.flush().unwrap();
+    wait_runtime(&api, 7).await;
+    let started = std::time::Instant::now();
+    loop {
+        adapter.drain_updates(64);
+        let advanced: Option<u64> = adapter
+            .status("view-a")
+            .and_then(|status| {
+                status
+                    .high_watermarks
+                    .iter()
+                    .find_map(|(id, high)| (*id == api.source_id()).then_some(*high))
+            })
+            .flatten();
+        if advanced == Some(6) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "input membership never advanced (high={advanced:?})"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    release_tx.send(()).unwrap();
+    let completion = wait_union(&mut adapter, 1).expect("a completion");
+    let error = completion
+        .error
+        .expect("the stale candidate must be rejected, not published");
+    assert!(
+        error.contains("advanced"),
+        "expected a high-watermark stale rejection, got: {error}"
+    );
+    // The prior union is preserved (nothing was ever published here, so the
+    // view is still Raw), and a fresh candidate fences the new state fine.
+    assert!(adapter.union_inputs("union").unwrap().is_empty());
+    adapter
+        .submit_union_candidate(candidate(2, &api, &worker, 1, 1), &|_| None)
+        .unwrap();
+    let completion = wait_union(&mut adapter, 2).expect("a completion");
+    assert_eq!(completion.error, None);
+    assert_eq!(union_texts(&mut adapter).len(), 13);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn union_published_view_renders_without_hanging() {
+    use lvu::{App, SourceItem, ViewItem, theme::Theme};
+    use ratatui::{Terminal, backend::TestBackend};
+    let (_root, manager, api, worker, mut adapter) = setup().await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    adapter
+        .submit_union_candidate(candidate(1, &api, &worker, 1, 1), &|_| None)
+        .unwrap();
+    let completion = wait_union(&mut adapter, 1).expect("a completion");
+    assert_eq!(completion.error, None);
+    // Settle raw rows first (as every paged test does): render asserts
+    // content, not delivery, and must not race the row cache.
+    assert_eq!(union_texts(&mut adapter).len(), 12);
+    // Full UI render over the published union membership: rows, sidebar,
+    // status and health paths all read it generically. Runs on the calling
+    // thread with TestBackend; any render-side loop over union structures
+    // hangs here instead of freezing a live terminal with its last frame.
+    let sources = vec![
+        SourceItem {
+            id: api.source_id().0.to_string(),
+            name: "api".into(),
+            health: String::new(),
+        },
+        SourceItem {
+            id: worker.source_id().0.to_string(),
+            name: "worker".into(),
+            health: String::new(),
+        },
+    ];
+    let views = vec![
+        ViewItem {
+            id: "view-a".into(),
+            source_id: api.source_id().0.to_string(),
+            name: "api view".into(),
+        },
+        ViewItem {
+            id: "view-b".into(),
+            source_id: worker.source_id().0.to_string(),
+            name: "worker view".into(),
+        },
+        ViewItem {
+            id: "union".into(),
+            source_id: api.source_id().0.to_string(),
+            name: "union view".into(),
+        },
+    ];
+    let mut app = App::new(sources, views, true);
+    app.select_view("union");
+    app.sync_provider(&adapter, 24);
+    let mut terminal = Terminal::new(TestBackend::new(150, 32)).unwrap();
+    terminal
+        .draw(|frame| {
+            lvu::ui::render_with_theme(frame, &mut app, &adapter, Theme::TERMINAL, None);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let text: String = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("union view"), "{text}");
+    assert!(text.contains("\"svc\":\"api\""), "{text}");
+    assert!(text.contains("\"svc\":\"worker\""), "{text}");
     adapter.shutdown();
     manager.shutdown().await;
 }

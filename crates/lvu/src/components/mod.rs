@@ -18,6 +18,8 @@ pub mod settings;
 pub mod source;
 pub mod storage;
 pub mod time;
+pub mod union;
+pub mod union_dialog;
 pub mod view;
 pub mod view_summary;
 
@@ -40,6 +42,7 @@ use settings::SettingsDialog;
 use source::SourceDialog;
 use storage::StorageDialog;
 use time::TimeDialog;
+use union_dialog::UnionDialogComponent;
 use view::ViewDialog;
 use view_summary::ViewSummaryDialog;
 
@@ -60,6 +63,8 @@ pub struct Layers {
     pub correlation: CorrelationDialog,
     pub bookmarks: BookmarksDialog,
     pub view: ViewDialog,
+    /// Union of accepted views (`components/union_dialog.rs`).
+    pub union: UnionDialogComponent,
     /// The per-view folding policy (`components/folding.rs`).
     pub folding: FoldingDialog,
     pub source: SourceDialog,
@@ -99,6 +104,7 @@ impl Default for Layers {
             correlation: CorrelationDialog::default(),
             bookmarks: BookmarksDialog::default(),
             view: ViewDialog::default(),
+            union: UnionDialogComponent::default(),
             folding: FoldingDialog::default(),
             source: SourceDialog::default(),
             recipes: RecipesDialog::default(),

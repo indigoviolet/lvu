@@ -1,15 +1,14 @@
 //! Union dialog draft state: `view1 + view2` as one timestamp-ordered view.
 //!
-//! Ownership: Muse union-views assignment. This file is new and owned here;
-//! shell registration (`components/mod.rs` slot, `LayerId`, palette) is
-//! primary-owned and proposed at the bottom of this module (`PROPOSED HOOKS`).
-//! Until then it is exercised through `crates/lvu/tests/component_union.rs`,
-//! which includes it by path, so no existing component, shell or manifest is
-//! touched.
+//! Ownership: union-views worktree. This file is std-only state plus the
+//! fence helper shared by the dialog and the application shell; the
+//! `Component` implementation (render/input/geometry) lives in
+//! `union_dialog.rs`, and shell registration (`components/mod.rs` slot,
+//! `LayerId`, palette) is listed under `PROPOSED HOOKS` until assigned.
 //!
-//! The dialog edits a DRAFT (the input list and the union name) while the
-//! ACCEPTED union — input view IDs fenced on their accepted revisions — keeps
-//! serving rows. Accepting records every input's current accepted revision as
+//! The dialog edits a DRAFT (the input list) while the ACCEPTED union —
+//! input view IDs fenced on their accepted revisions AND generations — keeps
+//! serving rows. Accepting records every input's current accepted state as
 //! the new fence baseline; an input that advances afterwards marks the union
 //! stale (refresh, not failure) and live appends re-merge on the new baseline.
 //! Rejecting a candidate preserves the entire last-good chain: accepted
@@ -19,9 +18,7 @@
 //! time; this layer pre-validates so the dialog can explain a bad spec before
 //! submitting it.
 //!
-//! Deliberately dependency-light (std only): the `Component` implementation,
-//! geometry and rendering land with the shell hook, where the dialog-model
-//! (§3–§10) and mnemonic (§8.10) audits apply. Nothing here decides row
+//! Deliberately dependency-light (std only): nothing here decides row
 //! membership or order — that is `lvu-view::union`'s job through Polars.
 //!
 //! PROPOSED HOOKS (primary-owned; do not apply without assignment).
@@ -54,12 +51,15 @@ pub const MAX_UNION_DIALOG_INPUTS: usize = 8;
 /// Longest view identity the draft accepts, mirroring the execution bound.
 pub const MAX_UNION_DIALOG_VIEW_ID_BYTES: usize = 256;
 
-/// One accepted union input: the view ID plus the accepted revision the union
-/// was fenced on when it published.
+/// One accepted union input: the view ID plus the accepted revision AND
+/// generation the union was fenced on. Both fence the candidate: a revision
+/// move means new definitions, a generation move means the source restarted
+/// underneath the membership.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnionInputRef {
     pub view_id: String,
     pub accepted_revision: u64,
+    pub applied_generation: u64,
 }
 
 /// The accepted union a view is serving: its own ID, the fenced inputs, and
@@ -234,9 +234,9 @@ impl UnionDialog {
 
     /// Accept the draft into a fenced union description.
     ///
-    /// `current_revision` reports each input's CURRENT accepted revision
-    /// (`None` for an unknown/closed view). The returned value records those
-    /// revisions as the fence baseline the execution layer publishes under;
+    /// `current_revision`/`current_generation` report each input's CURRENT
+    /// accepted state (`None` for an unknown/closed view). The returned value
+    /// records those as the fence baseline the execution layer publishes under;
     /// any input that advances afterwards is a refresh, and any input that
     /// vanished is a rejection that preserves the prior union.
     pub fn accept(
@@ -244,22 +244,13 @@ impl UnionDialog {
         union_view_id: &str,
         revision: u64,
         current_revision: impl Fn(&str) -> Option<u64>,
+        current_generation: impl Fn(&str) -> Option<u64>,
     ) -> Result<AcceptedUnion, String> {
         self.validate_for_create(union_view_id)?;
-        let mut inputs = Vec::with_capacity(self.inputs.len());
-        for view_id in &self.inputs {
-            match current_revision(view_id) {
-                Some(accepted_revision) => inputs.push(UnionInputRef {
-                    view_id: view_id.clone(),
-                    accepted_revision,
-                }),
-                None => {
-                    let message = format!("input view '{view_id}' is unavailable");
-                    self.error = Some(message.clone());
-                    return Err(message);
-                }
-            }
-        }
+        let inputs = fence_union_inputs(&self.inputs, current_revision, current_generation)
+            .inspect_err(|message| {
+                self.error = Some(message.clone());
+            })?;
         self.error = None;
         self.pending_generation = None;
         Ok(AcceptedUnion {
@@ -288,15 +279,52 @@ impl UnionDialog {
 
     /// True when any fenced input has advanced past (or vanished from) the
     /// revisions `accepted` published under — i.e. the union wants a refresh.
+    /// Generation moves count like revision moves: a restarted source is new
+    /// membership even at an old revision.
     pub fn accepted_is_stale(
         accepted: &AcceptedUnion,
         current_revision: impl Fn(&str) -> Option<u64>,
+        current_generation: impl Fn(&str) -> Option<u64>,
     ) -> bool {
-        accepted
-            .inputs
-            .iter()
-            .any(|input| current_revision(&input.view_id) != Some(input.accepted_revision))
+        accepted.inputs.iter().any(|input| {
+            current_revision(&input.view_id) != Some(input.accepted_revision)
+                || current_generation(&input.view_id) != Some(input.applied_generation)
+        })
     }
+}
+
+/// Fence input view IDs on their current accepted state: the shared helper
+/// the dialog and the application shell both build candidates through, so
+/// creation-time and submit-time fencing cannot drift apart.
+pub fn fence_union_inputs(
+    inputs: &[String],
+    current_revision: impl Fn(&str) -> Option<u64>,
+    current_generation: impl Fn(&str) -> Option<u64>,
+) -> Result<Vec<UnionInputRef>, String> {
+    let mut fenced = Vec::with_capacity(inputs.len());
+    for view_id in inputs {
+        match (current_revision(view_id), current_generation(view_id)) {
+            (Some(accepted_revision), Some(applied_generation)) => fenced.push(UnionInputRef {
+                view_id: view_id.clone(),
+                accepted_revision,
+                applied_generation,
+            }),
+            _ => return Err(format!("input view '{view_id}' is unavailable")),
+        }
+    }
+    Ok(fenced)
+}
+
+/// What the union dialog asks the application shell to do. The shell owns
+/// view identities, revision fences and adapter submission; the dialog only
+/// carries the user's selection. The shell derives the name ("Union of A,
+/// B", renamable through the ordinary Rename flow).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnionDialogRequest {
+    /// Create a union view over these input view IDs. The shell fences
+    /// revisions, registers the view and submits the first candidate;
+    /// failures return through `rejected` with the draft intact.
+    Create { inputs: Vec<String> },
 }
 
 /// Shared structural rule: no duplicates and never the union view itself.

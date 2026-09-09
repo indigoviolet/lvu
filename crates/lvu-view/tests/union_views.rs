@@ -13,15 +13,16 @@
 #[allow(dead_code)]
 mod union;
 
-use lvu_core::{RecordId, SourceId};
+use lvu_core::{ExactFieldConstraint, ExactScalar, RecordId, SourceId};
 use polars::prelude::*;
 use std::collections::BTreeMap;
 use union::{
     INPUT_COLUMN, MergedUnionRow, SEQUENCE_COLUMN, SOURCE_ID_COLUMN, StoredUnionInput,
     StoredUnionShape, UNION_TS_COLUMN, UnionError, UnionFilterSpec, UnionFrozenInput,
-    UnionFrozenRow, UnionInputRow, UnionInputSnapshot, UnionLimits, apply_union_filter,
-    detect_union_cycle, frozen_identity_snapshot, merge_union_rows, union_frozen_inputs,
-    union_input_stale, union_typed_frames, validate_union_spec,
+    UnionFrozenRow, UnionInputRow, UnionInputSnapshot, UnionLimits, UnionSourceFence,
+    apply_union_filter, detect_union_cycle, frozen_identity_snapshot, merge_union_rows,
+    union_frozen_inputs, union_input_stale, union_typed_frames, validate_union_spec,
+    verify_source_fence,
 };
 use uuid::Uuid;
 
@@ -409,6 +410,7 @@ fn stored_shape_round_trips_additively() {
         ],
         filter: UnionFilterSpec {
             search: "error".into(),
+            exact_key: None,
         },
     };
     let json = serde_json::to_string(&shape).unwrap();
@@ -416,6 +418,7 @@ fn stored_shape_round_trips_additively() {
     assert_eq!(shape, back);
     let legacy: StoredUnionShape = serde_json::from_str("{}").unwrap();
     assert!(legacy.inputs.is_empty());
+    assert_eq!(legacy.filter, UnionFilterSpec::default());
     let future: StoredUnionShape =
         serde_json::from_str(r#"{"inputs":[],"union_v99":{"x":1}}"#).unwrap();
     assert!(future.inputs.is_empty());
@@ -1018,6 +1021,7 @@ fn filtered_merge(search: &str) -> polars::prelude::DataFrame {
         merged,
         &UnionFilterSpec {
             search: search.into(),
+            exact_key: None,
         },
     )
     .unwrap()
@@ -1074,6 +1078,7 @@ fn union_search_rejects_advanced_forms_explicitly() {
         merged,
         &UnionFilterSpec {
             search: "pl.col(\"n\") .gt(1)".into(),
+            exact_key: None,
         },
     )
     .unwrap_err();
@@ -1119,6 +1124,7 @@ fn union_filter_preserves_first_input_precedence() {
         merged,
         &UnionFilterSpec {
             search: "beta".into(),
+            exact_key: None,
         },
     )
     .unwrap();
@@ -1156,8 +1162,346 @@ fn union_filter_preserves_first_input_precedence() {
         merged,
         &UnionFilterSpec {
             search: "alpha".into(),
+            exact_key: None,
         },
     )
     .unwrap();
     assert_eq!(matched.height(), 1);
+}
+
+fn keyed_merge() -> DataFrame {
+    use serde_json::json;
+    let first = frozen_input(
+        "view-a",
+        1,
+        vec![
+            frozen_row_text(1, 1, Some(1), &[("k", "String", json!("a"))], "alpha one"),
+            frozen_row_text(1, 2, Some(2), &[("k", "String", json!("b"))], "alpha two"),
+        ],
+    );
+    let second = frozen_input(
+        "view-b",
+        1,
+        vec![frozen_row_text(
+            2,
+            1,
+            Some(3),
+            &[("k", "String", json!("a"))],
+            "beta",
+        )],
+    );
+    union_frozen_inputs("union", &[first, second], &limits()).unwrap()
+}
+
+fn string_key(field: &str, value: &str) -> ExactFieldConstraint {
+    ExactFieldConstraint::new(field, ExactScalar::string(value).unwrap()).unwrap()
+}
+
+#[test]
+fn union_exact_key_filters_without_search() {
+    // Empty search plus an exact key must still constrain: the search
+    // early-out must not swallow the key.
+    let merged = keyed_merge();
+    assert_eq!(merged.height(), 3);
+    let matched = apply_union_filter(
+        merged,
+        &UnionFilterSpec {
+            search: String::new(),
+            exact_key: Some(string_key("k", "a")),
+        },
+    )
+    .unwrap();
+    assert_eq!(matched.height(), 2);
+}
+
+#[test]
+fn union_exact_key_combines_with_search_after_dedup() {
+    let merged = keyed_merge();
+    // Search narrows to view-a's two alpha rows; the key keeps k=a among them.
+    let matched = apply_union_filter(
+        merged,
+        &UnionFilterSpec {
+            search: "alpha".into(),
+            exact_key: Some(string_key("k", "a")),
+        },
+    )
+    .unwrap();
+    assert_eq!(matched.height(), 1);
+}
+
+#[test]
+fn union_exact_key_mismatch_rejects_without_coercion() {
+    let merged = keyed_merge();
+    let key = ExactFieldConstraint::new("k", ExactScalar::SignedInteger(1)).unwrap();
+    let error = apply_union_filter(
+        merged,
+        &UnionFilterSpec {
+            search: String::new(),
+            exact_key: Some(key),
+        },
+    )
+    .unwrap_err();
+    match error {
+        UnionError::Engine { reason } => {
+            assert!(reason.contains("matching column type"), "{reason}");
+        }
+        other => panic!("expected a typed-mismatch rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn stored_shape_round_trips_exact_key() {
+    let shape = StoredUnionShape {
+        inputs: vec![],
+        filter: UnionFilterSpec {
+            search: String::new(),
+            exact_key: Some(string_key("req", "r-7")),
+        },
+    };
+    let back: StoredUnionShape =
+        serde_json::from_str(&serde_json::to_string(&shape).unwrap()).unwrap();
+    assert_eq!(shape, back);
+    // Unknown future filter keys still ignored; absent key reads as None.
+    let legacy: StoredUnionShape =
+        serde_json::from_str(r#"{"inputs":[],"filter":{"search":"x"}}"#).unwrap();
+    assert_eq!(legacy.filter.exact_key, None);
+}
+
+fn evidenced_row(
+    source: u128,
+    sequence: u64,
+    with_evidence: bool,
+    value: serde_json::Value,
+) -> UnionFrozenRow {
+    use serde_json::json;
+    let mut fields = BTreeMap::new();
+    fields.insert("v".to_owned(), value);
+    let mut field_types = BTreeMap::new();
+    if with_evidence {
+        field_types.insert("v".to_owned(), "Int64".to_owned());
+    }
+    UnionFrozenRow {
+        record_id: RecordId {
+            source_id: self::source(source),
+            sequence,
+        },
+        timestamp_nanos: Some(sequence as i64),
+        fields,
+        field_types,
+        raw: json!("").to_string(),
+    }
+}
+
+#[test]
+fn mixed_dtype_evidence_rejects_in_either_row_order() {
+    use serde_json::json;
+    // Missing evidence followed by evidence must reach the same verdict as
+    // the reverse: a conflict, never order-dependent acceptance.
+    for rows in [
+        vec![
+            evidenced_row(1, 1, false, json!(7)),
+            evidenced_row(1, 2, true, json!(8)),
+        ],
+        vec![
+            evidenced_row(1, 1, true, json!(7)),
+            evidenced_row(1, 2, false, json!(8)),
+        ],
+    ] {
+        let first = frozen_input("view-a", 1, rows);
+        let second = frozen_input(
+            "view-b",
+            1,
+            vec![frozen_row(2, 1, Some(3), &[("n", "Int64", json!(1))])],
+        );
+        let error = union_frozen_inputs("union", &[first, second.clone()], &limits()).unwrap_err();
+        assert!(
+            matches!(error, UnionError::Engine { .. }),
+            "order-dependent acceptance: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn non_null_value_under_unknown_type_rejects() {
+    use serde_json::json;
+    // A `Null` declaration with a real value present is corruption: the
+    // decoder must not invent a schema around the value, and must not drop
+    // the value to keep the unknown type either.
+    let first = frozen_input(
+        "view-a",
+        1,
+        vec![frozen_row(1, 1, Some(1), &[("x", "Null", json!(7))])],
+    );
+    let second = frozen_input(
+        "view-b",
+        1,
+        vec![frozen_row(2, 1, Some(2), &[("n", "Int64", json!(1))])],
+    );
+    let error = union_frozen_inputs("union", &[first, second], &limits()).unwrap_err();
+    assert!(matches!(error, UnionError::Engine { .. }), "{error:?}");
+}
+
+#[test]
+fn float_declarations_reject_integer_carriers_exactly() {
+    use serde_json::json;
+    // 2^62+1 converts through `as_f64` rounded; the decoder must reject
+    // integer-form JSON under a float declaration rather than round it.
+    // Exact boundary integers and exact float carriers still decode bit-true.
+    let first = frozen_input(
+        "view-a",
+        1,
+        vec![
+            frozen_row(1, 1, Some(1), &[("f", "Float64", json!(0.5))]),
+            frozen_row(
+                1,
+                2,
+                Some(2),
+                &[("f", "Float64", json!(4611686018427387905i64))],
+            ),
+            frozen_row(1, 3, Some(3), &[("i", "Int64", json!(i64::MIN))]),
+            frozen_row(1, 4, Some(4), &[("i", "Int64", json!(i64::MAX))]),
+        ],
+    );
+    let second = frozen_input(
+        "view-b",
+        1,
+        vec![frozen_row(2, 1, Some(5), &[("n", "Int64", json!(1))])],
+    );
+    let error = union_frozen_inputs("union", &[first, second.clone()], &limits()).unwrap_err();
+    assert!(matches!(error, UnionError::Engine { .. }), "{error:?}");
+    let first = frozen_input(
+        "view-a",
+        1,
+        vec![
+            frozen_row(1, 1, Some(1), &[("f", "Float64", json!(0.5))]),
+            frozen_row(1, 3, Some(3), &[("i", "Int64", json!(i64::MIN))]),
+            frozen_row(1, 4, Some(4), &[("i", "Int64", json!(i64::MAX))]),
+        ],
+    );
+    let merged = union_frozen_inputs("union", &[first, second], &limits()).unwrap();
+    assert_eq!(merged.column("f").unwrap().dtype(), &DataType::Float64);
+    assert_eq!(merged.column("i").unwrap().dtype(), &DataType::Int64);
+    // ts order is 1,3,4,5: (f=0.5,i=null),(f=null,i=MIN),(f=null,i=MAX),(n=1).
+    let floats: Vec<f64> = (0..4)
+        .map(|i| {
+            merged
+                .column("f")
+                .unwrap()
+                .get(i)
+                .unwrap()
+                .try_extract::<f64>()
+                .unwrap_or(f64::NAN)
+        })
+        .collect();
+    assert_eq!(floats[0], 0.5);
+    assert!(floats[1..].iter().all(|v| v.is_nan()));
+    let ints: Vec<Option<i64>> = (0..4)
+        .map(|i| match merged.column("i").unwrap().get(i).unwrap() {
+            AnyValue::Null => None,
+            value => Some(value.try_extract::<i64>().unwrap()),
+        })
+        .collect();
+    assert_eq!(ints, vec![None, Some(i64::MIN), Some(i64::MAX), None]);
+}
+
+fn fence(source: &str, generation: u64, high: Option<u64>) -> UnionSourceFence {
+    UnionSourceFence {
+        source_id: source.into(),
+        generation,
+        high_watermark: high,
+    }
+}
+
+#[test]
+fn source_fence_accepts_identical_metadata() {
+    let frozen = vec![fence("a", 1, Some(5)), fence("b", 1, Some(9))];
+    let current = vec![fence("b", 1, Some(9)), fence("a", 1, Some(5))];
+    assert!(verify_source_fence("union", &frozen, &current).is_ok());
+}
+
+#[test]
+fn source_fence_rejects_high_watermark_advance() {
+    // The revision fence cannot see this: same revision and generation, but
+    // an ordinary live incremental publication accepted seven more rows
+    // after the freeze. Publishing now would omit them as current.
+    let frozen = vec![fence("a", 1, Some(5))];
+    let current = vec![fence("a", 1, Some(12))];
+    let error = verify_source_fence("union", &frozen, &current).unwrap_err();
+    match error {
+        UnionError::StaleInput { view_id, detail } => {
+            assert_eq!(view_id, "union");
+            assert!(detail.contains("advanced"), "{detail}");
+        }
+        other => panic!("expected a stale-input rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn source_fence_rejects_restart_vanished_and_added_sources() {
+    let frozen = vec![fence("a", 1, Some(5))];
+    let restarted = vec![fence("a", 2, Some(5))];
+    assert!(matches!(
+        verify_source_fence("union", &frozen, &restarted),
+        Err(UnionError::StaleInput { .. })
+    ));
+    let vanished: Vec<UnionSourceFence> = vec![];
+    assert!(matches!(
+        verify_source_fence("union", &frozen, &vanished),
+        Err(UnionError::StaleInput { .. })
+    ));
+    let added = vec![fence("a", 1, Some(5)), fence("b", 1, Some(0))];
+    assert!(matches!(
+        verify_source_fence("union", &frozen, &added),
+        Err(UnionError::StaleInput { .. })
+    ));
+}
+
+#[test]
+fn cumulative_frame_bytes_reject_before_merge() {
+    use serde_json::json;
+    // Each input fits the budget alone; together they overflow it. Per-frame
+    // sizes are measured first through merges against an empty input, and the
+    // budget is derived from those measurements — so the test asserts its own
+    // premise instead of passing weakly if Polars sizing ever shifts.
+    let empty = frozen_input("view-empty", 1, vec![]);
+    let first = frozen_input(
+        "view-a",
+        1,
+        vec![frozen_row_text(
+            1,
+            1,
+            Some(1),
+            &[("pad", "String", json!("x".repeat(100)))],
+            "a",
+        )],
+    );
+    let second = frozen_input(
+        "view-b",
+        1,
+        vec![frozen_row_text(
+            2,
+            1,
+            Some(2),
+            &[("pad", "String", json!("y".repeat(100)))],
+            "b",
+        )],
+    );
+    let generous = UnionLimits::default();
+    let size_a = union_frozen_inputs("union", &[first.clone(), empty.clone()], &generous)
+        .unwrap()
+        .estimated_size();
+    let size_b = union_frozen_inputs("union", &[empty, second.clone()], &generous)
+        .unwrap()
+        .estimated_size();
+    let budget = size_a.saturating_add(size_b).saturating_sub(1);
+    assert!(
+        budget > size_a && budget > size_b,
+        "test premise broken: each frame must fit alone ({size_a}, {size_b}, budget {budget})"
+    );
+    let limits = UnionLimits {
+        maximum_rows: 1_000_000,
+        maximum_bytes: budget as u64,
+    };
+    let error = union_frozen_inputs("union", &[first, second], &limits).unwrap_err();
+    assert!(matches!(error, UnionError::ByteLimit { .. }), "{error:?}");
 }

@@ -1777,6 +1777,7 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             time_field_draft: None,
             time_gap_threshold_seconds: 0,
             exact_field: None,
+            union: None,
             applied_search: "request 01".into(),
             search_draft: "unfinished literal".into(),
             search_error: None,

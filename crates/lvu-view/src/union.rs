@@ -102,6 +102,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use lvu_core::ExactFieldConstraint;
 use lvu_core::RecordId;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -112,7 +113,7 @@ use lvu_query::TextSearch;
 /// computes): diagonal concat, stable-identity dedup and the total timestamp
 /// ordering all execute in `lvu_query::union` through the proper module
 /// boundary. This module holds only the spec/contract layer.
-
+///
 /// Canonical identity columns, re-exported so the union worker and tests name
 /// exactly the columns the engine reads — never a near-miss spelling.
 pub use lvu_query::{RAW_COLUMN, SEQUENCE_COLUMN, SOURCE_ID_COLUMN, union_sorted_frames};
@@ -239,17 +240,25 @@ pub struct UnionFrozenInput {
 
 /// The union view's own filter, applied over the merged stream.
 ///
-/// Today this is the search box's own language only (literal, `field: value`,
+/// `search` is the search box's own language (literal, `field: value`,
 /// `/regex/flags`): the worker compiles it with `TextSearch::parse` and no
 /// Python host, exactly like an ordinary view's text search, and filters the
 /// merged frame AFTER first-input dedup so precedence survives filtering.
-/// Empty means no constraint. Advanced (`pl.`) filters, enrichment steps and
-/// time windows over unions are explicitly rejected upstream — never silently
+/// `exact_key` is the correlation-replacement typed key
+/// (`lvu_core::ExactFieldConstraint`, one DTO): native Polars equality over
+/// the actual merged typed column via `lvu_query::union::exact_key_filter`,
+/// applied alongside search after dedup. Empty search and no key mean no
+/// constraint. Advanced (`pl.`) filters, enrichment steps and time windows
+/// over unions are explicitly rejected upstream — never silently
 /// dropped — with follow-up seams named in the module hooks.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UnionFilterSpec {
     #[serde(default)]
     pub search: String,
+    /// Exact typed key filter. Additive (`serde(default)`) so older persisted
+    /// rows read as unconstrained: no schema bump, unknown fields ignored.
+    #[serde(default)]
+    pub exact_key: Option<ExactFieldConstraint>,
 }
 
 /// Apply a union's own filter to its merged frame (see [`UnionFilterSpec`]).
@@ -263,26 +272,31 @@ pub fn apply_union_filter(
     frame: DataFrame,
     filter: &UnionFilterSpec,
 ) -> Result<DataFrame, UnionError> {
-    if filter.search.is_empty() {
-        return Ok(frame);
+    let mut frame = frame;
+    if !filter.search.is_empty() {
+        if TextSearch::is_polars(&filter.search) {
+            return Err(UnionError::Engine {
+                reason: "advanced (pl.) filters are not supported over unions yet; filter the input views instead".into(),
+            });
+        }
+        let search = TextSearch::parse(filter.search.clone(), None)
+            .map_err(|error| UnionError::Engine { reason: error })?;
+        if let Some(predicate) = search.expression(&frame) {
+            frame =
+                frame
+                    .lazy()
+                    .filter(predicate)
+                    .collect()
+                    .map_err(|error| UnionError::Engine {
+                        reason: error.to_string(),
+                    })?;
+        }
     }
-    if TextSearch::is_polars(&filter.search) {
-        return Err(UnionError::Engine {
-            reason: "advanced (pl.) filters are not supported over unions yet; filter the input views instead".into(),
-        });
+    if let Some(key) = &filter.exact_key {
+        frame = lvu_query::union::exact_key_filter(frame, key)
+            .map_err(|reason| UnionError::Engine { reason })?;
     }
-    let search = TextSearch::parse(filter.search.clone(), None)
-        .map_err(|error| UnionError::Engine { reason: error })?;
-    let Some(predicate) = search.expression(&frame) else {
-        return Ok(frame);
-    };
-    frame
-        .lazy()
-        .filter(predicate)
-        .collect()
-        .map_err(|error| UnionError::Engine {
-            reason: error.to_string(),
-        })
+    Ok(frame)
 }
 /// The identity-plus-timestamp view of a frozen input for [`merge_union_rows`].
 ///
@@ -424,6 +438,8 @@ pub enum UnionError {
         dtype: String,
         reason: String,
     },
+    #[error("union input '{view_id}' advanced during the merge: {detail}")]
+    StaleInput { view_id: String, detail: String },
     #[error("union engine: {reason}")]
     Engine { reason: String },
 }
@@ -609,6 +625,67 @@ pub fn union_input_stale(fenced_revision: u64, current_accepted_revision: u64) -
     fenced_revision != current_accepted_revision
 }
 
+/// Per-source fence for atomic publication: the generation and capture
+/// high-watermark one frozen input observed, in plain data so the check is a
+/// pure function. Source identities are UUID spellings, matching both frozen
+/// summaries and published memberships.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnionSourceFence {
+    pub source_id: String,
+    pub generation: u64,
+    pub high_watermark: Option<u64>,
+}
+
+/// Verify frozen per-source metadata against current state, atomically with
+/// publication.
+///
+/// Accepted definition revisions and request generations can both stand
+/// still while an ordinary live incremental publication advances a
+/// membership's high-watermarks underneath a running union job. Comparing
+/// only revisions would then publish a stale merge that omits newly accepted
+/// rows. Every frozen source must still be present with the same generation
+/// AND the same high-watermark; anything else — advance, restart, vanished
+/// or added source — is stale and the candidate must not publish.
+pub fn verify_source_fence(
+    view_id: &str,
+    frozen: &[UnionSourceFence],
+    current: &[UnionSourceFence],
+) -> Result<(), UnionError> {
+    for fence in frozen {
+        match current
+            .iter()
+            .find(|entry| entry.source_id == fence.source_id)
+        {
+            None => {
+                return Err(UnionError::StaleInput {
+                    view_id: view_id.to_owned(),
+                    detail: format!("source {} is no longer published", fence.source_id),
+                });
+            }
+            Some(entry) if entry.generation != fence.generation => {
+                return Err(UnionError::StaleInput {
+                    view_id: view_id.to_owned(),
+                    detail: format!("source {} restarted during the merge", fence.source_id),
+                });
+            }
+            Some(entry) if entry.high_watermark != fence.high_watermark => {
+                return Err(UnionError::StaleInput {
+                    view_id: view_id.to_owned(),
+                    detail: format!("source {} advanced during the merge", fence.source_id),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    if current.len() != frozen.len() {
+        return Err(UnionError::StaleInput {
+            view_id: view_id.to_owned(),
+            detail: "input source set changed during the merge".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Union frozen accepted evaluations in timestamp order: the worker-facing
 /// entry point.
 ///
@@ -664,12 +741,23 @@ pub fn union_frozen_inputs(
         });
     }
     let mut frames = Vec::with_capacity(inputs.len());
+    // Cumulative preflight: the merge concatenates everything below, so the
+    // SUM of decoded frames is fenced before Polars allocates it — inputs
+    // that each fit alone can still overflow together.
+    let mut cumulative_bytes: u64 = 0;
     for input in inputs {
         let frame = frozen_frame(input)?;
         let bytes = u64::try_from(frame.estimated_size()).unwrap_or(u64::MAX);
         if bytes > limits.maximum_bytes {
             return Err(UnionError::ByteLimit {
                 bytes,
+                maximum: limits.maximum_bytes,
+            });
+        }
+        cumulative_bytes = cumulative_bytes.saturating_add(bytes);
+        if cumulative_bytes > limits.maximum_bytes {
+            return Err(UnionError::ByteLimit {
+                bytes: cumulative_bytes,
                 maximum: limits.maximum_bytes,
             });
         }
@@ -775,16 +863,16 @@ fn frozen_frame(input: &UnionFrozenInput) -> Result<DataFrame, UnionError> {
 /// declaration (genuinely unknown type) contributes no column.
 ///
 /// Supported declarations: `Boolean`, all `Int*`/`UInt*` widths (direct
-/// numbers plus the precise replay's lossless `{"kind","decimal"}` wrappers,
-/// values range-checked, never wrapped), `Float32` (round-trip-checked
-/// widening to `Float64`, which is value-identical), `Float64`, `String`.
+/// numbers plus the precise replay's lossless integer `{"kind","decimal"}`
+/// wrappers, values range-checked, never wrapped), `Float32`/`Float64` over
+/// float carriers only — integer-form JSON rejects under a float declaration
+/// rather than rounding through `as_f64` — `String`.
 /// Explicitly rejected with [`UnionError::UnsupportedValue`] (values stay
 /// semantically identical or the candidate fails; nothing is silently
 /// coerced): temporal (`Date`, `Datetime(..)`, `Duration(..)`, `Time`),
 /// nested (`List(..)`, `Array`, `Struct(..)`), decimal, categorical, binary,
-/// object, unknown spellings, and any JSON array/object value (including the
-/// frozen big-integer/datetime `{"kind":..}` wrappers) — until a native type
-/// carries them.
+/// object, unknown spellings, and any JSON array/object value that is not a
+/// lossless integer wrapper — until a native type carries them.
 fn decode_union_field(input: &UnionFrozenInput, name: &str) -> Result<Option<Column>, UnionError> {
     let rows = &input.rows;
     let unsupported = |dtype: String, reason: &str| UnionError::UnsupportedValue {
@@ -798,9 +886,12 @@ fn decode_union_field(input: &UnionFrozenInput, name: &str) -> Result<Option<Col
     };
     // One authority per field per input: the distinct native dtype evidence
     // across the rows carrying the field. Evolution mid-input is a conflict
-    // and fails closed rather than inferred.
+    // and fails closed rather than inferred. Missing evidence is tracked
+    // independently of order: rows WITHOUT evidence mixed with rows WITH it
+    // reject identically whether the gap comes first or last.
     let mut declared: Option<&str> = None;
     let mut evidenced = false;
+    let mut saw_missing = false;
     for row in rows {
         if !row.fields.contains_key(name) {
             continue;
@@ -816,20 +907,16 @@ fn decode_union_field(input: &UnionFrozenInput, name: &str) -> Result<Option<Col
                     ));
                 }
             },
-            // No evidence on this row: the authority path is unavailable;
-            // the fallback below decides per JSON kinds. A row WITH evidence
-            // mixed with rows WITHOUT is itself a conflict.
-            None => {
-                if declared.is_some() {
-                    return Err(reject(
-                        "conflicting native dtype evidence across records".into(),
-                    ));
-                }
-            }
+            None => saw_missing = true,
         }
     }
     if !evidenced {
         return Ok(None);
+    }
+    if saw_missing && declared.is_some() {
+        return Err(reject(
+            "conflicting native dtype evidence across records".into(),
+        ));
     }
     match declared {
         Some(dtype) => decode_typed_field(name, rows, dtype, &reject, &unsupported),
@@ -1008,7 +1095,11 @@ fn decode_typed_field(
             (0..rows.len())
                 .map(|index| match get(index) {
                     None | Some(Json::Null) => Ok(None),
-                    Some(Json::Number(number)) => number
+                    // Float carriers only: an integer-form number converts
+                    // through `as_f64`, which rounds magnitudes above 2^53.
+                    // Integers belong under an integer declaration; here they
+                    // reject, consistently fail-closed.
+                    Some(Json::Number(number)) if number.is_f64() => number
                         .as_f64()
                         .map(Some)
                         .ok_or_else(|| reject(format!("declared Float64 but found {number}"))),
@@ -1018,12 +1109,13 @@ fn decode_typed_field(
         ))),
         "Float32" => {
             // Widening `f32` to `f64` is value-identical; anything that does
-            // not round-trip is rejected rather than rounded.
+            // not round-trip is rejected rather than rounded. Integer-form
+            // carriers reject here for the same reason as Float64.
             let mut out: Vec<Option<f32>> = Vec::with_capacity(rows.len());
             for index in 0..rows.len() {
                 match get(index) {
                     None | Some(Json::Null) => out.push(None),
-                    Some(Json::Number(number)) => {
+                    Some(Json::Number(number)) if number.is_f64() => {
                         let value = number.as_f64().ok_or_else(|| {
                             reject(format!("declared Float32 but found {number}"))
                         })?;
@@ -1122,7 +1214,15 @@ fn decode_typed_field(
                     ))
                 })
         }
-        "Null" => Ok(None),
+        "Null" => {
+            // Unknown type: only all-null decodes (as absence). A non-null
+            // value under an unknown declaration is corruption, not a cue to
+            // invent a schema around it.
+            if present_count(rows, name) > 0 {
+                return Err(reject("non-null value under unknown native type".into()));
+            }
+            Ok(None)
+        }
         _ => Err(unsupported(
             dtype.to_owned(),
             "no native union encoding carries this type yet; normalize upstream in enrichment",

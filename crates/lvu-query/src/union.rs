@@ -29,6 +29,7 @@
 //! surfaced as `Err`: the candidate is rejected, the prior union stands, and
 //! normalization stays where it belongs — ordinary upstream enrichment.
 
+use lvu_core::{ExactFieldConstraint, ExactScalar};
 use polars::prelude::*;
 
 /// Merge accepted typed frames into one timestamp-ordered frame.
@@ -91,5 +92,60 @@ pub fn union_sorted_frames(
             ],
             SortMultipleOptions::default().with_nulls_last(true),
         )
+        .map_err(|error| error.to_string())
+}
+
+/// Apply one exact typed key over a merged union frame: native Polars
+/// equality against the ACTUAL merged typed column, never the legacy
+/// `_lvu_exact_correlation_value` token projection.
+///
+/// This is the single canonical exact-key predicate for unions (correlation
+/// replacement): the worker applies it after concat/dedup alongside search,
+/// and the correlation controller resolves the selected key value through
+/// frozen precise replay before submitting. One DTO
+/// (`lvu_core::ExactFieldConstraint`), one predicate, no second evaluator.
+///
+/// Semantics: a missing column matches nothing (same as the search path's
+/// absent-column rule); null cells never match (Polars three-valued
+/// equality); a carrier/dtype mismatch rejects the candidate instead of
+/// silently coercing (float/int mixing, string/number mixing, bool/anything
+/// mixing). Integer widening within one signedness is exact and allowed;
+/// float comparison runs in binary64, which is exact for finite values.
+pub fn exact_key_filter(
+    frame: DataFrame,
+    constraint: &ExactFieldConstraint,
+) -> Result<DataFrame, String> {
+    constraint.validate().map_err(|error| error.to_string())?;
+    let field = constraint.field();
+    let Ok(column) = frame.column(field) else {
+        return Ok(frame.clear());
+    };
+    if matches!(constraint.value(), ExactScalar::Null) {
+        return Ok(frame.clear());
+    }
+    let predicate = match (column.dtype(), constraint.value()) {
+        (DataType::String, ExactScalar::String(value)) => col(field).eq(lit(value.clone())),
+        (DataType::Boolean, ExactScalar::Bool(value)) => col(field).eq(lit(*value)),
+        (
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
+            ExactScalar::SignedInteger(value),
+        ) => col(field).eq(lit(*value)),
+        (
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64,
+            ExactScalar::UnsignedInteger(value),
+        ) => col(field).eq(lit(*value)),
+        (DataType::Float32 | DataType::Float64, ExactScalar::FloatBits(bits)) => {
+            col(field).eq(lit(f64::from_bits(*bits)))
+        }
+        (dtype, scalar) => {
+            return Err(format!(
+                "exact key on {field:?} needs a matching column type, found {dtype:?} for {scalar:?}"
+            ));
+        }
+    };
+    frame
+        .lazy()
+        .filter(predicate)
+        .collect()
         .map_err(|error| error.to_string())
 }

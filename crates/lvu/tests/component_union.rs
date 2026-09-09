@@ -13,15 +13,20 @@ mod union_dialog;
 use std::collections::HashMap;
 use union_dialog::{AcceptedUnion, UnionDialog};
 
-fn revisions(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+/// Accepted (revision, generation) per input view.
+fn states(pairs: &[(&str, u64, u64)]) -> HashMap<String, (u64, u64)> {
     pairs
         .iter()
-        .map(|(view, revision)| ((*view).to_owned(), *revision))
+        .map(|(view, revision, generation)| ((*view).to_owned(), (*revision, *generation)))
         .collect()
 }
 
-fn current(map: &HashMap<String, u64>) -> impl Fn(&str) -> Option<u64> + '_ {
-    move |view| map.get(view).copied()
+fn current_revision(map: &HashMap<String, (u64, u64)>) -> impl Fn(&str) -> Option<u64> + '_ {
+    move |view| map.get(view).map(|state| state.0)
+}
+
+fn current_generation(map: &HashMap<String, (u64, u64)>) -> impl Fn(&str) -> Option<u64> + '_ {
+    move |view| map.get(view).map(|state| state.1)
 }
 
 fn draft_with(inputs: &[&str]) -> UnionDialog {
@@ -58,9 +63,11 @@ fn draft_rejects_self_reference() {
 
 #[test]
 fn accept_fences_on_current_revisions() {
-    let map = revisions(&[("view-a", 3), ("view-b", 5)]);
+    let map = states(&[("view-a", 3, 1), ("view-b", 5, 1)]);
     let mut dialog = draft_with(&["view-a", "view-b"]);
-    let accepted = dialog.accept("union", 1, current(&map)).unwrap();
+    let accepted = dialog
+        .accept("union", 1, current_revision(&map), current_generation(&map))
+        .unwrap();
     assert_eq!(
         accepted,
         AcceptedUnion {
@@ -69,10 +76,12 @@ fn accept_fences_on_current_revisions() {
                 union_dialog::UnionInputRef {
                     view_id: "view-a".into(),
                     accepted_revision: 3,
+                    applied_generation: 1,
                 },
                 union_dialog::UnionInputRef {
                     view_id: "view-b".into(),
                     accepted_revision: 5,
+                    applied_generation: 1,
                 },
             ],
             revision: 1,
@@ -83,9 +92,11 @@ fn accept_fences_on_current_revisions() {
 
 #[test]
 fn accept_rejects_unavailable_inputs_and_keeps_the_draft() {
-    let map = revisions(&[("view-a", 3)]);
+    let map = states(&[("view-a", 3, 1)]);
     let mut dialog = draft_with(&["view-a", "view-gone"]);
-    let error = dialog.accept("union", 1, current(&map)).unwrap_err();
+    let error = dialog
+        .accept("union", 1, current_revision(&map), current_generation(&map))
+        .unwrap_err();
     assert!(error.contains("view-gone"), "{error}");
     assert!(dialog.error().is_some());
     // The draft is intact for correction, not cleared by the failure.
@@ -97,18 +108,36 @@ fn accept_rejects_unavailable_inputs_and_keeps_the_draft() {
 
 #[test]
 fn rejection_preserves_accepted_and_stays_editable() {
-    let map = revisions(&[("view-a", 3), ("view-b", 5)]);
+    let map = states(&[("view-a", 3, 1), ("view-b", 5, 1)]);
     let mut dialog = draft_with(&["view-a", "view-b"]);
-    let accepted = dialog.accept("union", 1, current(&map)).unwrap();
+    let accepted = dialog
+        .accept("union", 1, current_revision(&map), current_generation(&map))
+        .unwrap();
     dialog.mark_pending(7);
     dialog.reject_candidate("engine refused the timestamp column");
     assert_eq!(dialog.error(), Some("engine refused the timestamp column"));
     assert_eq!(dialog.pending_generation(), None);
     // The accepted union the view keeps serving is untouched by the failure.
-    assert!(!UnionDialog::accepted_is_stale(&accepted, current(&map)));
+    assert!(!UnionDialog::accepted_is_stale(
+        &accepted,
+        current_revision(&map),
+        current_generation(&map)
+    ));
     let mut moved = map;
-    moved.insert("view-a".into(), 4);
-    assert!(UnionDialog::accepted_is_stale(&accepted, current(&moved)));
+    moved.insert("view-a".into(), (4, 1));
+    assert!(UnionDialog::accepted_is_stale(
+        &accepted,
+        current_revision(&moved),
+        current_generation(&moved)
+    ));
+    // A generation move alone (restart at the same revision) is stale too.
+    let mut restarted = states(&[("view-a", 3, 1), ("view-b", 5, 1)]);
+    restarted.insert("view-b".into(), (5, 2));
+    assert!(UnionDialog::accepted_is_stale(
+        &accepted,
+        current_revision(&restarted),
+        current_generation(&restarted)
+    ));
 }
 
 #[test]

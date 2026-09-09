@@ -703,6 +703,14 @@ pub struct ViewState {
     pub applied_query_revision: u64,
     pub desired_query_revision: u64,
     pub exact_field: Option<FieldCorrelation>,
+    /// Accepted union inputs, fenced on revision and generation. `Some`
+    /// marks this view as a live union over other views: its queries
+    /// translate to union candidates instead of source scans (the adapter
+    /// refuses ordinary queries for union views). `None` is an ordinary view.
+    pub union_inputs: Option<Vec<crate::components::union::UnionInputRef>>,
+    /// Last query generation this view accepted, for union input fencing.
+    /// Recorded from every accepted completion, ordinary or union.
+    pub applied_generation: u64,
     pub pinned_columns: Vec<String>,
     pub color_field: Option<String>,
     /// Accepted predicate colour rules: what the rows on screen were painted
@@ -898,6 +906,27 @@ pub struct PersistentViewState {
     pub fold_normalisation: crate::provider::FoldNormalisation,
     pub fold_expanded: Vec<RowId>,
     pub exact_field: Option<FieldCorrelation>,
+    /// Accepted union inputs for a union view: input view IDs fenced on
+    /// revision and generation, plus the union's own search text. `None` is
+    /// an ordinary view. Persisted additively like every other presentation
+    /// field; restore reinstalls it into `ViewState.union_inputs` and the
+    /// shell resubmits the merge (query work, never capture).
+    pub union: Option<PersistentUnion>,
+}
+
+/// One persisted union input reference.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PersistentUnionInput {
+    pub view_id: String,
+    pub accepted_revision: u64,
+    pub applied_generation: u64,
+}
+
+/// A union view's persisted definition: fenced inputs plus its own search.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PersistentUnion {
+    pub inputs: Vec<PersistentUnionInput>,
+    pub filter: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2495,6 +2524,66 @@ impl Views {
         Some(revision)
     }
 
+    /// Fresh revision+ generation fence for a union view's inputs, read live
+    /// from view states. Shared by creation and every resubmit so submit-time
+    /// fencing cannot drift from the dialog's: unknown or closed inputs fail
+    /// with the input named.
+    pub(crate) fn union_fence(
+        &self,
+        view_id: &str,
+    ) -> Result<Vec<crate::components::union::UnionInputRef>, String> {
+        let inputs = self
+            .states
+            .get(view_id)
+            .and_then(|state| state.union_inputs.clone())
+            .ok_or_else(|| "unknown union view".to_owned())?;
+        let ids: Vec<String> = inputs.iter().map(|input| input.view_id.clone()).collect();
+        crate::components::union::fence_union_inputs(
+            &ids,
+            |id| {
+                self.states
+                    .get(id)
+                    .map(|state| state.applied_query_revision)
+            },
+            |id| self.states.get(id).map(|state| state.applied_generation),
+        )
+    }
+
+    /// Enqueue a union refresh: the current desired constraints re-submitted
+    /// at a new revision for translation into a fenced union candidate. Used
+    /// for live-append refresh, never for edits (those flow through the
+    /// ordinary editor submits, which land in the same queue).
+    pub(crate) fn enqueue_union_refresh(&mut self, view_id: &str) -> Option<u64> {
+        let key = (view_id.to_owned(), QueryPurpose::Search);
+        if !self.requests.contains_key(&key) && self.requests.len() >= MAX_PENDING_QUERY_REQUESTS {
+            return None;
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let state = self.states.get_mut(view_id)?;
+        let base_revision = state.applied_query_revision;
+        let base_constraints = applied_constraints(state);
+        let constraints = state.desired_constraints.clone();
+        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
+        let revision = state.desired_query_revision;
+        state.search.pending_generation = Some(generation);
+        state.search.pending_revision = Some(revision);
+        state.search.pending_value = Some(state.search.applied.clone());
+        self.requests.insert(
+            key,
+            QueryRequest {
+                view_id: view_id.to_owned(),
+                generation,
+                revision,
+                base_revision,
+                base_constraints,
+                purpose: QueryPurpose::Search,
+                constraints,
+            },
+        );
+        Some(revision)
+    }
+
     /// Enqueue a whole replacement enrichment chain (a removal or a reorder),
     /// as opposed to `enqueue_value`'s single-step add or edit. Moved verbatim
     /// out of `App` for step 13: the enrichment list is a component now and
@@ -3603,6 +3692,17 @@ impl App {
             fold_normalisation: state.fold_normalisation,
             fold_expanded: state.fold_expanded.clone(),
             exact_field: state.exact_field.clone(),
+            union: state.union_inputs.as_ref().map(|inputs| PersistentUnion {
+                inputs: inputs
+                    .iter()
+                    .map(|input| PersistentUnionInput {
+                        view_id: input.view_id.clone(),
+                        accepted_revision: input.accepted_revision,
+                        applied_generation: input.applied_generation,
+                    })
+                    .collect(),
+                filter: state.search.applied.clone(),
+            }),
         })
     }
 
@@ -3613,6 +3713,15 @@ impl App {
             .states
             .get(view_id)
             .map(|state| state.user_interaction_revision)
+    }
+
+    /// A view's accepted (revision, generation) for union input fencing.
+    /// `None` for unknown views; the union submitter reports those by name.
+    pub fn view_accepted_state(&self, view_id: &str) -> Option<(u64, u64)> {
+        self.views
+            .states
+            .get(view_id)
+            .map(|state| (state.applied_query_revision, state.applied_generation))
     }
 
     pub fn view_definition_revision(&self, view_id: &str) -> Option<u64> {
@@ -3799,6 +3908,19 @@ impl App {
     /// whole mapping so the user can adjust it; the origin view is untouched.
     pub fn correlation_accept_failed(&mut self, generation: u64, message: String) -> bool {
         self.layers.correlation.accept_failed(generation, message)
+    }
+
+    /// A union creation the shell refused after the dialog closed. The draft
+    /// survives inside the layer with the reason shown; the caller re-pushes
+    /// the layer so the user can adjust the selection instead of rebuilding
+    /// it. Nothing about any existing view changed.
+    pub fn union_create_failed(&mut self, message: String) {
+        self.layers.union.create_failed(message);
+    }
+
+    /// Close the union dialog after the shell created its view.
+    pub fn close_union_dialog(&mut self) {
+        self.close_layer(LayerId::Union);
     }
 
     /// The correlated view exists. Close the mapping layer and say so.
@@ -4128,6 +4250,37 @@ impl App {
         // so the previous value is what that request is fenced against.
         let previous_exact_field = state.exact_field.take();
         state.exact_field = restored.exact_field.clone();
+        // A union is accepted state or nothing, like a correlation: the
+        // stored input fence reinstalls here, and the request below re-merges
+        // (query work, never capture). Restores carrying editors unions
+        // cannot run yet — enrichment, advanced filters, time windows — are
+        // refused rather than half-installed.
+        let restored_union = restored.union.clone();
+        if let Some(union) = restored_union.as_ref() {
+            if !restored.applied_enrichments.is_empty()
+                || !restored.applied_enrichment.is_empty()
+                || !restored.applied_advanced.is_empty()
+                || restored.applied_capture_time.is_some()
+            {
+                return false;
+            }
+            if union.inputs.len() < 2 || union.inputs.len() > 8 {
+                return false;
+            }
+            state.union_inputs = Some(
+                union
+                    .inputs
+                    .iter()
+                    .map(|input| crate::components::union::UnionInputRef {
+                        view_id: input.view_id.clone(),
+                        accepted_revision: input.accepted_revision,
+                        applied_generation: input.applied_generation,
+                    })
+                    .collect(),
+            );
+        } else {
+            state.union_inputs = None;
+        }
         state.search.draft = restored.search_draft;
         state.search.error = restored.search_error;
         state.advanced.draft = restored.advanced_draft;
@@ -4193,7 +4346,14 @@ impl App {
             resolve_capture_time_policy(policy, self.shell.clock_now_unix_nanos)
         });
         let constraints = QueryConstraints {
-            text: nonempty_text(&restored.applied_search),
+            text: nonempty_text(if restored_union.is_some() {
+                restored_union
+                    .as_ref()
+                    .map(|union| union.filter.as_str())
+                    .unwrap_or_default()
+            } else {
+                restored.applied_search.as_str()
+            }),
             exact_field: restored.exact_field.clone(),
             advanced_polars: nonempty(&restored.applied_advanced),
             enrichments: if restored.applied_enrichments.is_empty() {
@@ -4208,7 +4368,11 @@ impl App {
             grouping: nonempty(&restored.applied_grouping),
             color_rules: restored.color_rules.clone(),
         };
-        let purpose = if !constraints.enrichments.is_empty() {
+        let purpose = if restored_union.is_some() {
+            // Union restores re-merge through the union pipeline, which runs
+            // text search only; anything fancier was refused above.
+            QueryPurpose::Search
+        } else if !constraints.enrichments.is_empty() {
             QueryPurpose::Enrichment
         } else if constraints.advanced_polars.is_some() {
             QueryPurpose::Advanced
@@ -4235,23 +4399,30 @@ impl App {
         };
         state.search.pending_generation = Some(generation);
         state.search.pending_revision = Some(revision);
-        state.search.pending_value = Some(restored.applied_search);
-        state.advanced.pending_generation = Some(generation);
-        state.advanced.pending_revision = Some(revision);
-        state.advanced.pending_value = Some(restored.applied_advanced);
-        state.enrichment.pending_generation = Some(generation);
-        state.enrichment.pending_revision = Some(revision);
-        state.enrichment.pending_value = Some(restored.applied_enrichment);
+        state.search.pending_value = Some(
+            restored_union
+                .as_ref()
+                .map(|union| union.filter.clone())
+                .unwrap_or(restored.applied_search),
+        );
+        if restored_union.is_none() {
+            state.advanced.pending_generation = Some(generation);
+            state.advanced.pending_revision = Some(revision);
+            state.advanced.pending_value = Some(restored.applied_advanced);
+            state.enrichment.pending_generation = Some(generation);
+            state.enrichment.pending_revision = Some(revision);
+            state.enrichment.pending_value = Some(restored.applied_enrichment);
+            state.pending_time = Some(PendingTime {
+                generation,
+                revision,
+                value: constraints.capture_time,
+                policy: restored_policy,
+                basis: restored.applied_time_basis,
+            });
+        }
         state.grouping.pending_generation = Some(generation);
         state.grouping.pending_revision = Some(revision);
         state.grouping.pending_value = Some(restored.applied_grouping);
-        state.pending_time = Some(PendingTime {
-            generation,
-            revision,
-            value: constraints.capture_time,
-            policy: restored_policy,
-            basis: restored.applied_time_basis,
-        });
         self.views.requests.insert(
             (view_id.to_owned(), purpose),
             QueryRequest {
@@ -5409,11 +5580,63 @@ impl App {
 
     /// At most one unsent request per view and purpose is retained.
     pub fn take_query_requests(&mut self) -> Vec<QueryRequest> {
-        self.views
+        // Union views translate separately (`take_union_requests`): ordinary
+        // source scans must never run for them, and the adapter refuses such
+        // queries outright. Both drains partition the same queue.
+        let ordinary: Vec<(String, QueryPurpose)> = self
+            .views
             .requests
-            .drain()
-            .map(|(_, request)| request)
+            .keys()
+            .filter(|(view_id, _)| !self.is_union_view(view_id))
+            .cloned()
+            .collect();
+        ordinary
+            .into_iter()
+            .filter_map(|key| self.views.requests.remove(&key))
             .collect()
+    }
+
+    /// Whether a view is a live union over other views. Union queries never
+    /// enter the ordinary source-scan pipeline (the adapter refuses them);
+    /// they translate to union candidates through `take_union_requests`.
+    pub fn is_union_view(&self, view_id: &str) -> bool {
+        self.views
+            .states
+            .get(view_id)
+            .is_some_and(|state| state.union_inputs.is_some())
+    }
+
+    /// Drain queued requests for union views, leaving ordinary ones for
+    /// `take_query_requests`. Both drain the same queue by partition, in
+    /// either call order, so the terminal loop needs no union branch.
+    pub fn take_union_requests(&mut self) -> Vec<QueryRequest> {
+        let unioned: Vec<(String, QueryPurpose)> = self
+            .views
+            .requests
+            .keys()
+            .filter(|(view_id, _)| self.is_union_view(view_id))
+            .cloned()
+            .collect();
+        unioned
+            .into_iter()
+            .filter_map(|key| self.views.requests.remove(&key))
+            .collect()
+    }
+
+    /// Fresh revision+generation fence for a union view's inputs, for the
+    /// shell's candidate submissions (creation, resubmit, refresh).
+    pub fn union_fence(
+        &self,
+        view_id: &str,
+    ) -> Result<Vec<crate::components::union::UnionInputRef>, String> {
+        self.views.union_fence(view_id)
+    }
+
+    /// Enqueue a live-append refresh for a union view: current desired
+    /// constraints re-submitted for translation into a fenced candidate.
+    /// Returns the new revision, or `None` when the submit queue is full.
+    pub fn enqueue_union_refresh(&mut self, view_id: &str) -> Option<u64> {
+        self.views.enqueue_union_refresh(view_id)
     }
 
     /// Enqueues due live searches. Tests pass a future instant to avoid sleeps.
@@ -5560,6 +5783,84 @@ impl App {
         accepted
     }
 
+    /// Accepts a finished union job for a union view. Union candidates never
+    /// enter the ordinary query pipeline, so their completions arrive here
+    /// (drained from the adapter beside query completions) rather than
+    /// through `apply_query_completion`. Only editors a union submit can
+    /// carry — search, advanced, grouping and colour rules — settle here;
+    /// enrichment and time edits are refused before submission, so they can
+    /// never be pending on one. A revision mismatch or an unknown generation
+    /// means stale or superseded: ignored like its ordinary counterpart.
+    pub fn apply_union_completion(
+        &mut self,
+        view_id: &str,
+        union_revision: u64,
+        generation: u64,
+        error: Option<String>,
+    ) -> bool {
+        let Some(state) = self.views.states.get_mut(view_id) else {
+            return false;
+        };
+        if state.union_inputs.is_none() || union_revision != state.desired_query_revision {
+            return false;
+        }
+        let pending = [&state.search, &state.advanced, &state.grouping]
+            .into_iter()
+            .any(|editor| editor.pending_generation == Some(generation))
+            || state
+                .pending_color_rules
+                .is_some_and(|(pending, _)| pending == generation);
+        if !pending {
+            return false;
+        }
+        match error {
+            None => {
+                let constraints = state.desired_constraints.clone();
+                state.search.applied = constraint_text(&constraints);
+                state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
+                state.grouping.applied = constraints.grouping.clone().unwrap_or_default();
+                state.color_rules = constraints.color_rules.clone();
+                if state
+                    .pending_color_rules
+                    .is_some_and(|(_, revision)| revision <= union_revision)
+                {
+                    state.pending_color_rules = None;
+                    state.color_rules_error = None;
+                }
+                state.applied_query_revision = union_revision;
+                state.applied_generation = generation;
+                clear_accepted_pending(&mut state.search, union_revision);
+                clear_accepted_pending(&mut state.advanced, union_revision);
+                clear_accepted_pending(&mut state.grouping, union_revision);
+                if state.search.draft == state.search.applied {
+                    state.search.error = None;
+                }
+                if state.advanced.draft == state.advanced.applied {
+                    state.advanced.error = None;
+                }
+                if state.grouping.draft == state.grouping.applied {
+                    state.grouping.error = None;
+                }
+            }
+            Some(message) => {
+                for editor in [&mut state.search, &mut state.advanced, &mut state.grouping] {
+                    if editor.pending_generation == Some(generation) {
+                        editor.pending_generation = None;
+                        editor.pending_revision = None;
+                        editor.pending_value = None;
+                        editor.error = Some(message.clone());
+                    }
+                }
+                if state.pending_color_rules == Some((generation, union_revision)) {
+                    state.pending_color_rules = None;
+                    state.color_rules_error = Some(message.clone());
+                }
+                state.desired_constraints = applied_constraints(state);
+            }
+        }
+        true
+    }
+
     fn apply_query_completion_inner(&mut self, completion: QueryCompletion) -> bool {
         let Some(state) = self.views.states.get_mut(&completion.view_id) else {
             return false;
@@ -5584,6 +5885,7 @@ impl App {
                         }
                         state.source_ids = sources;
                         state.applied_query_revision = completion.revision;
+                        state.applied_generation = completion.generation;
                         self.action_notice =
                             Some("view sources updated; source order, then record sequence".into());
                     }
@@ -5733,6 +6035,7 @@ impl App {
                     state.applied_time_field = constraints.time_field.clone();
                 }
                 state.applied_query_revision = completion.revision;
+                state.applied_generation = completion.generation;
                 if state
                     .pending_recipe
                     .as_ref()
@@ -6132,6 +6435,7 @@ impl App {
             Open::Ask(params) => layers.ask.open(params, &mut ctx),
             Open::Investigation => layers.investigation.open((), &mut ctx),
             Open::Correlation(params) => layers.correlation.open(params, &mut ctx),
+            Open::Union => layers.union.open((), &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
@@ -6229,6 +6533,7 @@ impl App {
             LayerId::Ask => dispatch_raw(&mut layers.ask, event, &mut ctx),
             LayerId::Investigation => dispatch_raw(&mut layers.investigation, event, &mut ctx),
             LayerId::Correlation => dispatch_raw(&mut layers.correlation, event, &mut ctx),
+            LayerId::Union => dispatch_raw(&mut layers.union, event, &mut ctx),
             LayerId::ViewSummary => dispatch_raw(&mut layers.view_summary, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
@@ -6280,6 +6585,7 @@ impl App {
             LayerId::Ask => layers.ask.action_labels(&ctx),
             LayerId::Investigation => layers.investigation.action_labels(&ctx),
             LayerId::Correlation => layers.correlation.action_labels(&ctx),
+            LayerId::Union => layers.union.action_labels(&ctx),
             LayerId::ViewSummary => layers.view_summary.action_labels(&ctx),
         }
     }
@@ -6312,6 +6618,7 @@ impl App {
             LayerId::Ask => layers.ask.text_focus(),
             LayerId::Investigation => layers.investigation.text_focus(),
             LayerId::Correlation => layers.correlation.text_focus(),
+            LayerId::Union => layers.union.text_focus(),
             LayerId::ViewSummary => layers.view_summary.text_focus(),
         }
     }
@@ -6384,6 +6691,7 @@ impl App {
             LayerId::Correlation => layers
                 .correlation
                 .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Union => layers.union.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::ViewSummary => layers
                 .view_summary
                 .handle(ComponentEvent::Command(id), &mut ctx),
@@ -6473,6 +6781,9 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Correlation => layers
                     .correlation
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Union => layers
+                    .union
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::ViewSummary => layers
                     .view_summary
@@ -6616,6 +6927,13 @@ impl App {
                 .commands(&self.views)
                 .into_iter()
                 .map(|entry| (LayerId::Correlation, entry)),
+        );
+        entries.extend(
+            self.layers
+                .union
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Union, entry)),
         );
         entries
     }

@@ -19,6 +19,7 @@ pub use union::{
     detect_union_cycle, frozen_identity_snapshot, merge_union_rows, union_frozen_inputs,
     union_input_stale, union_typed_frames, validate_union_spec,
 };
+pub use union_worker::UnionTestBarrier;
 
 mod appended;
 

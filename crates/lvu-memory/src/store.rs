@@ -992,6 +992,11 @@ pub struct PresentationState {
     /// Exact typed equality installed by an accepted cross-source correlation.
     #[serde(default)]
     pub exact_field: Option<lvu_core::FieldCorrelation>,
+    /// Accepted union inputs for a union view, plus its own search text.
+    /// Additive like every other presentation field: an older binary ignores
+    /// the key and a newer one defaults it, so no schema bump.
+    #[serde(default)]
+    pub union: Option<StoredUnion>,
     #[serde(default)]
     pub applied_enrichment: Option<String>,
     /// None means legacy single-stage state. Some([]) is explicitly cleared.
@@ -1099,6 +1104,27 @@ pub struct StoredEnrichment {
     /// Present on a command step: the saved definition, never a result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<lvu_core::CommandDefinition>,
+}
+
+/// One accepted union input: the input view ID fenced on revision and
+/// generation. Shape-locked with `lvu::PersistentUnionInput` by construction.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StoredUnionInput {
+    #[serde(default)]
+    pub view_id: String,
+    #[serde(default)]
+    pub accepted_revision: u64,
+    #[serde(default)]
+    pub applied_generation: u64,
+}
+
+/// A union view's persisted definition: fenced inputs plus its own search.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StoredUnion {
+    #[serde(default)]
+    pub inputs: Vec<StoredUnionInput>,
+    #[serde(default)]
+    pub filter: String,
 }
 
 /// One command step's run state: its definition revision and the reference

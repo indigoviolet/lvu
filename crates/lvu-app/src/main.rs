@@ -745,6 +745,11 @@ struct Composition {
     retire_ai_session: bool,
     ai_session_busy: bool,
     source_ai_work: Option<SourceAiWork>,
+    /// Union revisions with a candidate in flight, by union view ID. A view
+    /// stays here from submit until its completion lands, so live-append
+    /// refresh never resubmits over a running job (each submit would cancel
+    /// and restart it, starving publication forever).
+    union_inflight: HashMap<String, u64>,
     source_ai_session: Option<(String, u64)>,
     source_ai_session_config: Option<SessionConfig>,
     deferred_owned_lifecycle_events: VecDeque<BridgeEvent>,
@@ -957,6 +962,7 @@ impl Composition {
         changed |= self.handle_view_forks(app, adapter);
         changed |= self.handle_view_requests(app, adapter);
         changed |= self.handle_correlation(app, adapter);
+        changed |= self.handle_union(app, adapter);
         changed |= self.handle_field_stats(app, adapter);
         changed |= self.handle_command_enrichment(app, adapter);
         changed |= self.queue_memory_saves(app, false);
@@ -3678,6 +3684,279 @@ impl Composition {
         ))
     }
 
+    /// The accepted union draft becomes a registered union view over the
+    /// deduped union of its inputs' sources, named for its inputs. Like a
+    /// correlated view it is installed through the ordinary restore path —
+    /// which enqueues its first merge as a union `QueryRequest` — so
+    /// creation, restart and the translator share one submission shape.
+    /// Failures name the input or source that is gone; nothing is
+    /// half-registered.
+    fn open_union_view(
+        &mut self,
+        app: &mut App,
+        adapter: &mut NativeViewAdapter,
+        inputs: Vec<String>,
+    ) -> Result<String, String> {
+        eprintln!("UNION-TRACE open_union_view inputs={inputs:?}");
+        if inputs.len() < 2 {
+            return Err("a union needs at least two input views".into());
+        }
+        let mut names = Vec::with_capacity(inputs.len());
+        let mut source_ids: Vec<String> = Vec::new();
+        for input in &inputs {
+            let Some(item) = app.views().iter().find(|view| &view.id == input) else {
+                return Err(format!("input view '{input}' is no longer open"));
+            };
+            names.push(item.name.clone());
+            for source in app.view_source_ids(input) {
+                if !source_ids.contains(&source) {
+                    source_ids.push(source);
+                }
+            }
+        }
+        if source_ids.is_empty() {
+            return Err("the input views carry no sources".into());
+        }
+        let primary = source_ids.first().cloned().expect("checked");
+        if let Some(error) = view_admission_error(app, &primary) {
+            return Err(error.into());
+        }
+        let mut uuids = Vec::with_capacity(source_ids.len());
+        for id in &source_ids {
+            let uuid = Uuid::parse_str(id).map_err(|error| format!("source identity: {error}"))?;
+            if !self.sources.contains_key(&SourceId(uuid)) {
+                return Err("an input source is no longer open".into());
+            }
+            uuids.push(SourceId(uuid));
+        }
+        let name = format!("Union of {}", names.join(", "));
+        self.memory_sequence = self.memory_sequence.saturating_add(1);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let new_id = Uuid::new_v5(
+            &SOURCE_NAMESPACE,
+            format!(
+                "union-view:{primary}:{nonce}:{}:{name}",
+                self.memory_sequence
+            )
+            .as_bytes(),
+        )
+        .to_string();
+        adapter
+            .register_union_view(&new_id, uuids)
+            .map_err(|error| format!("register union view: {error}"))?;
+        app.add_view(lvu::ViewItem {
+            id: new_id.clone(),
+            source_id: primary,
+            name: name.clone(),
+        });
+        // Fence now: every input's current accepted state travels in the
+        // persisted shape, so restore and the first submit agree exactly.
+        let fenced: Vec<lvu::PersistentUnionInput> = inputs
+            .iter()
+            .map(|input| {
+                app.view_accepted_state(input)
+                    .map(|(revision, generation)| lvu::PersistentUnionInput {
+                        view_id: input.clone(),
+                        accepted_revision: revision,
+                        applied_generation: generation,
+                    })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "an input view is no longer open".to_owned())?;
+        let restored = lvu::PersistentViewState {
+            source_ids: source_ids.clone(),
+            view_name: name.clone(),
+            union: Some(lvu::PersistentUnion {
+                inputs: fenced,
+                filter: String::new(),
+            }),
+            ..lvu::PersistentViewState::default()
+        };
+        if !app.restore_persistent_view(&new_id, restored) {
+            adapter.unregister_union_view(&new_id);
+            return Err("the union view could not be installed".into());
+        }
+        let memory_id =
+            lvu_core::ViewId(Uuid::parse_str(&new_id).expect("generated view identity"));
+        self.memory_load_fences.insert(
+            memory_id,
+            app.view_interaction_revision(&new_id).unwrap_or_default(),
+        );
+        app.select_view(&new_id);
+        Ok(format!(
+            "{name} across {} source{}",
+            source_ids.len(),
+            if source_ids.len() == 1 { "" } else { "s" }
+        ))
+    }
+
+    /// Translate one queued request for a union view into a fenced union
+    /// candidate. Text search and presentation-only grouping/colour rules
+    /// pass through (the worker runs text search itself); advanced filters,
+    /// enrichment and time windows are refused here — before any freeze is
+    /// spent — with the input-preserving error the editor shows. Unknown or
+    /// closed inputs fail the same way, and every failure preserves the
+    /// prior union through the ordinary editor-error path.
+    fn submit_union_request(
+        &mut self,
+        app: &mut App,
+        adapter: &mut NativeViewAdapter,
+        request: lvu::QueryRequest,
+    ) -> bool {
+        let view_id = request.view_id.clone();
+        let revision = request.revision;
+        let generation = request.generation;
+        let fail = |app: &mut App, message: String| {
+            app.apply_union_completion(&view_id, revision, generation, Some(message));
+        };
+        if request.constraints.advanced_polars.is_some() {
+            fail(
+                app,
+                "advanced (pl.) filters are not supported over unions yet; filter the input views instead".into(),
+            );
+            return true;
+        }
+        if !request.constraints.enrichments.is_empty() || request.constraints.enrichment.is_some() {
+            fail(
+                app,
+                "enrichment over unions is not supported yet; enrich the input views instead"
+                    .into(),
+            );
+            return true;
+        }
+        if request.constraints.capture_time.is_some() {
+            fail(app, "time windows over unions are not supported yet".into());
+            return true;
+        }
+        if request.constraints.exact_field.is_some() {
+            fail(app, "correlations cannot be combined with unions".into());
+            return true;
+        }
+        let fences = match app.union_fence(&view_id) {
+            Ok(fences) => fences,
+            Err(message) => {
+                fail(app, message);
+                return true;
+            }
+        };
+        let candidate = lvu_view::UnionCandidateSpec {
+            union_view_id: view_id.clone(),
+            union_revision: revision,
+            generation,
+            inputs: fences
+                .into_iter()
+                .map(|input| lvu_view::StoredUnionInput {
+                    view_id: input.view_id,
+                    accepted_revision: input.accepted_revision,
+                    applied_generation: input.applied_generation,
+                })
+                .collect(),
+            filter: lvu_view::UnionFilterSpec {
+                search: request
+                    .constraints
+                    .text
+                    .map(|text| text.literal)
+                    .unwrap_or_default(),
+                // The correlation-replacement typed key never travels on the
+                // legacy QueryConstraints.exact_field path (which stays
+                // rejected for unions); its controller submits candidates
+                // carrying exact_key directly.
+                exact_key: None,
+            },
+        };
+        let graph: std::collections::HashMap<String, Vec<String>> = app
+            .views()
+            .iter()
+            .filter(|view| app.is_union_view(&view.id))
+            .filter_map(|view| {
+                adapter
+                    .union_inputs(&view.id)
+                    .map(|inputs| (view.id.clone(), inputs))
+            })
+            .map(|(id, inputs)| (id, inputs.into_iter().map(|input| input.view_id).collect()))
+            .collect();
+        let resolve = |id: &str| graph.get(id).cloned();
+        match adapter.submit_union_candidate(candidate, &resolve) {
+            Ok(()) => {
+                self.union_inflight.insert(view_id, revision);
+            }
+            Err(message) => {
+                fail(app, message);
+            }
+        }
+        true
+    }
+
+    /// Union dialog creations, union resubmits and union completions: the
+    /// whole application side of live union views, beside the correlation
+    /// handler. Dialog drafts become registered views here; queued
+    /// `QueryRequest`s for union views translate into fenced union
+    /// candidates (ordinary source scans are refused for them); finished
+    /// jobs settle editor state through `apply_union_completion`; and input
+    /// advances resubmit through the ordinary refresh path.
+    fn handle_union(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
+        let mut changed = false;
+        for request in app.layers.union.take_requests() {
+            changed = true;
+            let lvu::UnionDialogRequest::Create { inputs } = request;
+            match self.open_union_view(app, adapter, inputs) {
+                Ok(notice) => {
+                    app.action_notice = Some(notice);
+                    app.close_union_dialog();
+                }
+                Err(message) => {
+                    app.union_create_failed(message);
+                }
+            }
+        }
+        for request in app.take_union_requests() {
+            changed = true;
+            self.submit_union_request(app, adapter, request);
+        }
+        for completion in adapter.take_union_completions() {
+            changed = true;
+            self.union_inflight.remove(&completion.union_view_id);
+            app.apply_union_completion(
+                &completion.union_view_id,
+                completion.union_revision,
+                completion.generation,
+                completion.error,
+            );
+        }
+        // Live-append refresh: any accepted input that moved past the
+        // published fence resubmits, unless a job is already in flight for
+        // that union (each submit supersedes, so resubmitting over a running
+        // job would starve publication forever).
+        for view in app.views().to_vec() {
+            if !app.is_union_view(&view.id) || self.union_inflight.contains_key(&view.id) {
+                continue;
+            }
+            let Some(accepted) = adapter.union_inputs(&view.id) else {
+                continue;
+            };
+            let current = match app.union_fence(&view.id) {
+                Ok(current) => current,
+                Err(_) => continue,
+            };
+            let moved = accepted.iter().any(|base| {
+                current
+                    .iter()
+                    .find(|live| live.view_id == base.view_id)
+                    .is_none_or(|live| {
+                        live.accepted_revision != base.accepted_revision
+                            || live.applied_generation != base.applied_generation
+                    })
+            }) || current.len() != accepted.len();
+            if moved && app.enqueue_union_refresh(&view.id).is_some() {
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn handle_view_requests(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let requests = app.layers.view.outbox.take();
         let changed = !requests.is_empty();
@@ -3944,7 +4223,34 @@ impl Composition {
                             memory_notice(app, format!("restore view {:?}: {error}", value.name));
                             continue;
                         }
-                        if let Err(error) = adapter.register_view(&ui_id, sources.clone()) {
+                        if value.presentation.union.is_some() {
+                            // Union views register their merged membership,
+                            // never an ordinary source scan.
+                            let mut uuids = Vec::with_capacity(sources.len());
+                            let mut bad = None;
+                            for id in &sources {
+                                if self.sources.contains_key(id) {
+                                    uuids.push(*id);
+                                } else {
+                                    bad = Some(*id);
+                                    break;
+                                }
+                            }
+                            if let Some(id) = bad {
+                                memory_notice(
+                                    app,
+                                    format!(
+                                        "restore union {:?}: source {id:?} unavailable",
+                                        value.name
+                                    ),
+                                );
+                                continue;
+                            }
+                            if let Err(error) = adapter.register_union_view(&ui_id, uuids) {
+                                memory_notice(app, format!("restore union: {error}"));
+                                continue;
+                            }
+                        } else if let Err(error) = adapter.register_view(&ui_id, sources.clone()) {
                             memory_notice(app, format!("restore view: {error}"));
                             continue;
                         }
@@ -3957,7 +4263,8 @@ impl Composition {
                     // The role always comes from persisted metadata, including
                     // for a view this session created before the load finished.
                     app.set_view_role(&ui_id, view_role(value.role));
-                    if adapter.view_sources(&ui_id).as_ref() != Some(&sources)
+                    if value.presentation.union.is_none()
+                        && adapter.view_sources(&ui_id).as_ref() != Some(&sources)
                         && let Err(error) = adapter.register_view(&ui_id, sources)
                     {
                         memory_notice(app, format!("restore source membership: {error}"));
@@ -7307,6 +7614,7 @@ async fn run() -> Result<(), String> {
         retire_ai_session: false,
         ai_session_busy: false,
         source_ai_work: None,
+        union_inflight: HashMap::new(),
         source_ai_session: None,
         source_ai_session_config: None,
         deferred_owned_lifecycle_events: VecDeque::new(),
@@ -9354,6 +9662,7 @@ mod tests {
             retire_ai_session: false,
             ai_session_busy: false,
             source_ai_work: None,
+            union_inflight: HashMap::new(),
             source_ai_session: None,
             source_ai_session_config: None,
             deferred_owned_lifecycle_events: VecDeque::new(),
@@ -11015,6 +11324,7 @@ for line in sys.stdin:
             retire_ai_session: false,
             ai_session_busy: false,
             source_ai_work: None,
+            union_inflight: HashMap::new(),
             source_ai_session: None,
             source_ai_session_config: None,
             deferred_owned_lifecycle_events: VecDeque::new(),
@@ -11142,6 +11452,7 @@ for line in sys.stdin:
             retire_ai_session: false,
             ai_session_busy: false,
             source_ai_work: None,
+            union_inflight: HashMap::new(),
             source_ai_session: None,
             source_ai_session_config: None,
             deferred_owned_lifecycle_events: VecDeque::new(),

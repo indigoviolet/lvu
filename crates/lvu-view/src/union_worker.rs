@@ -28,9 +28,12 @@
 //! * After all inputs decode, the worker merges through
 //!   [`union_frozen_inputs`](super::union::union_frozen_inputs), then
 //!   publishes under ONE `shared` lock: input revisions/generations are
-//!   re-verified against the fence atomically with publication, so an input
-//!   that advanced mid-job aborts as stale instead of publishing a mixed
-//!   revision. Any failure preserves the prior published union.
+//!   re-verified against the adopted (frozen) fence atomically with
+//!   publication, so an input that advanced mid-job aborts as stale instead
+//!   of publishing a mixed revision. Submit-time skew from a live tail is
+//!   adopted at freeze time, never failed: only movement during the job's
+//!   own visit/merge window aborts. Any failure preserves the prior
+//!   published union.
 //! * Publication is an ordinary `Membership`: per-source surviving sequences
 //!   (ascending, for raw resolution through the existing provider),
 //!   `NO_BASIS_TIME` where the basis had no value, and `merge_keys` set to
@@ -90,6 +93,18 @@ pub(crate) enum FrozenDelivery {
     Failed(String),
 }
 
+/// Deterministic test instrumentation for the freeze/publish window.
+///
+/// The worker signals `frozen` once every input is frozen and visited, then
+/// waits for `release` before merging. Production jobs never carry one.
+/// This is how tests advance an input strictly inside the window instead of
+/// racing it: without a barrier the interleaving cannot be arranged on
+/// purpose, and sleep-based tests only prove the race is usually lost.
+pub struct UnionTestBarrier {
+    pub frozen: SyncSender<()>,
+    pub release: Receiver<()>,
+}
+
 /// Runtime state of one union view. Registration (`inputs`) is the accepted
 /// baseline; `pending` is the parked candidate; the rest is job plumbing.
 pub(crate) struct UnionViewState {
@@ -103,6 +118,9 @@ pub(crate) struct UnionViewState {
     cmd_rx: Option<Receiver<DriverCmd>>,
     frozen_tx: Option<SyncSender<FrozenDelivery>>,
     pending_delivery: Option<FrozenDelivery>,
+    /// One-shot deterministic test barrier for the next job only. Taken by
+    /// the worker at start; production code never sets it.
+    test_barrier: Option<UnionTestBarrier>,
     completed: VecDeque<UnionCompletion>,
 }
 
@@ -119,6 +137,7 @@ impl UnionViewState {
             cmd_rx: None,
             frozen_tx: None,
             pending_delivery: None,
+            test_barrier: None,
             completed: VecDeque::new(),
         }
     }
@@ -266,9 +285,11 @@ impl super::NativeViewAdapter {
     /// the dependency-graph cycle check run here on the caller's thread;
     /// `resolve` maps a union view ID to its stored inputs (`None` for
     /// ordinary views) and is supplied by the caller, which owns the
-    /// dependency graph. Revision fencing is per input at freeze time AND
-    /// atomically at publication: any input that moved aborts the job as
-    /// stale with the prior union preserved. A newer submit for the same
+    /// dependency graph. The submit-time fence travels with the candidate;
+    /// the worker adopts each input's frozen revisions at freeze time and
+    /// re-verifies the adopted fence atomically at publication, so only
+    /// movement during the job's own visit/merge window aborts as stale
+    /// with the prior union preserved. A newer submit for the same
     /// union supersedes: the older thread is cancelled and replaced.
     /// Union revisions must strictly increase; anything at or below the
     /// published revision is a no-op `Ok`, mirroring `submit_query`.
@@ -318,6 +339,7 @@ impl super::NativeViewAdapter {
             state.generation = state.generation.saturating_add(1);
             let generation = state.generation;
             let cancel = Arc::clone(&state.cancel);
+            let test_barrier = state.test_barrier.take();
             let ctx = UnionJobCtx {
                 spec: candidate.clone(),
                 generation,
@@ -328,6 +350,7 @@ impl super::NativeViewAdapter {
                 cmd_tx,
                 frozen_rx,
                 limits: UnionLimits::default(),
+                test_barrier,
             };
             let handle = thread::Builder::new()
                 .name("lvu-view-union".into())
@@ -350,6 +373,24 @@ impl super::NativeViewAdapter {
             out.extend(state.completed.drain(..));
         }
         out
+    }
+
+    /// Arm the deterministic freeze/publish barrier for the next job on this
+    /// union view. Test instrumentation only: production code never calls it,
+    /// and each barrier is consumed once. The worker signals `frozen` after
+    /// visiting every input and waits for `release` before merging, so tests
+    /// can advance an input strictly inside the window.
+    pub fn arm_union_test_barrier(
+        &self,
+        union_view_id: &str,
+        barrier: UnionTestBarrier,
+    ) -> Result<(), String> {
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        let Some(state) = shared.union_views.get_mut(union_view_id) else {
+            return Err("unknown union view".into());
+        };
+        state.test_barrier = Some(barrier);
+        Ok(())
     }
 
     /// Serve freeze traffic for running union jobs: parked deliveries first,
@@ -464,6 +505,15 @@ struct UnionJobCtx {
     cmd_tx: SyncSender<DriverCmd>,
     frozen_rx: Receiver<FrozenDelivery>,
     limits: UnionLimits,
+    test_barrier: Option<UnionTestBarrier>,
+}
+
+/// Per-input frozen metadata for the atomic publication fence. Small scalar
+/// data only — rows travel separately by move, never cloned.
+struct FrozenUnionMeta {
+    basis: lvu::TimeBasis,
+    source_meta: Vec<(SourceId, u64, Option<u64>)>,
+    scanned_records: u64,
 }
 
 /// Per-input frozen data the worker carries between freeze and publication.
@@ -481,12 +531,18 @@ struct FrozenUnionWork {
 
 /// Entry point of the per-candidate background thread. Records exactly one
 /// [`UnionCompletion`] and never touches published state on failure.
+///
+/// The completion carries the CALLER's submission generation
+/// (`spec.generation`, the dialog/request generation the shell routes on).
+/// The adapter's private per-union worker counter (`ctx.generation`) is only
+/// for internal cancellation and supersession correlation: reporting it
+/// would misroute completions whenever the two differ.
 fn union_job_loop(ctx: UnionJobCtx) {
     let error = run_union_job(&ctx).err();
     let completion = UnionCompletion {
         union_view_id: ctx.spec.union_view_id.clone(),
         union_revision: ctx.spec.union_revision,
-        generation: ctx.generation,
+        generation: ctx.spec.generation,
         error,
     };
     let mut shared = ctx.shared.lock().expect("view state poisoned");
@@ -518,20 +574,24 @@ fn union_job_loop(ctx: UnionJobCtx) {
 
 /// Freeze, visit, decode, merge and publish one union candidate.
 ///
-/// Freeze, visit, decode, merge and publish one union candidate.
-///
 /// Every fallible step returns an error with published state untouched; only
 /// the final locked section mutates anything.
 fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
     let mut frozen_inputs = Vec::with_capacity(ctx.spec.inputs.len());
     let mut remaining_rows = ctx.limits.maximum_rows as u64;
     let mut remaining_bytes = ctx.limits.maximum_bytes;
-    for input in ctx.spec.inputs.iter() {
+    // Working fence, adopted per input at freeze time (see visit_union_input):
+    // a lease is a self-consistent snapshot of exactly one input revision,
+    // so the job fences what it actually froze rather than failing on the
+    // submit-time skew a live tail inevitably opens while the job was queued.
+    let mut fence: Vec<StoredUnionInput> = ctx.spec.inputs.clone();
+    for (index, input) in ctx.spec.inputs.iter().enumerate() {
         check_cancelled(&ctx.cancel, &ctx.shared)?;
+        let view_id = input.view_id.clone();
         ctx.cmd_tx
             .send(DriverCmd {
                 union_view_id: ctx.spec.union_view_id.clone(),
-                view_id: input.view_id.clone(),
+                view_id,
                 limits: union_freeze_limits(remaining_rows, remaining_bytes),
             })
             .map_err(|_| "union driver is gone".to_owned())?;
@@ -546,9 +606,12 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
                 }
             }
         };
+        let summary = frozen.summary().clone();
+        fence[index].accepted_revision = summary.applied_revision;
+        fence[index].applied_generation = summary.applied_generation;
         let work = visit_union_input(
             ctx,
-            input,
+            &fence[index],
             frozen,
             &mut remaining_rows,
             &mut remaining_bytes,
@@ -556,23 +619,48 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
         frozen_inputs.push(work);
     }
     check_cancelled(&ctx.cancel, &ctx.shared)?;
-    let frozen_refs: Vec<UnionFrozenInput> = frozen_inputs
-        .iter()
-        .map(|work| UnionFrozenInput {
-            view_id: work.view_id.clone(),
+    // Move rows out of the per-input work: no second copy of the frozen
+    // evaluation exists anywhere in the pipeline. Small metadata travels
+    // beside the owned inputs for the atomic publication fence.
+    let mut metas = Vec::with_capacity(frozen_inputs.len());
+    let mut decoded_inputs = Vec::with_capacity(frozen_inputs.len());
+    for work in frozen_inputs {
+        metas.push(FrozenUnionMeta {
+            basis: work.basis,
+            source_meta: work.source_meta.clone(),
+            scanned_records: work.scanned_records,
+        });
+        decoded_inputs.push(UnionFrozenInput {
+            view_id: work.view_id,
             applied_revision: work.summary_revision,
             applied_generation: work.summary_generation,
             timestamp_column: String::new(),
-            rows: work.rows.clone(),
-        })
-        .collect();
-    let merged = union_frozen_inputs(&ctx.spec.union_view_id, &frozen_refs, &ctx.limits)
+            rows: work.rows,
+        });
+    }
+    // Deterministic test barrier, if armed: every input is frozen and
+    // visited, nothing is merged or published yet.
+    if let Some(barrier) = &ctx.test_barrier {
+        let _ = barrier.frozen.send(());
+        loop {
+            check_cancelled(&ctx.cancel, &ctx.shared)?;
+            match barrier.release.recv_timeout(FREEZE_WAIT) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("union test barrier is gone".to_owned());
+                }
+            }
+        }
+    }
+    check_cancelled(&ctx.cancel, &ctx.shared)?;
+    let merged = union_frozen_inputs(&ctx.spec.union_view_id, &decoded_inputs, &ctx.limits)
         .map_err(|error| error.to_string())?;
     // The union's own search filter runs here, after first-input dedup so
     // precedence survives filtering, and before publication so counts,
     // order and ranks all describe the filtered stream.
     let merged = apply_union_filter(merged, &ctx.spec.filter).map_err(|error| error.to_string())?;
-    publish_union(ctx, frozen_inputs, merged)
+    publish_union(ctx, &fence, metas, merged)
 }
 
 /// True when the adapter is shutting down or this job was superseded.
@@ -588,12 +676,16 @@ fn check_cancelled(cancel: &Arc<AtomicBool>, shared: &Arc<Mutex<Shared>>) -> Res
 
 /// Freeze-check, timestamp-map and bounded visit for one input.
 ///
-/// The fence is checked against the frozen summary first (the input may have
-/// advanced between submit and freeze), then the accepted basis times are
-/// mapped from the input's published membership: filtered views contribute
-/// their basis vector, raw views contribute capture nanos. A visited record
-/// missing from the membership map means the input moved mid-freeze and the
-/// job aborts as stale — never a silent mix.
+/// The caller adopts the frozen summary's revisions into the working fence
+/// before calling: the lease is a self-consistent snapshot of exactly one
+/// input revision, so submit-time skew from a live tail queued behind this
+/// job is adopted, never failed. Timestamp authority per record is read from
+/// the input's published membership: filtered views contribute their basis
+/// vector, raw views contribute capture nanos. Membership only ever appends
+/// under a live tail, so every frozen row is still mapped; a visited record
+/// missing from the membership map means the input moved non-monotonically
+/// mid-freeze and the job aborts as stale — never a silent mix. Movement
+/// after the freeze is the publication fence's business, not the visit's.
 fn visit_union_input(
     ctx: &UnionJobCtx,
     input: &StoredUnionInput,
@@ -602,12 +694,6 @@ fn visit_union_input(
     remaining_bytes: &mut u64,
 ) -> Result<FrozenUnionWork, String> {
     let summary = frozen.summary().clone();
-    if union_input_stale_fence(input, &summary) {
-        return Err(format!(
-            "union input '{}' moved from revision {} to {}",
-            input.view_id, input.accepted_revision, summary.applied_revision
-        ));
-    }
     // Timestamp authority per record, read under one lock with the fence.
     enum TimeSource {
         Membership(HashMap<(String, u64), Option<i64>>),
@@ -618,12 +704,6 @@ fn visit_union_input(
         let Some(view) = shared.views.get(&input.view_id) else {
             return Err(format!("union input view '{}' is unknown", input.view_id));
         };
-        if view.applied_revision != input.accepted_revision {
-            return Err(format!(
-                "union input '{}' moved from revision {} to {}",
-                input.view_id, input.accepted_revision, view.applied_revision
-            ));
-        }
         match &view.published {
             Published::Filtered { membership } => {
                 let mut map = HashMap::new();
@@ -644,7 +724,6 @@ fn visit_union_input(
     };
     let cancel = Arc::clone(&ctx.cancel);
     let mut rows: Vec<UnionFrozenRow> = Vec::new();
-    let mut bytes: u64 = 0;
     let stats = frozen
         .visit_precise(&cancel, |batch| {
             if cancel.load(Ordering::Acquire) {
@@ -678,14 +757,12 @@ fn visit_union_input(
                         })?,
                     TimeSource::Capture => Some(row.record.captured_at_unix_nanos),
                 };
-                bytes =
-                    bytes.saturating_add(u64::try_from(row.record.bytes.len()).unwrap_or(u64::MAX));
-                if bytes > *remaining_bytes {
-                    return Err(format!(
-                        "union input '{}' exceeds the byte budget",
-                        input.view_id
-                    ));
-                }
+                // Byte accounting uses the replay's own output figure, which
+                // covers serialized fields and dtype evidence — not just the
+                // raw record bytes. The visit itself was already capped by
+                // the remaining budget through its input limits; the actual
+                // is subtracted here so later inputs freeze under a truthful
+                // remainder. A field-heavy input consumes its true share.
                 rows.push(UnionFrozenRow {
                     record_id: row.record.record_id,
                     timestamp_nanos,
@@ -707,7 +784,7 @@ fn visit_union_input(
             other => other.to_string(),
         })?;
     *remaining_rows = remaining_rows.saturating_sub(rows.len() as u64);
-    *remaining_bytes = remaining_bytes.saturating_sub(bytes);
+    *remaining_bytes = remaining_bytes.saturating_sub(stats.output_bytes);
     // The lease releases here, before the next input freezes: at most one
     // snapshot lease is ever held per union job.
     drop(frozen);
@@ -726,13 +803,35 @@ fn visit_union_input(
     })
 }
 
-/// The fence for one input: revision AND generation must match.
-fn union_input_stale_fence(
-    input: &StoredUnionInput,
-    summary: &super::export::FrozenInputSummary,
-) -> bool {
-    input.accepted_revision != summary.applied_revision
-        || input.applied_generation != summary.applied_generation
+/// Current per-source fence for one input view: published membership state,
+/// or live source progress for raw views. Read under the publication lock so
+/// the comparison with frozen metadata is atomic with the install.
+fn current_source_fence(shared: &Shared, view: &ViewState) -> Vec<super::union::UnionSourceFence> {
+    match &view.published {
+        Published::Filtered { membership } => membership
+            .sources
+            .iter()
+            .map(|source| super::union::UnionSourceFence {
+                source_id: source.source_id.clone(),
+                generation: source.generation,
+                high_watermark: source.high_watermark,
+            })
+            .collect(),
+        Published::Raw => view
+            .registration
+            .sources
+            .iter()
+            .filter_map(|id| {
+                let handle = shared.sources.get(id)?.handle.clone();
+                let progress = handle.progress();
+                Some(super::union::UnionSourceFence {
+                    source_id: id.0.to_string(),
+                    generation: progress.generation,
+                    high_watermark: progress.high_watermark.map(|record| record.sequence),
+                })
+            })
+            .collect(),
+    }
 }
 
 /// Merge result publication: fence re-verification and membership install
@@ -740,7 +839,8 @@ fn union_input_stale_fence(
 /// check and the install. Any failure leaves the prior union untouched.
 fn publish_union(
     ctx: &UnionJobCtx,
-    frozen_inputs: Vec<FrozenUnionWork>,
+    fence: &[StoredUnionInput],
+    frozen_inputs: Vec<FrozenUnionMeta>,
     merged: polars::prelude::DataFrame,
 ) -> Result<(), String> {
     use super::union::{SEQUENCE_COLUMN, SOURCE_ID_COLUMN, UNION_TS_COLUMN};
@@ -756,7 +856,9 @@ fn publish_union(
     let times = merged
         .column(UNION_TS_COLUMN)
         .map_err(|error| error.to_string())?;
-    let mut ranks: HashMap<(String, u64), i64> = HashMap::with_capacity(height);
+    // Display rank per identity, in engine output order. This transient map
+    // is decode workspace bounded by the already-budgeted row count; the
+    // durable publication below is reserved separately before it is built.
     let mut per_source: HashMap<String, Vec<(u64, Option<i64>, i64)>> = HashMap::new();
     for index in 0..height {
         let source = match sources.get(index).map_err(|error| error.to_string())? {
@@ -779,22 +881,26 @@ fn publish_union(
             ),
         };
         let rank = i64::try_from(index).map_err(|error| error.to_string())?;
-        ranks.insert((source.clone(), sequence), rank);
         per_source
             .entry(source)
             .or_default()
             .push((sequence, time, rank));
     }
     let mut shared = ctx.shared.lock().expect("view state poisoned");
-    // Atomic fence re-verification: every input still at its fenced revision
-    // and generation, and this job still the live generation.
+    // Atomic fence re-verification against the ADOPTED (frozen) fence: every
+    // input still at the revision the merge actually read, every frozen
+    // per-source generation/high-watermark still current, and this job still
+    // the live generation. An ordinary live incremental publication can
+    // advance a membership underneath a running union without touching
+    // accepted revisions, so the revision fence alone would publish a stale
+    // merge omitting newly accepted rows.
     let Some(state) = shared.union_views.get(&ctx.spec.union_view_id) else {
         return Err("unknown union view".into());
     };
     if state.generation != ctx.generation || ctx.cancel.load(Ordering::Acquire) {
         return Err("union superseded".into());
     }
-    for input in &ctx.spec.inputs {
+    for (input, work) in fence.iter().zip(frozen_inputs.iter()) {
         let Some(view) = shared.views.get(&input.view_id) else {
             return Err(format!("union input view '{}' is unknown", input.view_id));
         };
@@ -806,18 +912,31 @@ fn publish_union(
                 input.view_id
             ));
         }
+        let current = current_source_fence(&shared, view);
+        let frozen = work
+            .source_meta
+            .iter()
+            .map(|(id, generation, high)| super::union::UnionSourceFence {
+                source_id: id.0.to_string(),
+                generation: *generation,
+                high_watermark: *high,
+            })
+            .collect::<Vec<_>>();
+        super::union::verify_source_fence(&input.view_id, &frozen, &current)
+            .map_err(|error| error.to_string())?;
     }
     let Some(view) = shared.views.get(&ctx.spec.union_view_id) else {
         return Err("unknown union view".into());
     };
-    // Charge the publication like any membership: per-row identity/time/rank
-    // plus per-source overhead. Over budget fails as limited with the prior
-    // union preserved.
+    // Charge the publication like any membership, plus rank keys and map
+    // overhead: per-row identity/time/rank plus per-source overhead. The
+    // reservation precedes every publication allocation below; over budget
+    // fails as limited with the prior union preserved.
     let mut reservation = Reservation::new(Arc::clone(&ctx.budget));
     let source_count = view.registration.sources.len();
     if !reservation.add(
         (height as u64)
-            .saturating_mul(SEQUENCE_BYTES.saturating_mul(2))
+            .saturating_mul(SEQUENCE_BYTES.saturating_mul(3))
             .saturating_add(
                 (source_count as u64).saturating_mul(SOURCE_OVERHEAD.saturating_add(64)),
             ),
@@ -931,9 +1050,136 @@ fn publish_union(
         .union_views
         .get_mut(&ctx.spec.union_view_id)
         .expect("checked");
-    state.inputs = ctx.spec.inputs.clone();
+    state.inputs = fence.to_vec();
     state.pending = None;
     state.published_revision = ctx.spec.union_revision;
     state.published_generation = ctx.spec.generation;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NativeViewAdapter, ViewConfig};
+    use lvu_core::{Acquisition, SourceDefinition};
+    use lvu_ingest::{RuntimeConfig, SourceManager};
+    use lvu_live::{LiveConfig, LiveRowProvider};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// Byte accounting charges the replay's serialized output — fields plus
+    /// dtype evidence — never the raw record bytes alone. A field-heavy input
+    /// with tiny raw lines must consume its true share, or later inputs would
+    /// freeze under a remainder the first input already spent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn visit_accounts_serialized_output_not_raw_bytes() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("fat.log");
+        std::fs::write(
+            &path,
+            format!("{{\"k\":\"{}\"}}\n{{\"k\":\"b\"}}\n", "x".repeat(5000)),
+        )
+        .unwrap();
+        let manager =
+            SourceManager::new(root.path().join("capture"), RuntimeConfig::default()).unwrap();
+        let handle = manager
+            .start(SourceDefinition {
+                schema_version: 1,
+                id: SourceId::new(),
+                name: "fat".into(),
+                acquisition: Acquisition::File { path, follow: true },
+                identity_hints: BTreeMap::new(),
+                retention: None,
+            })
+            .await
+            .unwrap();
+        let mut progress = handle.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if progress.borrow().records >= 2 {
+                    break;
+                }
+                progress.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let live = LiveConfig::new(root.path().join("raw-index"));
+        let raw = Arc::new(LiveRowProvider::new(live).unwrap());
+        let view = ViewConfig::new(root.path().join("view-index"));
+        let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
+        adapter.register_source(handle.clone()).unwrap();
+        adapter
+            .register_view("v", vec![handle.source_id()])
+            .unwrap();
+        let frozen = adapter
+            .freeze_input("v", FrozenInputLimits::default())
+            .unwrap();
+        let (cmd_tx, _cmd_rx) = sync_channel(8);
+        let (_frozen_tx, frozen_rx) = sync_channel(1);
+        let ctx = UnionJobCtx {
+            spec: UnionCandidateSpec {
+                union_view_id: "u".into(),
+                union_revision: 1,
+                generation: 1,
+                inputs: vec![StoredUnionInput {
+                    view_id: "v".into(),
+                    // Fresh raw view: adapter revision and generation are both
+                    // still zero, matching the frozen summary exactly.
+                    accepted_revision: 0,
+                    applied_generation: 0,
+                }],
+                filter: Default::default(),
+            },
+            generation: 1,
+            cancel: Arc::new(AtomicBool::new(false)),
+            shared: Arc::clone(&adapter.shared),
+            page_bytes: adapter.config.page_bytes,
+            budget: Arc::clone(&adapter.budget),
+            cmd_tx,
+            frozen_rx,
+            limits: UnionLimits::default(),
+            test_barrier: None,
+        };
+        let mut remaining_rows = 1_000_000u64;
+        let mut remaining_bytes = 1_000_000u64;
+        let input = ctx.spec.inputs[0].clone();
+        let work = visit_union_input(
+            &ctx,
+            &input,
+            frozen,
+            &mut remaining_rows,
+            &mut remaining_bytes,
+        )
+        .expect("visit succeeds");
+        assert_eq!(work.rows.len(), 2);
+        let raw_total: u64 = work
+            .rows
+            .iter()
+            .map(|row| u64::try_from(row.raw.len()).unwrap_or(u64::MAX))
+            .sum();
+        let consumed = 1_000_000u64 - remaining_bytes;
+        // The 5KB field value dominates: serialized output far exceeds raw
+        // line bytes, and the remainder reflects the output figure exactly.
+        assert!(
+            consumed > raw_total,
+            "consumed {consumed} must exceed raw {raw_total}"
+        );
+        let expect = 1_000_000u64
+            - work
+                .rows
+                .iter()
+                .map(|row| {
+                    serde_json::to_vec(&row.fields)
+                        .map(|bytes| bytes.len() as u64)
+                        .unwrap_or(0)
+                })
+                .sum::<u64>();
+        assert!(
+            remaining_bytes <= expect,
+            "remainder {remaining_bytes} must account for at least the serialized fields"
+        );
+        adapter.shutdown();
+        manager.shutdown().await;
+    }
 }
