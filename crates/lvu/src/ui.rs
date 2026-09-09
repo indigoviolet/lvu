@@ -507,7 +507,15 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let mut text = if let (Some(_view_id), Some(state)) = (app.active_view_id(), app.view_state()) {
         let follow = if state.follow { "FOLLOW" } else { "HISTORY" };
         let raw_return = app.raw_context_origin().is_some() && !app.jump_pending();
-        let protected = if raw_return { "o back" } else { follow };
+        let locating = app
+            .raw_context_origin()
+            .filter(|_| app.jump_pending())
+            .map(|origin| format!("locating #{}", origin.anchor.sequence));
+        // A pending jump can draw an empty retained window. Keep its compact
+        // explanation even when the full source/view context cannot fit.
+        let protected = locating
+            .as_deref()
+            .unwrap_or(if raw_return { "o back" } else { follow });
         let protected_width =
             UnicodeWidthStr::width(format!(" {protected}{STATUS_DOORS}").as_str());
         let high_priority_width = width.saturating_sub(protected_width);
@@ -613,12 +621,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                 .iter()
                 .find(|view| view.id == origin.view_id)
                 .map_or("view", |view| view.name.as_str());
-            let locating = if app.jump_pending() {
-                " · locating…"
-            } else {
-                ""
-            };
-            format!(" | raw of {from} · #{}{locating}", origin.anchor.sequence)
+            format!(" | raw of {from} · #{}", origin.anchor.sequence)
         });
         let capture_time = match state.applied_capture_time_policy {
             Some(crate::CaptureTimePolicy::Recent { .. })

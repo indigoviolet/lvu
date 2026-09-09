@@ -336,7 +336,11 @@ fn saving_a_command_never_runs_it_and_the_state_vocabulary_is_unchanged() {
     let output = screen(&draw(&provider, &mut app, 100, 30));
     assert!(output.contains("Unrun"), "{output}");
     assert!(
-        output.contains("new records wait for an explicit run"),
+        output.contains("New records stay pending until you run it again."),
+        "{output}"
+    );
+    assert!(
+        output.contains("Saving or restoring never starts this command."),
         "{output}"
     );
 }

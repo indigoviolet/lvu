@@ -1439,3 +1439,31 @@ original bytes/IDs with conservative bounded event boundaries. The proposed Auto
 token must be invalid legacy regex syntax so existing valid custom rules retain
 their meaning; unknown token versions must reject actionably. No generic multiline
 implementation or acceptance is claimed yet.
+
+## 2026-09-09 — multiline review and raw-jump status correction
+
+W22 candidate `f9441e1` is not accepted. Focused worker gates pass, but primary
+review found boundary/UI/accounting gaps: indented credible event headers are
+classified as continuations; Auto's internal token can be edited by cursor/kill
+commands; GroupRange growth still uses the old 64-byte charge; expansion includes
+group_line_count as if it were a member. Further regressions requested cover a
+backward timestamp still after the head timestamp, and arbitrary partial-line
+Start/End provenance leaving multiline state open after an unrecognized line.
+Worker owns correction before a final matrix or integration claim.
+
+The three broader lvu test failures reported by W22 reproduce on accepted-base
+product content without the multiline commit. Two are stale wording assertions:
+the external-command dialog says new records stay pending until explicitly run,
+and landed raw context now presents a compact `o back` independently of its full
+origin label. The pending-jump failure is a real status regression: the narrow
+empty pane showed HISTORY and 0-0/0 without explaining that record location was
+pending. The protected prefix now says `locating #N` until the chase resolves or
+reports its bounded failure. Full origin context remains optional when space fits.
+
+Primary validation: component enrichment 13/13, raw context 6/6, discoverability
+17/17; formatting, workspace all-target clippy, app/demo builds and actual raw
+context PTY pass. Tests retain pending-command guarantees, anchor/neighbor IDs,
+bounded unresolved chase, return state and wide origin context, and check the
+compact locating notice at 80/100/160 columns. Logs:
+`primary-w22-baseline-assertions.log`, `primary-raw-jump-notice-gate.log`.
+The immutable public v0.1.2 archive is unchanged.

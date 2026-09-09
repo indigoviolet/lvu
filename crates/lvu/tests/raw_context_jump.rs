@@ -89,10 +89,7 @@ fn o_jumps_to_the_record_in_all_events_and_o_again_returns() {
     // get back (the `locating…` state is the readiness test below).
     app.sync_provider(&provider, 6);
     let landed = screen(&draw(&provider, &mut app, 100, 12));
-    assert!(
-        landed.contains("raw of Warnings · #10 · o back"),
-        "{landed}"
-    );
+    assert!(landed.contains("o back"), "{landed}");
     let state = app.view_state().unwrap();
     assert_eq!(state.selected.as_ref(), Some(&anchor));
     assert!(!state.follow);
@@ -104,6 +101,8 @@ fn o_jumps_to_the_record_in_all_events_and_o_again_returns() {
     // Neighbours the filter hid are on screen.
     assert!(landed.contains("fixture request 09 completed"), "{landed}");
     assert!(landed.contains("fixture request 11 completed"), "{landed}");
+    let wide = screen(&draw(&provider, &mut app, 160, 12));
+    assert!(wide.contains("raw of Warnings · #10"), "{wide}");
 
     key(&mut app, &provider, KeyCode::Char('o'));
     assert_eq!(app.active_view_id(), Some("filtered"));
@@ -227,11 +226,13 @@ fn a_record_the_raw_view_cannot_address_stops_being_chased_and_says_so() {
     provider.hide_view_rows("all");
     key(&mut app, &provider, KeyCode::Char('o'));
     assert_eq!(app.active_view_id(), Some("all"));
-    let locating = screen(&draw(&provider, &mut app, 100, 12));
-    assert!(
-        locating.contains("raw of Warnings · #10 · locating…"),
-        "{locating}"
-    );
+    for width in [80, 100, 160] {
+        let locating = screen(&draw(&provider, &mut app, width, 12));
+        assert!(locating.contains("locating #10"), "{locating}");
+        assert!(locating.contains("? help"), "{locating}");
+        assert!(locating.contains("Ctrl-P commands"), "{locating}");
+        assert!(app.jump_pending());
+    }
     for _ in 0..300 {
         app.sync_provider(&provider, 6);
         if !app.jump_pending() {
