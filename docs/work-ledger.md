@@ -1753,10 +1753,30 @@ unified grouping and the four independent reliability fixes remain active.
 ## 2026-09-09 — independent Sol review assigned
 
 At the user's suggestion, primary launched a dedicated reviewer using the
-configured Sol Implementer profile in lvu-sol-review. Review starts with autosave
+configured Sol Implementer profile in lvu-sol-review (agent
+528a1517-fa4f-4075-b43c-e7ce65773eb6). Review starts with autosave
 0d3d828 and journal b4c77f5, then viewport90e802c and diagnostic/test revisions.
 The reviewer checks code and evidence independently and reports concrete findings;
 Muse implementers retain their paths, and primary retains acceptance/integration.
 No new review builds are authorized by default. The latest enrichment PTY failure
 was traced to a wrapped diagnostic wait and cleanup typing q into the still-open
 editor, not established load-induced shutdown failure; e2fc618 addresses the test.
+
+
+Current union implementer: 397504aa-a443-4491-b412-d72f44b43bc1 in
+lvu-muse-union-views. Enrichment diagnostic worker has also been assigned a
+read-only seam/design pass for the UTC timestamp/severity assistance shortcuts,
+without editing paths currently owned by grouping or source assistance.
+Diagnostic final PTY commit 2ccb9c2 passed under the shared lock with the same
+timeouts, including actual draft editing and live append. The intermediate
+whitespace-normalized wait still failed because terminal borders interrupted
+the phrase; row-contiguous token checks were verified against saved failure
+artifacts before the successful run. No load-causation claim remains.
+
+
+Independent Sol review of autosave0d3d828 found a compile error at memory.rs450
+(double dereference of latest:&usize). New8929174 corrects that one line; prior
+candidate must not inherit final revision's validation. No second verified
+atomicity/ack-order defect was found by read-only review. Final worker gates are
+still required; no build/slow-volume evidence is implied by the review.
+Report: sol-review-scratch/autosave-0d3d828-review.md on the build volume.
