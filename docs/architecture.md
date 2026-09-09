@@ -209,6 +209,18 @@ short-context inspection after omissions is not yet wired. Both paths are publis
 Proposals are reviewed and then submitted through the same query/source admission
 paths as manual actions. JSON-schema validity does not establish expression
 semantics, data correctness or revision freshness; all require validation.
+Integrated after v0.1.2, source assistance requests a `sources` proposal with
+`schema_version: 1` and one to eight definitions; legacy `source` responses
+normalize to one item. The application stores reviewed definitions by generation
+and starts acquisition only after Apply. Applying disables repeated confirmation.
+Each item reserves the shared source/pending/view capacity, and outcomes settle
+into one summary. Total failure retains an uncancelled review for retry with the
+same identities; partial success consumes it. Cancellation discards retry
+authority while already-admitted starts finish. Admission compares lossless
+acquisition identities and full policies against live and pending definitions;
+path comparison uses per-pass canonicalization evidence or exact unresolved
+spellings, never display text. This batch flow is not yet in a published release.
+
 Timestamp assistance should inspect actual usable typed fields first, regardless
 of their names, and produce `timestamp_utc`. Raw extraction is a fallback requiring
 evidence. Capture time is not a substitute for a missing event timestamp.
