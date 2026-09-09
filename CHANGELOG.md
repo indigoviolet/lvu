@@ -4,21 +4,20 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
-## Unreleased
-
-Accepted and integrated after v0.1.2; not yet published.
+## [v0.1.3](https://github.com/indigoviolet/lvu/releases/tag/v0.1.3) — 2026-09-09
 
 ### Features
 
-- Messy multiline output reads as grouped events. The Grouping dialog (`m`)
-  offers Auto, Custom or Off; grouped events render downstream through
-  Folding (`z`). Auto recognition is conservative and bounded: it joins up
-  to 64 physical records / 64 KiB of payload per group, and an oversized
-  physical record remains standalone. Head classification uses nondecreasing
-  capture timestamps within 30 seconds of the group head and a 512-byte
-  prefix. Original bytes, record identities and filter
-  membership are preserved; ambiguous orphans stay standalone. This is not a
-  universal parser: unrecognized structure stays ungrouped.
+- Collapse common tracebacks, wrapped log messages and pretty-printed payloads
+  into grouped events with Grouping (`m` → Auto). Each row shows its first line
+  and constituent count; Enter expands or collapses the lines. Custom accepts
+  a continuation rule, and Off restores individual-record presentation.
+  Optional Folding (`z`) can then collapse consecutive similar events.
+  Auto uses conservative recognition, with at most 64 physical records /
+  64 KiB per group and nondecreasing capture times within 30 seconds of its
+  head. An oversized physical record stays standalone; unfamiliar structure
+  may stay ungrouped. Original bytes, identities and filter membership remain
+  unchanged.
 
 ### Fixes
 

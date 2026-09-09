@@ -1640,3 +1640,34 @@ rollback and regression tests were requested. Journal 8a1a043 remains unaccepted
 review requested removal of a scheduling-sensitive observation oracle, overdue
 commit priority during continuous pages, and preservation of event-channel-close
 cleanup. None of these candidates is part of the v0.1.3 acceptance runtime.
+
+
+## 2026-09-09 — v0.1.3 primary acceptance complete
+
+Primary matrix on 1481ef6 passed **73/73 in 133 seconds** (four workers), after
+integrating only the two reviewed PTY changes and documentation. Runtime remains
+9176e6b: application SHA-256
+d0afea60727bc887e0dfe1f8386525ecf110d26ef541b04405231bf1acf3893d.
+The inherited primary formatting, complete workspace Rust tests, workspace
+all-target clippy, bridge typecheck/tests/build and app/demo builds passed at
+9176e6b; matrix task confirmed app/demo builds fresh. Python compilation of both
+changed PTYs passed. Validation held sol-validation.lock and used a marked
+private /tmp fixture root, now removed; logs and optional failure-artifact root
+remain on the volume under primary-astra-scratch. No failure artifacts were
+produced. An independently launched multi-source compile briefly overlapped
+this matrix despite lock coordination; the worker was told to complete the
+active command and put all subsequent costly gates inside one locked script.
+
+The earlier primary 72/73 multiline timeout remains unexplained. Three isolated
+passes and this full matrix establish successful reruns, not a root-cause fix.
+The full volume-backed soak remains unaccepted, including preserved cold-query
+and autosave-flush shutdown failures. No general capture or leak-resolution
+claim is made.
+
+CHANGELOG now names v0.1.3 and explains multiline collapse/Enter expansion and
+optional repeated-event folding separately. Primary is cutting the matching
+immutable annotated tag. Muse distribution owner
+9b0f0727-bdab-47df-ade7-faecc23732e5 owns four-archive/hash/resource checks and
+exclusive /tmp/tap11 formula publication after this accepted tag is sent;
+primary retains installed-archive PTY acceptance. v0.1.2 is still the public and
+installed runtime until archive checks and publication finish.
