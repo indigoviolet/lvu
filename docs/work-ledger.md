@@ -1114,3 +1114,38 @@ volume scratch. Two real Rust library compilations passed through the wrapper,
 including after removing the smoke check's own caller TMPDIR. Synthetic files
 were cleaned up and no other gate fixture was recreated. Repair log:
 `primary-sol-sccache-repair.log` on the build volume.
+
+## 2026-09-09 — corrected capture measurements; soak still fails
+
+W25 candidate `4193ed8` on `d85807e` remains unintegrated. Its corrected
+capture-only counters exclude journal-page reads from writer CPU. The final
+volume-backed soak records 48.43 source MiB per reader+writer CPU-second,
+88.22 journal MiB per writer CPU-second, 1.29 commits per journal MiB and
+1685 records per handover, passing unchanged capture thresholds. Within-process
+steady RSS growth is 2.7 and 0.1 MiB; the earlier 69.7 MiB comparison crossed
+process restarts and does not establish a retained-memory leak.
+
+Matched ext4 /dev/sdb A/B used the same 67,108,993-byte fixture and settings.
+The original all-writer-thread measurement is retained separately: shared
+reader/writer CPU .0946/5.5605 seconds, versus .2245/6.9912 for per-record
+copies. Shared backing improved combined throughput 27%, writer throughput
+26%, and reduced reader CPU 58%. These all-thread values must not be compared
+directly with the later capture-only writer denominator.
+
+The final soak remains red: the first SOAK_MARKER query took 12.921 seconds
+(1.74 process CPU seconds), followed by 35 queries at .55–1.52 seconds. Both
+exits returned 1 with memory autosave flush deadlines; the second also reported
+three bridge-worker shutdown deadlines. Raw evidence: `w25-final-soak.log`
+and `w25-final-report.json` on the build volume. Earlier false-settle and
+900-second wait failures remain in `w25-corrected*`; historical p99 .955 and
+clean restarts are not acceptance for this final run. Path ownership alone
+does not prove these failures are independent of W25.
+
+Worker focused evidence includes ten Python fixtures, writer-page accounting,
+app build, workspace all-target check and isolated ingest throughput 37.59
+MiB per CPU-second; previous full Rust/clippy results belong to earlier
+revisions. Primary requested stronger boundary tests through raw probe inputs
+and capture accounting through actual append/commit before final amendment.
+W14 is tracing assistance shutdown; W13 is reproducing the two remaining
+primary PTY failures with exact binaries and full transcripts. No preview is
+accepted from this evidence.
