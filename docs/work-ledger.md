@@ -1303,3 +1303,22 @@ lost its just-completed action notice, a real status-priority regression. W22 is
 fixing that and retaining applied-state/membership assertions in targeted PTYs
 before another full matrix. Status/FOLLOW and generic multiline remain outside
 the published preview.
+
+
+Primary confirmation on `0d15f63`: formatting, the complete protocol suite
+15/15, and workspace all-target clippy with warnings denied passed under the
+shared lock. Log: `primary-pid-fixture-gate.log`. No product binary changed and
+preview 058 was not rebuilt or retagged for this fixture-only correction.
+
+W25 preserved-binary diagnosis on `826704a` (SHA-256
+`107c73db5414769c376befbb6d0d37165b0f5069508a3120870fe7b67682fd57`)
+used ext4 /dev/sdb without builds or source edits. Canonical PTY failed before
+shutdown at a 10.00-second filter wait. One bounded short soak reproduced exit 1:
+memory-flush 0.502 seconds, worker phase `persisting view`, pending=0, inflight=1;
+total shutdown 2.324 seconds, including assistance 0.755 and capture cleanup
+1.064 seconds. Query p99 was independently 1.514 seconds; capture/RSS checks
+passed (49.73 combined capture MiB/CPU-second, 90.68 writer, RSS growth 1.3/0.4
+MiB). Evidence: `w25-shutdown-diagnosis/` canonical/short-soak logs, report JSON
+and provenance. A pending save remained inside persistence; this does not yet
+distinguish SQLite lock contention, serialization work or storage flush latency.
+A bounded syscall diagnosis is assigned before changing deadlines or durability.
