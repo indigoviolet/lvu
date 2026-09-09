@@ -1525,3 +1525,33 @@ Validation: 23 local Markdown links resolve; historical archive comparison,
 active-row inventory (one Working, three Ready, eight Open), four categorized
 changelog sections and diff whitespace checks pass. Documentation only; no
 Rust/PTY build, release tag or installed-version change.
+
+## 2026-09-09 — parallel Muse work and retired-target cleanup
+
+The user requested maximum parallel progress, with the primary retained as
+supervisor. Six Muse Spark 1.3 implementers now have bounded independent work.
+
+| Work | Agent | Workspace |
+| --- | --- | --- |
+| Multiline acceptance | cd5b5729-cb1c-45f9-9a1c-ad3835e4835e | lvu-w22-folding-blank (exclusive handoff from stopped Sol) |
+| Memory autosave shutdown | 0523e863-b8b7-405e-a49e-0376c0d4a295 | lvu-muse-autosave |
+| Blank viewport | 8b525718-a120-4638-adfe-39d8265a85e6 | lvu-muse-viewport |
+| Missing enrichment columns | a8f5e7f1-56c3-49e3-9b7e-f8e03cd87a72 | lvu-muse-enrichment |
+| Fields PTY stability | 62af14ba-1247-47b2-b0a7-00f6cc088c46 | lvu-muse-fields |
+| Cold-query journal scheduling | fc42914a-c8d6-482a-bd56-d61a33afba89 | lvu-muse-journal |
+
+Source analysis, fixtures and edits proceed concurrently in disjoint ownership.
+Costly gates retain the shared validation lock; multiline has first matrix
+priority. Fresh worktree targets remain isolated, with shared compiler caching.
+
+Disk inventory found twelve retired Cargo targets using roughly 51 GiB; the
+installed v0.1.2 is only 100 MiB and no previews directory remains. Under the
+shared lock, primary verified no target symlinks, held Cargo locks or live
+process references, then used cargo clean with an exact twelve-target allowlist:
+W13, W15, W21, W27, W25, W24, W31, W19, W14, W18, W29 and W28. Measured free
+space rose from 6.37 to 57.17 GiB, reclaiming 50.80 GiB. Primary and W22 targets,
+compiler cache, installed release, captures and proof were preserved. The exact
+commands/output are in retired-target-cleanup-20260909.log on the build volume.
+The supervisor will retire completed-worker build output after integration and
+any required diagnostic binary preservation, rather than retain every target
+indefinitely merely because its branch was not merged into main.

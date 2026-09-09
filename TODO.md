@@ -10,11 +10,16 @@ integrated, awaiting the next release. **Open** = unresolved, not currently assi
 
 ## Ongoing work
 
-Actively being worked now.
+Six parallel Muse Spark implementation/validation assignments; the supervisor owns review, integration and releases.
 
 | Status | Work |
 | --- | --- |
 | **Working** | Readable multiline output through reversible Grouping/Folding: wrapped messages, pretty-printed payloads, diagnostics, stack traces and stray continuation lines. Conservative bounded event recognition; every original byte and record preserved, incomplete output stays visible. Corrected implementation is awaiting final validation and integration; not released. |
+| **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
+| **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
+| **Working** | Investigate enrichment-chain/filter mismatches and replace missing-column implementation errors with actionable diagnostics, preserving the last valid view. |
+| **Working** | Stabilize the empty-event Fields close PTY check using observable dialog state rather than a longer timeout. |
+| **Working** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no performance or full-soak pass is claimed yet. |
 
 ## Accepted for the next release
 
@@ -32,11 +37,6 @@ Unresolved and not currently assigned. No new product commitments beyond what is
 
 | Status | Work |
 | --- | --- |
-| **Open** | Diagnose the volume-backed soak failures: a 12.921 s first cold query and memory autosave-flush shutdown failures, with shared capture/journal `RecordBytes` already in v0.1.2. No full-soak pass or capture performance promise is claimed. |
-| **Open** | Diagnose long blank viewports on 512 MB captures and show useful loading/indexing progress while rows are pending. Progress display is not a substitute for delivering the rows. |
-| **Open** | A filter naming a column its own enrichment chain has not produced shows Polars' lowering error verbatim. Investigate why the chain and the filter compiled against it can disagree, and report the cause (`error_flag is not produced by this chain`) instead of the implementation. The engine's `dependency_unavailable` guard covers a stage that ran and failed, not one absent from the chain. Pinned by `a_filter_naming_a_column_no_stage_produces_reports_polars_lowering_verbatim` in `crates/lvu-query/tests/query.rs`. |
 | **Open** | Display time zones are fixed UTC offsets only: no timezone database, so daylight saving is never applied and a named zone (`Europe/Berlin`) cannot be chosen. Every displayed timestamp carries its offset; the Settings help line says so. |
 | **Open** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
-| **Open** | The writer thread serves every page read between appends, so a query paging the journal waits behind capture's own appends. Measure before assuming it matters. |
-| **Open** | `test_empty_event_fields_pty.py` loses its 3 s wait for `Fields closed` at load 15 or so, independent of any recent change (1 in 8 against both pre- and post-fix binaries). Needs a bound tied to something the app actually signals, not a wider number. |
 | **Open** | Validate installation/terminal/process behavior on macOS and Windows (audit in docs/portability.md, checklist in docs/mac-test-plan.md; no run yet). arm64 Linux archive is built and CI-executed but has had no human interactive acceptance. |
