@@ -118,6 +118,17 @@ inputs. These translate into the existing query engine. lvu does not implement a
 second general Python, Polars or regex language. Regex enrichment lowers named
 captures to native Polars string extraction and does not start Python.
 
+Literal search uses an escaped ASCII-insensitive regex kernel for ASCII needles
+and ASCII data. Mixed batches partition ASCII rows from Unicode rows; Unicode
+rows retain lowercase-substring semantics, including dotted I and combining
+characters. This optimization applies to search and colour predicates without
+changing record membership or identity order.
+
+The View Summary component reads applied view state and provider-reported merged
+ordering. Its rows open the owning dialog, including the two Filter tabs and
+Colour Rules. Transient whole-view field statistics are inspection state and do
+not appear as applied operations.
+
 Preview033 checks Python construction separately from native semantics.
 Pinned Expr-returning constructors and public transformation namespaces are
 available; eager data construction, I/O, callbacks, plugins and metadata tooling

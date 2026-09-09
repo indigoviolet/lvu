@@ -1203,3 +1203,31 @@ soak fixtures pass. Combined Rust validation remains pending; the earlier
 primary memory gate stopped at disk preflight and ran no Rust tests. Latest
 W25 cold-query and shutdown failures remain open. W22 status/FOLLOW are now
 `36e1d77`/`14bf9a5` on `34baf29`, still awaiting final corrected validation.
+
+
+## 2026-09-09 — capture/memory Rust gate and summary/search integration
+
+Primary `826704a` passed formatting, workspace Rust tests with no-fail-fast,
+workspace all-target clippy with warnings denied, and app/TUI builds under the
+shared validation lock. This includes W25 shared backing and primary memory
+phase diagnostics plus saturated-save durability tests. Evidence:
+`primary-sol-capture-memory-gate.log`. It does not resolve the volume-backed
+cold query or shutdown soak failures. W25 is preserving that exact app for a
+bounded runtime diagnostic using the new phase/count errors.
+
+Integrated W28 `c2b0633` as `8f28148`. Worker summary components passed 5/5,
+dedicated summary PTY passed, and builds/clippy passed. Workspace tests had
+one empty-PID parse in command cancellation; its exact rerun passed. Matrix
+69/71 retains real-source and Settings wrapping-sensitive failures. Primary
+inspection found that the delivery fixture creates its final PID path before
+writing its contents, while reservation waits only for file existence before
+cancelling the child. W28 owns a separate atomic-publication fixture correction;
+the passing rerun alone does not close this race.
+
+Integrated W24 `7894576` as `7b8ce95`. Worker query tests, scan throughput,
+clippy and app/TUI builds passed; matrix 68/70 retains the same two harness
+areas. Eight-repeat matched search throughput was 6.526M versus disabled-path
+4.863M records per CPU-second, with a fixed 5.6M guard. Primary adapted the new
+throughput fixture to the integrated RecordBytes type. W13 is checking corrected
+wrapped assertions against preserved primary and W24 binaries; final integration
+validation has not yet run. No preview acceptance is claimed.

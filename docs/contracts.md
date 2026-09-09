@@ -182,8 +182,9 @@ Rules are presentation, not definition:
   unchanged and the last applied rows stay on screen while it settles;
 * a canonical view is repainted in place rather than forked, because its
   *definition* is fixed and its presentation never is;
-* a rule that will not compile is skipped with the rest still evaluated, and the
-  view keeps rendering;
+* a compiler, parse or runtime predicate error rejects the complete candidate
+  with an indexed diagnostic. Applied rules, membership and live refresh remain
+  usable, and the rejected draft stays editable;
 * the view-adapter staleness check compares definitions and ignores rules, so an
   unacknowledged repaint cannot make a later filter look stale.
 
@@ -203,7 +204,7 @@ setting for a hard refusal on every downgrade.
 Span highlighting is a separate, terminal-side concern and decides nothing about
 membership: it re-locates a search or rule pattern inside the line already being
 drawn. Spans are computed on the rendered `String`, which is already
-`from_utf8_lossy` of the captured bytes, so a replacement character cannot shift
+`from_utf8_lossy` of the captured bytes with ANSI controls removed, so a replacement character cannot shift
 a highlight — searching the original bytes and reporting offsets into them
 would, because one invalid byte becomes three. Only pattern forms are located; a
 `field: value` or `pl.…` predicate names a column, not a run of characters, and

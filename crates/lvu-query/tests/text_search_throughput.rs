@@ -42,7 +42,8 @@ fn ascii_literal_search_uses_the_regex_kernel() {
                     "request"
                 }
             )
-            .into_bytes(),
+            .into_bytes()
+            .into(),
             delimiter: b"\n".into(),
             chunk: ChunkPosition::Complete,
             acquisition_id: Uuid::nil(),
