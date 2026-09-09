@@ -1273,3 +1273,33 @@ feature set; only the completed workspace gate supplies acceptance evidence.
 The current launcher advances to preview 058 after tag verification. Retire only
 the superseded preview 057 binary if no process uses it; preserve its manifest,
 all capture data and proof archives. The next new preview number is 059.
+
+
+## 2026-09-09 — follow-up integration after preview 058
+
+Integrated W28 atomic PID fixture `13c3ba2` as `699814a`. The helper closes a
+process-unique sibling PID file before os.replace publishes readiness. Strict
+PID parsing, cancellation, no-delivery and reap assertions are unchanged.
+Worker locked evidence: protocol 15/15 and former race 20/20 exact repetitions;
+formatting and diff checks clean. Reused paths belong to already-attempted
+retries that do not spawn. Primary targeted confirmation follows; preview 058
+remains immutable.
+
+W14 `5332f09` remains held after correcting delayed-start request/EOF ordering.
+Worker typecheck and bridge 92/92 pass; two focused Rust regressions pass.
+Primary's actual lifecycle/server probe with a synchronous response stub and two
+staged chunks found a further EOF/backpressure deadlock: after 250ms with a 20ms
+drain budget, zero bridge closes, no diagnostic, and 67 unread staged bytes.
+The first response paused staged input, preventing end and therefore preventing
+the shutdown timer from starting. This is a lifecycle/server probe, not an
+end-to-end backend result. Worker is confirming the same ordering with a real
+server parse-error response followed by valid input and correcting bounded
+settlement, including input-error stop paths, without extending the host budget.
+
+W22's six non-wrapping matrix findings were reviewed against exact screens.
+Four assertions collided with deliberate compact status presentation; the base
+lvu diagnostic invoked the wrong binary and is invalid evidence. Gap navigation
+lost its just-completed action notice, a real status-priority regression. W22 is
+fixing that and retaining applied-state/membership assertions in targeted PTYs
+before another full matrix. Status/FOLLOW and generic multiline remain outside
+the published preview.
