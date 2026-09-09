@@ -25,6 +25,10 @@ but does not satisfy that requirement.
 
 ### Fixes
 
+- Keep the drawable beginning of a requested log window when its rows exceed
+  the display cache byte limit. Show loading while indexed rows are not yet
+  drawable. This addresses one blank-viewport case, not the full capture soak.
+
 - Status line prioritizes actionable notices, event-time diagnostics, row
   ranges and visible return/help controls; wide and combining text fits, with
   optional indicators giving way as whole segments.

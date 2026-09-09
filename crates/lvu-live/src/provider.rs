@@ -1439,7 +1439,17 @@ impl State {
                     source.lookup_failure = None;
                 }
                 self.completed_requests = self.completed_requests.saturating_add(1);
-                for (position, row) in rows {
+                // A positional page can only draw a contiguous prefix from its
+                // start, so under a bounded cache the start of a just-served
+                // window outranks its end. Inserting ascending evicts that
+                // prefix first when the window does not fit, leaving a cached
+                // suffix no page can draw and re-requesting the same window for
+                // ever (cap-exhaustion blank with completed work climbing).
+                // Descending insertion keeps the prefix drawable as partial
+                // progress instead. This is presentation-only cache ordering for
+                // live append paging; cached bytes, identities and journal data
+                // are unchanged, and Polars owns all query evaluation.
+                for (position, row) in rows.into_iter().rev() {
                     self.insert_cache(source_id, generation, position, row, config);
                 }
                 self.bump_views_for(source_id);

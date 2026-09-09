@@ -1425,3 +1425,156 @@ async fn a_moving_viewport_is_served_its_newest_window_not_a_backlog() {
 
     provider.shutdown().await;
 }
+
+/// A window larger than the bounded byte cache must still draw its prefix.
+///
+/// The row-count bound cannot produce this shape: `page` caps its length by
+/// `cache_rows`, so a window always fits count-wise and both insertion orders
+/// keep it whole. Only the byte bound can overflow a single window, and then
+/// the cache evicts least-recently-touched rows. Inserting a served window
+/// ascending evicts its own start first, keeping a suffix no positional page
+/// can draw: `page` returns empty for ever while completed work climbs
+/// (cap-exhaustion blank). Descending insertion keeps the drawable prefix as
+/// partial progress instead. This is the small deterministic analogue of a
+/// 512 MB capture pressing a bounded cache: no broad soak, just paging.
+#[tokio::test]
+async fn oversized_window_keeps_drawable_prefix_under_byte_cap() {
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("cap-bytes.log");
+    fs::write(
+        &input,
+        (0..8)
+            .map(|index| format!("cap-{index:04}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let id = SourceId::new();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager.start(file_source(id, &input, false)).await.unwrap();
+    wait_runtime(&handle, |state, _| state == RuntimeState::Stopped).await;
+    let mut config = live_config(&root);
+    config.cache_rows = 32;
+    config.cache_bytes = 400;
+    let provider = LiveRowProvider::new(config).unwrap();
+    provider.register_source(handle.clone()).unwrap();
+    provider.register_raw_view("raw", vec![id]).unwrap();
+    wait_index(&provider, id, 8).await;
+
+    let prefix = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            provider.drain_ready_updates(64);
+            let page = provider.page("raw", ViewportRequest { start: 0, len: 8 });
+            if !page.rows.is_empty() {
+                break page.rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a byte-capped window must still draw its prefix, not blank");
+    assert_eq!(
+        prefix[0].text, "cap-0000",
+        "the drawable end is the start, not the suffix"
+    );
+    let stats = provider.stats();
+    assert!(stats.cached_bytes <= 400, "{stats:?}");
+    assert!(stats.completed_requests >= 1, "{stats:?}");
+    provider.shutdown().await;
+}
+
+/// Overlapping windows keep their order and stable identities.
+///
+/// With `cache_rows` at four, each window below is served whole. Successive
+/// overlapping windows must each draw their own ordered prefix with stable
+/// sequence identities, a row evicted by the next window must still resolve by
+/// ID through the index, and returning to the first window must re-serve its
+/// prefix in order. (The byte-cap test above is the one that discriminates the
+/// cache insertion order; this one pins the surrounding order/ID contract that
+/// the reordering must not disturb.)
+#[tokio::test]
+async fn overlapping_windows_keep_prefix_order_and_stable_ids() {
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("overlap.log");
+    fs::write(
+        &input,
+        (0..12)
+            .map(|index| format!("cap-{index:04}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let id = SourceId::new();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager.start(file_source(id, &input, false)).await.unwrap();
+    wait_runtime(&handle, |state, _| state == RuntimeState::Stopped).await;
+    let mut config = live_config(&root);
+    config.cache_rows = 4;
+    let provider = LiveRowProvider::new(config).unwrap();
+    provider.register_source(handle.clone()).unwrap();
+    provider.register_raw_view("raw", vec![id]).unwrap();
+    wait_index(&provider, id, 12).await;
+    assert_eq!(provider.source_status(id).unwrap().index, IndexState::Ready);
+
+    let first = wait_page(&provider, "raw", 0, 4).await;
+    assert_eq!(
+        first
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>(),
+        ["cap-0000", "cap-0001", "cap-0002", "cap-0003"]
+    );
+
+    // Overlaps the first window on 2..4; the shared rows must read identically.
+    let second = wait_page(&provider, "raw", 2, 4).await;
+    assert_eq!(
+        second
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>(),
+        ["cap-0002", "cap-0003", "cap-0004", "cap-0005"]
+    );
+    assert_eq!(second[0].id.sequence, 2);
+
+    // Sequences 0..1 were evicted by the second window; they still resolve by
+    // stable ID through the index rather than going permanently missing.
+    let probe = first[0].id.clone();
+    let looked_up = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            provider.drain_ready_updates(64);
+            if let Some(row) = provider.row_by_id("raw", &probe) {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("evicted row must still resolve by stable id");
+    assert_eq!(looked_up.text, "cap-0000");
+    let located = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            provider.drain_ready_updates(64);
+            if let Some(position) = provider.index_of_id("raw", &probe) {
+                break position;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("evicted row must still locate by stable id");
+    assert_eq!(located, 0);
+
+    // Returning to the first window re-serves its prefix in order.
+    let again = wait_page(&provider, "raw", 0, 4).await;
+    assert_eq!(
+        again
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>(),
+        ["cap-0000", "cap-0001", "cap-0002", "cap-0003"]
+    );
+    assert_eq!(again[0].id.sequence, 0);
+    let stats = provider.stats();
+    assert!(stats.cached_rows <= 4, "{stats:?}");
+    assert!(stats.pending_requests <= 2, "{stats:?}");
+    let _ = handle.stop().await;
+    provider.shutdown().await;
+}

@@ -1789,3 +1789,16 @@ enrichment, with selected event time distinct from capture metadata. Normal new
 flows must not retain hidden timestamp/severity inference. Existing saved legacy
 semantics require explicit compatibility handling. Source/grouping/autosave
 owners were contacted about narrow disjoint UI/projection/persistence seams.
+
+
+## 2026-09-09 — viewport byte-cap correction integrated
+
+Primary reviewed and cherry-picked90e802c (reverse insertion retains a drawable
+prefix; status names loading over indexed rows). Worker exact-final evidence:
+live27/27 including retained overlap/order/identity regression, TestBackend2/2,
+clippy/fmt clean; old insertion control fails the byte-cap regression. Actual
+blank-view PTY passed on the worker's fresh final binary with restart/restored
+accepted-filter behavior. Logs: sol-muse-viewport/{finish-90e802c.log,
+pty-blank-view2.log,gate-73456b1.log}. Primary integrated Rust/PTY validation is
+pending; independent Sol review continues. No full512MB or volume-soak pass is
+claimed and the overall viewport TODO remains unresolved.

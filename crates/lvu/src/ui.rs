@@ -545,6 +545,14 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         } else {
             ""
         };
+        // A blank pane over indexed rows is loading, not an empty result. Name
+        // it while the row range still carries the counts; progress visibility
+        // never substitutes for the rows themselves.
+        let live_loading = if state.rows_drawn == 0 && state.last_total > 0 && pending.is_empty() {
+            " | loading"
+        } else {
+            ""
+        };
         let search = if state.search.applied.is_empty() {
             String::new()
         } else {
@@ -697,6 +705,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             (RANK_FILTERS, search),
             (RANK_FILTERS, advanced.to_owned()),
             (RANK_READINESS, pending.to_owned()),
+            (RANK_READINESS, live_loading.to_owned()),
             (RANK_FILTERS, enrichment.to_owned()),
             (RANK_FILTERS, grouping.to_owned()),
             (RANK_FILTERS, folding),
