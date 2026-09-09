@@ -2,38 +2,40 @@
 //!
 //! Path-includes `crates/lvu-app/src/union_controller.rs` following the
 //! `tests/settings.rs` precedent, so no worker or manifest change is needed
-//! before the primary assigns the composition-tick hooks.
+//! before the primary assigns the composition-tick hooks. Candidates and
+//! persisted shapes are the single `lvu_view::union` definitions.
 
 #[path = "../src/union_controller.rs"]
 #[allow(dead_code)]
 mod union_controller;
 
+use lvu_view::union::{StoredUnionInput, StoredUnionShape, UnionCandidateSpec};
 use std::collections::HashMap;
-use union_controller::{
-    StoredUnion, StoredUnionInput, UnionCandidate, UnionController, UnionControllerError,
-};
+use union_controller::{UnionController, UnionControllerError};
 
-fn revisions(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+/// Accepted (revision, generation) per input view.
+fn states(pairs: &[(&str, u64, u64)]) -> HashMap<String, (u64, u64)> {
     pairs
         .iter()
-        .map(|(view, revision)| ((*view).to_owned(), *revision))
+        .map(|(view, revision, generation)| ((*view).to_owned(), (*revision, *generation)))
         .collect()
 }
 
-fn current(map: &HashMap<String, u64>) -> impl Fn(&str) -> Option<u64> + '_ {
+fn current(map: &HashMap<String, (u64, u64)>) -> impl Fn(&str) -> Option<(u64, u64)> + '_ {
     move |view| map.get(view).copied()
 }
 
-fn candidate(view: &str, revision: u64, inputs: &[(&str, u64)]) -> UnionCandidate {
-    UnionCandidate {
+fn candidate(view: &str, revision: u64, inputs: &[(&str, u64, u64)]) -> UnionCandidateSpec {
+    UnionCandidateSpec {
         union_view_id: view.into(),
         union_revision: revision,
         generation: 1,
         inputs: inputs
             .iter()
-            .map(|(id, rev)| StoredUnionInput {
+            .map(|(id, rev, generation)| StoredUnionInput {
                 view_id: (*id).into(),
                 accepted_revision: *rev,
+                applied_generation: *generation,
             })
             .collect(),
     }
@@ -41,9 +43,9 @@ fn candidate(view: &str, revision: u64, inputs: &[(&str, u64)]) -> UnionCandidat
 
 #[test]
 fn publish_fences_every_input_and_serves_the_union() {
-    let map = revisions(&[("view-a", 3), ("view-b", 5)]);
+    let map = states(&[("view-a", 3, 1), ("view-b", 5, 1)]);
     let mut controller = UnionController::default();
-    controller.propose(candidate("union", 1, &[("view-a", 3), ("view-b", 5)]));
+    controller.propose(candidate("union", 1, &[("view-a", 3, 1), ("view-b", 5, 1)]));
     let published = controller
         .note_union_published("union", current(&map))
         .unwrap();
@@ -60,17 +62,28 @@ fn publish_fences_every_input_and_serves_the_union() {
 
 #[test]
 fn stale_candidate_is_rejected_and_prior_union_survives() {
-    let map = revisions(&[("view-a", 3), ("view-b", 5)]);
+    let map = states(&[("view-a", 3, 1), ("view-b", 5, 1)]);
     let mut controller = UnionController::default();
-    controller.propose(candidate("union", 1, &[("view-a", 3), ("view-b", 5)]));
+    controller.propose(candidate("union", 1, &[("view-a", 3, 1), ("view-b", 5, 1)]));
     controller
         .note_union_published("union", current(&map))
         .unwrap();
     // An input advances while the next candidate is in flight.
-    controller.propose(candidate("union", 2, &[("view-a", 3), ("view-b", 5)]));
-    let moved = revisions(&[("view-a", 4), ("view-b", 5)]);
+    controller.propose(candidate("union", 2, &[("view-a", 3, 1), ("view-b", 5, 1)]));
+    let moved = states(&[("view-a", 4, 1), ("view-b", 5, 1)]);
     let error = controller
         .note_union_published("union", current(&moved))
+        .unwrap_err();
+    assert!(
+        matches!(error, UnionControllerError::StaleCandidate { .. }),
+        "{error:?}"
+    );
+    // A source restart bumps generation without touching revisions: still
+    // stale, because the membership underneath changed identity.
+    controller.propose(candidate("union", 2, &[("view-a", 3, 1), ("view-b", 5, 1)]));
+    let restarted = states(&[("view-a", 3, 2), ("view-b", 5, 1)]);
+    let error = controller
+        .note_union_published("union", current(&restarted))
         .unwrap_err();
     assert!(
         matches!(error, UnionControllerError::StaleCandidate { .. }),
@@ -84,9 +97,13 @@ fn stale_candidate_is_rejected_and_prior_union_survives() {
 
 #[test]
 fn missing_input_rejects_without_touching_accepted() {
-    let map = revisions(&[("view-a", 3)]);
+    let map = states(&[("view-a", 3, 1)]);
     let mut controller = UnionController::default();
-    controller.propose(candidate("union", 1, &[("view-a", 3), ("view-gone", 1)]));
+    controller.propose(candidate(
+        "union",
+        1,
+        &[("view-a", 3, 1), ("view-gone", 1, 1)],
+    ));
     let error = controller
         .note_union_published("union", current(&map))
         .unwrap_err();
@@ -99,13 +116,13 @@ fn missing_input_rejects_without_touching_accepted() {
 
 #[test]
 fn runtime_failure_rejects_idempotently_and_preserves_accepted() {
-    let map = revisions(&[("view-a", 3), ("view-b", 5)]);
+    let map = states(&[("view-a", 3, 1), ("view-b", 5, 1)]);
     let mut controller = UnionController::default();
-    controller.propose(candidate("union", 1, &[("view-a", 3), ("view-b", 5)]));
+    controller.propose(candidate("union", 1, &[("view-a", 3, 1), ("view-b", 5, 1)]));
     controller
         .note_union_published("union", current(&map))
         .unwrap();
-    controller.propose(candidate("union", 2, &[("view-a", 3), ("view-b", 5)]));
+    controller.propose(candidate("union", 2, &[("view-a", 3, 1), ("view-b", 5, 1)]));
     controller.reject("union");
     controller.reject("union");
     assert_eq!(controller.accepted("union").unwrap().revision, 1);
@@ -113,13 +130,21 @@ fn runtime_failure_rejects_idempotently_and_preserves_accepted() {
 
 #[test]
 fn input_advance_requests_refresh_only_for_dependent_unions() {
-    let map = revisions(&[("view-a", 3), ("view-b", 5), ("view-c", 1)]);
+    let map = states(&[("view-a", 3, 1), ("view-b", 5, 1), ("view-c", 1, 1)]);
     let mut controller = UnionController::default();
-    controller.propose(candidate("union-one", 1, &[("view-a", 3), ("view-b", 5)]));
+    controller.propose(candidate(
+        "union-one",
+        1,
+        &[("view-a", 3, 1), ("view-b", 5, 1)],
+    ));
     controller
         .note_union_published("union-one", current(&map))
         .unwrap();
-    controller.propose(candidate("union-two", 1, &[("view-c", 1), ("view-b", 5)]));
+    controller.propose(candidate(
+        "union-two",
+        1,
+        &[("view-c", 1, 1), ("view-b", 5, 1)],
+    ));
     controller
         .note_union_published("union-two", current(&map))
         .unwrap();
@@ -136,15 +161,17 @@ fn restore_rehydrates_inputs_without_launching_anything() {
     controller.restore(
         "union",
         4,
-        StoredUnion {
+        StoredUnionShape {
             inputs: vec![
                 StoredUnionInput {
                     view_id: "view-a".into(),
                     accepted_revision: 9,
+                    applied_generation: 2,
                 },
                 StoredUnionInput {
                     view_id: "view-b".into(),
                     accepted_revision: 2,
+                    applied_generation: 1,
                 },
             ],
         },
@@ -161,21 +188,25 @@ fn restore_rehydrates_inputs_without_launching_anything() {
 }
 
 #[test]
-fn stored_shape_matches_view_layer_json() {
-    // The controller and view persistence shapes must stay in lockstep: the
-    // same JSON key carries both. Field-for-field JSON equality, not parallel
-    // structs drifting apart.
-    let stored = StoredUnion {
+fn stored_shape_is_the_single_view_definition() {
+    // No parallel DTOs: the controller persists exactly
+    // `lvu_view::union::StoredUnionShape`, generation fence included, and old
+    // rows without it read as generation 0 and refresh once.
+    let stored = StoredUnionShape {
         inputs: vec![StoredUnionInput {
             view_id: "view-a".into(),
             accepted_revision: 3,
+            applied_generation: 1,
         }],
     };
     let json = serde_json::to_string(&stored).unwrap();
     assert_eq!(
         json,
-        r#"{"inputs":[{"view_id":"view-a","accepted_revision":3}]}"#
+        r#"{"inputs":[{"view_id":"view-a","accepted_revision":3,"applied_generation":1}]}"#
     );
-    let legacy: StoredUnion = serde_json::from_str("{}").unwrap();
-    assert!(legacy.inputs.is_empty());
+    let legacy: StoredUnionShape =
+        serde_json::from_str(r#"{"inputs":[{"view_id":"view-a","accepted_revision":3}]}"#).unwrap();
+    assert_eq!(legacy.inputs[0].applied_generation, 0);
+    let empty: StoredUnionShape = serde_json::from_str("{}").unwrap();
+    assert!(empty.inputs.is_empty());
 }

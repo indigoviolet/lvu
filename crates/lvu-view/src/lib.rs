@@ -4,8 +4,21 @@ pub mod command_columns;
 mod export;
 pub mod folding;
 pub mod time_basis;
+/// Live union views over accepted input views (Muse union-views worktree).
+/// The worker and all union methods live in `union_worker.rs`; the pure
+/// spec/decode/merge contract lives in `union.rs`.
+pub mod union;
+mod union_worker;
 pub use command_columns::CommandColumns;
 pub use export::*;
+pub use union::{
+    INPUT_COLUMN, MAX_UNION_BYTES, MAX_UNION_INPUTS, MAX_UNION_ROWS, MergedUnionRow,
+    SEQUENCE_COLUMN, SOURCE_ID_COLUMN, StoredUnionInput, StoredUnionShape, UNION_TS_COLUMN,
+    UnionCandidateSpec, UnionCompletion, UnionError, UnionFrozenInput, UnionFrozenRow,
+    UnionInputRow, UnionInputSnapshot, UnionLimits, detect_union_cycle, frozen_identity_snapshot,
+    merge_union_rows, union_frozen_inputs, union_input_stale, union_typed_frames,
+    validate_union_spec,
+};
 
 mod appended;
 
@@ -1204,6 +1217,9 @@ struct Shared {
     accepting: bool,
     sources: HashMap<SourceId, SourceRegistration>,
     views: HashMap<String, ViewState>,
+    /// Live union views by union view ID (Muse union-views worktree; the
+    /// state type and all union methods live in `union_worker.rs`).
+    union_views: HashMap<String, union_worker::UnionViewState>,
 }
 
 enum Work {
@@ -1419,6 +1435,7 @@ impl NativeViewAdapter {
             accepting: true,
             sources: HashMap::new(),
             views: HashMap::new(),
+            union_views: HashMap::new(),
         }));
         let correlation_tx = update_tx.clone();
         let worker_shared = Arc::clone(&shared);
@@ -1651,6 +1668,9 @@ impl NativeViewAdapter {
     /// per view. It never waits for journal I/O, Python, or Polars work.
     pub fn drain_updates(&mut self, maximum: usize) -> usize {
         self.raw.drain_ready_updates(maximum);
+        // Union freeze traffic shares the tick under its own per-call bound
+        // (Muse union-views worktree); freezing is lock-plus-clones work.
+        self.drive_unions();
         let mut count = 0;
         while count < maximum {
             let Ok(update) = self.updates.try_recv() else {
@@ -2085,6 +2105,13 @@ impl NativeViewAdapter {
                 if sources.iter().any(|id| !shared.sources.contains_key(id)) {
                     return Err("source membership references an unavailable source".into());
                 }
+            }
+            // Union views take union candidates through `submit_union_candidate`,
+            // never ordinary queries: a source scan over the union's raw
+            // sources would silently bypass the merged membership (Muse
+            // union-views worktree).
+            if shared.union_views.contains_key(&request.view_id) {
+                return Err("union views take union candidates, not ordinary queries".into());
             }
             let view = shared
                 .views

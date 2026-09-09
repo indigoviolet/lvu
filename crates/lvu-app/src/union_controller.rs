@@ -51,7 +51,7 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use lvu_view::union::{StoredUnionInput, StoredUnionShape, UnionCandidateSpec};
 use thiserror::Error;
 
 /// How many accepted union views one controller tracks.
@@ -59,34 +59,6 @@ use thiserror::Error;
 /// Bounded like every other registry: unions are views, and views already
 /// have their own admission cap. This only bounds the controller's map.
 pub const MAX_TRACKED_UNIONS: usize = 128;
-
-/// One persisted union input: the input view ID plus the accepted revision
-/// the union published under. Shape-compatible with
-/// `lvu_view::union::StoredUnionInput` by construction (same JSON); the two
-/// must stay in lockstep and the lockstep is asserted in tests.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StoredUnion {
-    #[serde(default)]
-    pub inputs: Vec<StoredUnionInput>,
-}
-
-/// One persisted union input reference.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StoredUnionInput {
-    #[serde(default)]
-    pub view_id: String,
-    #[serde(default)]
-    pub accepted_revision: u64,
-}
-
-/// A submitted-but-unpublished union candidate with its fence baseline.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UnionCandidate {
-    pub union_view_id: String,
-    pub union_revision: u64,
-    pub generation: u64,
-    pub inputs: Vec<StoredUnionInput>,
-}
 
 /// The accepted union a union view is serving.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,13 +88,15 @@ pub enum UnionControllerError {
     #[error("no union candidate is pending for '{view_id}'")]
     NoPendingCandidate { view_id: String },
     #[error(
-        "union candidate for '{view_id}' is stale: input '{input_id}' moved from {fenced} to {current}"
+        "union candidate for '{view_id}' is stale: input '{input_id}' moved from revision {fenced} (generation {fenced_generation}) to revision {current} (generation {current_generation})"
     )]
     StaleCandidate {
         view_id: String,
         input_id: String,
         fenced: u64,
         current: u64,
+        fenced_generation: u64,
+        current_generation: u64,
     },
     #[error("union input '{input_id}' for '{view_id}' is unavailable")]
     MissingInput { view_id: String, input_id: String },
@@ -131,10 +105,11 @@ pub enum UnionControllerError {
 }
 
 /// Application-side union registry. Pure state machine: the composition tick
-/// drives it, the query runtime executes under it.
+/// drives it, the query runtime executes under it. Candidates and persisted
+/// shapes are the single `lvu_view::union` definitions — no parallel DTOs.
 #[derive(Clone, Debug, Default)]
 pub struct UnionController {
-    pending: HashMap<String, UnionCandidate>,
+    pending: HashMap<String, UnionCandidateSpec>,
     accepted: HashMap<String, UnionAcceptedState>,
 }
 
@@ -143,13 +118,13 @@ impl UnionController {
     ///
     /// Overwrites any earlier pending candidate for the same union view: a
     /// newer draft supersedes, never queues behind, the older one.
-    pub fn propose(&mut self, candidate: UnionCandidate) {
+    pub fn propose(&mut self, candidate: UnionCandidateSpec) {
         self.pending
             .insert(candidate.union_view_id.clone(), candidate);
     }
 
     /// The pending candidate for a union view, if any.
-    pub fn pending(&self, union_view_id: &str) -> Option<&UnionCandidate> {
+    pub fn pending(&self, union_view_id: &str) -> Option<&UnionCandidateSpec> {
         self.pending.get(union_view_id)
     }
 
@@ -159,7 +134,7 @@ impl UnionController {
     }
 
     /// Publish a candidate after the runtime reports success, fencing every
-    /// input against its CURRENT accepted revision.
+    /// input against its CURRENT accepted revision AND generation.
     ///
     /// Any input that moved (or vanished) since submission rejects the
     /// candidate as stale and preserves the prior accepted union: the caller
@@ -168,23 +143,29 @@ impl UnionController {
     pub fn note_union_published(
         &mut self,
         union_view_id: &str,
-        current_revision: impl Fn(&str) -> Option<u64>,
+        current_state: impl Fn(&str) -> Option<(u64, u64)>,
     ) -> Result<UnionAcceptedState, UnionControllerError> {
-        let candidate = self.pending.get(union_view_id).ok_or_else(|| {
-            UnionControllerError::NoPendingCandidate {
+        let candidate = self
+            .pending
+            .get(union_view_id)
+            .ok_or_else(|| UnionControllerError::NoPendingCandidate {
                 view_id: union_view_id.to_owned(),
-            }
-        })?;
+            })?
+            .clone();
         for input in &candidate.inputs {
-            match current_revision(&input.view_id) {
-                Some(current) if current == input.accepted_revision => {}
-                Some(current) => {
+            match current_state(&input.view_id) {
+                Some((current, generation))
+                    if current == input.accepted_revision
+                        && generation == input.applied_generation => {}
+                Some((current, generation)) => {
                     self.pending.remove(union_view_id);
                     return Err(UnionControllerError::StaleCandidate {
                         view_id: union_view_id.to_owned(),
                         input_id: input.view_id.clone(),
                         fenced: input.accepted_revision,
                         current,
+                        fenced_generation: input.applied_generation,
+                        current_generation: generation,
                     });
                 }
                 None => {
@@ -238,16 +219,16 @@ impl UnionController {
     pub fn note_input_revision(&self, moved_view_id: &str) -> Vec<UnionRefresh> {
         self.accepted
             .iter()
-            .filter_map(|(union_view_id, state)| {
+            .filter(|(_, state)| {
                 state
                     .inputs
                     .iter()
                     .any(|input| input.view_id == moved_view_id)
-                    .then(|| UnionRefresh {
-                        union_view_id: union_view_id.clone(),
-                        union_revision: state.revision,
-                        moved_view_id: moved_view_id.to_owned(),
-                    })
+            })
+            .map(|(union_view_id, state)| UnionRefresh {
+                union_view_id: union_view_id.clone(),
+                union_revision: state.revision,
+                moved_view_id: moved_view_id.to_owned(),
             })
             .collect()
     }
@@ -271,7 +252,7 @@ impl UnionController {
     /// so the next input advance produces a refresh against a known baseline.
     /// The composition tick re-resolves the input IDs through the ordinary
     /// view-restore path; commands are never started as a side effect.
-    pub fn restore(&mut self, union_view_id: &str, revision: u64, stored: StoredUnion) {
+    pub fn restore(&mut self, union_view_id: &str, revision: u64, stored: StoredUnionShape) {
         if self.accepted.len() >= MAX_TRACKED_UNIONS && !self.accepted.contains_key(union_view_id) {
             return;
         }

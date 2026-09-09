@@ -24,27 +24,26 @@
 //! (§3–§10) and mnemonic (§8.10) audits apply. Nothing here decides row
 //! membership or order — that is `lvu-view::union`'s job through Polars.
 //!
-//! PROPOSED HOOKS (primary-owned; do not apply without assignment):
+//! PROPOSED HOOKS (primary-owned; do not apply without assignment).
 //!
-//! 1. `crates/lvu/src/components/mod.rs`:
-//!      `pub mod union;`
-//!    plus `use union::UnionDialog;` and a `pub union: UnionDialog` slot on
-//!    `Layers` (constructed in `Layers::default`), following the
-//!    `CorrelationDialog` precedent.
-//! 2. `crates/lvu/src/component.rs`: a `LayerId::Union` variant with dialog
-//!    class M (modal task over one view, like Folding/Correlate), palette row
-//!    `Union views…` reachable from a derived view, and mnemonic-audited action
-//!    labels (`&Add input`, `&Remove`, `&Create union`, `&Cancel`).
-//! 3. `crates/lvu/src/app.rs`: union draft/accepted state per derived view
-//!    (accepted input IDs + fenced revisions, mirroring `exact_field` as
-//!    accepted-state-or-nothing), `take_query_requests` emitting the union
-//!    candidate with its fence, and `apply_query_completion` preserving the
-//!    prior union on failure. Coordinate with W22 (grouping/folding UI) and
-//!    the source-assistance owner (main.rs source methods) — nonoverlapping
-//!    regions per the assignment.
-//! 4. Persistence (autosave owner): accepted union inputs ride the additive
-//!    `presentation_json.union` key shaped in `lvu-view/src/union.rs`
-//!    (`StoredUnionShape`); no schema bump.
+//! H1 — `crates/lvu/src/components/mod.rs`: `pub mod union;`, plus
+//! `use union::UnionDialog;` and a `pub union: UnionDialog` slot on `Layers`
+//! (constructed in `Layers::default`), following the `CorrelationDialog`
+//! precedent.
+//! H2 — `crates/lvu/src/component.rs`: a `LayerId::Union` variant with dialog
+//! class M (modal task over one view, like Folding/Correlate), palette row
+//! `Union views…` reachable from a derived view, and mnemonic-audited action
+//! labels (`&Add input`, `&Remove`, `&Create union`, `&Cancel`).
+//! H3 — `crates/lvu/src/app.rs`: union draft/accepted state per derived view
+//! (accepted input IDs + fenced revisions, mirroring `exact_field` as
+//! accepted-state-or-nothing), `take_query_requests` emitting the union
+//! candidate with its fence, and `apply_query_completion` preserving the
+//! prior union on failure. Coordinate with W22 (grouping/folding UI) and
+//! the source-assistance owner (main.rs source methods) — nonoverlapping
+//! regions per the assignment.
+//! H4 — persistence (autosave owner): accepted union inputs ride the additive
+//! `presentation_json.union` key shaped in `lvu-view/src/union.rs`
+//! (`StoredUnionShape`); no schema bump.
 
 /// Dialog-side bound mirroring `lvu-view`'s `MAX_UNION_INPUTS`.
 ///
@@ -161,34 +160,74 @@ impl UnionDialog {
         validate_union_ids(union_view_id, &self.inputs)
     }
 
-    /// Transitive cycle check against the stored dependency graph.
+    /// Cycle check against the stored dependency graph: a real depth-first
+    /// search reporting ANY cycle in the reachable subgraph with its path.
     ///
-    /// `resolve` maps a union view ID to its own input IDs (`None` for
-    /// ordinary views). Bounded like the execution check; corrupt graphs
-    /// report a cycle rather than hanging the dialog.
+    /// `resolve` maps a union view ID to its own STORED input IDs (`None` for
+    /// ordinary views). No edge is truncated: a stored union declaring more
+    /// than the dialog bound fails closed. Bounded like the execution check;
+    /// corrupt graphs report rather than hanging the dialog.
     pub fn validate_no_cycle(
         &self,
         union_view_id: &str,
         resolve: impl Fn(&str) -> Option<Vec<String>>,
     ) -> Result<(), String> {
         const MAX_VISITED: usize = 64;
-        let mut visited = std::collections::HashSet::new();
-        let mut work: Vec<String> = self.inputs.clone();
-        while let Some(next) = work.pop() {
-            if next == union_view_id {
-                return Err(format!("union inputs reach back to '{union_view_id}'"));
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum Mark {
+            Gray,
+            Black,
+        }
+        fn visit<F>(
+            node: &str,
+            resolve: &F,
+            marks: &mut std::collections::HashMap<String, Mark>,
+            stack: &mut Vec<String>,
+        ) -> Result<(), String>
+        where
+            F: Fn(&str) -> Option<Vec<String>>,
+        {
+            match marks.get(node) {
+                Some(Mark::Black) => return Ok(()),
+                Some(Mark::Gray) => {
+                    let start = stack.iter().position(|id| id == node).unwrap_or(0);
+                    let mut path = stack[start..].to_vec();
+                    path.push(node.to_owned());
+                    return Err(format!(
+                        "union inputs contain a cycle: {}",
+                        path.join(" -> ")
+                    ));
+                }
+                None => {}
             }
-            if !visited.insert(next.clone()) {
-                continue;
-            }
-            if visited.len() > MAX_VISITED {
+            if marks.len() >= MAX_VISITED {
                 return Err(format!(
                     "dependency graph exceeds {MAX_VISITED} views; refusing the union"
                 ));
             }
-            if let Some(inputs) = resolve(&next) {
-                work.extend(inputs.into_iter().take(MAX_UNION_DIALOG_INPUTS + 1));
+            marks.insert(node.to_owned(), Mark::Gray);
+            stack.push(node.to_owned());
+            if let Some(inputs) = resolve(node) {
+                if inputs.len() > MAX_UNION_DIALOG_INPUTS {
+                    return Err(format!(
+                        "stored union '{node}' declares {} inputs, above the {} bound",
+                        inputs.len(),
+                        MAX_UNION_DIALOG_INPUTS
+                    ));
+                }
+                for input in &inputs {
+                    visit(input, resolve, marks, stack)?;
+                }
             }
+            stack.pop();
+            marks.insert(node.to_owned(), Mark::Black);
+            Ok(())
+        }
+        let mut marks = std::collections::HashMap::new();
+        let mut stack = vec![union_view_id.to_owned()];
+        marks.insert(union_view_id.to_owned(), Mark::Gray);
+        for input in &self.inputs {
+            visit(input, &resolve, &mut marks, &mut stack)?;
         }
         Ok(())
     }
