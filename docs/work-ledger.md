@@ -1866,3 +1866,21 @@ primary-astra-scratch/enrichment-integrated-gate.{log,py}. Inner mise environmen
 explicitly set the primary target and metadata confirmed it. Marked private
 fixtures were removed on exit. No app binary or full matrix was built by this
 gate; the next runtime gate must build the app before any primary PTY run.
+
+
+## 2026-09-09 — reviewed autosave batch integrated
+
+Integrated 135ceac after Sol source review of dcd83ff and primary verification
+that the final delta only removes seven dead stash assignments immediately
+before return. Exact worker gate passed memory batch6/6, app memory20/20 and
+app/memory all-target clippy, with GATE_EXIT:0. The corrected script is retained
+as lvu-muse-autosave-gate-script.sh; log lvu-muse-autosave-gate.log, final run
+08:04:52Z. It uses explicit target arguments and inner mise environment, marked
+private fixtures, exit-preserving cleanup and the shared validation lock.
+Primary integrated validation follows. No changed deadline, durability rule,
+fsync-causation or full slow-volume-soak resolution is claimed.
+
+Recovered worker completion reports also identify journal45c0e3b and source
+c324530 for immediate delta review. Roles and grouping were stalled at
+coordination despite approved scopes; explicit implementation continuation
+has been sent, with union application wiring assigned to its existing owner.

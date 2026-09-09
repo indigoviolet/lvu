@@ -1265,6 +1265,10 @@ pub struct WorkspaceStore {
     recipes_root: PathBuf,
 }
 
+/// Per-entry results of [`WorkspaceStore::save_sources_and_views`]: the input
+/// position with that entry's version or error.
+type BatchSaveOutcomes = Vec<(usize, Result<u64, MemoryError>)>;
+
 impl WorkspaceStore {
     pub fn import_legacy_snapshot(
         seed: &LegacyWorkspaceSeed,
@@ -2247,6 +2251,129 @@ impl WorkspaceStore {
         write_source_bookmarks(&tx, &view_sources(view), &view.presentation.bookmarks)?;
         tx.commit()?;
         Ok(version)
+    }
+
+    /// Persists several source/view pairs in one `BEGIN IMMEDIATE` transaction.
+    ///
+    /// Each entry keeps the serial save's all-or-nothing scope — its source
+    /// upsert, view insert/update with optimistic-concurrency check, and
+    /// bookmark replacement commit or roll back together via a savepoint —
+    /// so one entry's failure is reported per entry without changing what
+    /// the others made durable. Bookmarks keep the serial last-writer-wins
+    /// rule in batch order. A duplicate view id in one batch is refused as
+    /// a conflict. Callers should pass at most one entry per view.
+    pub fn save_sources_and_views(
+        &mut self,
+        items: &[(SourceMetadata, WorkingView, Option<u64>)],
+    ) -> Vec<Result<u64, MemoryError>> {
+        let mut results: Vec<Result<u64, MemoryError>> = Vec::with_capacity(items.len());
+        let mut valid: Vec<usize> = Vec::with_capacity(items.len());
+        let mut seen_views: BTreeSet<String> = BTreeSet::new();
+        for (index, (source, view, _)) in items.iter().enumerate() {
+            let outcome = validate_source(&source.definition)
+                .map_err(MemoryError::from)
+                .and_then(|()| validate_working_view(view))
+                .and_then(|()| {
+                    if source.definition.id != view.source_id {
+                        Err(MemoryError::InvalidData(
+                            "view/source identity mismatch".into(),
+                        ))
+                    } else if !seen_views.insert(view.id.0.to_string()) {
+                        Err(MemoryError::Conflict)
+                    } else {
+                        Ok(())
+                    }
+                });
+            match outcome {
+                Ok(()) => {
+                    results.push(Ok(0));
+                    valid.push(index);
+                }
+                Err(error) => results.push(Err(error)),
+            }
+        }
+        if valid.is_empty() {
+            return results;
+        }
+        let commit: Result<BatchSaveOutcomes, MemoryError> = (|| {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut versions: BatchSaveOutcomes = Vec::new();
+            for (slot, index) in valid.iter().enumerate() {
+                let (source, view, expected) = &items[*index];
+                // One savepoint per entry: the serial save rolled back the
+                // view write, its source upsert and its bookmark replacement
+                // together on any failure, so the batch must be able to undo
+                // exactly this entry — including a bookmark write that fails
+                // after the view row was already changed — while committing
+                // the rest. Savepoint mechanics failing means the transaction
+                // itself is unusable, so those errors abort the whole batch;
+                // entry-body errors roll back to the savepoint and are
+                // reported per entry.
+                tx.execute_batch(&format!("SAVEPOINT batch_view_{slot}"))?;
+                let body: Result<u64, MemoryError> = (|| {
+                    tx.execute("INSERT INTO sources(source_id,definition_json,project,command,fields_json,last_seen,missing) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(source_id) DO UPDATE SET definition_json=excluded.definition_json,project=excluded.project,command=excluded.command,fields_json=excluded.fields_json,last_seen=excluded.last_seen,missing=excluded.missing", params![source.definition.id.0.to_string(), serde_json::to_vec(&source.definition).map_err(invalid)?, source.project, source.command, serde_json::to_vec(&source.fields).map_err(invalid)?, source.last_seen, source.missing])?;
+                    let version = match expected {
+                        None => {
+                            let inserted = tx.execute("INSERT INTO working_views(view_id,source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10)", params![view.id.0.to_string(),view.source_id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?,stored_presentation(&tx, view)?])?;
+                            if inserted != 1 {
+                                return Err(MemoryError::Conflict);
+                            }
+                            0
+                        }
+                        Some(expected) => {
+                            let next = expected.checked_add(1).ok_or_else(|| {
+                                MemoryError::InvalidData("view version overflow".into())
+                            })?;
+                            let changed=tx.execute("UPDATE working_views SET name=?2,applied_revision_id=?3,applied_search=?4,search_draft=?5,applied_advanced_filter=?6,advanced_filter_draft_json=?7,navigation_json=?8,version=?9,presentation_json=?11 WHERE view_id=?1 AND version=?10",params![view.id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?,to_i64(next)?,to_i64(*expected)?,stored_presentation(&tx, view)?])?;
+                            if changed != 1 {
+                                return Err(MemoryError::Conflict);
+                            }
+                            next
+                        }
+                    };
+                    write_source_bookmarks(&tx, &view_sources(view), &view.presentation.bookmarks)?;
+                    Ok(version)
+                })();
+                match body {
+                    Ok(version) => {
+                        tx.execute_batch(&format!("RELEASE batch_view_{slot}"))?;
+                        versions.push((*index, Ok(version)));
+                    }
+                    Err(error) => {
+                        tx.execute_batch(&format!(
+                            "ROLLBACK TO batch_view_{slot}; RELEASE batch_view_{slot}"
+                        ))?;
+                        versions.push((*index, Err(error)));
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(versions)
+        })();
+        match commit {
+            Ok(done) => {
+                for (index, outcome) in done {
+                    results[index] = outcome;
+                }
+            }
+            Err(error) => {
+                // A transaction-level failure (BEGIN, savepoint mechanics,
+                // commit) rolls everything back: nothing in this batch is
+                // durable, so every view that was not already refused for its
+                // own data fails with the same cause rather than reporting a
+                // partial commit. Entry-body failures above are already
+                // per-entry and stay as they are.
+                let message = error.to_string();
+                for index in valid {
+                    if results[index].is_ok() {
+                        results[index] = Err(MemoryError::InvalidData(message.clone()));
+                    }
+                }
+            }
+        }
+        results
     }
 
     pub fn recipe_history(

@@ -307,8 +307,18 @@ fn worker(
     let mut newest: HashMap<ViewId, u64> = HashMap::new();
     let mut failed: HashMap<ViewId, String> = HashMap::new();
     let mut recipe_failure: Option<String> = None;
+    // One-entry lookahead so a Save can drain the Saves queued directly
+    // behind it into a single commit instead of one commit per queued save.
+    let mut stash: Option<Command> = None;
     phase.store(1, Ordering::Relaxed);
-    while let Ok(command) = commands.recv() {
+    loop {
+        let command = match stash.take() {
+            Some(command) => command,
+            None => match commands.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
         phase.store(
             match &command {
                 Command::Load(..) => 2,
@@ -390,72 +400,244 @@ fn worker(
                 }
             }
             Command::Save(request) => {
-                if newest
-                    .get(&request.view_id)
-                    .is_some_and(|seen| *seen >= request.sequence)
-                {
-                    phase.store(4, Ordering::Relaxed);
+                // Drain the Saves queued directly behind this one so one commit
+                // persists every queued dirty view instead of one commit per
+                // view. The first non-Save command is stashed, never
+                // dropped, so Flush/Load/Stop keep their queue order behind
+                // the whole batch.
+                let mut batch = vec![request];
+                while batch.len() < QUEUE_CAPACITY {
+                    match commands.try_recv() {
+                        Ok(Command::Save(next)) => batch.push(next),
+                        Ok(other) => {
+                            stash = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Coalesce to the newest sequence per view. A superseded queued
+                // save is never acknowledged here: its Saved/SaveFailed is
+                // emitted only after its replacement's fate is known. Acking
+                // Saved for a state that was never written would advance the
+                // main thread's durable baseline past what is actually
+                // durable; if the replacement then fails, a later revert to
+                // the superseded state would look durable and never retry.
+                // The only write-free acks are stale ones the long-standing
+                // newest guard covers, where a newer sequence already
+                // committed.
+                let mut by_view: BTreeMap<ViewId, Vec<usize>> = BTreeMap::new();
+                for (position, queued) in batch.iter().enumerate() {
+                    by_view.entry(queued.view_id).or_default().push(position);
+                }
+                // Stale groups whose newest committed already: safe to ack
+                // without a write, exactly like the old guard.
+                let mut ack_without_write: Vec<(SourceId, ViewId, u64)> = Vec::new();
+                // Superseded triples withheld per newest position, ascending
+                // sequence for deterministic ack ordering.
+                let mut held_by_latest: HashMap<usize, Vec<(SourceId, ViewId, u64)>> =
+                    HashMap::new();
+                // Positions of the per-view newest requests that still need
+                // the database, in batch order for deterministic last-wins.
+                let mut persist_positions: Vec<usize> = Vec::new();
+                for positions in by_view.values() {
+                    let latest = positions
+                        .iter()
+                        .max_by_key(|position| batch[**position].sequence)
+                        .expect("nonempty");
+                    let mut held: Vec<(SourceId, ViewId, u64)> = positions
+                        .iter()
+                        .filter(|position| **position != *latest)
+                        .map(|position| {
+                            let queued = &batch[*position];
+                            (queued.definition.id, queued.view_id, queued.sequence)
+                        })
+                        .collect();
+                    held.sort_by_key(|(_, _, sequence)| *sequence);
+                    let queued = &batch[*latest];
+                    if newest
+                        .get(&queued.view_id)
+                        .is_some_and(|seen| *seen >= queued.sequence)
+                    {
+                        ack_without_write.extend(held);
+                        ack_without_write.push((
+                            queued.definition.id,
+                            queued.view_id,
+                            queued.sequence,
+                        ));
+                    } else {
+                        held_by_latest.insert(*latest, held);
+                        persist_positions.push(*latest);
+                    }
+                }
+                persist_positions.sort_unstable();
+                phase.store(4, Ordering::Relaxed);
+                for (source_id, view_id, sequence) in ack_without_write {
                     if events
-                        .send(Event::Saved(
-                            request.definition.id,
-                            request.view_id,
-                            request.sequence,
-                        ))
+                        .send(Event::Saved(source_id, view_id, sequence))
                         .is_err()
                     {
-                        break;
+                        phase.store(7, Ordering::Relaxed);
+                        return;
                     }
+                }
+                if persist_positions.is_empty() {
                     phase.store(1, Ordering::Relaxed);
                     continue;
                 }
-                let expected = versions.get(&request.view_id).copied();
-                let metadata = source_metadata(request.definition.clone());
-                let view = working_view(&request);
-                let result = if request.state.bookmarks.iter().any(|bookmark| {
-                    bookmark.id.source_id != request.definition.id.0.to_string()
-                        && !request.state.source_ids.contains(&bookmark.id.source_id)
-                }) || request
-                    .state
-                    .source_ids
-                    .iter()
-                    .any(|id| uuid::Uuid::parse_str(id).is_err())
-                {
-                    Err(lvu_memory::MemoryError::InvalidData(
-                        "bookmark source does not match the working view".into(),
-                    ))
-                } else {
-                    store.save_source_and_view(&metadata, &view, expected)
-                };
-                phase.store(4, Ordering::Relaxed);
-                match result {
-                    Ok(version) => {
-                        newest.insert(request.view_id, request.sequence);
-                        versions.insert(request.view_id, version);
-                        failed.remove(&request.view_id);
-                        if events
-                            .send(Event::Saved(
-                                request.definition.id,
-                                request.view_id,
-                                request.sequence,
-                            ))
-                            .is_err()
-                        {
-                            break;
+                // Per-request app-level checks that live above the store, kept
+                // per request so one view's draft never fails another's save.
+                let mut items: Vec<(
+                    lvu_memory::SourceMetadata,
+                    lvu_memory::WorkingView,
+                    Option<u64>,
+                )> = Vec::with_capacity(persist_positions.len());
+                let mut item_of_position: HashMap<usize, usize> = HashMap::new();
+                let mut invalid: Vec<(usize, String)> = Vec::new();
+                for position in &persist_positions {
+                    let queued = &batch[*position];
+                    if queued.state.bookmarks.iter().any(|bookmark| {
+                        bookmark.id.source_id != queued.definition.id.0.to_string()
+                            && !queued.state.source_ids.contains(&bookmark.id.source_id)
+                    }) || queued
+                        .state
+                        .source_ids
+                        .iter()
+                        .any(|id| uuid::Uuid::parse_str(id).is_err())
+                    {
+                        invalid.push((
+                            *position,
+                            "bookmark source does not match the working view".into(),
+                        ));
+                        continue;
+                    }
+                    item_of_position.insert(*position, items.len());
+                    items.push((
+                        source_metadata(queued.definition.clone()),
+                        working_view(queued),
+                        versions.get(&queued.view_id).copied(),
+                    ));
+                }
+                for (position, diagnostic) in invalid {
+                    let queued = &batch[position];
+                    let message = format!("memory autosave: stored data is invalid: {diagnostic}");
+                    failed.insert(queued.view_id, message.clone());
+                    phase.store(4, Ordering::Relaxed);
+                    // The withheld superseded sequences resolve as failures
+                    // with the same cause: their state was never written, so
+                    // claiming them Saved would fake durability for it.
+                    if let Some(held) = held_by_latest.remove(&position) {
+                        for (source_id, view_id, sequence) in held {
+                            if events
+                                .send(Event::SaveFailed(
+                                    source_id,
+                                    view_id,
+                                    sequence,
+                                    message.clone(),
+                                ))
+                                .is_err()
+                            {
+                                phase.store(7, Ordering::Relaxed);
+                                return;
+                            }
                         }
                     }
-                    Err(error) => {
-                        let message = format!("memory autosave: {error}");
-                        failed.insert(request.view_id, message.clone());
-                        if events
-                            .send(Event::SaveFailed(
-                                request.definition.id,
-                                request.view_id,
-                                request.sequence,
-                                message,
-                            ))
-                            .is_err()
-                        {
-                            break;
+                    if events
+                        .send(Event::SaveFailed(
+                            queued.definition.id,
+                            queued.view_id,
+                            queued.sequence,
+                            message,
+                        ))
+                        .is_err()
+                    {
+                        phase.store(7, Ordering::Relaxed);
+                        return;
+                    }
+                }
+                // Positions that survived validation, in the same order as
+                // `items`, so each store result maps back to its request.
+                let db_positions: Vec<usize> = persist_positions
+                    .iter()
+                    .copied()
+                    .filter(|position| item_of_position.contains_key(position))
+                    .collect();
+                if !items.is_empty() {
+                    // Single BEGIN IMMEDIATE commit for the whole batch
+                    // instead of one commit per queued save.
+                    let outcomes = store.save_sources_and_views(&items);
+                    phase.store(4, Ordering::Relaxed);
+                    for (item_index, outcome) in outcomes.into_iter().enumerate() {
+                        let position = db_positions[item_index];
+                        let queued = &batch[position];
+                        match outcome {
+                            Ok(version) => {
+                                newest.insert(queued.view_id, queued.sequence);
+                                versions.insert(queued.view_id, version);
+                                failed.remove(&queued.view_id);
+                                // Replacement durable: only now may the
+                                // withheld superseded sequences be acked.
+                                if let Some(held) = held_by_latest.remove(&position) {
+                                    for (source_id, view_id, sequence) in held {
+                                        if events
+                                            .send(Event::Saved(source_id, view_id, sequence))
+                                            .is_err()
+                                        {
+                                            phase.store(7, Ordering::Relaxed);
+                                            return;
+                                        }
+                                    }
+                                }
+                                if events
+                                    .send(Event::Saved(
+                                        queued.definition.id,
+                                        queued.view_id,
+                                        queued.sequence,
+                                    ))
+                                    .is_err()
+                                {
+                                    phase.store(7, Ordering::Relaxed);
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                let message = format!("memory autosave: {error}");
+                                failed.insert(queued.view_id, message.clone());
+                                // Replacement failed: nothing in this group
+                                // became durable, so the withheld sequences
+                                // resolve as failures too rather than false
+                                // acks. Flush therefore keeps failing until a
+                                // later save lands, and a revert to a withheld
+                                // state still queues a real save.
+                                if let Some(held) = held_by_latest.remove(&position) {
+                                    for (source_id, view_id, sequence) in held {
+                                        if events
+                                            .send(Event::SaveFailed(
+                                                source_id,
+                                                view_id,
+                                                sequence,
+                                                message.clone(),
+                                            ))
+                                            .is_err()
+                                        {
+                                            phase.store(7, Ordering::Relaxed);
+                                            return;
+                                        }
+                                    }
+                                }
+                                if events
+                                    .send(Event::SaveFailed(
+                                        queued.definition.id,
+                                        queued.view_id,
+                                        queued.sequence,
+                                        message,
+                                    ))
+                                    .is_err()
+                                {
+                                    phase.store(7, Ordering::Relaxed);
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -1410,6 +1592,262 @@ mod tests {
             "latest"
         );
         worker.stop();
+    }
+
+    #[test]
+    fn queued_superseded_save_for_one_view_costs_no_second_commit() {
+        // A newer save for a view arriving while an older one is still queued
+        // must not cost a second commit: only the newest state is persisted.
+        // Both requests are queued before the worker thread starts so the
+        // drain sees them together deterministically, without timing.
+        let temp = TempDir::new().unwrap();
+        let (commands_tx, commands_rx) = mpsc::sync_channel(8);
+        let (events_tx, events_rx) = mpsc::sync_channel(8);
+        let definition = definition();
+        let id = ViewId::new();
+        commands_tx
+            .send(Command::Save(Box::new(request(
+                1,
+                definition.clone(),
+                id,
+                "superseded",
+            ))))
+            .unwrap();
+        commands_tx
+            .send(Command::Save(Box::new(request(
+                2,
+                definition.clone(),
+                id,
+                "latest",
+            ))))
+            .unwrap();
+        commands_tx.send(Command::Stop).unwrap();
+        let root = temp.path().to_path_buf();
+        let phase = Arc::new(AtomicU8::new(0));
+        let worker_phase = Arc::clone(&phase);
+        let join = thread::spawn(move || worker(root, commands_rx, events_tx, worker_phase));
+        let mut saved = Vec::new();
+        while saved.len() < 2 {
+            match events_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                Event::Saved(_, view, sequence) => {
+                    assert_eq!(view, id);
+                    saved.push(sequence);
+                }
+                _ => panic!("expected both saves acknowledged"),
+            }
+        }
+        saved.sort_unstable();
+        assert_eq!(saved, vec![1, 2]);
+        join.join().unwrap();
+        // One commit, not two: the coalesced save inserts version 0 with the
+        // latest state. Two serial commits would have left version 1.
+        let stored = WorkspaceStore::open(temp.path())
+            .unwrap()
+            .get_view(id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.applied_search, "latest");
+        assert_eq!(stored.version, 0);
+    }
+
+    #[test]
+    fn superseded_save_is_failed_not_acked_when_its_replacement_fails() {
+        // Acking Saved for a coalesced older sequence before its replacement
+        // is durable would advance main's durable baseline past what was
+        // written; a later revert to that state would then look durable and
+        // never retry. Both requests are queued before the worker starts so
+        // they drain as one batch deterministically, without timing.
+        let temp = TempDir::new().unwrap();
+        let (commands_tx, commands_rx) = mpsc::sync_channel(8);
+        let (events_tx, events_rx) = mpsc::sync_channel(8);
+        let definition = definition();
+        let id = ViewId::new();
+        // The replacement carries a bookmark no source owns: app-level
+        // invalid, so nothing in this group reaches the database.
+        let mut failing = request(2, definition.clone(), id, "replacement");
+        failing.state.bookmarks = vec![lvu::Bookmark {
+            id: lvu::RowId::new(SourceId::new().0.to_string(), 7),
+            note: "nowhere".into(),
+        }];
+        commands_tx
+            .send(Command::Save(Box::new(request(
+                1,
+                definition.clone(),
+                id,
+                "superseded",
+            ))))
+            .unwrap();
+        commands_tx.send(Command::Save(Box::new(failing))).unwrap();
+        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+        commands_tx.send(Command::Flush(ack_tx)).unwrap();
+        commands_tx.send(Command::Stop).unwrap();
+        let root = temp.path().to_path_buf();
+        let phase = Arc::new(AtomicU8::new(0));
+        let worker_phase = Arc::clone(&phase);
+        let join = thread::spawn(move || worker(root, commands_rx, events_tx, worker_phase));
+        let mut failed = Vec::new();
+        let mut saved = 0u32;
+        for _ in 0..2 {
+            match events_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                Event::SaveFailed(_, view, sequence, _) => {
+                    assert_eq!(view, id);
+                    failed.push(sequence);
+                }
+                Event::Saved(..) => saved += 1,
+                _ => panic!("expected failures"),
+            }
+        }
+        assert_eq!(saved, 0, "no false durable ack for either sequence");
+        failed.sort_unstable();
+        assert_eq!(failed, vec![1, 2]);
+        // Flush tracks the failure instead of acknowledging durability.
+        let flush = ack_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(flush.is_err(), "{flush:?}");
+        assert!(
+            flush.unwrap_err().contains("bookmark source"),
+            "flush surfaces the entry failure"
+        );
+        join.join().unwrap();
+        // Nothing became durable.
+        let store = WorkspaceStore::open(temp.path()).unwrap();
+        assert!(store.get_view(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn one_queued_batch_persists_every_dirty_view_before_flush_ack() {
+        // Previously each queued save committed separately, so a flush ack
+        // waited on one commit per dirty view. All three saves are queued
+        // before the worker starts so they must drain as one batch; the
+        // flush ack then means every view is durable, not just the first.
+        let temp = TempDir::new().unwrap();
+        let (commands_tx, commands_rx) = mpsc::sync_channel(8);
+        let (events_tx, events_rx) = mpsc::sync_channel(8);
+        let first_definition = definition();
+        let second_definition = definition();
+        let first_view = ViewId::new();
+        let second_view = ViewId::new();
+        let third_view = ViewId::new();
+        // Two views share the first source; the third view owns the second
+        // source.
+        commands_tx
+            .send(Command::Save(Box::new(request(
+                1,
+                first_definition.clone(),
+                first_view,
+                "first",
+            ))))
+            .unwrap();
+        commands_tx
+            .send(Command::Save(Box::new(request(
+                2,
+                first_definition.clone(),
+                second_view,
+                "second",
+            ))))
+            .unwrap();
+        commands_tx
+            .send(Command::Save(Box::new(request(
+                3,
+                second_definition.clone(),
+                third_view,
+                "third",
+            ))))
+            .unwrap();
+        let root = temp.path().to_path_buf();
+        let phase = Arc::new(AtomicU8::new(0));
+        let worker_phase = Arc::clone(&phase);
+        let join = thread::spawn(move || worker(root, commands_rx, events_tx, worker_phase));
+        let worker = MemoryWorker {
+            tx: commands_tx,
+            rx: events_rx,
+            _join: join,
+            phase,
+        };
+        let (events, result) = worker.flush(Duration::from_secs(2));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Saved(..)))
+                .count(),
+            3
+        );
+        let store = WorkspaceStore::open(temp.path()).unwrap();
+        assert_eq!(
+            store.get_view(first_view).unwrap().unwrap().applied_search,
+            "first"
+        );
+        assert_eq!(
+            store.get_view(second_view).unwrap().unwrap().applied_search,
+            "second"
+        );
+        assert_eq!(
+            store.get_view(third_view).unwrap().unwrap().applied_search,
+            "third"
+        );
+        worker.stop();
+        worker._join.join().unwrap();
+    }
+
+    #[test]
+    fn stashed_load_and_recent_keep_queue_order_behind_a_save_batch() {
+        // The batch drain must never drop or reorder the first non-Save
+        // command: a Load queued between Saves still runs in place, and a
+        // Recent queued behind a Save still answers after it.
+        let temp = TempDir::new().unwrap();
+        let (commands_tx, commands_rx) = mpsc::sync_channel(8);
+        let (events_tx, events_rx) = mpsc::sync_channel(8);
+        let saved_definition = definition();
+        let loaded_definition = definition();
+        let saved_view = ViewId::new();
+        let load_view = ViewId::new();
+        commands_tx
+            .send(Command::Save(Box::new(request(
+                1,
+                saved_definition.clone(),
+                saved_view,
+                "saved-first",
+            ))))
+            .unwrap();
+        commands_tx
+            .send(Command::Load(
+                Box::new(loaded_definition.clone()),
+                load_view,
+            ))
+            .unwrap();
+        commands_tx.send(Command::Recent).unwrap();
+        commands_tx.send(Command::Stop).unwrap();
+        let root = temp.path().to_path_buf();
+        let phase = Arc::new(AtomicU8::new(0));
+        let worker_phase = Arc::clone(&phase);
+        let join = thread::spawn(move || worker(root, commands_rx, events_tx, worker_phase));
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            match events_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                Event::Saved(_, view, _) => {
+                    assert_eq!(view, saved_view);
+                    order.push("saved");
+                }
+                Event::Loaded(source, _, _) => {
+                    assert_eq!(source, loaded_definition.id);
+                    order.push("loaded");
+                }
+                Event::Recent(_) => order.push("recent"),
+                _ => panic!("unexpected event in order probe"),
+            }
+            if order.len() == 3 {
+                break;
+            }
+        }
+        // The Load emits Loaded then its own Recent, so four events arrive;
+        // the first three already prove the order Saved < Loaded < Recent.
+        assert_eq!(order, vec!["saved", "loaded", "recent"]);
+        join.join().unwrap();
+        let store = WorkspaceStore::open(temp.path()).unwrap();
+        assert_eq!(
+            store.get_view(saved_view).unwrap().unwrap().applied_search,
+            "saved-first"
+        );
     }
 
     #[test]

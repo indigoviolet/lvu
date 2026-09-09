@@ -2558,6 +2558,316 @@ fn an_occupied_canonical_identity_yields_a_new_one_rather_than_a_takeover() {
     assert_eq!(survivor.role, ViewRole::Derived);
 }
 
+/// Several views sharing sources persist together in one commit, keeping
+/// each view's optimistic-concurrency check: every entry reports its own
+/// version while the batch commits once.
+#[test]
+fn batch_save_persists_several_views_in_one_commit() {
+    let root = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let shared_source = SourceId::new();
+    let other_source = SourceId::new();
+    let first = ViewId::new();
+    let second = ViewId::new();
+    let third = ViewId::new();
+    let outcomes = store.save_sources_and_views(&[
+        (
+            metadata(shared_source, "p", "c", 1, &[]),
+            private_view(first, shared_source, "first", 1),
+            None,
+        ),
+        (
+            metadata(shared_source, "p", "c", 2, &[]),
+            private_view(second, shared_source, "second", 2),
+            None,
+        ),
+        (
+            metadata(other_source, "p", "c", 3, &[]),
+            private_view(third, other_source, "third", 3),
+            None,
+        ),
+    ]);
+    assert_eq!(outcomes.len(), 3);
+    for outcome in &outcomes {
+        assert_eq!(*outcome.as_ref().unwrap(), 0);
+    }
+    assert_eq!(
+        store.get_view(first).unwrap().unwrap().applied_search,
+        "first"
+    );
+    assert_eq!(
+        store.get_view(second).unwrap().unwrap().applied_search,
+        "second"
+    );
+    assert_eq!(
+        store.get_view(third).unwrap().unwrap().applied_search,
+        "third"
+    );
+    // Two distinct sources own the three views.
+    assert_eq!(store.recent_sources(None, 32).unwrap().len(), 2);
+    // A duplicate view id inside one batch is refused rather than chaining
+    // two version bumps inside a single commit.
+    let duplicate = store.save_sources_and_views(&[
+        (
+            metadata(shared_source, "p", "c", 4, &[]),
+            private_view(ViewId::new(), shared_source, "fresh", 4),
+            None,
+        ),
+        (
+            metadata(shared_source, "p", "c", 5, &[]),
+            private_view(first, shared_source, "duplicate", 5),
+            Some(0),
+        ),
+        (
+            metadata(shared_source, "p", "c", 6, &[]),
+            private_view(first, shared_source, "duplicate-again", 6),
+            Some(0),
+        ),
+    ]);
+    assert!(duplicate[0].is_ok());
+    assert!(duplicate[1].is_ok());
+    assert!(matches!(duplicate[2], Err(MemoryError::Conflict)));
+    assert_eq!(
+        store.get_view(first).unwrap().unwrap().applied_search,
+        "duplicate"
+    );
+}
+
+/// One view's stale version must not lose another view's save in the same
+/// batch: the conflict is reported per view and the other view stays durable.
+#[test]
+fn batch_save_reports_a_single_conflict_without_losing_other_views() {
+    let root = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let source_id = SourceId::new();
+    let stale = ViewId::new();
+    let fresh = ViewId::new();
+    store
+        .save_source_and_view(
+            &metadata(source_id, "p", "c", 1, &[]),
+            &private_view(stale, source_id, "original", 1),
+            None,
+        )
+        .unwrap();
+    // An external writer moves the view the batch will name stale.
+    let mut bumped = store.get_view(stale).unwrap().unwrap();
+    bumped.applied_search = "external".into();
+    store.update_view(&bumped, 0).unwrap();
+    let outcomes = store.save_sources_and_views(&[
+        (
+            metadata(source_id, "p", "c", 2, &[]),
+            private_view(stale, source_id, "stale-write", 2),
+            Some(0),
+        ),
+        (
+            metadata(source_id, "p", "c", 3, &[]),
+            private_view(fresh, source_id, "fresh-write", 3),
+            None,
+        ),
+    ]);
+    assert_eq!(outcomes.len(), 2);
+    assert!(matches!(outcomes[0], Err(MemoryError::Conflict)));
+    assert_eq!(*outcomes[1].as_ref().unwrap(), 0);
+    assert_eq!(
+        store.get_view(stale).unwrap().unwrap().applied_search,
+        "external"
+    );
+    assert_eq!(
+        store.get_view(fresh).unwrap().unwrap().applied_search,
+        "fresh-write"
+    );
+}
+
+/// A late per-entry failure must roll back exactly that entry: when a view
+/// row update succeeds and its bookmark replacement then fails, the serial
+/// save left neither durable. The batch must report the error for that entry
+/// while still committing the other entries.
+#[test]
+fn batch_save_rolls_back_a_view_whose_bookmarks_fail_late() {
+    let root = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let source_id = SourceId::new();
+    let failing = ViewId::new();
+    let healthy = ViewId::new();
+    store
+        .save_source_and_view(
+            &metadata(source_id, "p", "c", 1, &[]),
+            &private_view(failing, source_id, "original", 1),
+            None,
+        )
+        .unwrap();
+    // Passes validation (no length/control/duplicate rule covers the
+    // sequence range) but fails inside the transaction after the view row
+    // was already updated, like a bookmark write hitting a late error.
+    let mut late_failure = private_view(failing, source_id, "changed-search", 9);
+    late_failure.presentation.bookmarks = vec![StoredBookmark {
+        record: RecordId {
+            source_id,
+            sequence: u64::MAX,
+        },
+        note: "late".into(),
+    }];
+    let outcomes = store.save_sources_and_views(&[
+        (metadata(source_id, "p", "c", 2, &[]), late_failure, Some(0)),
+        (
+            metadata(source_id, "p", "c", 3, &[]),
+            private_view(healthy, source_id, "healthy-write", 3),
+            None,
+        ),
+    ]);
+    assert_eq!(outcomes.len(), 2);
+    assert!(
+        matches!(outcomes[0], Err(MemoryError::InvalidData(_))),
+        "late bookmark failure is reported for its own entry, got {:?}",
+        outcomes[0].as_ref().map(|_| ()),
+    );
+    assert_eq!(*outcomes[1].as_ref().unwrap(), 0);
+    // The failed entry changed nothing durable: same search and version the
+    // serial path would have left by rolling back.
+    let stored = store.get_view(failing).unwrap().unwrap();
+    assert_eq!(stored.applied_search, "original");
+    assert_eq!(stored.version, 0);
+    assert_eq!(
+        store.get_view(healthy).unwrap().unwrap().applied_search,
+        "healthy-write"
+    );
+}
+
+/// A conflicting entry must not overwrite the source row: serial saves
+/// rolled the failed save's source upsert back with its view, so last-wins
+/// runs among successful entries only. The conflict is listed last here, so
+/// a batch that upserted every entry's source upfront would leave the
+/// loser's payload durable.
+#[test]
+fn batch_save_keeps_conflicting_entries_source_payload_out() {
+    let root = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let source_id = SourceId::new();
+    let stale = ViewId::new();
+    let fresh = ViewId::new();
+    store
+        .save_source_and_view(
+            &metadata(source_id, "winner", "c", 1, &[]),
+            &private_view(stale, source_id, "original", 1),
+            None,
+        )
+        .unwrap();
+    let mut bumped = store.get_view(stale).unwrap().unwrap();
+    bumped.applied_search = "external".into();
+    store.update_view(&bumped, 0).unwrap();
+    let outcomes = store.save_sources_and_views(&[
+        (
+            metadata(source_id, "winner", "c", 2, &[]),
+            private_view(fresh, source_id, "fresh-write", 2),
+            None,
+        ),
+        (
+            metadata(source_id, "loser", "c", 3, &[]),
+            private_view(stale, source_id, "stale-write", 3),
+            Some(0),
+        ),
+    ]);
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(*outcomes[0].as_ref().unwrap(), 0);
+    assert!(matches!(outcomes[1], Err(MemoryError::Conflict)));
+    let sources = store.recent_sources(None, 32).unwrap();
+    let kept = sources
+        .iter()
+        .find(|source| source.definition.id == source_id)
+        .expect("source still present");
+    assert_eq!(kept.project.as_deref(), Some("winner"));
+    assert_eq!(
+        store.get_view(stale).unwrap().unwrap().applied_search,
+        "external"
+    );
+}
+
+/// A database-level failure for one view (an INSERT for a view id that
+/// already exists, which the serial path reported for that view alone) must
+/// not roll back the other views in the same batch.
+#[test]
+fn batch_save_isolates_a_single_database_error_without_rollback() {
+    let root = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let source_id = SourceId::new();
+    let existing = ViewId::new();
+    let fresh = ViewId::new();
+    store
+        .save_source_and_view(
+            &metadata(source_id, "p", "c", 1, &[]),
+            &private_view(existing, source_id, "original", 1),
+            None,
+        )
+        .unwrap();
+    let outcomes = store.save_sources_and_views(&[
+        (
+            metadata(source_id, "p", "c", 2, &[]),
+            private_view(fresh, source_id, "fresh-write", 2),
+            None,
+        ),
+        (
+            metadata(source_id, "p", "c", 3, &[]),
+            private_view(existing, source_id, "clashing-insert", 3),
+            None,
+        ),
+    ]);
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(*outcomes[0].as_ref().unwrap(), 0);
+    assert!(
+        matches!(outcomes[1], Err(MemoryError::Database(_))),
+        "an INSERT for an existing view id stays a per-view database error, got {:?}",
+        outcomes[1].as_ref().map(|_| ()),
+    );
+    assert_eq!(
+        store.get_view(fresh).unwrap().unwrap().applied_search,
+        "fresh-write"
+    );
+    assert_eq!(
+        store.get_view(existing).unwrap().unwrap().applied_search,
+        "original"
+    );
+}
+
+/// Bookmarks keep the serial last-writer-wins rule inside a batch: two views
+/// of one source each replace that source's set, so the batch-order-last
+/// view's bookmarks are what every view of the source shows afterwards —
+/// exactly what two serial commits would have left.
+#[test]
+fn batch_save_keeps_serial_bookmark_last_writer_wins() {
+    let root = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let source_id = SourceId::new();
+    let first = ViewId::new();
+    let second = ViewId::new();
+    let mut first_view = private_view(first, source_id, "first", 1);
+    first_view.presentation.bookmarks = vec![StoredBookmark {
+        record: RecordId {
+            source_id,
+            sequence: 1,
+        },
+        note: "first-note".into(),
+    }];
+    let mut second_view = private_view(second, source_id, "second", 2);
+    second_view.presentation.bookmarks = vec![StoredBookmark {
+        record: RecordId {
+            source_id,
+            sequence: 2,
+        },
+        note: "second-note".into(),
+    }];
+    let outcomes = store.save_sources_and_views(&[
+        (metadata(source_id, "p", "c", 1, &[]), first_view, None),
+        (metadata(source_id, "p", "c", 2, &[]), second_view, None),
+    ]);
+    assert!(outcomes.iter().all(|outcome| outcome.is_ok()));
+    for view in [first, second] {
+        let stored = store.get_view(view).unwrap().unwrap();
+        assert_eq!(stored.presentation.bookmarks.len(), 1);
+        assert_eq!(stored.presentation.bookmarks[0].record.sequence, 2);
+        assert_eq!(stored.presentation.bookmarks[0].note, "second-note");
+    }
+}
+
 /// A workspace that kept bookmarks inside each view is migrated so the source
 /// owns them. Nothing a user wrote is discarded: two notes for one record are
 /// joined rather than one silently winning.

@@ -25,6 +25,10 @@ but does not satisfy that requirement.
 
 ### Fixes
 
+- Batch queued view saves into one transaction, with per-view rollback and
+  acknowledgements only after durable completion. Shutdown deadlines are
+  unchanged; the full slow-volume soak remains unresolved.
+
 - Missing enrichment or filter columns report which input is unavailable in
   the current batch, including later-stage ordering mistakes. Rejected drafts
   preserve the last accepted view and live refresh.
