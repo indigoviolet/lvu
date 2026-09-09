@@ -45,7 +45,10 @@ After building the copied preview binary and completing its acceptance checks:
 The `preview-*` namespace does not match the current release workflow's `v*`
 trigger. Publishing a preview tag records the source without starting the
 versioned archive release workflow. Existing previews remain immutable; this
-requirement applies prospectively and does not retag historical artifacts.
+requirement applies prospectively. On 2026-09-09, `preview-057` was also added
+to the existing current preview after verifying its original source and binary
+checksum. Its published binary and original manifest were left unchanged; the
+supplemental tag record is in `previews/manifests/057-statistics-and-capture.json`.
 
 Where to look for what a preview contains:
 

@@ -1231,3 +1231,14 @@ areas. Eight-repeat matched search throughput was 6.526M versus disabled-path
 throughput fixture to the integrated RecordBytes type. W13 is checking corrected
 wrapped assertions against preserved primary and W24 binaries; final integration
 validation has not yet run. No preview acceptance is claimed.
+
+
+## 2026-09-09 — current preview tag published
+
+Created and pushed annotated `preview-057` on the existing current preview's
+recorded source `618b19ba65640ea3d9489369c55ce871c89695ea`. Verified the copied
+binary SHA-256 `657db3f898127ddb8af0a104af78c3613721e80ec4ab9659a4a6699bfec3bb0d`
+and remote peeled tag. Annotation records the original checks and limitations;
+this does not claim a new build or acceptance of today's integration. The
+published binary, original manifest and latest symlink are unchanged. A small
+supplemental manifest records source_tag. The next new preview remains 058.
