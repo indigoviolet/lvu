@@ -1748,3 +1748,15 @@ colour classification through enrichment, and enrichment-key filtering over
 union views as the correlation replacement. They remain Open until assigned;
 recording them does not claim implementation. Existing multi-source assistance,
 unified grouping and the four independent reliability fixes remain active.
+
+
+## 2026-09-09 — independent Sol review assigned
+
+At the user's suggestion, primary launched a dedicated reviewer using the
+configured Sol Implementer profile in lvu-sol-review. Review starts with autosave
+0d3d828 and journal b4c77f5, then viewport90e802c and diagnostic/test revisions.
+The reviewer checks code and evidence independently and reports concrete findings;
+Muse implementers retain their paths, and primary retains acceptance/integration.
+No new review builds are authorized by default. The latest enrichment PTY failure
+was traced to a wrapped diagnostic wait and cleanup typing q into the still-open
+editor, not established load-induced shutdown failure; e2fc618 addresses the test.
