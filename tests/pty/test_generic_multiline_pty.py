@@ -1,11 +1,65 @@
 #!/usr/bin/env python3
 """Auto grouping presents messy multiline logs without changing their records."""
+import os
 import pathlib
 import sys
 import tempfile
+import time
 
 from test_folding_pty import open_palette
 from test_lvu_pty import PtyApp
+
+# Bounded failure evidence, failure-only. The wait_until AssertionError already
+# carries the pyte screen plus a 4 KiB transcript tail, but the matrix summary
+# prints only its last Error/assert line, so a matrix failure arrives with no
+# screen to read. Mirror the fold suite's `screen-*.txt` / `terminal-*.ansi`
+# pair into a caller-provided durable directory outside this fixture's
+# TemporaryDirectory (deleted on exit). Success writes nothing. Contents are
+# fixture-only: this suite's synthetic events.log plus app chrome; no user
+# capture data is read or written here.
+_TRANSCRIPT_TAIL_BYTES = 65536
+
+
+def _artifact_dir() -> pathlib.Path | None:
+    raw = os.environ.get("LVU_PTY_ARTIFACT_DIR")
+    if not raw:
+        return None
+    try:
+        path = pathlib.Path(raw)
+        path.mkdir(parents=True, exist_ok=True)
+        return path if path.is_dir() else None
+    except OSError:
+        return None
+
+
+def _save_failure_artifacts(app: PtyApp | None, error: BaseException) -> list[str]:
+    where = _artifact_dir()
+    if where is None:
+        return []
+    stamp = f"{int(time.time())}-{os.getpid()}"
+    try:
+        screen = app.text() if app is not None else "<no app>"
+    except Exception as exc:  # never mask the original failure
+        screen = f"<screen unavailable: {exc!r}>"
+    try:
+        tail = bytes(app.transcript[-_TRANSCRIPT_TAIL_BYTES:]) if app is not None else b""
+    except Exception:
+        tail = b""
+    saved: list[str] = []
+    try:
+        error_path = where / f"test_generic_multiline_pty-{stamp}-error.txt"
+        error_path.write_text(f"{error!r}\n", encoding="utf-8")
+        saved.append(str(error_path))
+        screen_path = where / f"test_generic_multiline_pty-{stamp}-screen.txt"
+        screen_path.write_text(screen, encoding="utf-8")
+        saved.append(str(screen_path))
+        transcript_path = where / f"test_generic_multiline_pty-{stamp}-transcript.ansi"
+        transcript_path.write_bytes(tail)
+        saved.append(str(transcript_path))
+    except OSError:
+        return saved
+    print(f"generic-multiline failure artifacts: {', '.join(saved)}", file=sys.stderr)
+    return saved
 
 
 def run(binary: pathlib.Path) -> None:
@@ -65,6 +119,12 @@ def run(binary: pathlib.Path) -> None:
             app.send(b"q")
             assert app.wait_exit(timeout=8) == 0
             app.assert_restored()
+        except BaseException as error:
+            try:
+                _save_failure_artifacts(app, error)
+            except Exception:
+                pass
+            raise
         finally:
             if app.process.poll() is None:
                 app.process.kill()
