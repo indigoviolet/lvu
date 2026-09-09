@@ -1780,3 +1780,12 @@ candidate must not inherit final revision's validation. No second verified
 atomicity/ack-order defect was found by read-only review. Final worker gates are
 still required; no build/slow-volume evidence is implied by the review.
 Report: sol-review-scratch/autosave-0d3d828-review.md on the build volume.
+
+
+UTC timestamp/severity AI shortcuts and explicit column-role implementation
+are now assigned to a8f5e7f on a new feature branch, preserving the diagnostic
+candidate ref. Role defaults are unset; role assignment follows accepted reviewed
+enrichment, with selected event time distinct from capture metadata. Normal new
+flows must not retain hidden timestamp/severity inference. Existing saved legacy
+semantics require explicit compatibility handling. Source/grouping/autosave
+owners were contacted about narrow disjoint UI/projection/persistence seams.
