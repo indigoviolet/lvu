@@ -1727,3 +1727,24 @@ boundary choices. These other consumers are recorded as unresolved follow-up,
 not claimed migrated. Run keys currently truncate to maximum_key_chars before
 comparison; distinct long values can merge. The corrected grouping must preserve
 exact key semantics rather than use truncated presentation strings as identity.
+
+
+## 2026-09-09 — live union views authorized
+
+The user requested implementation of a union derived view over existing views
+from different sources, merged in timestamp order, then reusable with ordinary
+filters and grouping. It is now Working in TODO. This supersedes a need for
+special-purpose correlation extraction as the primary workflow; existing
+correlation is not silently removed. A union references captured records rather
+than acquiring them again. Stable identity, deterministic time ties/missing-time
+handling, overlapping inputs, live refresh and dependency revision fencing are
+required design boundaries. Primary is assigning a Muse worktree for this
+bounded feature alongside grouping and multi-source assistance.
+
+
+User requested explicit tracking of all related items. TODO now separates
+AI-proposed UTC timestamp/severity enrichment columns and view-role selection,
+colour classification through enrichment, and enrichment-key filtering over
+union views as the correlation replacement. They remain Open until assigned;
+recording them does not claim implementation. Existing multi-source assistance,
+unified grouping and the four independent reliability fixes remain active.
