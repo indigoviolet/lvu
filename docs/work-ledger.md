@@ -1485,3 +1485,21 @@ group; and leading ANSI styling is skipped for head classification but not for
 structured-state initialization, so a coloured JSON head may remain open after
 its closing bracket. W22 owns the bounded corrections and regression evidence.
 The current installed and published version remains v0.1.2 unchanged.
+
+## 2026-09-09 — multiline implementation handoff and Muse routing
+
+W22 ended its Sol implementation session clean at `6ee22cf`. The three final
+review corrections cover Custom mode preservation, partial-chain boundary reset
+and ANSI-prefixed structured closure. Focused regressions, complete lvu-view
+and lvu suites, workspace all-target clippy, app/demo builds, multiline PTY
+and real-source PTY passed. The first final matrix was 72/73: fold-by-column
+failed once and passed an immediate isolated rerun with the same binary and
+environment. A second matrix ended without a recoverable summary; no pass is
+claimed. Historical `a3eb19a` 73/73 remains evidence only for that revision.
+The corrected candidate is not integrated or released yet.
+
+The user selected Muse Spark 1.3 for subsequent implementation subagents while
+retaining this primary as supervisor. The configured profile passed a read-only
+repository/command smoke test. Sol W22 holds all further work; future fixes and
+validation route to Muse. The TODO/changelog implementation is assigned to a
+dedicated Muse worktree; primary retains review, integration and publication.
