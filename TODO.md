@@ -14,7 +14,7 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 
 | Status | Work |
 | --- | --- |
-| **Working** | Configure true log-event starts using accepted enrichment output, such as a column being non-null; collapse every intervening record until the next start. The integrated continuation heuristics do not satisfy this requirement; v0.1.3 publication is held for correction. |
+| **Working** | Unify Grouping with Run and Filter modes over enrichment outputs: consecutive equal keys, or non-null event starts with all intervening records collapsed. Move pattern definition out of grouping, preserve exact key equality and legacy saved meaning. v0.1.3 publication is held for this correction. |
 | **Working** | Let source assistance propose and add multiple reviewed sources in one request, with bounded results, stable identities and no execution before approval in the application. |
 | **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
 | **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
@@ -37,6 +37,7 @@ Unresolved and not currently assigned. No new product commitments beyond what is
 
 | Status | Work |
 | --- | --- |
+| **Open** | Align other derived-data consumers with enrichment: built-in timestamp recognition/severity mapping, direct colour predicates and raw-only correlation keys remain separate paths. Basic structured input decoding and raw search are deliberate boundaries to settle. |
 | **Open** | Display time zones are fixed UTC offsets only: no timezone database, so daylight saving is never applied and a named zone (`Europe/Berlin`) cannot be chosen. Every displayed timestamp carries its offset; the Settings help line says so. |
 | **Open** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
 | **Open** | Validate installation/terminal/process behavior on macOS and Windows (audit in docs/portability.md, checklist in docs/mac-test-plan.md; no run yet). arm64 Linux archive is built and CI-executed but has had no human interactive acceptance. |

@@ -1708,3 +1708,22 @@ W22 is authorized to implement immediately through the existing typed projection
 with explicit failed/pending handling, and normal grouping UX replacing heuristic
 recognition. Legacy persisted settings retain their meaning. app memory.rs is
 excluded from W22 ownership; existing persistence plus separate tests suffice.
+
+
+## 2026-09-09 — unified grouping and enrichment-only pattern ownership
+
+The user clarified that runs of equal values and event-start/filter grouping
+are modes of one grouping feature, both consuming enrichment outputs. Patterns
+and extracted keys belong in enrichment, with raw-text search as a convenience
+exception. W22 ownership expands to the existing folding engine/component and
+scoped grouping app methods. Normal new grouping should expose Run/Filter/Off;
+legacy saved semantics must remain explicit and stable.
+
+Primary code audit found current exceptions: folding's built-in pattern_key
+normalizer; live timestamp recognition and severity aliases; direct colour-rule
+predicates; correlation's raw JSON/logfmt-only key extraction. Basic structured
+input decoding, capture metadata and raw search were identified separately as
+boundary choices. These other consumers are recorded as unresolved follow-up,
+not claimed migrated. Run keys currently truncate to maximum_key_chars before
+comparison; distinct long values can merge. The corrected grouping must preserve
+exact key semantics rather than use truncated presentation strings as identity.
