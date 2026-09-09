@@ -280,8 +280,8 @@ brew install uv node     # or: mise use -g uv node
 
 ## 5. Cutting the next version
 
-`v0.1.2` was completed on 2026-09-09. For a subsequent patch release, use
-`0.1.3` below only when that is the intended new version.
+`v0.1.2` was completed on 2026-09-09. `0.1.3` is the version now in
+preparation below; use another number only when a different version is intended.
 
 ```sh
 git status --short --branch # use the reviewed integration/release checkout

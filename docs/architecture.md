@@ -435,6 +435,18 @@ column, minimum run, scope and normalisation, and persists them with the view;
 folding on several fields is an enrichment column built from them, which its
 picker creates by opening the ordinary step editor pre-filled.
 
+Multiline grouping (`crates/lvu/src/grouping.rs`) maps the persisted grouping
+field to Auto or Custom without changing stored custom rules: only the exact
+reserved token `(?lvu:auto:v1)` — which the legacy regex parser rejects —
+means Auto, and any other `(?lvu:auto:…)` version is rejected with an
+instruction to reopen Grouping and choose Auto. The Grouping dialog (`m`)
+offers Auto, Custom or Off; grouped events render downstream through the
+existing Folding presentation (`z`). Auto recognition is engine-side and
+bounded (64 physical records, 64 KiB payload, 30 s head span over monotonic
+earlier captures, 512-byte classification prefix); orphans that match nothing
+stay standalone. A Custom draft is remembered per view in memory only and does
+not survive restart.
+
 
 Settings uses explicit control focus, a staged theme dropdown and a bounded
 overflow/details viewport. A late save acknowledgment advances the rollback

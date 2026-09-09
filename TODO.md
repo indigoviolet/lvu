@@ -14,7 +14,11 @@ Six parallel Muse Spark implementation/validation assignments; the supervisor ow
 
 | Status | Work |
 | --- | --- |
-| **Working** | Readable multiline output through reversible Grouping/Folding: wrapped messages, pretty-printed payloads, diagnostics, stack traces and stray continuation lines. Conservative bounded event recognition; every original byte and record preserved, incomplete output stays visible. Corrected implementation is awaiting final validation and integration; not released. |
+| **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
+| **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
+| **Working** | Investigate enrichment-chain/filter mismatches and replace missing-column implementation errors with actionable diagnostics, preserving the last valid view. |
+| **Working** | Stabilize the empty-event Fields close PTY check using observable dialog state rather than a longer timeout. |
+| **Working** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no performance or full-soak pass is claimed yet. |
 | **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
 | **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
 | **Working** | Investigate enrichment-chain/filter mismatches and replace missing-column implementation errors with actionable diagnostics, preserving the last valid view. |
@@ -30,6 +34,7 @@ Integrated after v0.1.2; outside the immutable v0.1.2 tag and installed runtime.
 | **Ready** | Status prioritizes actionable notices, event-time diagnostics, row ranges and visible return/help controls; wide/combining text fits and optional indicators give way as whole segments. |
 | **Ready** | FOLLOW draws the newest servable window while preserving true-tail selection. HISTORY keeps its requested destination separate from retained displayed rows, retries without another keypress, and reports the actual range. |
 | **Ready** | Pending raw-context location is visible in narrow status lines: the protected prefix says `locating #N` until the chase resolves or reports its bounded failure. Full origin context remains optional when space fits. |
+| **Ready** | Readable multiline output through reversible Grouping/Folding: wrapped messages, pretty-printed payloads, diagnostics, stack traces and stray continuation lines. Conservative bounded event recognition; every original byte and record preserved, incomplete output stays visible. |
 
 ## Upcoming backlog
 

@@ -14,7 +14,9 @@ What each version shipped is recorded in
 
 The volume-backed full soak remains unaccepted: cold-query latency and memory
 autosave-flush shutdown failures remain unresolved. Status/FOLLOW corrections
-are integrated for the next version; generic multiline work is in progress.
+and generic multiline grouping are integrated for the next version (v0.1.3
+source in preparation, not published); v0.1.2 remains the current public
+release.
 
 See the [release runbook](release-runbook.md) for validation, archive publication,
 Homebrew updates and installation checks. Archives contain the application,

@@ -209,3 +209,14 @@ a highlight — searching the original bytes and reporting offsets into them
 would, because one invalid byte becomes three. Only pattern forms are located; a
 `field: value` or `pl.…` predicate names a column, not a run of characters, and
 underlines nothing.
+
+## Multiline grouping (display-only)
+
+Grouping changes presentation, never capture: original bytes, stable record
+identities and filter membership are preserved, and ambiguous orphans remain
+standalone events rather than joining a group. The persisted grouping field
+carries a custom regex verbatim with its legacy meaning unchanged; automatic
+recognition is selected only by the exact reserved token `(?lvu:auto:v1)`,
+and unknown `(?lvu:auto:…)` versions are rejected actionably. Per-view Custom
+drafts are in-memory editor state, not durable workspace state: they are not
+restored after restart.
