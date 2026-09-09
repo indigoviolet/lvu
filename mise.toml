@@ -358,5 +358,9 @@ python scripts/janitor.py --dry-run | sed 's/^/  /'
 
 [tasks."test:pty:matrix"]
 description = "Run every PTY suite concurrently and report the pass/fail matrix"
-depends = ["matrix:preflight", "build:app", "build:tui"]
-run = 'python scripts/pty-matrix.py --workers 4 --target "${CARGO_TARGET_DIR:-target}/debug"'
+depends = ["build:app", "build:tui"]
+# Freshness is checked after both build dependencies finish, not alongside them.
+run = '''
+mise run matrix:preflight || exit 1
+python scripts/pty-matrix.py --workers 4 --target "${CARGO_TARGET_DIR:-target}/debug"
+'''

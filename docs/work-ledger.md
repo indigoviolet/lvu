@@ -1069,3 +1069,24 @@ lowercase (6M guard); 620k/3M engine rates were 1554/1519 versus 542/467 MB/s.
 Mixed batches partition ASCII rows for escaped ASCII-insensitive regex and
 retain lowercase semantics for non-ASCII rows, then restore original order.
 These are worker benchmark results, not a completed combined validation.
+
+## 2026-09-09 — ordering fixture and matrix build ordering corrected
+
+The primary gate on `e6dae0e` with local /tmp fixtures passed formatting,
+bridge typecheck, all 87 bridge tests and bridge build. Rust workspace tests
+and clippy stopped at the ordering-test Membership initializer missing the
+new color_matches/color_rules fields. The matrix did not execute: its
+freshness prerequisite ran concurrently with its builds and rejected stale
+binaries before the rebuild completed. Log: `primary-sol-local-fixture-gate.log`
+on the build volume. No full-gate acceptance is claimed.
+
+Primary added empty color state to the ordering fixture and moved the matrix
+freshness check into its run phase, after both binary build dependencies.
+Formatting and diff checks pass; Rust and matrix validation are pending.
+
+W24's current candidate is `bb2fe9d` on `7e0fa22`. Worker query tests, Unicode
+and color-rule integration coverage, and scan throughput passed. Clippy hit
+the same primary initializer error; builds and matrix were not run. The
+optimized guard measured 5.64–6.89M records per CPU-second versus 4.77M with
+the fast path disabled. Its revised floor is 5.2M, replacing the earlier 6M
+floor after the observed 5.64M enabled result. Full integration remains pending.

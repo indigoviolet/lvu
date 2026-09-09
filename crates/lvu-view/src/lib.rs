@@ -6067,6 +6067,8 @@ mod order_tests {
             }),
             enrichment_names: Vec::new(),
             derived: HashMap::new(),
+            color_matches: HashMap::new(),
+            color_rules: Vec::new(),
             advanced: None,
             enrichment: Vec::new(),
             evaluation_page_bytes: 0,
