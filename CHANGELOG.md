@@ -4,7 +4,11 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
-## [v0.1.3](https://github.com/indigoviolet/lvu/releases/tag/v0.1.3) — 2026-09-09
+## Unreleased
+
+v0.1.3 remains untagged. Event-start grouping is being corrected to the requested
+configurable boundary model; the existing heuristic behavior below is integrated
+but does not satisfy that requirement.
 
 ### Features
 

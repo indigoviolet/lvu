@@ -1671,3 +1671,30 @@ immutable annotated tag. Muse distribution owner
 exclusive /tmp/tap11 formula publication after this accepted tag is sent;
 primary retains installed-archive PTY acceptance. v0.1.2 is still the public and
 installed runtime until archive checks and publication finish.
+
+
+## 2026-09-09 — user corrects grouping semantics; publication held
+
+Before tag creation/push, the user clarified that grouping must identify true
+log-event starts through a configurable rule, potentially an enrichment column
+being non-null, and collapse every record between successive starts. The
+integrated Auto/continuation heuristics do not satisfy that requirement, despite
+their green tests. v0.1.3 was not tagged or published; distribution acknowledged
+the hold and verified remote tag/release absence. The source version remains
+0.1.3 in preparation, with v0.1.2 still public and installed.
+
+W22 Muse owns the correction: one native Polars boolean start criterion with a
+column picker for non-null checks; all intervening records join regardless of
+lexical shape. A valid null is evaluated normally by is_not_null, distinct from
+pending/failed prerequisite data. Preserve legacy persisted grouping meaning,
+last-good fencing, stable identities, live raw visibility and bounded paging.
+Large events must not acquire invented starts merely from the heuristic
+64-record/64-KiB limits. Query expression-seam ownership transfers from the
+finishing diagnostic worker to W22, while app memory.rs remains autosave-owned
+and ui.rs status remains viewport-owned. Primary retains shared documentation.
+
+The diagnostic candidate is now 4e066ce plus 1a96a76, with batch-scoped missing
+column wording and later-stage ordering diagnostics; targeted view/PTY evidence
+is still pending. Journal candidate 443fdae needs its expired-commit regression
+to establish an explicitly overdue initial state, replacing the remaining
+100,000-page hardware-speed assumption. Neither candidate is integrated yet.
