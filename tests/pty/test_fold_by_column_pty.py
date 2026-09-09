@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Folding by a column, in the actual application.
+"""Run grouping on an enrichment column, in the actual application.
 
-The fold key is the value of exactly one column. By default that column is a
-derived one — the row text with volatile substrings replaced — which is what
-folding always did. This story builds an enrichment column, chooses it in the
-Folding dialog, and shows the same rows collapsing on a completely different
-axis, at 80x24 and again at 54x16.
+A run is a group of consecutive rows sharing one exact enrichment value.
+This story builds an enrichment column, selects it in the Grouping dialog's
+Run tab, and shows the service rows collapsing on that axis while the
+keyless flood stays listed individually — at 80x24 and again at 54x16.
+Recognition lives in Enrichment; Grouping only names its output column, so
+no pattern normalisation takes part.
 """
 
 import os
@@ -29,12 +30,10 @@ WORDS = [
 
 
 def source_text() -> str:
-    """Twelve rows no two of which share a shape, then a flood that does.
+    """Twelve rows sharing a service key, then a keyless flood.
 
-    The first twelve differ in every word, so the derived pattern column has
-    nothing to collapse; they share a service, so a service column does. The
-    flood is the opposite, which is what makes the two keys distinguishable on
-    one screen.
+    The first twelve share `service`, so Run grouping collapses them into two
+    events; the flood carries no key, so every retry stays listed on its own.
     """
     lines = [f"svc=shipper {word}" for word in WORDS]
     lines += [f"svc=indexer {word}" for word in WORDS]
@@ -43,15 +42,6 @@ def source_text() -> str:
         for attempt in range(FLOOD)
     ]
     return "\n".join(lines) + "\n"
-
-
-def open_palette(app, query, expected):
-    app.send(b"\x10")
-    app.wait_for("Command palette")
-    app.send(query.encode())
-    app.wait_for(expected)
-    app.send(b"\r")
-    app.wait_until(lambda text: "Command palette" not in text, "palette dismissed")
 
 
 def add_service_column(app):
@@ -70,9 +60,16 @@ def add_service_column(app):
     app.wait_until(lambda text: "Steps" not in text, "enrichment closed")
 
 
-def open_folding(app):
-    app.send(b"z")
-    return app.wait_for("Folding")
+def open_grouping(app):
+    app.send(b"m")
+    return app.wait_for("Multiline grouping")
+
+
+def choose_run_column(app, column):
+    """Grouping opens on the Run tab with a blank column and the caret in
+    its slot: pasting names the column in place, keeping a valid rule."""
+    paste(app, column)
+    app.wait_for(f"(?lvu:run:v1:column:{column})")
 
 
 def run(binary):
@@ -99,59 +96,44 @@ def run(binary):
             app.wait_for("retry con")
             add_service_column(app)
 
-            # The default key is unchanged: the flood of same-shaped retries
-            # collapses to one line and the twelve service rows, which share no
-            # shape, do not. Counting rows rather than reading the `[xN
-            # repeated]` suffix keeps the assertion honest at 80 columns, where
-            # the suffix is off the right edge.
-            open_palette(app, "fold repeated", "Fold repeated events")
-            folded = app.wait_until(
-                lambda text: text.count("retry con") == 1,
-                "the default key still folds the flood", timeout=20)
-            assert folded.count("svc=ship") == len(WORDS), folded
-            assert folded.count("svc=inde") == len(WORDS), folded
-
-            # The dialog names the default column and offers the one setting
-            # that applies only to it.
-            dialog = open_folding(app)
-            assert "Message pattern" in dialog, dialog
-            assert "Normalisation" in dialog, dialog
-            assert "Minimum run" in dialog, dialog
-            assert "Scope" in dialog, dialog
-
-            # Choose the enrichment column: one row down from the derived one.
+            # The Run tab opens with a blank column: name the enrichment
+            # output and every run of equal values becomes one group, while
+            # the keyless flood rows stay listed individually — nulls never
+            # join runs, not even each other.
+            dialog = open_grouping(app)
+            assert "Run" in dialog, dialog
+            assert "Legacy" in dialog, dialog
+            assert "empty draft turns grouping" in dialog, dialog
+            choose_run_column(app, "service")
             app.send(b"\r")
-            picker = app.wait_for("(default)")
-            assert "service" in picker, picker
-            assert "New column" in picker, picker
-            app.send(b"\x1b[B")
-            app.send(b"\r")
-            by_service = app.wait_until(
-                lambda text: "Normalisation" not in text and "service" in text,
-                "the service column becomes the fold key", timeout=20)
-            # Normalisation is gone: a column key is used as it stands, so the
-            # setting that rewrites the derived column cannot apply.
-            assert "the key as it stands" in by_service, by_service
-            assert "folding on service" in by_service, by_service
+            app.wait_until(lambda text: "Applied" in text,
+                           "run grouping applied", timeout=15)
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Key column" not in text, "the dialog closed")
+            app.wait_until(lambda text: "Multiline grouping" not in text,
+                           "the dialog closed", timeout=10)
 
-            # The same rows now fold on a completely different axis.
+            # Each service collapses to one counted line; the flood has no
+            # key and stays individual.
             collapsed = app.wait_until(
                 lambda text: text.count("svc=ship") == 1
                 and text.count("svc=inde") == 1,
                 "each service collapses to one counted line", timeout=20)
-            assert collapsed.count("retry con") == 1, collapsed
+            assert collapsed.count("retry con") == FLOOD, collapsed
 
-            # Presentation only: Enter restores the constituent rows in order.
+            # Presentation only: expanding swaps the shipper head for its six
+            # member lines, leaving the indexer run collapsed; collapsing
+            # restores the head. (Count suffixes sit off the right edge at 80
+            # columns, so head presence is the honest signal.)
             app.send(b"g")
             app.send(b"\r")
             expanded = app.wait_until(
-                lambda text: text.count("svc=ship") == len(WORDS),
+                lambda text: "svc=shipper" not in text
+                and text.count("svc=inde") == 1,
                 "the run expands into its own rows", timeout=15)
-            assert expanded.count("svc=inde") == 1, expanded
+            assert "retry con" in expanded, expanded
             app.send(b"\r")
-            app.wait_until(lambda text: text.count("svc=ship") == 1,
+            app.wait_until(lambda text: text.count("svc=ship") == 1
+                           and text.count("svc=inde") == 1,
                            "and collapses again", timeout=15)
             stop(app)
         finally:
@@ -162,48 +144,39 @@ def run(binary):
                 app.process.wait(timeout=5)
                 app.close()
 
-        # The key column is view state, so it comes back with the view — and the
-        # dialog is operable in the smallest supported terminal.
+        # The run column is view state, so it comes back with the view — and
+        # the dialog is operable in the smallest supported terminal.
         small = PtyApp(binary, arguments, width=54, height=16, environment=environment)
         try:
+            # Eleven rows fit, so only the flood's first singles are
+            # visible: persistence is the two collapsed heads either way.
             restored = small.wait_until(
                 lambda text: text.count("svc=ship") == 1
                 and text.count("svc=inde") == 1,
-                "the column key survives a restart", timeout=30)
-            assert restored.count("retry con") == 1, restored
-            narrow = open_folding(small)
-            assert "Key column" in narrow, narrow
+                "the run column survives a restart", timeout=30)
+            assert restored.count("retry con") >= 1, restored
+            narrow = open_grouping(small)
+            assert "Run" in narrow, narrow
             assert "service" in narrow, narrow
-            assert "Normalisation" not in narrow, narrow
             for line in narrow.splitlines():
                 assert len(line) <= 54, (len(line), line)
 
-            # Back to the default column, from the narrow terminal.
-            # `(default)` marks the open list; the field alone would read
-            # `Message pattern` once the row is chosen, which is not the same
-            # thing to wait for.
-            small.send(b"\r")
-            small.wait_for("(default)")
-            small.send(b"\x1b[A")
-            small.send(b"\r")
-            back = small.wait_until(lambda text: "Normalisation" in text,
-                                    "the derived column is selected again", timeout=15)
-            assert "Message pattern" in back, back
+            # Off clears the draft, from the narrow terminal: click the Off
+            # segment, which also hands the keys to the field. Applying the
+            # empty rule (dialog request plus worker ungroup) is pinned at the
+            # Rust layer instead of through an unobservable focus walk here.
+            tab_row = next(
+                line for line in narrow.splitlines()
+                if "Run" in line and "Legacy" in line and "Off" in line
+            )
+            row = narrow.splitlines().index(tab_row) + 1
+            col = tab_row.index("Off") + 1
+            small.send(f"\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m".encode())
+            small.wait_until(lambda text: "(?lvu:" not in text,
+                             "off selected", timeout=10)
             small.send(b"\x1b")
-            small.wait_until(lambda text: "Key column" not in text, "the dialog closed")
-            default = small.wait_until(
-                lambda text: text.count("svc=ship") == len(WORDS),
-                "and the default fold returns: every service row is its own",
-                timeout=20)
-            # Eleven log rows fit here, so the six shipper rows and the first
-            # of the indexer ones are what is on screen.
-            assert default.count("svc=inde") >= 4, default
-            # Eleven visible rows at this size, so the flood's counted line is
-            # below them; the end of the stream is where it stands.
-            small.send(b"G")
-            tail = small.wait_until(lambda text: "retry con" in text,
-                                    "the flood is still one line", timeout=15)
-            assert tail.count("retry con") == 1, tail
+            small.wait_until(lambda text: "Multiline grouping" not in text,
+                             "the dialog closed", timeout=10)
             stop(small)
         finally:
             (root / "terminal-54x16.ansi").write_bytes(small.transcript)
@@ -219,6 +192,6 @@ def run(binary):
 
 if __name__ == "__main__":
     run(pathlib.Path(sys.argv[1]).resolve())
-    print("Fold-by-column PTY passed: the default derived column folds as before, an "
-          "enrichment column becomes the key, normalisation applies only to the "
-          "derived column, and the choice survives a restart at 54x16")
+    print("Run-grouping PTY passed: equal enrichment values collapse, keyless rows "
+          "stay individual, expansion restores order, the choice survives a "
+          "restart at 54x16, and Off clears the draft")

@@ -1112,7 +1112,7 @@ fn render_logs<P: RowProvider>(
                     crate::ansi::without_ansi(field_value(&row, field).unwrap_or("—")).into_owned(),
                 )
             }));
-            let group_lines = row
+            let mut group_lines = row
                 .details
                 .iter()
                 .filter(|(key, _)| {
@@ -1122,6 +1122,16 @@ fn render_logs<P: RowProvider>(
                 })
                 .map(|(_, value)| value.clone())
                 .collect::<Vec<_>>();
+            // A capped group page states its shown/total when expanded: the
+            // collapsed head text (which carries the counts) is replaced by
+            // the member lines, so without this the expansion would imply all
+            // lines are displayed. Remaining members stay in the source view.
+            if expanded.contains(&row.id)
+                && let Some((_, notice)) =
+                    row.details.iter().find(|(key, _)| key == "group_truncated")
+            {
+                group_lines.push(notice.clone());
+            }
             let is_expanded = expanded.contains(&row.id) && group_lines.len() > 1;
             let ascii = app.appearance.ascii;
             let fold = FoldMark::from_details(&row.details).filter(|_| fold_gutter_fits);

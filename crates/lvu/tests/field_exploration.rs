@@ -283,60 +283,94 @@ fn filter_exclude_and_fold_act_on_the_selected_value() {
         )
     );
 
-    // Fold by field sets the fold key and turns folding on, like the dialog.
+    // Fold by field submits a Run grouping on that column through the unified
+    // control; the worker names any non-enrichment column actionably while
+    // the last-good view stays put.
     key(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
-    let state = app.view_state().unwrap();
-    assert!(state.fold_enabled);
-    assert_eq!(state.fold_key_column.as_deref(), Some("level"));
-    assert_eq!(app.action_notice.as_deref(), Some("folding on level"));
+    let request = app.take_query_requests().pop().expect("a grouping request");
+    assert_eq!(request.purpose, QueryPurpose::Grouping);
+    assert_eq!(
+        request.constraints.grouping,
+        Some(lvu::grouping::run_rule("level"))
+    );
+    assert_eq!(app.action_notice.as_deref(), Some("grouping runs on level"));
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id.clone(),
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    assert_eq!(
+        app.view_state().unwrap().grouping.applied,
+        lvu::grouping::run_rule("level")
+    );
 
-    // §8.9: the action follows the state it acts on. Folding from here and
-    // then having to find the Folding dialog to undo it is the trap that rule
-    // exists to close, so the same key on the same column stops folding.
+    // §8.9: the action follows the state it acts on, so the same key on the
+    // same column clears the rule again instead of leaving no way back.
     key(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
-    let state = app.view_state().unwrap();
-    assert!(!state.fold_enabled);
+    let request = app.take_query_requests().pop().expect("an off request");
+    assert_eq!(request.purpose, QueryPurpose::Grouping);
+    assert!(request.constraints.grouping.is_none());
     assert_eq!(
         app.action_notice.as_deref(),
-        Some("folding off; was on level")
+        Some("grouping off; runs were on level")
     );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id.clone(),
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    assert!(app.view_state().unwrap().grouping.applied.is_empty());
 
     // And turning it on again from the same place works.
     key(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
-    assert!(app.view_state().unwrap().fold_enabled);
+    let request = app.take_query_requests().pop().expect("a grouping request");
+    assert_eq!(
+        request.constraints.grouping,
+        Some(lvu::grouping::run_rule("level"))
+    );
 }
 
-/// Switching the fold from one column to another says which key it left, since
-/// every run on screen changes and the status count moving is otherwise the
-/// only sign of it.
+/// Switching runs from one column to another submits the new rule, since
+/// every run on screen changes and the worker names any column it cannot
+/// evaluate.
 #[test]
-fn folding_from_fields_by_a_second_column_names_the_key_it_replaces() {
+fn grouping_from_fields_by_a_second_column_submits_its_rule() {
     let (provider, mut app) = nested();
     app.handle(Action::Top, &provider);
     app.handle(Action::Open(Open::Fields), &provider);
     // The first top-level column the picker offers.
     key(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
-    let first = app
-        .view_state()
-        .unwrap()
-        .fold_key_column
-        .clone()
-        .expect("a fold key");
+    let first = app.take_query_requests().pop().expect("a grouping request");
+    assert_eq!(first.purpose, QueryPurpose::Grouping);
+    let Ok(lvu::grouping::GroupingSpec::Run {
+        column: first_column,
+    }) = lvu::grouping::parse_grouping(first.constraints.grouping.as_deref().unwrap_or_default())
+    else {
+        panic!("a run rule");
+    };
     assert_eq!(
         app.action_notice.as_deref(),
-        Some(&*format!("folding on {first}"))
+        Some(&*format!("grouping runs on {first_column}"))
     );
 
-    // Move to a different top-level column and fold by that instead.
+    // Move to a different top-level column and group by that instead.
     plain(&mut app, &provider, KeyCode::Down);
     key(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
-    let state = app.view_state().unwrap();
-    let second = state.fold_key_column.clone().expect("a fold key");
-    assert!(state.fold_enabled);
-    assert_ne!(second, first, "the second column must differ");
+    let second = app.take_query_requests().pop().expect("a grouping request");
+    let Ok(lvu::grouping::GroupingSpec::Run {
+        column: second_column,
+    }) = lvu::grouping::parse_grouping(second.constraints.grouping.as_deref().unwrap_or_default())
+    else {
+        panic!("a run rule");
+    };
+    assert_ne!(second_column, first_column, "the second column must differ");
     assert_eq!(
         app.action_notice.as_deref(),
-        Some(&*format!("folding by {first} → {second}"))
+        Some(&*format!("grouping runs on {second_column}"))
     );
 }
 

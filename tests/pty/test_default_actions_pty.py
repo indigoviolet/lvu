@@ -152,22 +152,14 @@ def run(binary: pathlib.Path) -> None:
             app.send(b"\x1b")
             app.wait_until(lambda text: "[ Refresh ]" not in text, "storage closes")
 
-            # Folding: a settings dialog whose one verb is its default, so the
-            # fill marks the row. The initial focus is the key-column dropdown,
-            # which keeps Enter (§8.9), and Escape closes the list only.
+            # Grouping: `z` opens the same unified Run/Filter/Off control as
+            # `m`. Its one verb is its default, so the fill marks the row.
             app.send(b"z")
-            app.wait_for("[ Collapse expanded runs ]")
-            assert_only_default(app, "[ Collapse expanded runs ]", ())
-            # `(default)` only ever appears inside the open picker, so it is
-            # what says the list is up; the field itself reads `Message pattern`
-            # either way.
-            app.send(b"\r")
-            app.wait_for("(default)")
+            app.wait_for("Multiline grouping")
+            assert_only_default(app, "[ Apply ]", ())
             app.send(b"\x1b")
-            app.wait_until(lambda text: "(default)" not in text and "Key column" in text,
-                           "the picker closes, not the dialog")
-            app.send(b"\x1b")
-            app.wait_until(lambda text: "Key column" not in text, "folding closes")
+            app.wait_until(lambda text: "Multiline grouping" not in text,
+                           "grouping closes")
 
             # Settings: Enter from the Provider field saves the pending draft.
             app.send(b",")
@@ -194,10 +186,11 @@ def run(binary: pathlib.Path) -> None:
             app.send(b"\x1b")
             app.wait_until(lambda text: "[ New blank ]" not in text, "view closes")
             app.send(b"z")
-            app.wait_for("[ Collapse expanded runs ]")
-            assert_only_default(app, "[ Collapse expanded runs ]", ())
+            app.wait_for("Multiline grouping")
+            assert_only_default(app, "[ Apply ]", ())
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Key column" not in text, "folding closes")
+            app.wait_until(lambda text: "Multiline grouping" not in text,
+                           "grouping closes")
             app.send(b",")
             app.wait_for("[ Save ]")
             assert_only_default(app, "[ Save ]", ())

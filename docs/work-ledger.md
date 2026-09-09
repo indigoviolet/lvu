@@ -2002,3 +2002,18 @@ sound apart from the retained collapse-all action and required-command list,
 which are assigned with final UI tests. Worker-only roles451c182 has been
 submitted for independent review; union app-flow work continues. These later
 features remain outside v0.1.3.
+
+
+## 2026-09-09 — unified grouping integrated for final acceptance
+
+Integrated the reviewed delta 655d1a1..be577da. Run/Filter/Off now shares normal
+keyboard, palette, Fields and summary routing. Retained group accounting and
+unsupported-key rejection preserve bounds and last-good publication. Independent
+engine and routing delta reviews are clear. The worker's last gate was interrupted
+by a supervisor follow-up during compilation; it is not final acceptance.
+
+Primary corrected the large-view PTY to sample blank frames from dialog close
+through grouping and ungrouping completion, rather than only after completion.
+The exact clean integration commit will now run the reviewed isolated final gate.
+No v0.1.3 tag or archive acceptance is claimed by this entry. Roles and union
+remain separate work in progress outside this release.

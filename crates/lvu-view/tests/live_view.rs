@@ -1596,6 +1596,608 @@ async fn automatic_multiline_grouping_is_conservative_exact_and_incremental() {
     manager.shutdown().await;
 }
 
+/// Filter grouping is the configured event-start rule: one accepted
+/// enrichment column is non-null on true log lines, and every intervening
+/// record continues whatever it looks like — including unindented lines no
+/// lexical classifier would join.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filter_grouping_collapses_unindented_continuations_until_next_start() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(
+        &root,
+        "prologue\nERROR one\nplain a\nINDENTED?\nno indent at all\nERROR two\nplain c\n",
+        true,
+    )
+    .await;
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.enrichments = vec![lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("mark".into()),
+        source: "/^(?P<is_start>ERROR)/".into(),
+        command: None,
+    }];
+    grouped.constraints.grouping = Some(lvu::grouping::filter_rule("is_start"));
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 3).await;
+    // The leading record precedes every start: visible and standalone.
+    assert_eq!(rows[0].text, "prologue  [1 orphan continuation]");
+    assert!(rows[1].text.contains("4 physical lines"), "{rows:#?}");
+    assert!(rows[2].text.contains("2 physical lines"));
+    assert_eq!(adapter.status("view").unwrap().matched_records, 7);
+    let continued = rows[1]
+        .details
+        .iter()
+        .filter(|(key, _)| key.starts_with("group_line_") && key != "group_line_count")
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(continued.len(), 4);
+    // Member lines render text first with the stable ID after it, so narrow
+    // surfaces show content instead of a UUID prefix.
+    assert!(continued[0].starts_with("ERROR one"), "{continued:#?}");
+    assert!(continued[1].starts_with("plain a"), "{continued:#?}");
+    assert!(
+        continued[3].starts_with("no indent at all"),
+        "{continued:#?}"
+    );
+
+    // Live append opens a new event without disturbing the accepted heads.
+    let head = rows[1].id.clone();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    writeln!(file, "ERROR three").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 8).await;
+    let rows = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let rows = adapter
+                .rows()
+                .page("view", ViewportRequest { start: 0, len: 4 })
+                .rows;
+            if rows.len() == 4 && rows[3].text == "ERROR three" {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(rows[1].id, head);
+
+    // A fresh full scan reproduces the incremental groups exactly, so batch
+    // boundaries cannot invent or move event starts.
+    let expected = rows
+        .iter()
+        .map(|row| (row.id.clone(), row.text.clone(), row.details.clone()))
+        .collect::<Vec<_>>();
+    let mut replay = request("view", 2, 2, 1, None, None);
+    replay.purpose = QueryPurpose::Grouping;
+    replay.base_constraints = grouped.constraints.clone();
+    replay.constraints.enrichments = grouped.constraints.enrichments.clone();
+    replay.constraints.grouping = Some(lvu::grouping::filter_rule("is_start"));
+    adapter.submit(replay.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let replayed = wait_page(&mut adapter, 4).await;
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|row| (row.id.clone(), row.text.clone(), row.details.clone()))
+            .collect::<Vec<_>>(),
+        expected,
+        "a fresh full scan must reproduce incremental groups exactly"
+    );
+
+    // An unknown column rejects the candidate and preserves the last good
+    // groups; a malformed rule does the same.
+    for bad in [
+        lvu::grouping::filter_rule("no_such_column"),
+        "(?lvu:filter:v1:column:)".to_owned(),
+    ] {
+        let mut invalid = request("view", 3, 3, 2, None, None);
+        invalid.purpose = QueryPurpose::Grouping;
+        invalid.base_constraints = replay.constraints.clone();
+        invalid.constraints.enrichments = replay.constraints.enrichments.clone();
+        invalid.constraints.grouping = Some(bad);
+        adapter.submit(invalid).unwrap();
+        let failure = wait_completion(&mut adapter, 3).await;
+        assert_eq!(failure.result.unwrap_err().purpose, QueryPurpose::Grouping);
+        let kept = wait_page(&mut adapter, 4).await;
+        assert_eq!(
+            kept.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(id, _, _)| id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// Clearing a configured rule restores ungrouped rows: an empty grouping is
+/// no grouping, not a failed draft, and the last-good chain stays intact
+/// underneath either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filter_grouping_off_restores_ungrouped_rows() {
+    let root = TempDir::new().unwrap();
+    let (manager, _handle, mut adapter) =
+        setup(&root, "ERROR one\nplain a\nERROR two\n", true).await;
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.enrichments = vec![lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("mark".into()),
+        source: "/^(?P<is_start>ERROR)/".into(),
+        command: None,
+    }];
+    grouped.constraints.grouping = Some(lvu::grouping::filter_rule("is_start"));
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    assert_eq!(wait_page(&mut adapter, 2).await.len(), 2);
+
+    let mut off = request("view", 2, 2, 1, None, None);
+    off.purpose = QueryPurpose::Grouping;
+    off.base_constraints = grouped.constraints.clone();
+    off.constraints.enrichments = grouped.constraints.enrichments.clone();
+    off.constraints.grouping = None;
+    adapter.submit(off.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 3).await;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| !row.text.contains("physical lines")));
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// A produced `false` is a non-null value, so under Filter grouping it opens
+/// an event exactly like `true` does. Only produced nulls continue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filter_grouping_opens_on_false_values_and_continues_on_null() {
+    let root = TempDir::new().unwrap();
+    let (manager, _handle, mut adapter) = setup(&root, "alpha\nbeta\ngamma\n", true).await;
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.enrichments = vec![lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("mark".into()),
+        source: "is_start = pl.col('raw').str.contains('ZZZ-NEVER-MATCHES')".into(),
+        command: None,
+    }];
+    grouped.constraints.grouping = Some(lvu::grouping::filter_rule("is_start"));
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    // Every record carries `false`: three singleton events, none joined and
+    // none orphaned. Had `false` been read as continue, this would be one
+    // group; had it been read as unknown, three pending orphans.
+    let rows = wait_page(&mut adapter, 3).await;
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert_eq!(row.text, row.text.trim(), "{row:#?}");
+        assert!(
+            !row.text.contains("physical lines")
+                && !row.text.contains("orphan")
+                && !row.text.contains("pending"),
+            "{row:#?}"
+        );
+    }
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// A giant live group still forms under a budget that only fits its stored
+/// page: dropped member projections are never charged, so bounds cannot
+/// split what the rule keeps whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filter_grouping_charges_only_retained_pages_under_a_low_budget() {
+    let root = TempDir::new().unwrap();
+    let mut input = String::from("ERROR head\n");
+    for _ in 0..399 {
+        input.push_str("p\n");
+    }
+    let input_path = root.path().join("input.log");
+    fs::write(&input_path, &input).unwrap();
+    let manager =
+        SourceManager::new(root.path().join("capture"), line_framed_runtime_config()).unwrap();
+    let handle = manager
+        .start(source(SourceId::new(), &input_path, true))
+        .await
+        .unwrap();
+    wait_runtime(&handle, 400).await;
+    let (live_config, mut view_config) = configs(&root);
+    // Membership IDs, derived values and one 64-row page fit comfortably;
+    // retaining all 400 projections would not.
+    view_config.maximum_index_bytes = 96 * 1024;
+    let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, view_config).unwrap();
+    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_view("view", vec![handle.source_id()])
+        .unwrap();
+
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.enrichments = vec![lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("mark".into()),
+        source: "/^(?P<is_start>ERROR)/".into(),
+        command: None,
+    }];
+    grouped.constraints.grouping = Some(lvu::grouping::filter_rule("is_start"));
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 1).await;
+    assert_eq!(adapter.status("view").unwrap().matched_records, 400);
+    assert!(
+        rows[0].text.contains("400 physical lines") && rows[0].text.contains("first 64 shown"),
+        "{rows:#?}"
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// Hundreds of distinct run keys each hold their own base state and key
+/// heap without merging, dropping, or moving stable heads on refresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_grouping_keeps_many_distinct_keys_apart() {
+    let root = TempDir::new().unwrap();
+    let mut input = String::new();
+    for index in 0..200 {
+        input.push_str(&format!("key-{index:03}\n"));
+    }
+    let (manager, handle, mut adapter) = setup(&root, &input, true).await;
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.enrichments = vec![lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("key".into()),
+        source: "/^(?P<k>key-\\d+)/".into(),
+        command: None,
+    }];
+    grouped.constraints.grouping = Some(lvu::grouping::run_rule("k"));
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let page = adapter
+                .rows()
+                .page("view", ViewportRequest { start: 0, len: 200 });
+            if page.total == 200 && page.rows.len() == 200 {
+                break page.rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(rows.iter().all(|row| row.text.starts_with("key-")));
+    assert_eq!(adapter.status("view").unwrap().matched_records, 200);
+
+    // A live new key appends one group; every earlier head is stable.
+    let before = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    writeln!(file, "key-200").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 201).await;
+    let rows = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let page = adapter
+                .rows()
+                .page("view", ViewportRequest { start: 0, len: 201 });
+            if page.total == 201 && page.rows.len() == 201 {
+                break page.rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rows[..200]
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert!(rows[200].text.starts_with("key-200"));
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// A temporal run key rejects the candidate actionably instead of leaving
+/// every batch pending forever, and the whole last-good view stays put.
+/// Both boundaries are pinned: a format matching nothing yields all-null
+/// datetimes, which display projection carries as nulls, so the grouping
+/// seam rejects them; a format matching some lines yields real datetimes,
+/// which display projection itself refuses first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_grouping_on_temporal_output_rolls_back() {
+    let root = TempDir::new().unwrap();
+    let (manager, _handle, mut adapter) =
+        setup(&root, "2026-01-01\nplain\n2026-01-02\n", true).await;
+    let mark = lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("mark".into()),
+        source: "/^(?P<is_start>2026)/".into(),
+        command: None,
+    };
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.enrichments = vec![mark.clone()];
+    grouped.constraints.grouping = Some(lvu::grouping::filter_rule("is_start"));
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let good = wait_page(&mut adapter, 2).await;
+    assert_eq!(good.len(), 2);
+    let good_ids = || good.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+
+    // All-null datetimes ride projection as nulls and reach the grouping
+    // seam, which rejects them for having no exact identity.
+    let mut empty = request("view", 2, 2, 1, None, None);
+    empty.purpose = QueryPurpose::Grouping;
+    empty.base_constraints = grouped.constraints.clone();
+    empty.constraints.enrichments = vec![
+        mark.clone(),
+        lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("never".into()),
+            source: "never = pl.col('raw').str.to_datetime('%d-%m-%Y', strict=False)".into(),
+            command: None,
+        },
+    ];
+    empty.constraints.grouping = Some(lvu::grouping::run_rule("never"));
+    adapter.submit(empty).unwrap();
+    let failure = wait_completion(&mut adapter, 2).await;
+    let error = failure.result.unwrap_err();
+    assert_eq!(error.purpose, QueryPurpose::Grouping, "{error:?}");
+    assert!(error.message.contains("exact"), "{error:?}");
+    let kept = wait_page(&mut adapter, 2).await;
+    assert_eq!(
+        kept.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+        good_ids()
+    );
+
+    // Real datetimes never get that far: display projection refuses them at
+    // the enrichment seam, still with last-good intact.
+    let mut dated = request("view", 3, 3, 1, None, None);
+    dated.purpose = QueryPurpose::Grouping;
+    dated.base_constraints = grouped.constraints.clone();
+    dated.constraints.enrichments = vec![
+        mark,
+        lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("stamp".into()),
+            source: "ts = pl.col('raw').str.to_datetime('%Y-%m-%d', strict=False)".into(),
+            command: None,
+        },
+    ];
+    dated.constraints.grouping = Some(lvu::grouping::run_rule("ts"));
+    adapter.submit(dated).unwrap();
+    let failure = wait_completion(&mut adapter, 3).await;
+    let error = failure.result.unwrap_err();
+    assert_eq!(error.purpose, QueryPurpose::Enrichment, "{error:?}");
+    assert!(error.message.contains("unsupported"), "{error:?}");
+    let kept = wait_page(&mut adapter, 2).await;
+    assert_eq!(
+        kept.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+        good_ids()
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// A giant event stays one group past the legacy 64-record/64 KiB bounds:
+/// the stored page is capped with explicit shown/total, and the next start
+/// still splits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filter_grouping_keeps_giant_events_whole_with_explicit_shown_total() {
+    let root = TempDir::new().unwrap();
+    let mut input = String::from("ERROR head\n");
+    for index in 0..105 {
+        input.push_str(&format!("payload-{:03} {}\n", index, "x".repeat(1000)));
+    }
+    input.push_str("ERROR tail\n");
+    assert!(input.len() > 100 * 1024);
+    let (manager, _handle, mut adapter) = setup(&root, &input, true).await;
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.enrichments = vec![lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("mark".into()),
+        source: "/^(?P<is_start>ERROR)/".into(),
+        command: None,
+    }];
+    grouped.constraints.grouping = Some(lvu::grouping::filter_rule("is_start"));
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    // Long input lines may arrive as physical partial-line fragments (each
+    // its own record until its terminator) across live refreshes, so settle
+    // until the two groups account for every matched record.
+    let rows = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let matched = adapter.status("view").unwrap().matched_records;
+            let rows = adapter
+                .rows()
+                .page("view", ViewportRequest { start: 0, len: 2 })
+                .rows;
+            let counted: usize = rows
+                .iter()
+                .filter_map(|row| {
+                    row.details
+                        .iter()
+                        .find(|(key, _)| key == "group_record_count")
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                })
+                .sum();
+            if rows.len() == 2 && counted == matched as usize && matched > 100 {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Derive the counts instead of hard-coding lines: what matters is one
+    // group past both legacy bounds.
+    let matched = adapter.status("view").unwrap().matched_records;
+    assert!(matched > 100, "over the 64-record bound: {matched}");
+    let members = matched - 1;
+    // Fragments render as "physical records" rather than "physical lines";
+    // either way the count must be the whole event with an explicit page.
+    assert!(
+        rows[0].text.contains(&members.to_string()) && rows[0].text.contains("first 64 shown"),
+        "{rows:#?}"
+    );
+    assert_eq!(rows[1].text, "ERROR tail");
+    let details = &rows[0].details;
+    assert!(
+        details.contains(&("group_record_count".to_owned(), members.to_string())),
+        "{details:#?}"
+    );
+    let stored = details
+        .iter()
+        .filter(|(key, _)| key.starts_with("group_line_") && key.as_str() != "group_line_count")
+        .count();
+    assert_eq!(stored, 64, "only the first page of members is stored");
+    assert!(
+        details.iter().any(|(key, value)| key == "group_truncated"
+            && value.contains(&format!("first 64 of {members}"))),
+        "{details:#?}"
+    );
+    assert!(
+        !details.iter().any(|(key, _)| key == "group_overflow"),
+        "a giant configured event is never split by bounds"
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// Run grouping collapses consecutive records with equal exact enrichment
+/// keys. Produced nulls stand alone (null never equals), and keys compare by
+/// exact typed bytes: values sharing a long prefix must not merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_grouping_collapses_equal_exact_keys_and_leaves_nulls() {
+    let root = TempDir::new().unwrap();
+    let shared = "y".repeat(300);
+    let input = format!(
+        "svc=alpha one\nsvc=alpha two\nsvc=beta three\nplain line\nid {shared}-one\nid {shared}-two\n"
+    );
+    let (manager, _handle, mut adapter) = setup(&root, &input, true).await;
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.enrichments = vec![
+        lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("service".into()),
+            source: "/svc=(?P<svc>[a-z]+)/".into(),
+            command: None,
+        },
+        lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("identity".into()),
+            source: "/id (?P<rid>\\S+)/".into(),
+            command: None,
+        },
+    ];
+    grouped.constraints.grouping = Some(lvu::grouping::run_rule("svc"));
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 5).await;
+    assert!(rows[0].text.contains("2 physical lines"), "{rows:#?}");
+    assert_eq!(rows[1].text, "svc=beta three");
+    // Null-keyed lines stand alone without claiming a run and never merge
+    // with each other.
+    assert_eq!(rows[2].text, "plain line");
+    assert!(rows[3].text.starts_with("id "));
+    assert!(!rows[3].text.contains("physical lines"), "{rows:#?}");
+    assert!(rows[4].text.starts_with("id "));
+    assert!(!rows[4].text.contains("physical lines"), "{rows:#?}");
+    drop(rows);
+
+    // The same run key under another view groups identical long values only
+    // when they are exactly equal: the two `id …` lines share a 300-byte
+    // prefix past any display truncation yet differ, so they stay separate.
+    let mut exact = request("view", 2, 2, 1, None, None);
+    exact.purpose = QueryPurpose::Grouping;
+    exact.base_constraints = grouped.constraints.clone();
+    exact.constraints.enrichments = grouped.constraints.enrichments.clone();
+    exact.constraints.grouping = Some(lvu::grouping::run_rule("rid"));
+    adapter.submit(exact.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let rows = adapter
+        .rows()
+        .page("view", ViewportRequest { start: 4, len: 2 })
+        .rows;
+    assert_eq!(rows.len(), 2, "{rows:#?}");
+    assert!(rows[0].text.starts_with("id "));
+    assert!(!rows[0].text.contains("physical lines"), "{rows:#?}");
+    assert!(rows[1].text.starts_with("id "));
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// A run key beyond the exact-identity bound refuses loudly: the record
+/// stays unfolded with a diagnostic instead of merging on a truncated key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_grouping_refuses_oversize_keys_instead_of_merging() {
+    let root = TempDir::new().unwrap();
+    let big = "z".repeat(600);
+    let input = format!("token {big}\nshort line\n");
+    let (manager, _handle, mut adapter) = setup(&root, &input, true).await;
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.enrichments = vec![lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("token".into()),
+        source: "/token (?P<tok>\\S+)/".into(),
+        command: None,
+    }];
+    grouped.constraints.grouping = Some(lvu::grouping::run_rule("tok"));
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[0]
+            .details
+            .iter()
+            .any(|(key, value)| key == "group_key_unavailable" && value.contains("exact-identity")),
+        "{rows:#?}"
+    );
+    let status = adapter.status("view").unwrap();
+    assert!(
+        status
+            .diagnostic
+            .as_deref()
+            .is_some_and(|text| text.contains("exact-identity")),
+        "{status:?}"
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// Records whose start column is genuinely unevaluated (a command step that
+/// has not run) stand alone pending evaluation: visible raw, never folded
+/// into their neighbours on a guessed flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_grouping_waits_for_pending_command_output() {
+    let root = TempDir::new().unwrap();
+    let (manager, _handle, mut adapter) = setup(&root, "alpha\nbeta\ngamma\n", true).await;
+    let chain = vec![
+        command_step("command-1", "geo"),
+        expression_step("marker", "is_start = pl.col('geo.flag').is_not_null()"),
+    ];
+    let mut grouped = chain_request(1, 0, &[], &chain, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(lvu::grouping::filter_rule("is_start"));
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 3).await;
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert!(row.text.contains("pending grouping evaluation"), "{row:#?}");
+    }
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_grouping_uses_exact_partial_record_provenance_across_batches() {
     let root = TempDir::new().unwrap();

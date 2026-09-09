@@ -210,15 +210,12 @@ would, because one invalid byte becomes three. Only pattern forms are located; a
 `field: value` or `pl.…` predicate names a column, not a run of characters, and
 underlines nothing.
 
-## Multiline grouping (display-only)
+## Grouping (display-only)
 
-Grouping changes presentation, never capture: original bytes, stable record
-identities and filter membership are preserved, and ambiguous orphans remain
-standalone events rather than joining a group. The persisted grouping field
-carries a custom regex verbatim with its legacy meaning unchanged; automatic
-recognition is selected only by the exact reserved token `(?lvu:auto:v1)`,
-and unknown `(?lvu:auto:…)` versions are rejected actionably ("unsupported
-automatic grouping version …; reopen Grouping and choose Auto"). Switching
-the dialog to Auto or Off keeps an extra remembered copy of the Custom text
-per view in memory only, lost on restart; the active grouping editor draft
-itself persists as before.
+Run and Filter grouping are presentation over accepted enrichment columns.
+They never define extraction patterns or change capture/filter membership.
+Non-null starts include false and empty strings; only typed null continues a
+Filter group. Run key comparison must preserve native equality rather than use
+truncated display text. Unsupported types fail the candidate; pending work is
+not a negative predicate. Live append preserves the open tail group and stable
+record identities. Rendering limits cannot invent event boundaries.

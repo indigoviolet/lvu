@@ -5694,9 +5694,11 @@ fn grouping_editor_is_per_view_transactional_and_groups_expand_by_key_and_mouse(
     let (fixture, mut app) = demo();
     app.handle(Action::Open(Open::Grouping), &fixture);
     assert_eq!(app.focus, Focus::Layer);
+    // The normal control opens on Run with a blank column: Run is the
+    // primary configured path and legacy Auto is never the default.
     assert_eq!(
         app.view_state().unwrap().grouping.draft,
-        lvu::grouping::AUTO_GROUPING_TOKEN
+        lvu::grouping::run_rule("")
     );
     app.handle(raw_key(KeyCode::Enter), &fixture);
     let request = app.take_query_requests().pop().unwrap();
@@ -5710,7 +5712,7 @@ fn grouping_editor_is_per_view_transactional_and_groups_expand_by_key_and_mouse(
     }));
     assert_eq!(
         app.view_state().unwrap().grouping.applied,
-        lvu::grouping::AUTO_GROUPING_TOKEN
+        lvu::grouping::run_rule("")
     );
     app.handle(Action::NextView, &fixture);
     assert!(app.view_state().unwrap().grouping.applied.is_empty());
@@ -5769,6 +5771,128 @@ fn grouping_editor_is_per_view_transactional_and_groups_expand_by_key_and_mouse(
         &provider,
     );
     assert!(grouped_app.view_state().unwrap().expanded_groups.is_empty());
+}
+
+#[test]
+fn expanded_groups_state_shown_total_when_the_page_is_capped() {
+    let truncated = DisplayRow {
+        id: RowId::new("api", 1),
+        timestamp: "12:00:01".into(),
+        captured_at_unix_nanos: Some(1),
+        level: "ERROR".into(),
+        text: "ERROR head  [101 physical lines, first 2 shown]".into(),
+        details: vec![
+            ("group_line_count".into(), "101".into()),
+            ("group_record_count".into(), "101".into()),
+            ("group_line_1".into(), "api:1: ERROR head".into()),
+            ("group_line_2".into(), "api:2: payload".into()),
+            (
+                "group_truncated".into(),
+                "showing first 2 of 101 records; every member stays in the source view".into(),
+            ),
+        ],
+        fields: vec![],
+    };
+    let provider = GrowingProvider {
+        rows: RefCell::new(vec![truncated]),
+    };
+    let mut app = App::new(
+        vec![SourceItem {
+            id: "api".into(),
+            name: "api".into(),
+            health: "ok".into(),
+        }],
+        vec![ViewItem {
+            id: "all".into(),
+            source_id: "api".into(),
+            name: "all".into(),
+        }],
+        false,
+    );
+    let collapsed = render(&provider, &mut app, 100, 18);
+    assert!(collapsed.contains("[101 physical lines, first 2 shown]"));
+    app.handle(Action::ToggleExpandedGroup, &provider);
+    let expanded = render(&provider, &mut app, 100, 18);
+    assert!(expanded.contains("api:1: ERROR head"));
+    assert!(expanded.contains("api:2: payload"));
+    // The expansion must not imply all lines are displayed: the truncation
+    // notice travels with the member lines.
+    assert!(
+        expanded.contains("showing first 2 of 101 records"),
+        "{expanded}"
+    );
+    assert_eq!(
+        expanded
+            .lines()
+            .filter(|line| line.contains("api:"))
+            .count(),
+        2,
+        "count metadata must not become a synthetic expanded row\n{expanded}"
+    );
+}
+
+#[test]
+fn collapse_all_collapses_expanded_configured_groups_without_enabling() {
+    use lvu::command_palette::{CommandId, Palette, PaletteContext};
+
+    let grouped = DisplayRow {
+        id: RowId::new("api", 1),
+        timestamp: "12:00:01".into(),
+        captured_at_unix_nanos: Some(1),
+        level: "ERROR".into(),
+        text: "Error: boom  [2 physical lines]".into(),
+        details: vec![
+            ("group_line_count".into(), "2".into()),
+            ("group_line_1".into(), "Error: boom [api:1]".into()),
+            ("group_line_2".into(), "at worker.rs:42 [api:2]".into()),
+        ],
+        fields: vec![],
+    };
+    let provider = GrowingProvider {
+        rows: RefCell::new(vec![grouped]),
+    };
+    let mut app = App::new(
+        vec![SourceItem {
+            id: "api".into(),
+            name: "api".into(),
+            health: "ok".into(),
+        }],
+        vec![ViewItem {
+            id: "all".into(),
+            source_id: "api".into(),
+            name: "all".into(),
+        }],
+        false,
+    );
+    let collapsed = render(&provider, &mut app, 100, 18);
+    assert!(collapsed.contains("[2 physical lines]"), "{collapsed}");
+    app.handle(Action::ToggleExpandedGroup, &provider);
+    assert!(!app.view_state().unwrap().expanded_groups.is_empty());
+    let expanded = render(&provider, &mut app, 100, 18);
+    assert!(expanded.contains("at worker.rs:42"), "{expanded}");
+
+    // The palette row reaches the collapse without enabling anything, and it
+    // clears legacy fold expansions alongside group ones.
+    let mut palette = Palette::new();
+    palette.open(PaletteContext::new(Focus::Logs, true));
+    for character in "collapse expanded".chars() {
+        let context = palette.context();
+        palette.handle_key(
+            KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            context.clone(),
+        );
+    }
+    assert_eq!(
+        palette.selected_command().map(|command| command.id),
+        Some(CommandId::CollapseAllFolds)
+    );
+    app.handle(Action::CollapseAllFolds, &provider);
+    assert!(app.view_state().unwrap().expanded_groups.is_empty());
+    assert!(app.view_state().unwrap().fold_expanded.is_empty());
+    assert!(!app.view_state().unwrap().fold_enabled);
+    let collapsed = render(&provider, &mut app, 100, 18);
+    assert!(!collapsed.contains("at worker.rs:42"), "{collapsed}");
+    assert!(collapsed.contains("[2 physical lines]"), "{collapsed}");
 }
 
 #[test]
@@ -9306,9 +9430,7 @@ fn folding_app() -> (FoldingProvider, App) {
 #[test]
 fn an_unfinished_fold_reports_what_it_has_not_reached() {
     let (provider, mut app) = folding_app();
-    app.handle(Action::ToggleFolding, &provider);
-    // The toggle leaves its own notice on the status line; any next action
-    // clears it, which is when the view's own indicators are readable again.
+    enable_folding_via_dialog(&mut app, &provider);
     app.handle(Action::Top, &provider);
     *provider.pending_rows.borrow_mut() = 4_806_126;
     app.sync_provider(&provider, 8);
@@ -9355,7 +9477,7 @@ fn event_cell(screen: &str, needle: &str) -> String {
 #[test]
 fn a_collapsed_fold_reads_as_a_fold_rather_than_a_log_line() {
     let (provider, mut app) = folding_app();
-    app.handle(Action::ToggleFolding, &provider);
+    enable_folding_via_dialog(&mut app, &provider);
     app.handle(Action::Top, &provider);
     let folded = render(&provider, &mut app, 100, 12);
     // The gutter marks it, the shape is shown with its placeholders rather than
@@ -9381,7 +9503,7 @@ fn a_collapsed_fold_reads_as_a_fold_rather_than_a_log_line() {
 #[test]
 fn an_expanded_run_is_bracketed_from_its_first_member_to_its_last() {
     let (provider, mut app) = folding_app();
-    app.handle(Action::ToggleFolding, &provider);
+    enable_folding_via_dialog(&mut app, &provider);
     app.handle(Action::Top, &provider);
     app.handle(Action::MoveLine(1), &provider);
     app.handle(Action::ToggleExpandedGroup, &provider);
@@ -9407,7 +9529,7 @@ fn an_expanded_run_is_bracketed_from_its_first_member_to_its_last() {
 fn the_fold_gutter_has_an_ascii_form() {
     let (provider, mut app) = folding_app();
     app.appearance.ascii = true;
-    app.handle(Action::ToggleFolding, &provider);
+    enable_folding_via_dialog(&mut app, &provider);
     app.handle(Action::Top, &provider);
     let folded = render(&provider, &mut app, 100, 12);
     let entry = event_cell(&folded, "retry connect failed after");
@@ -9444,8 +9566,19 @@ fn folding_is_off_until_asked_for_and_then_says_so() {
     assert!(!plain.contains("fold:"), "{plain}");
     assert!(!plain.contains("repeated"), "{plain}");
 
-    app.handle(Action::ToggleFolding, &provider);
-    assert!(app.view_state().unwrap().fold_enabled);
+    // Exact keys only: name the service column first, then enable from the
+    // dialog checkbox. The request plumbing below proves the exact key
+    // reaches the provider; this fixture double keeps rendering its fixed
+    // legacy Pattern shape, which is what the rest of this test reads.
+    app.handle(Action::Open(Open::Folding), &provider);
+    folding_pick_key(&mut app, &provider, 1);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    enable_folding_via_dialog(&mut app, &provider);
+    render(&provider, &mut app, 100, 18);
+    assert_eq!(
+        provider.request.borrow().key_column.as_deref(),
+        Some("service")
+    );
     let folded = render(&provider, &mut app, 100, 18);
     // The collapse is shown as a fold — gutter mark, shape, count — rather than
     // as an "[x3 repeated]" suffix on one member's text, which sat off the right
@@ -9458,7 +9591,7 @@ fn folding_is_off_until_asked_for_and_then_says_so() {
     app.handle(Action::Top, &provider);
     app.handle(Action::MoveLine(1), &provider);
     let indicated = render(&provider, &mut app, 100, 18);
-    // The status says folding is on and how much it is hiding.
+    // The status says folding is on and how much is hiding.
     assert!(indicated.contains("fold:1 runs, 2 hidden"), "{indicated}");
     assert_eq!(
         app.view_state().unwrap().selected,
@@ -9490,7 +9623,13 @@ fn folding_is_off_until_asked_for_and_then_says_so() {
     assert!(recollapsed.contains("×3 events"), "{recollapsed}");
 
     // Turning folding off restores every row and clears the indicator.
-    app.handle(Action::ToggleFolding, &provider);
+    // The toggle routes the unified Grouping UI, so the dialog checkbox that
+    // enabled the fold disables it here.
+    app.handle(Action::Open(Open::Folding), &provider);
+    folding_focus(&mut app, &provider, FoldingControl::Enabled);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert!(!app.view_state().unwrap().fold_enabled);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     let off = render(&provider, &mut app, 100, 18);
     assert!(!off.contains("fold:"), "{off}");
     assert!(!off.contains("repeated"), "{off}");
@@ -9508,7 +9647,10 @@ fn folding_is_off_until_asked_for_and_then_says_so() {
 fn folding_configuration_and_expansion_survive_restart() {
     let (provider, mut app) = folding_app();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::ToggleFolding, &provider);
+    app.handle(Action::Open(Open::Folding), &provider);
+    folding_pick_key(&mut app, &provider, 1);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    enable_folding_via_dialog(&mut app, &provider);
     render(&provider, &mut app, 100, 18);
     app.handle(Action::Top, &provider);
     app.handle(Action::MoveLine(1), &provider);
@@ -9520,6 +9662,7 @@ fn folding_configuration_and_expansion_survive_restart() {
 
     let persisted = app.persistent_view_state(&view_id).unwrap();
     assert!(persisted.fold_enabled);
+    assert_eq!(persisted.fold_key_column.as_deref(), Some("service"));
     assert_eq!(persisted.fold_minimum_run, 3);
     assert_eq!(persisted.fold_expanded, vec![RowId::new("api", 1)]);
 
@@ -9540,11 +9683,11 @@ fn folding_configuration_and_expansion_survive_restart() {
 }
 
 #[test]
-fn folding_is_reachable_from_the_command_palette() {
+fn grouping_is_reachable_from_the_command_palette() {
     use lvu::command_palette::{CommandId, Palette, PaletteContext};
     let mut palette = Palette::new();
     palette.open(PaletteContext::new(Focus::Logs, true));
-    for character in "fold repeated".chars() {
+    for character in "grouping".chars() {
         let context = palette.context();
         palette.handle_key(
             KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
@@ -9553,8 +9696,8 @@ fn folding_is_reachable_from_the_command_palette() {
     }
     assert_eq!(
         palette.selected_command().map(|command| command.id),
-        Some(CommandId::ToggleFolding),
-        "folding must be discoverable without a memorised key"
+        Some(CommandId::Grouping),
+        "grouping must be discoverable without a memorised key"
     );
     let mut collapse = Palette::new();
     collapse.open(PaletteContext::new(Focus::Logs, true));
@@ -10087,6 +10230,17 @@ fn folding_focus<P: RowProvider>(app: &mut App, provider: &P, control: FoldingCo
     panic!("{control:?} is not reachable by Tab");
 }
 
+/// Enable folding with the stored key through the dialog checkbox. The
+/// ToggleFolding action routes the unified Grouping UI, so tests that pin
+/// legacy fold rendering enable here instead of through it.
+fn enable_folding_via_dialog<P: RowProvider>(app: &mut App, provider: &P) {
+    app.handle(Action::Open(Open::Folding), provider);
+    folding_focus(app, provider, FoldingControl::Enabled);
+    app.handle(raw_key(KeyCode::Enter), provider);
+    assert!(app.view_state().unwrap().fold_enabled);
+    app.handle(raw_key(KeyCode::Esc), provider);
+}
+
 /// Open the key-column list and pick the row at `index`.
 fn folding_pick_key<P: RowProvider>(app: &mut App, provider: &P, index: usize) {
     folding_focus(app, provider, FoldingControl::KeyColumn);
@@ -10102,17 +10256,17 @@ fn folding_pick_key<P: RowProvider>(app: &mut App, provider: &P, index: usize) {
 }
 
 #[test]
-fn the_folding_dialog_opens_from_a_key_and_from_the_palette() {
+fn the_grouping_dialog_opens_from_either_multiline_key_and_the_palette() {
     use lvu::command_palette::{CommandId, Palette, PaletteContext};
 
-    // `z` is vim's fold prefix and was unbound; the palette-only toggle stays.
-    assert_eq!(
-        key_to_action(
-            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
-            Focus::Logs
-        ),
-        Action::Open(Open::Folding)
-    );
+    // `m` and `z` route the same unified Grouping UI: runs and starts are
+    // defined once, on enrichment columns.
+    for code in [KeyCode::Char('m'), KeyCode::Char('z')] {
+        assert_eq!(
+            key_to_action(KeyEvent::new(code, KeyModifiers::NONE), Focus::Logs),
+            Action::Open(Open::Grouping)
+        );
+    }
     let (provider, mut app) = folding_app();
     app.handle(
         key_to_action(
@@ -10121,40 +10275,41 @@ fn the_folding_dialog_opens_from_a_key_and_from_the_palette() {
         ),
         &provider,
     );
-    assert!(app.layers.folding.is_open());
+    assert!(app.layers.grouping.is_open());
     let dialog = render(&provider, &mut app, 100, 28);
-    assert!(dialog.contains("Folding · view"), "{dialog}");
-    assert!(dialog.contains("Key column"), "{dialog}");
-    assert!(dialog.contains("Message pattern"), "{dialog}");
-    assert!(dialog.contains("Minimum run"), "{dialog}");
-    assert!(dialog.contains("Scope"), "{dialog}");
+    assert!(dialog.contains("Multiline grouping"), "{dialog}");
+    assert!(dialog.contains("Run"), "{dialog}");
+    app.handle(raw_key(KeyCode::Esc), &provider);
 
     let mut palette = Palette::new();
     palette.open(PaletteContext::new(Focus::Logs, true));
-    for character in "folding".chars() {
+    for character in "grouping".chars() {
         let context = palette.context();
         palette.handle_key(
             KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
             context.clone(),
         );
     }
-    assert_eq!(
-        palette.selected_command().map(|command| command.id),
-        Some(CommandId::FoldingDialog),
-        "the dialog must be reachable without a memorised key"
+    assert!(
+        palette
+            .selected_command()
+            .map(|command| command.id == CommandId::Grouping
+                || command.id == CommandId::FoldingDialog)
+            .unwrap_or(false),
+        "grouping must be reachable without a memorised key"
     );
 }
 
 #[test]
 fn choosing_a_key_column_is_what_the_view_asks_its_provider_for() {
     let (provider, mut app) = folding_app();
-    app.handle(Action::ToggleFolding, &provider);
     render(&provider, &mut app, 100, 28);
     assert_eq!(provider.request.borrow().key_column, None);
 
     app.handle(Action::Open(Open::Folding), &provider);
-    // Row 0 is the derived pattern column; the sampled columns follow, sorted.
-    folding_pick_key(&mut app, &provider, 1);
+    // Row 0 is the first sampled column, sorted; the derived pattern is
+    // restore-only and never offered for new selection.
+    folding_pick_key(&mut app, &provider, 0);
     assert_eq!(
         app.view_state().unwrap().fold_key_column.as_deref(),
         Some("host")
@@ -10173,18 +10328,94 @@ fn choosing_a_key_column_is_what_the_view_asks_its_provider_for() {
         column.contains("nothing is normalised"),
         "the help must say what a column key does: {column}"
     );
+    // The pattern row is gone for good: reopening the list offers exact
+    // columns, so row 0 keeps naming the first sampled column instead of
+    // switching back to normalisation.
     folding_pick_key(&mut app, &provider, 0);
-    assert_eq!(app.view_state().unwrap().fold_key_column, None);
-    let pattern = render(&provider, &mut app, 100, 28);
-    assert!(pattern.contains("Normalisation"), "{pattern}");
+    assert_eq!(
+        app.view_state().unwrap().fold_key_column.as_deref(),
+        Some("host")
+    );
+    let exact = render(&provider, &mut app, 100, 28);
+    assert!(!exact.contains("Normalisation"), "{exact}");
+    assert!(!exact.contains("Message pattern"), "{exact}");
     render(&provider, &mut app, 100, 28);
-    assert_eq!(provider.request.borrow().key_column, None);
+    assert_eq!(
+        provider.request.borrow().key_column.as_deref(),
+        Some("host")
+    );
+
+    // A stored pattern key still restores through the engine default: a fresh
+    // dialog names the plain default value while the list stays exact-only.
+    let (legacy_provider, mut legacy_app) = folding_app();
+    legacy_app.handle(Action::Open(Open::Folding), &legacy_provider);
+    let legacy = render(&legacy_provider, &mut legacy_app, 100, 28);
+    assert!(legacy.contains("Message pattern"), "{legacy}");
+    assert!(legacy.contains("Normalisation"), "{legacy}");
+}
+
+#[test]
+fn folding_picker_never_offers_the_pattern_row() {
+    use lvu::QueryCompletion;
+
+    let (provider, mut app) = folding_app();
+    // Even ungrouped, the list names exact columns: the derived pattern is
+    // restore-only through the engine default, never a new selection.
+    app.handle(Action::Open(Open::Folding), &provider);
+    folding_focus(&mut app, &provider, FoldingControl::KeyColumn);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    let legacy = render(&provider, &mut app, 100, 28);
+    // The stored default still names itself in the value row, but no picker
+    // row offers it: every line naming the pattern is the value display.
+    for line in legacy.lines() {
+        assert!(
+            !line.contains("Message pattern") || line.contains("Key column"),
+            "{line}\n{legacy}"
+        );
+    }
+    assert!(legacy.contains("host"), "{legacy}");
+    // Pick the first sampled column to close the list.
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert_eq!(
+        app.view_state().unwrap().fold_key_column.as_deref(),
+        Some("host")
+    );
+    app.handle(raw_key(KeyCode::Esc), &provider);
+
+    // Group the view by runs of that column through the normal control.
+    app.handle(Action::Open(Open::Grouping), &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::run_rule("host")
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(request.purpose, QueryPurpose::Grouping);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    app.handle(raw_key(KeyCode::Esc), &provider);
+
+    // Beside configured grouping the pattern row is gone: recognition lives
+    // in Enrichment, so normalisation is not newly selectable. The stored
+    // pattern would still restore through the engine default.
+    app.handle(Action::Open(Open::Folding), &provider);
+    folding_focus(&mut app, &provider, FoldingControl::KeyColumn);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    let exact = render(&provider, &mut app, 100, 28);
+    assert!(!exact.contains("Message pattern"), "{exact}");
+    assert!(exact.contains("host"), "{exact}");
+    app.handle(raw_key(KeyCode::Esc), &provider);
 }
 
 #[test]
 fn minimum_run_scope_and_normalisation_reach_the_provider() {
     let (provider, mut app) = folding_app();
-    app.handle(Action::ToggleFolding, &provider);
     app.handle(Action::Open(Open::Folding), &provider);
 
     folding_focus(&mut app, &provider, FoldingControl::MinimumRun);
@@ -10229,8 +10460,8 @@ fn the_new_column_action_opens_the_step_editor_on_a_concatenation() {
     app.handle(Action::Open(Open::Folding), &provider);
     folding_focus(&mut app, &provider, FoldingControl::KeyColumn);
     app.handle(raw_key(KeyCode::Enter), &provider);
-    // Past the derived column and the two sampled ones sits `[ New column… ]`.
-    for _ in 0..3 {
+    // Past the two sampled columns sits `[ New column… ]`: no derived row.
+    for _ in 0..2 {
         app.handle(raw_key(KeyCode::Down), &provider);
     }
     let picker = render(&provider, &mut app, 100, 28);
@@ -10336,9 +10567,8 @@ fn a_cancelled_generated_column_never_changes_the_fold_key() {
 fn the_folding_key_column_and_policy_survive_a_restart() {
     let (provider, mut app) = folding_app();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::ToggleFolding, &provider);
     app.handle(Action::Open(Open::Folding), &provider);
-    folding_pick_key(&mut app, &provider, 2);
+    folding_pick_key(&mut app, &provider, 1);
     folding_focus(&mut app, &provider, FoldingControl::Scope);
     app.handle(raw_key(KeyCode::Enter), &provider);
     app.handle(raw_key(KeyCode::Down), &provider);
@@ -10354,6 +10584,13 @@ fn the_folding_key_column_and_policy_survive_a_restart() {
     let state = restarted.view_state().unwrap();
     assert_eq!(state.fold_key_column.as_deref(), Some("service"));
     assert_eq!(state.fold_lookback, 2);
+    // The provider only hears the key while folding is enabled: enable from
+    // the dialog checkbox, as the retired toggle used to.
+    restarted.handle(Action::Open(Open::Folding), &provider);
+    folding_focus(&mut restarted, &provider, FoldingControl::Enabled);
+    restarted.handle(raw_key(KeyCode::Enter), &provider);
+    assert!(restarted.view_state().unwrap().fold_enabled);
+    restarted.handle(raw_key(KeyCode::Esc), &provider);
     render(&provider, &mut restarted, 100, 28);
     assert_eq!(
         provider.request.borrow().key_column.as_deref(),
@@ -10376,7 +10613,6 @@ fn the_folding_key_column_and_policy_survive_a_restart() {
 #[test]
 fn the_folding_dialog_fits_a_narrow_terminal() {
     let (provider, mut app) = folding_app();
-    app.handle(Action::ToggleFolding, &provider);
     app.handle(Action::Open(Open::Folding), &provider);
     for (width, height) in [(80u16, 24u16), (54, 16)] {
         let screen = render(&provider, &mut app, width, height);
@@ -10438,15 +10674,15 @@ fn the_key_column_picker_keeps_one_rectangle_while_the_column_set_changes() {
 #[test]
 fn folding_declares_collapse_as_its_default_and_every_control_consumes_enter() {
     let (provider, mut app) = folding_app();
-    app.handle(Action::ToggleFolding, &provider);
     app.handle(Action::Open(Open::Folding), &provider);
+    folding_pick_key(&mut app, &provider, 0);
 
-    // A checkbox toggles.
+    // A checkbox toggles with Enter and back with Space.
     folding_focus(&mut app, &provider, FoldingControl::Enabled);
     app.handle(raw_key(KeyCode::Enter), &provider);
-    assert!(!app.view_state().unwrap().fold_enabled);
-    app.handle(raw_key(KeyCode::Char(' ')), &provider);
     assert!(app.view_state().unwrap().fold_enabled);
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
+    assert!(!app.view_state().unwrap().fold_enabled);
 
     // A closed dropdown opens; Escape closes the list, not the dialog.
     folding_focus(&mut app, &provider, FoldingControl::Scope);
@@ -10457,7 +10693,11 @@ fn folding_declares_collapse_as_its_default_and_every_control_consumes_enter() {
     assert!(app.layers.folding.is_open());
 
     // §8.2: Space never presses a button. Enter on the default runs it.
+    // A disabled Collapse is skipped by focus navigation, so re-enable
+    // alongside the seeded expansion: this half tests the button, not the
+    // checkbox above.
     if let Some(state) = app.views.active_mut() {
+        state.fold_enabled = true;
         state.fold_expanded.push(RowId::new("api", 1));
     }
     folding_focus(&mut app, &provider, FoldingControl::Collapse);

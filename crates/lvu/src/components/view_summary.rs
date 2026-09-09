@@ -158,7 +158,13 @@ pub fn summary_rows(
                     match crate::grouping::parse_grouping(&value) {
                         Ok(crate::grouping::GroupingSpec::Auto) => "Auto".to_owned(),
                         Ok(crate::grouping::GroupingSpec::Custom(_)) => value,
-                        Err(_) => "Unsupported Auto version".to_owned(),
+                        Ok(crate::grouping::GroupingSpec::Run { column }) => {
+                            format!("Run on {column}")
+                        }
+                        Ok(crate::grouping::GroupingSpec::Filter { column }) => {
+                            format!("Starts on {column} non-null")
+                        }
+                        Err(_) => "Unsupported grouping version".to_owned(),
                     }
                 }),
                 SummaryRow::Fold => fold_value(state),
@@ -453,7 +459,7 @@ impl ViewSummaryDialog {
             SummaryRow::Search => Open::Search,
             SummaryRow::Filter => Open::Advanced,
             SummaryRow::Grouping => Open::Grouping,
-            SummaryRow::Fold => Open::Folding,
+            SummaryRow::Fold => Open::Grouping,
             SummaryRow::Columns => match state.pinned_columns.first() {
                 Some(column) => Open::FieldColumn {
                     column: column.clone(),

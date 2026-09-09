@@ -25,8 +25,8 @@ use lvu_query::{
     BatchQuery, BatchValidity, CompiledEnrichment, CompilerHost, CompilerHostConfig, DerivedState,
     EnrichmentDefinition as NativeEnrichmentDefinition, EnrichmentStage,
     EnrichmentStageId as NativeEnrichmentStageId, ExpressionKind, SchemaContext, TextSearch,
-    compile_enrichment_chain, execute_batch_with_exact_constraint, parse_regex_enrichment,
-    records_to_batch_with_context_and_exact_field, scalar_projection,
+    compile_enrichment_chain, exact_key_flags, execute_batch_with_exact_constraint, non_null_flags,
+    parse_regex_enrichment, records_to_batch_with_context_and_exact_field, scalar_projection,
 };
 use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use std::{
@@ -428,6 +428,24 @@ struct GroupRange {
     orphan: bool,
     split: bool,
     oversized: bool,
+    /// The group derives from unevaluated start/key flags (pending command
+    /// output, failed stage, or a batch missing the column). It stands alone
+    /// and never extends, so live unknowns stay visible without falsely
+    /// joining or cutting the accepted groups around them.
+    pending: bool,
+    /// The exact typed run key of this group's head. Only Runs groups carry
+    /// one; equality is byte equality over Polars-encoded values, and a new
+    /// record joins only on an exact match.
+    run_key: Option<Vec<u8>>,
+    /// A configured Run/Filter group rather than a legacy lexical one. Only
+    /// presentation differs: member lines render text first so narrow
+    /// terminals show content instead of a UUID prefix, with stable IDs kept
+    /// in the same details.
+    configured: bool,
+    /// The head's run key exceeded the exact-identity bound, so the record
+    /// stands alone unfolded with a diagnostic rather than merged on a
+    /// truncated identity.
+    key_refused: bool,
     auto_open: bool,
     auto_structured: bool,
     auto_structure_depth: u16,
@@ -445,6 +463,13 @@ struct GroupRange {
 
 const MAX_GROUP_LINES: usize = 64;
 const MAX_GROUP_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Member projections retained per configured (Run/Filter) group. The group
+/// keeps every member's identity via `start`/`len` over the source sequences;
+/// only the first page of projections is stored, so a giant event costs a
+/// bounded page per frame while staying one group. The head text and details
+/// always state shown/total explicitly, and the remaining members stay
+/// reachable through the source view.
+const MAX_CONFIGURED_GROUP_STORED: usize = 64;
 const MAX_GROUP_REGEX_BYTES: usize = 16 * 1024;
 const MAX_GROUP_REGEX_COMPILED_BYTES: usize = 1024 * 1024;
 const MAX_GROUP_REGEX_NESTING: u32 = 64;
@@ -471,6 +496,9 @@ fn group_state_bytes(group: &GroupRange) -> u64 {
         .unwrap_or(u64::MAX)
         .saturating_add(u64::try_from(group.partial_prefix.capacity()).unwrap_or(u64::MAX))
         .saturating_add(u64::try_from(group.structure_prefix.capacity()).unwrap_or(u64::MAX))
+        .saturating_add(
+            u64::try_from(group.run_key.as_ref().map_or(0, Vec::capacity)).unwrap_or(u64::MAX),
+        )
 }
 
 fn group_base_state_bytes() -> Result<u64, std::num::TryFromIntError> {
@@ -2326,13 +2354,7 @@ impl NativeViewRows {
                     // Grouped rows are projected inside membership; they never
                     // need a raw lookup and so are never partially available.
                     for group in membership_groups(membership, request.start, len) {
-                        rows.push(project_group(
-                            group.projection.to_vec(),
-                            group.orphan,
-                            group.split,
-                            group.oversized,
-                            group.logical_lines,
-                        ));
+                        rows.push(project_group(group));
                     }
                 } else {
                     let ids = membership_ids(membership, request.start, len);
@@ -2759,13 +2781,7 @@ impl RowProvider for NativeViewRows {
             Published::Filtered { membership } => {
                 if membership.grouped {
                     let group = membership_group_for_id(membership, id)?;
-                    Some(project_group(
-                        group.projection.to_vec(),
-                        group.orphan,
-                        group.split,
-                        group.oversized,
-                        group.logical_lines,
-                    ))
+                    Some(project_group(group))
                 } else {
                     membership_index(membership, id)?;
                     self.raw
@@ -4583,6 +4599,35 @@ fn run_query(
                     derived.insert((id.source_id, id.sequence, stage.name.clone()), value);
                 }
             }
+            // Configured grouping consumes engine verdicts computed from the
+            // same evaluated batch as the derived values above, so batch
+            // boundaries cannot change the flags: every batch carries its own
+            // complete verdicts for the records it holds.
+            let group_flags = match &grouping_rule {
+                Some(rule) if rule.is_configured() => {
+                    match configured_batch_flags(
+                        rule,
+                        &enrichment,
+                        &waiting_stages,
+                        &result,
+                        &source_id,
+                    ) {
+                        Ok(flags) => Some(flags),
+                        Err(message) => {
+                            fail(
+                                tx,
+                                &request,
+                                &cancelled,
+                                QueryPurpose::Grouping,
+                                &message,
+                                false,
+                            );
+                            return;
+                        }
+                    }
+                }
+                _ => None,
+            };
             if filter_waiting && runtime_diagnostic.is_none() {
                 // The filter reads a command step's output before the run:
                 // valid, and not applied until results exist. The rows stay,
@@ -4819,7 +4864,11 @@ fn run_query(
                 sequences.push(record.record_id.sequence);
                 times.push(basis_times[position].unwrap_or(NO_BASIS_TIME));
                 count += 1;
-                if let Some(rule) = &grouping_rule {
+                // Display projection is rule-independent: every grouped record
+                // carries its bounded text plus the accepted enrichment values
+                // shown beside it, whichever rule segments the groups. Each
+                // branch below reserves what it actually retains.
+                let mut projection = grouping_rule.as_ref().map(|_| {
                     let mut projection = lvu_live::display_projection(
                         record,
                         MAX_GROUP_LINE_DISPLAY_BYTES,
@@ -4840,6 +4889,201 @@ fn run_query(
                             .details
                             .push((format!("derived.{}", stage.name), value));
                     }
+                    projection
+                });
+                if let Some(rule) = &grouping_rule
+                    && rule.is_configured()
+                {
+                    let projection = projection.take().expect("built for grouped records");
+                    // Configured enrichment grouping: Polars computed the
+                    // flags for this batch above; this only segments stable
+                    // ordered membership. Raw bytes are never classified here.
+                    let sequence_index = sequences.len().saturating_sub(1);
+                    let flag = match &group_flags {
+                        Some(BatchFlags::Known(flags)) => flags
+                            .get(&record.record_id.sequence)
+                            .cloned()
+                            .unwrap_or(ConfiguredFlag::Unknown),
+                        _ => ConfiguredFlag::Unknown,
+                    };
+                    let same_stream = groups
+                        .last()
+                        .is_some_and(|group| group.stream == record.stream);
+                    let same_acquisition = groups.last().is_some_and(|group| {
+                        group.acquisition_id == *record.acquisition_id.as_bytes()
+                    });
+                    // Physical fragments join their head whatever the flags
+                    // say: acquisition framing split one logical line, and
+                    // splitting it on flags would corrupt the line.
+                    let chunk_join = groups.last().is_some_and(|group| {
+                        group.partial_open
+                            && group.acquisition_id == *record.acquisition_id.as_bytes()
+                            && matches!(
+                                (group.last_chunk, record.chunk),
+                                (
+                                    lvu_core::ChunkPosition::Start
+                                        | lvu_core::ChunkPosition::Continue,
+                                    lvu_core::ChunkPosition::Continue
+                                        | lvu_core::ChunkPosition::End
+                                )
+                            )
+                    }) && previous_physical_matched
+                        && physically_adjacent
+                        && same_stream;
+                    // An accepted group extends across batches, streams aside:
+                    // pending and orphan units never absorb records, so live
+                    // unknowns stay visible without falsely joining or cutting
+                    // the groups around them. New rules carry no span or size
+                    // bound: a new start or a changed key is the only thing
+                    // that cuts, so batch geometry cannot invent boundaries.
+                    let join_open = !chunk_join
+                        && previous_physical_matched
+                        && physically_adjacent
+                        && same_stream
+                        && same_acquisition
+                        && groups
+                            .last()
+                            .is_some_and(|group| !group.orphan && !group.pending && !group.split)
+                        && match (&flag, rule) {
+                            (ConfiguredFlag::Start, ContinuationRule::Filter { .. }) => false,
+                            (ConfiguredFlag::Continue, ContinuationRule::Filter { .. }) => true,
+                            (ConfiguredFlag::Key(key), ContinuationRule::Run { .. }) => groups
+                                .last()
+                                .is_some_and(|group| group.run_key.as_ref() == Some(key)),
+                            _ => false,
+                        };
+                    if chunk_join || join_open {
+                        // A retained member page is charged; records past the
+                        // stored page cost only their scalars, so a giant live
+                        // group cannot exhaust the budget on projections no
+                        // frame reads.
+                        let retained = groups.last().is_some_and(|group| {
+                            group.projection.len() < MAX_CONFIGURED_GROUP_STORED
+                        });
+                        if retained {
+                            let projection_bytes = display_projection_bytes(&projection);
+                            if !reservation.add(projection_bytes) {
+                                fail(
+                                    tx,
+                                    &request,
+                                    &cancelled,
+                                    QueryPurpose::Grouping,
+                                    "display grouping projection memory cap reached; previous view preserved",
+                                    true,
+                                );
+                                return;
+                            }
+                        }
+                        let group = groups.last_mut().expect("joinable group");
+                        group.len += 1;
+                        let fragment_join = chunk_join
+                            && matches!(
+                                record.chunk,
+                                lvu_core::ChunkPosition::Continue | lvu_core::ChunkPosition::End
+                            );
+                        if !fragment_join {
+                            group.logical_lines = group.logical_lines.saturating_add(1);
+                        }
+                        group.payload_bytes =
+                            group.payload_bytes.saturating_add(record.bytes.len());
+                        group.last_chunk = record.chunk;
+                        group.last_capture_nanos = record.captured_at_unix_nanos;
+                        if matches!(record.chunk, lvu_core::ChunkPosition::Start) {
+                            group.partial_open = true;
+                        }
+                        if matches!(record.chunk, lvu_core::ChunkPosition::End) {
+                            group.partial_open = false;
+                        }
+                        if retained {
+                            Arc::make_mut(&mut group.projection).push(projection);
+                        }
+                    } else {
+                        let (orphan, pending, key_refused, run_key) = match (&flag, rule) {
+                            (ConfiguredFlag::Start, ContinuationRule::Filter { .. }) => {
+                                (false, false, false, None)
+                            }
+                            (ConfiguredFlag::Key(key), ContinuationRule::Run { .. }) => {
+                                (false, false, false, Some(key.clone()))
+                            }
+                            (ConfiguredFlag::KeyOversize, _) => {
+                                if runtime_diagnostic.is_none() {
+                                    runtime_diagnostic = Some(format!(
+                                        "grouping key exceeds the {}-byte exact-identity bound; those records stay unfolded",
+                                        lvu_query::MAX_EXACT_KEY_BYTES
+                                    ));
+                                }
+                                (false, false, true, None)
+                            }
+                            // A produced null or NaN stands alone without
+                            // claiming a head; an unevaluated record stands
+                            // alone pending it. Anything else without an open
+                            // head is an orphan, kept visible rather than
+                            // joined upward.
+                            (ConfiguredFlag::KeyNull, _) | (ConfiguredFlag::KeyNan, _) => {
+                                (false, false, false, None)
+                            }
+                            (ConfiguredFlag::Unknown, _) => (true, true, false, None),
+                            _ => (true, false, false, None),
+                        };
+                        // A new group reserves its base state, its run-key
+                        // heap and its retained head projection up front, so
+                        // membership never holds unaccounted bytes. Prior
+                        // generations price the same shape through
+                        // group_projection_bytes, which includes run-key
+                        // capacity.
+                        let state_bytes = group_base_state_bytes()
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(
+                                u64::try_from(run_key.as_ref().map_or(0, Vec::capacity))
+                                    .unwrap_or(u64::MAX),
+                            )
+                            .saturating_add(display_projection_bytes(&projection));
+                        if !reservation.add(state_bytes) {
+                            fail(
+                                tx,
+                                &request,
+                                &cancelled,
+                                QueryPurpose::Grouping,
+                                "display grouping index memory cap reached; previous view preserved",
+                                true,
+                            );
+                            return;
+                        }
+                        groups.push(GroupRange {
+                            start: sequence_index,
+                            len: 1,
+                            logical_lines: 1,
+                            payload_bytes: record.bytes.len(),
+                            stream: record.stream,
+                            orphan,
+                            split: false,
+                            oversized: false,
+                            pending,
+                            run_key,
+                            key_refused,
+                            configured: true,
+                            auto_open: false,
+                            auto_structured: false,
+                            auto_structure_depth: 0,
+                            partial_open: matches!(record.chunk, lvu_core::ChunkPosition::Start),
+                            partial_truncated: false,
+                            structure_truncated: false,
+                            partial_prefix: Vec::new(),
+                            structure_prefix: Vec::new(),
+                            acquisition_id: *record.acquisition_id.as_bytes(),
+                            last_chunk: record.chunk,
+                            first_capture_nanos: record.captured_at_unix_nanos,
+                            last_capture_nanos: record.captured_at_unix_nanos,
+                            projection: Arc::new(vec![projection]),
+                        });
+                    }
+                    previous_physical_matched = true;
+                    continue;
+                }
+                if let Some(rule) = &grouping_rule {
+                    let projection = projection.take().expect("built for grouped records");
+                    // Legacy groups retain every member projection, so the
+                    // built page is always charged here.
                     let projection_bytes = display_projection_bytes(&projection);
                     if !reservation.add(projection_bytes) {
                         fail(
@@ -5113,6 +5357,10 @@ fn run_query(
                                     || auto_open
                                     || chunk_continuation),
                             oversized: record.bytes.len() > MAX_GROUP_PAYLOAD_BYTES,
+                            pending: false,
+                            run_key: None,
+                            key_refused: false,
+                            configured: false,
                             auto_open: (credible_start
                                 || (continuation
                                     && previous_physical_matched
@@ -5579,7 +5827,14 @@ struct DisplayGroup {
     orphan: bool,
     split: bool,
     oversized: bool,
+    pending: bool,
+    key_refused: bool,
+    configured: bool,
     logical_lines: usize,
+    /// Every member the group holds. The stored projection page may be
+    /// shorter (see `MAX_CONFIGURED_GROUP_STORED`); this total is what the
+    /// head text and details report, never the page length.
+    record_total: usize,
     projection: Arc<Vec<DisplayRow>>,
 }
 
@@ -5678,7 +5933,11 @@ fn membership_groups(membership: &Membership, start: usize, len: usize) -> Vec<D
                 orphan: group.orphan,
                 split: group.split,
                 oversized: group.oversized,
+                pending: group.pending,
+                key_refused: group.key_refused,
+                configured: group.configured,
                 logical_lines: group.logical_lines,
+                record_total: group.len,
                 projection: Arc::clone(&group.projection),
             })
         })
@@ -5714,32 +5973,47 @@ fn membership_group_for_id(membership: &Membership, wanted: &RowId) -> Option<Di
     membership_groups(membership, index, 1).pop()
 }
 
-fn project_group(
-    mut members: Vec<DisplayRow>,
-    orphan: bool,
-    split: bool,
-    oversized: bool,
-    logical_lines: usize,
-) -> DisplayRow {
+fn project_group(group: DisplayGroup) -> DisplayRow {
+    let mut members = group.projection.to_vec();
+    let shown = members.len();
+    // The total is the group's membership, never the stored page: a capped
+    // page must not shrink the reported event.
+    let record_count = group.record_total.max(shown).max(1);
+    let truncated = shown < record_count;
     let mut head = members.remove(0);
-    let record_count = members.len() + 1;
     head.details.push((
         "grouping".into(),
         "display-only; physical records unchanged".into(),
     ));
     head.details
-        .push(("group_line_count".into(), logical_lines.to_string()));
+        .push(("group_line_count".into(), group.logical_lines.to_string()));
     head.details
         .push(("group_record_count".into(), record_count.to_string()));
-    if orphan {
+    if group.orphan {
         head.details
             .push(("group_boundary".into(), "orphan continuation".into()));
     }
-    if split {
+    if group.split {
         head.details
             .push(("group_overflow".into(), "bounded split".into()));
     }
-    if oversized {
+    if group.pending {
+        head.details.push((
+            "group_pending".into(),
+            "start evaluation unavailable for this group; shown alone until its enrichment settles"
+                .into(),
+        ));
+    }
+    if group.key_refused {
+        head.details.push((
+            "group_key_unavailable".into(),
+            format!(
+                "run key exceeds the {}-byte exact-identity bound; left unfolded rather than merged",
+                lvu_query::MAX_EXACT_KEY_BYTES
+            ),
+        ));
+    }
+    if group.oversized {
         head.details.push((
             "group_oversized_record".into(),
             format!(
@@ -5747,32 +6021,61 @@ fn project_group(
             ),
         ));
     }
+    // Configured groups render member text first: a full UUID:sequence
+    // prefix hides content on narrow terminals and defeats multiline review.
+    // Stable IDs stay in the same details, after the text. Legacy groups keep
+    // the established `id: text` shape byte for byte.
+    let member_line = |id: &RowId, text: &str| {
+        if group.configured {
+            format!("{text} [{id}]")
+        } else {
+            format!("{id}: {text}")
+        }
+    };
     let first_text = head.text.clone();
-    head.details.push((
-        "group_line_1".into(),
-        format!("{}: {}", head.id, first_text),
-    ));
+    let first_id = head.id.clone();
+    head.details
+        .push(("group_line_1".into(), member_line(&first_id, &first_text)));
     for (index, member) in members.into_iter().enumerate() {
         head.details.push((
             format!("group_line_{}", index + 2),
-            format!("{}: {}", member.id, member.text),
+            member_line(&member.id, &member.text),
         ));
     }
-    if record_count > 1 || orphan {
-        let label = if orphan {
+    if truncated {
+        head.details.push((
+            "group_truncated".into(),
+            format!(
+                "showing first {shown} of {record_count} records; every member stays in the source view"
+            ),
+        ));
+    }
+    if record_count > 1 || group.orphan || group.pending {
+        let label = if group.pending {
+            "pending grouping evaluation"
+        } else if group.orphan {
             "orphan continuation"
-        } else if record_count != logical_lines {
+        } else if record_count != group.logical_lines {
             "physical records"
         } else {
             "physical lines"
         };
-        head.text = if record_count != logical_lines && !orphan {
+        head.text = if truncated {
+            format!(
+                "{}  [{} {label}, first {shown} shown]",
+                head.text, record_count
+            )
+        } else if record_count != group.logical_lines && !group.orphan && !group.pending {
             format!(
                 "{}  [{} {label} / {} logical {}]",
                 head.text,
                 record_count,
-                logical_lines,
-                if logical_lines == 1 { "line" } else { "lines" }
+                group.logical_lines,
+                if group.logical_lines == 1 {
+                    "line"
+                } else {
+                    "lines"
+                }
             )
         } else {
             format!("{}  [{} {label}]", head.text, record_count)
@@ -5818,6 +6121,19 @@ fn definitions_match(left: &lvu::QueryConstraints, right: &lvu::QueryConstraints
 enum ContinuationRule {
     Auto,
     Custom(regex::bytes::Regex),
+    /// Consecutive records whose exact typed enrichment key matches form one
+    /// run. The key comes from [`lvu_query::exact_key_flags`]; this never
+    /// compares truncated display strings.
+    Run {
+        column: String,
+    },
+    /// Every non-null value in the enrichment column opens an event; every
+    /// record until the next non-null value continues it. Flags come from
+    /// [`lvu_query::non_null_flags`]; a produced null is an evaluated
+    /// continue, never unknown.
+    Filter {
+        column: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5832,9 +6148,33 @@ impl ContinuationRule {
         matches!(self, Self::Auto)
     }
 
+    /// A configured enrichment rule (Run/Filter) rather than a legacy lexical
+    /// one. Configured rules segment engine-computed flags and never read raw
+    /// bytes for classification.
+    fn is_configured(&self) -> bool {
+        matches!(self, Self::Run { .. } | Self::Filter { .. })
+    }
+
+    fn configured_column(&self) -> Option<&str> {
+        match self {
+            Self::Run { column } | Self::Filter { column } => Some(column),
+            Self::Auto | Self::Custom(_) => None,
+        }
+    }
+
     fn parse(source: &str) -> Result<Self, String> {
         match lvu::grouping::parse_grouping(source)? {
             lvu::grouping::GroupingSpec::Auto => return Ok(Self::Auto),
+            lvu::grouping::GroupingSpec::Run { column } => {
+                return Ok(Self::Run {
+                    column: column.to_owned(),
+                });
+            }
+            lvu::grouping::GroupingSpec::Filter { column } => {
+                return Ok(Self::Filter {
+                    column: column.to_owned(),
+                });
+            }
             lvu::grouping::GroupingSpec::Custom(_) => {}
         }
         if source.len() > MAX_GROUP_REGEX_BYTES {
@@ -5854,12 +6194,118 @@ impl ContinuationRule {
         match self {
             Self::Auto => None,
             Self::Custom(regex) => Some(regex.is_match(bytes)),
+            // Configured rules never classify raw bytes: the engine already
+            // expressed the criterion as per-record flags.
+            Self::Run { .. } | Self::Filter { .. } => None,
         }
     }
 
     fn auto_line(&self, bytes: &[u8], open: bool) -> Option<AutoLine> {
         matches!(self, Self::Auto).then(|| classify_auto_line(bytes, open))
     }
+}
+
+/// One record's configured-grouping input for the current batch.
+///
+/// Every variant is an engine verdict, never a view inference: `Start` and
+/// `Continue` come from the native `is_not_null()` kernel, run keys from
+/// exact typed encodings proven against native `==`, and `Unknown` marks
+/// only genuinely unevaluated batches (pending command output, a failed
+/// stage, or a batch missing the column). A produced null is
+/// `Continue`/`KeyNull`, never `Unknown`; a produced NaN stands alone like
+/// native equality reports it.
+#[derive(Clone, Debug, PartialEq)]
+enum ConfiguredFlag {
+    Start,
+    Continue,
+    Key(Vec<u8>),
+    KeyNull,
+    KeyNan,
+    KeyOversize,
+    Unknown,
+}
+
+/// Engine-computed grouping flags for one source batch: either the whole
+/// batch is unevaluated, or flags are keyed by record sequence.
+enum BatchFlags {
+    Unknown,
+    Known(HashMap<u64, ConfiguredFlag>),
+}
+
+fn configured_batch_flags(
+    rule: &ContinuationRule,
+    enrichment: &[EnrichmentStage],
+    waiting: &HashSet<String>,
+    result: &lvu_query::BatchResult,
+    source_id: &str,
+) -> Result<BatchFlags, String> {
+    let Some(column) = rule.configured_column() else {
+        return Err("grouping rule needs an enrichment column".to_owned());
+    };
+    if !enrichment.iter().any(|stage| stage.name == column) {
+        return Err(format!(
+            "grouping column {column:?} is not an accepted enrichment output; add it in Enrichment first"
+        ));
+    }
+    let failed = result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.field.as_deref() == Some(column) && diagnostic.state == DerivedState::Error
+    });
+    if failed || waiting.contains(column) {
+        return Ok(BatchFlags::Unknown);
+    }
+    let mut known = HashMap::new();
+    match rule {
+        ContinuationRule::Filter { .. } => {
+            // Batch-scoped absence (a column this batch does not carry)
+            // is unevaluated, never a silent false; the batch diagnostics
+            // already name the cause.
+            let Ok(mask) = non_null_flags(&result.enriched_rows, column) else {
+                return Ok(BatchFlags::Unknown);
+            };
+            for (id, start) in mask {
+                if id.source_id == source_id {
+                    known.insert(id.sequence, {
+                        if start {
+                            ConfiguredFlag::Start
+                        } else {
+                            ConfiguredFlag::Continue
+                        }
+                    });
+                }
+            }
+        }
+        ContinuationRule::Run { .. } => {
+            // An unsupported dtype is deterministic for the chain: reject
+            // the candidate actionably with the whole last-good view intact.
+            // Only genuinely batch-scoped absence stays unevaluated.
+            let keys = match exact_key_flags(&result.enriched_rows, column) {
+                Ok(keys) => keys,
+                Err(lvu_query::KeyError::Unavailable(_)) => {
+                    return Ok(BatchFlags::Unknown);
+                }
+                Err(lvu_query::KeyError::Unsupported(message)) => {
+                    return Err(message);
+                }
+            };
+            for (id, key) in keys {
+                if id.source_id == source_id {
+                    known.insert(
+                        id.sequence,
+                        match key {
+                            lvu_query::KeyFlag::Value(bytes) => ConfiguredFlag::Key(bytes),
+                            lvu_query::KeyFlag::Null => ConfiguredFlag::KeyNull,
+                            lvu_query::KeyFlag::Nan => ConfiguredFlag::KeyNan,
+                            lvu_query::KeyFlag::Oversize => ConfiguredFlag::KeyOversize,
+                        },
+                    );
+                }
+            }
+        }
+        ContinuationRule::Auto | ContinuationRule::Custom(_) => {
+            return Err("lexical grouping rules have no engine flags".to_owned());
+        }
+    }
+    Ok(BatchFlags::Known(known))
 }
 
 fn classify_auto_line(bytes: &[u8], open: bool) -> AutoLine {
@@ -6439,6 +6885,92 @@ mod grouping_tests {
     }
 
     #[test]
+    fn group_state_bytes_prices_run_key_capacity() {
+        let plain = GroupRange {
+            start: 0,
+            len: 200,
+            logical_lines: 200,
+            payload_bytes: 0,
+            stream: lvu_core::StreamKind::File,
+            orphan: false,
+            split: false,
+            oversized: false,
+            pending: false,
+            run_key: None,
+            key_refused: false,
+            configured: true,
+            auto_open: false,
+            auto_structured: false,
+            auto_structure_depth: 0,
+            partial_open: false,
+            partial_truncated: false,
+            structure_truncated: false,
+            partial_prefix: Vec::new(),
+            structure_prefix: Vec::new(),
+            acquisition_id: [0; 16],
+            last_chunk: lvu_core::ChunkPosition::Complete,
+            first_capture_nanos: 0,
+            last_capture_nanos: 0,
+            projection: Arc::new(Vec::new()),
+        };
+        let mut keyed = plain.clone();
+        keyed.run_key = Some(vec![7u8; 100]);
+        // Exactly the key heap, no more: prior-generation accounting prices
+        // the same shape on refresh.
+        assert_eq!(group_state_bytes(&keyed) - group_state_bytes(&plain), 100);
+        assert_eq!(
+            group_projection_bytes(&keyed) - group_projection_bytes(&plain),
+            100
+        );
+    }
+
+    #[test]
+    fn group_projection_bytes_counts_stored_pages_not_members() {
+        let row = |sequence: u64| DisplayRow {
+            id: RowId::new("s", sequence),
+            timestamp: String::new(),
+            captured_at_unix_nanos: None,
+            level: String::new(),
+            text: "x".to_owned(),
+            details: Vec::new(),
+            fields: Vec::new(),
+        };
+        let stored = GroupRange {
+            start: 0,
+            len: 200,
+            logical_lines: 200,
+            payload_bytes: 0,
+            stream: lvu_core::StreamKind::File,
+            orphan: false,
+            split: false,
+            oversized: false,
+            pending: false,
+            run_key: None,
+            key_refused: false,
+            configured: true,
+            auto_open: false,
+            auto_structured: false,
+            auto_structure_depth: 0,
+            partial_open: false,
+            partial_truncated: false,
+            structure_truncated: false,
+            partial_prefix: Vec::new(),
+            structure_prefix: Vec::new(),
+            acquisition_id: [0; 16],
+            last_chunk: lvu_core::ChunkPosition::Complete,
+            first_capture_nanos: 0,
+            last_capture_nanos: 0,
+            projection: Arc::new((0..64).map(row).collect::<Vec<_>>()),
+        };
+        let per_row = display_projection_bytes(&row(0));
+        // 200 members but only the 64-row stored page is charged.
+        assert_eq!(
+            group_projection_bytes(&stored),
+            group_state_bytes(&stored) + 64 * per_row
+        );
+    }
+
+    #[test]
     fn group_index_uses_ordered_boundaries_for_large_memberships() {
         let groups = (0..10_000)
             .map(|index| GroupRange {
@@ -6450,6 +6982,10 @@ mod grouping_tests {
                 orphan: false,
                 split: false,
                 oversized: false,
+                pending: false,
+                run_key: None,
+                key_refused: false,
+                configured: false,
                 auto_open: true,
                 auto_structured: false,
                 auto_structure_depth: 0,

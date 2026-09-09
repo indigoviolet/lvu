@@ -5714,6 +5714,20 @@ impl App {
                     .last()
                     .map_or_else(String::new, |stage| stage.source.clone());
                 state.grouping.applied = constraints.grouping.clone().unwrap_or_default();
+                if accepted_grouping {
+                    // Applying a new Run/Filter/Off rule clears folding: runs
+                    // are defined once, by grouping, so a second collapsing
+                    // layer must be re-chosen, never inherited silently.
+                    // Legacy applies leave folding alone.
+                    let fresh_rule = match constraints.grouping.as_deref() {
+                        None => true,
+                        Some(rule) => !crate::grouping::is_legacy(rule),
+                    };
+                    if fresh_rule {
+                        state.fold_enabled = false;
+                        state.fold_expanded.clear();
+                    }
+                }
                 // Accepted with the query that evaluated them, so the dialog's
                 // "edited" state clears exactly when the rows repaint.
                 state.color_rules = constraints.color_rules.clone();
@@ -6843,36 +6857,23 @@ impl App {
                 }
             }
             Action::ToggleFolding => {
-                if let Some(state) = self.view_state_mut() {
-                    state.fold_enabled = !state.fold_enabled;
-                    if state.fold_minimum_run == 0 {
-                        state.fold_minimum_run = DEFAULT_FOLD_MINIMUM_RUN;
-                    }
-                    if !state.fold_enabled {
-                        state.fold_expanded.clear();
-                    }
-                    let enabled = state.fold_enabled;
-                    let run = state.fold_minimum_run;
-                    state.user_interaction_revision =
-                        state.user_interaction_revision.saturating_add(1);
-                    self.action_notice = Some(if enabled {
-                        format!("folding on: runs of {run}+ collapse")
-                    } else {
-                        "folding off; every event is listed individually".into()
-                    });
-                }
+                // The toggle is retired as a second folding layer: every state
+                // routes the unified Grouping UI, which defines runs and
+                // starts once on enrichment columns. Persisted legacy folds
+                // keep rendering until the user edits; nothing here enables,
+                // disables or re-keys them.
+                self.push_layer(crate::component::Open::Grouping, provider);
             }
             Action::CollapseAllFolds => {
+                // Collapse-all covers both expansion kinds without enabling
+                // anything: unified group expansions, plus legacy fold
+                // expansions where a restored fold still renders.
                 if let Some(state) = self.view_state_mut() {
-                    if !state.fold_enabled {
-                        self.action_notice =
-                            Some("folding is off for this view; nothing is collapsed".into());
-                        return;
-                    }
+                    state.expanded_groups.clear();
                     state.fold_expanded.clear();
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
-                    self.action_notice = Some("every repeated run is collapsed again".into());
+                    self.action_notice = Some("every expanded run is collapsed again".into());
                 }
             }
             Action::Open(open) => self.push_layer(open, provider),
@@ -8344,9 +8345,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('}') => Action::JumpToGap(GapDirection::Forward),
         KeyCode::Char('{') => Action::JumpToGap(GapDirection::Backward),
         KeyCode::Char('i') => Action::Open(Open::Fields),
-        // `z` is vim's fold prefix and is unbound here; the palette-only
-        // `Fold repeated events` toggle keeps working unchanged.
-        KeyCode::Char('z') => Action::Open(Open::Folding),
+        // `z` opens the unified Grouping UI alongside `m`: runs and starts
+        // are defined once, on enrichment columns, so there is a single
+        // normal control instead of two dialogs.
+        KeyCode::Char('z') => Action::Open(crate::component::Open::Grouping),
         KeyCode::Char('c') => Action::Open(crate::component::Open::ColorRules),
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,

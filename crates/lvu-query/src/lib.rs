@@ -11,6 +11,7 @@ pub use lvu_core::{
 pub mod adapter;
 pub mod column_stats;
 pub mod engine;
+pub mod grouping_flags;
 pub mod host;
 pub mod parquet;
 pub mod regex_enrichment;
@@ -21,6 +22,7 @@ pub mod validate;
 pub use adapter::*;
 pub use column_stats::*;
 pub use engine::*;
+pub use grouping_flags::*;
 pub use host::*;
 pub use parquet::*;
 pub use regex_enrichment::*;

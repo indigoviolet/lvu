@@ -70,8 +70,11 @@ const FILTER_TABS: [QueryPurpose; 2] = [QueryPurpose::Search, QueryPurpose::Adva
 /// letters do once the field no longer has the keys. The shell resolves them
 /// through `action_labels`, the same way it presses a button.
 const FILTER_TAB_LABELS: [&str; 2] = ["&Search", "&Advanced"];
-const GROUPING_MODE_LABELS: [&str; 3] = ["Auto", "Custom", "Off"];
-const DEFAULT_CUSTOM_GROUPING: &str = r"^(\s+|Caused by:)";
+/// The Grouping dialog's normal control: Run and Filter are the configured
+/// enrichment rules (consecutive equal keys; non-null enrichment opens an
+/// event), Off clears the rule, and Legacy is the explicit compat home for
+/// restored Auto tokens and custom continuation regexes — never a default.
+const GROUPING_MODE_LABELS: [&str; 4] = ["Run", "Filter", "Legacy", "Off"];
 
 /// Everything the Filter dialog lets a mnemonic press, in `action_labels`
 /// order: the two buttons, then the two segments (as View lists its mode
@@ -286,7 +289,7 @@ impl EditorDialog {
                     ctx.cursors.reset(target.clone(), "");
                 }
                 EditCommand::Backspace | EditCommand::KillToEndOfLine => {
-                    return self.set_grouping_mode(2, true, ctx);
+                    return self.set_grouping_mode(3, true, ctx);
                 }
                 _ => {
                     ctx.cursors.reset(target, "");
@@ -294,15 +297,32 @@ impl EditorDialog {
                 }
             }
         }
+        // Erasing in a blank configured rule clears it: a rule that names no
+        // column cannot apply, and Off is where empty drafts belong.
+        if self.purpose == QueryPurpose::Grouping
+            && (value == crate::grouping::run_rule("") || value == crate::grouping::filter_rule(""))
+            && matches!(
+                command,
+                EditCommand::Backspace | EditCommand::KillToEndOfLine
+            )
+        {
+            return self.set_grouping_mode(3, true, ctx);
+        }
         let mut cursor = ctx.cursors.get_or_end(target.clone(), &value);
         let outcome = edit(&mut value, &mut cursor, command, self.policy());
         ctx.cursors.store(target, cursor);
         if outcome.changed {
             if let Some(editor) = ctx.views.editor_mut(&view_id, self.purpose) {
                 editor.draft = value;
+                // Only legacy custom text is remembered for the Legacy tab;
+                // configured tokens are rebuilt by the tab and the column
+                // cycler, so remembering them here would resurface a stale
+                // column under the wrong tab.
                 if self.purpose == QueryPurpose::Grouping
-                    && !editor.draft.is_empty()
-                    && editor.draft != crate::grouping::AUTO_GROUPING_TOKEN
+                    && matches!(
+                        crate::grouping::parse_grouping(&editor.draft),
+                        Ok(crate::grouping::GroupingSpec::Custom(_))
+                    )
                 {
                     editor.custom_grouping_draft = Some(editor.draft.clone());
                 }
@@ -403,7 +423,7 @@ impl EditorDialog {
         if self.purpose == QueryPurpose::Grouping {
             let current = self
                 .draft(ctx)
-                .map_or(2, |(_, draft)| grouping_mode(&draft));
+                .map_or(3, |(_, draft)| grouping_mode(&draft));
             let next =
                 (current as i32 + delta).rem_euclid(GROUPING_MODE_LABELS.len() as i32) as usize;
             return self.set_grouping_mode(next, false, ctx);
@@ -425,7 +445,7 @@ impl EditorDialog {
         let current = ctx
             .views
             .editor(&view_id, QueryPurpose::Grouping)
-            .map_or(2, |editor| grouping_mode(&editor.draft));
+            .map_or(3, |editor| grouping_mode(&editor.draft));
         if current == mode {
             if to_field {
                 self.focus = EditorFocus::Field;
@@ -436,23 +456,111 @@ impl EditorDialog {
             .views
             .editor(&view_id, QueryPurpose::Grouping)
             .and_then(|editor| editor.custom_grouping_draft.clone());
+        // Run and Filter start blank: Up/Down names the enrichment column,
+        // and the caret opens inside the column slot so typing does too.
         let value = match mode {
-            0 => crate::grouping::AUTO_GROUPING_TOKEN.to_owned(),
-            1 => remembered_custom.unwrap_or_else(|| DEFAULT_CUSTOM_GROUPING.to_owned()),
+            0 => crate::grouping::run_rule(""),
+            1 => crate::grouping::filter_rule(""),
+            2 => {
+                remembered_custom.unwrap_or_else(|| crate::grouping::AUTO_GROUPING_TOKEN.to_owned())
+            }
             _ => String::new(),
         };
         if let Some(editor) = ctx.views.editor_mut(&view_id, QueryPurpose::Grouping) {
-            if current == 1 {
+            if current == 2
+                && matches!(
+                    crate::grouping::parse_grouping(&editor.draft),
+                    Ok(crate::grouping::GroupingSpec::Custom(_))
+                )
+            {
                 editor.custom_grouping_draft = Some(editor.draft.clone());
             }
             editor.draft.clone_from(&value);
             editor.error = None;
         }
-        ctx.cursors.reset(self.target(&view_id), &value);
+        self.reset_grouping_caret(ctx, &view_id, &value, mode == 0 || mode == 1);
         self.completion = None;
         if to_field {
             self.focus = EditorFocus::Field;
         }
+        ctx.views.touch(&view_id);
+        Outcome::Consumed
+    }
+
+    /// The caret opens inside a configured rule's column slot (before the
+    /// closing paren) so typing names the column; anywhere else it opens at
+    /// the end as before.
+    fn reset_grouping_caret(&self, ctx: &mut Ctx<'_>, view_id: &str, value: &str, in_slot: bool) {
+        let target = self.target(view_id);
+        ctx.cursors.reset(target.clone(), value);
+        if in_slot && value.ends_with(')') {
+            ctx.cursors.store(
+                target,
+                crate::text_edit::TextCursor {
+                    char_index: value.chars().count().saturating_sub(1),
+                },
+            );
+        }
+    }
+
+    /// Up/Down names the enrichment column of a Run/Filter draft by cycling
+    /// the columns the view actually carries. Manual edits still work: the
+    /// draft is the plain rule token. Anything the worker rejects (a column
+    /// no accepted enrichment produces) fails on apply with its cause, and
+    /// the last applied grouping stays.
+    fn cycle_grouping_column(&mut self, delta: i32, ctx: &mut Ctx<'_>) -> Outcome {
+        let Some(view_id) = ctx.views.active_id().map(str::to_owned) else {
+            return Outcome::Consumed;
+        };
+        let draft = ctx
+            .views
+            .editor(&view_id, QueryPurpose::Grouping)
+            .map(|editor| editor.draft.clone())
+            .unwrap_or_default();
+        let kind = if draft.starts_with(crate::grouping::RUN_NAMESPACE) {
+            0
+        } else if draft.starts_with(crate::grouping::FILTER_NAMESPACE) {
+            1
+        } else {
+            return Outcome::Consumed;
+        };
+        // Only offer names that form a valid rule; anything else the
+        // worker would reject on apply, so offering it picks a failure.
+        let columns: Vec<String> = super::folding::fold_columns(ctx.views, ctx.provider)
+            .into_iter()
+            .filter(|name| crate::grouping::is_grouping_column_name(name))
+            .collect();
+        if columns.is_empty() {
+            return Outcome::Consumed;
+        }
+        let current = if kind == 0 {
+            draft
+                .strip_prefix(crate::grouping::RUN_NAMESPACE)
+                .and_then(|suffix| suffix.strip_suffix(')'))
+                .unwrap_or_default()
+        } else {
+            draft
+                .strip_prefix(crate::grouping::FILTER_NAMESPACE)
+                .and_then(|suffix| suffix.strip_suffix(')'))
+                .unwrap_or_default()
+        };
+        let next = columns
+            .iter()
+            .position(|name| name == current)
+            .map_or(0, |index| {
+                (index as i32 + delta).rem_euclid(columns.len() as i32) as usize
+            });
+        let value = if kind == 0 {
+            crate::grouping::run_rule(&columns[next])
+        } else {
+            crate::grouping::filter_rule(&columns[next])
+        };
+        if let Some(editor) = ctx.views.editor_mut(&view_id, QueryPurpose::Grouping) {
+            editor.draft.clone_from(&value);
+            editor.error = None;
+        }
+        self.reset_grouping_caret(ctx, &view_id, &value, kind == 0 || kind == 1);
+        self.completion = None;
         ctx.views.touch(&view_id);
         Outcome::Consumed
     }
@@ -615,6 +723,16 @@ impl EditorDialog {
     /// from `is_text_editing`/`editor_completion`; the component has both.
     fn vertical(&mut self, delta: i32, ctx: &mut Ctx<'_>) -> Outcome {
         if self.text_editing() && self.completion.is_none() {
+            // In a configured grouping rule Up/Down names the enrichment
+            // column instead of moving a caret the single-line token cannot
+            // visibly use.
+            if self.purpose == QueryPurpose::Grouping
+                && let Some((_, draft)) = self.draft(ctx)
+                && (draft.starts_with(crate::grouping::RUN_NAMESPACE)
+                    || draft.starts_with(crate::grouping::FILTER_NAMESPACE))
+            {
+                return self.cycle_grouping_column(delta, ctx);
+            }
             return self.text(
                 if delta < 0 {
                     EditCommand::MoveUp
@@ -736,12 +854,19 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
 }
 
 fn grouping_mode(draft: &str) -> usize {
-    if draft == crate::grouping::AUTO_GROUPING_TOKEN {
+    // The tab follows intent (namespace), not validity: a half-typed
+    // configured rule stays on its tab and the error row reports it.
+    if draft.is_empty() {
+        3
+    } else if draft.starts_with(crate::grouping::RUN_NAMESPACE) {
         0
-    } else if draft.is_empty() {
-        2
-    } else {
+    } else if draft.starts_with(crate::grouping::FILTER_NAMESPACE) {
         1
+    } else {
+        // Legacy Auto tokens and custom continuation regexes share the
+        // explicit compat tab; their distinct meanings are unchanged. A
+        // malformed draft lands here and the error row reports it.
+        2
     }
 }
 
@@ -787,14 +912,19 @@ impl Component for EditorDialog {
         if let Some(tab) = tab {
             let _ = self.switch_tab(tab, true);
         }
-        // §12.3: an unset grouping rule opens in conservative Auto mode.
+        // An unset grouping rule opens on the Run tab with a blank column:
+        // Run is the primary configured path, and the blank names no column
+        // until Up/Down (or typing) picks the enrichment output. Legacy Auto
+        // stays reachable under Legacy, never as the default.
         if self.purpose == QueryPurpose::Grouping
             && let Some(view_id) = ctx.views.active_id().map(str::to_owned)
             && let Some(editor) = ctx.views.editor_mut(&view_id, QueryPurpose::Grouping)
             && editor.draft.is_empty()
             && editor.applied.is_empty()
         {
-            editor.draft = crate::grouping::AUTO_GROUPING_TOKEN.into();
+            editor.draft = crate::grouping::run_rule("");
+            let caret = editor.draft.clone();
+            self.reset_grouping_caret(ctx, &view_id, &caret, true);
         }
     }
 
@@ -1014,12 +1144,32 @@ impl EditorDialog {
             )
         };
         let auto = editor.draft == crate::grouping::AUTO_GROUPING_TOKEN;
-        let help = if auto {
-            "Mode Auto · type to replace it with a Custom raw-byte regex · Backspace selects Off."
+        let run_column = editor
+            .draft
+            .strip_prefix(crate::grouping::RUN_NAMESPACE)
+            .and_then(|suffix| suffix.strip_suffix(')'));
+        let filter_column = editor
+            .draft
+            .strip_prefix(crate::grouping::FILTER_NAMESPACE)
+            .and_then(|suffix| suffix.strip_suffix(')'));
+        let help = if let Some(column) = run_column {
+            if column.is_empty() {
+                "Run · Up/Down names the enrichment column whose equal consecutive values form one run."
+            } else {
+                "Run · equal consecutive values form one run; recognition belongs in Enrichment."
+            }
+        } else if let Some(column) = filter_column {
+            if column.is_empty() {
+                "Filter · Up/Down names the enrichment column whose non-null values open events."
+            } else {
+                "Filter · each non-null value opens an event; everything until the next one continues."
+            }
+        } else if auto {
+            "Legacy Auto · kept for restored settings; prefer Run or Filter. Backspace selects Off."
         } else if editor.draft.is_empty() {
-            "Mode Off · type a raw-byte regex for Custom grouping. Grouping is display only."
+            "Off · grouping is display only; Run and Filter group on enrichment columns."
         } else {
-            "Mode Custom · continuation lines match this regex over raw bytes; clear it for Off."
+            "Legacy Custom · continuation lines match this regex over raw bytes; prefer Run or Filter."
         };
         // §3: the action row is part of the anatomy, not an afterthought. Without
         // it this dialog rendered no way to apply at all and relied on the user

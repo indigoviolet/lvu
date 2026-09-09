@@ -292,14 +292,16 @@ fn action_buttons(
         .active()
         .map_or_else(Vec::new, |state| state.pinned_columns.clone());
     let color_field = views.active().and_then(|state| state.color_field.clone());
-    // The column this view is folded by right now, if it is folding at all. A
-    // one-key action that only ever turns something on leaves the user looking
-    // for where to turn it off; §8.9's Add/Edit rule is that the button says
-    // what pressing it will do from here.
-    let folded_by = views
-        .active()
-        .filter(|state| state.fold_enabled)
-        .and_then(|state| state.fold_key_column.clone());
+    // The column this view is run-grouped by right now, if it is. A one-key
+    // action that only ever turns something on leaves the user looking for
+    // where to turn it off; §8.9's Add/Edit rule is that the button says what
+    // pressing it will do from here.
+    let folded_by = views.active().and_then(|state| {
+        match crate::grouping::parse_grouping(&state.grouping.applied) {
+            Ok(crate::grouping::GroupingSpec::Run { column }) => Some(column.to_owned()),
+            _ => None,
+        }
+    });
     let pin_label = if selected_column
         .as_ref()
         .is_some_and(|key| pinned.contains(key))
@@ -538,13 +540,15 @@ impl FieldsDialog {
         Outcome::Consumed
     }
 
-    /// §8.12: fold the view by the selected field's column, exactly as
-    /// choosing that column in the Folding dialog does — and, when the view is
-    /// already folded by it, stop folding.
+    /// §8.12: run-group the view by the selected field's column through the
+    /// unified grouping control — and, when the view is already run-grouped
+    /// by it, clear the rule again.
     ///
     /// §8.9's rule for Add/Edit: a one-key action follows the state it acts on
-    /// rather than only ever switching it on. Folding from here and then having
-    /// to find the Folding dialog to undo it is the same trap.
+    /// rather than only ever switching it on. Recognition lives in
+    /// Enrichment: the column must be an accepted enrichment output, and the
+    /// worker names any other column actionably while the last-good view
+    /// stays put.
     fn fold_by_field(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         let Some(column) = Self::selected_column(ctx) else {
             return Outcome::Consumed;
@@ -552,42 +556,32 @@ impl FieldsDialog {
         let Some(view_id) = ctx.views.active_id().map(str::to_owned) else {
             return Outcome::Consumed;
         };
-        let mut notice = None;
-        if let Some(state) = ctx.views.state_mut(&view_id) {
-            let folded_by_this =
-                state.fold_enabled && state.fold_key_column.as_deref() == Some(column.as_str());
-            if folded_by_this {
-                state.fold_enabled = false;
-                state.fold_expanded.clear();
-                notice = Some(format!("folding off; was on {column}"));
-            } else {
-                // Say which key is being left behind: switching from one column
-                // to another changes every run on screen, and the count in the
-                // status line moving is otherwise the only sign of it.
-                let previous = state.fold_enabled.then(|| {
-                    state
-                        .fold_key_column
-                        .clone()
-                        .unwrap_or_else(|| "pattern".to_owned())
-                });
-                state.fold_key_column = Some(column.clone());
-                state.fold_expanded.clear();
-                state.fold_enabled = true;
-                if state.fold_minimum_run == 0 {
-                    state.fold_minimum_run = crate::app::DEFAULT_FOLD_MINIMUM_RUN;
-                }
-                notice = Some(match previous {
-                    Some(previous) if previous != column => {
-                        format!("folding by {previous} → {column}")
-                    }
-                    _ => format!("folding on {column}"),
-                });
-            }
+        let grouped_by_this = ctx.views.active().is_some_and(|state| {
+            matches!(
+                crate::grouping::parse_grouping(&state.grouping.applied),
+                Ok(crate::grouping::GroupingSpec::Run { column: applied })
+                    if applied == column.as_str()
+            )
+        });
+        let rule = if grouped_by_this {
+            String::new()
+        } else {
+            crate::grouping::run_rule(&column)
+        };
+        if ctx
+            .views
+            .enqueue(&view_id, QueryPurpose::Grouping, Some(rule))
+            .is_err()
+        {
+            ctx.notice("query submission queue is full; draft was preserved".to_owned());
+            return Outcome::Consumed;
         }
         ctx.views.touch(&view_id);
-        if let Some(notice) = notice {
-            ctx.notice(notice);
-        }
+        ctx.notice(if grouped_by_this {
+            format!("grouping off; runs were on {column}")
+        } else {
+            format!("grouping runs on {column}")
+        });
         Outcome::Consumed
     }
 

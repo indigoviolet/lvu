@@ -434,35 +434,24 @@ layers use the §3 region order, the §7.4 message row and §8.7 panes; the layo
 scrim and pane helpers are private to `ui.rs` until the shared `dialog_layout`
 module exists.
 
-Repeated-run folding (`lvu-view/src/folding.rs`) collapses consecutive rows that
-share one key. The key is the value of exactly one column per view: by default a
-derived `pattern` column — the row text with timestamps, ids, paths and numbers
-replaced and the level prefixed — and otherwise any column the rows carry,
-including an enrichment column, whose value is used unchanged. Normalisation
-aggressiveness therefore governs the derived column only. Folding is reversible
-presentation: no record is dropped, reordered or rewritten, every constituent
-stays addressable by its `RowId`, and every sampling consumer reads
-`RowProvider::unfolded_page`. The `Folding` layer (`z`, class M) sets the key
-column, minimum run, scope and normalisation, and persists them with the view;
-folding on several fields is an enrichment column built from them, which its
-picker creates by opening the ordinary step editor pre-filled.
+Grouping consumes accepted enrichment outputs. Run joins consecutive equal
+non-null keys; Filter starts a group at each non-null value and appends the
+following null-valued records until the next start. A boolean false is non-null
+and therefore starts a Filter group. Define patterns and composite keys in
+Enrichment, not in Grouping. Normal entry points share Run/Filter/Off and do
+not enable a second normalization layer. Saved legacy settings retain their
+meaning until explicitly changed.
 
-Multiline grouping (`crates/lvu/src/grouping.rs`) maps the persisted grouping
-field to Auto or Custom without changing stored custom rules: only the exact
-reserved token `(?lvu:auto:v1)` — which the legacy regex parser rejects —
-means Auto, and any other `(?lvu:auto:…)` version is rejected with an
-instruction to reopen Grouping and choose Auto. The Grouping dialog (`m`)
-offers Auto, Custom or Off; grouped events render downstream through the
-existing Folding presentation (`z`). Auto recognition is view-adapter
-presentation logic over raw record metadata, not Polars execution, under the
-raw-bytes/stable-identity exemption — joining up to 64 physical records /
-64 KiB of payload per group, where an oversized physical record remains
-standalone (continuation-admission bound, not a per-record size guarantee),
-nondecreasing capture timestamps within 30 seconds of the group head, and a
-512-byte classification prefix; orphans that match nothing stay standalone.
-Switching to Auto or Off keeps an extra remembered copy of
-the Custom text per view in memory only, lost on restart; the active grouping
-editor draft itself persists as before.
+Polars computes typed start flags and keys. The view adapter segments ordered
+record membership for presentation, preserving source, stream, acquisition and
+physical-adjacency boundaries. Records before the first start stay standalone.
+Unavailable work remains pending; an unsupported key type rejects the candidate
+with an actionable diagnostic and leaves the last-good grouping usable.
+
+Long events remain one group. The retained display page is bounded independently
+of the group membership and reports shown/total counts when truncated. Retained
+group metadata, keys and projections count against the membership budget.
+Original bytes, record identities and filter membership remain unchanged.
 
 
 Settings uses explicit control focus, a staged theme dropdown and a bounded

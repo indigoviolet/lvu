@@ -6,9 +6,7 @@ validation evidence lives in the [work ledger](docs/work-ledger.md).
 
 ## Unreleased
 
-v0.1.3 remains untagged. Event-start grouping is being corrected to the requested
-configurable boundary model; the existing heuristic behavior below is integrated
-but does not satisfy that requirement.
+v0.1.3 is prepared below; publication follows final acceptance.
 
 ### Features
 
@@ -18,16 +16,12 @@ but does not satisfy that requirement.
   Admission compares acquisition identities and policies against live and
   pending sources to avoid duplicate starts or silently changed settings.
 
-- Collapse common tracebacks, wrapped log messages and pretty-printed payloads
-  into grouped events with Grouping (`m` → Auto). Each row shows its first line
-  and constituent count; Enter expands or collapses the lines. Custom accepts
-  a continuation rule, and Off restores individual-record presentation.
-  Optional Folding (`z`) can then collapse consecutive similar events.
-  Auto uses conservative recognition, with at most 64 physical records /
-  64 KiB per group and nondecreasing capture times within 30 seconds of its
-  head. An oversized physical record stays standalone; unfamiliar structure
-  may stay ungrouped. Original bytes, identities and filter membership remain
-  unchanged.
+- Grouping (`m` or `z`) offers Run, Filter and Off over enrichment columns.
+  Run collapses consecutive equal keys. Filter starts an event at each non-null
+  value and joins following null-valued records until the next start. Define
+  extraction patterns in Enrichment. Long events retain their full membership
+  with a bounded display page and explicit shown/total counts. Bytes, identities
+  and filter membership are unchanged.
 
 ### Fixes
 
@@ -60,7 +54,8 @@ but does not satisfy that requirement.
 
 ### Breaking changes
 
-- None recorded.
+- Normal folding controls now open the unified Grouping dialog. New rules use
+  enrichment columns; saved legacy rules retain their meaning until changed.
 
 ## [v0.1.2](https://github.com/indigoviolet/lvu/releases/tag/v0.1.2) — 2026-09-09
 

@@ -3,14 +3,14 @@
 //!
 //! The model this dialog exposes is deliberately small: **a run is a group of
 //! consecutive rows sharing one key, and the key is the value of exactly one
-//! column.** The default column is a derived one, `Message pattern`, which is
-//! the row text with volatile substrings replaced and the level prefixed —
-//! precisely what folding keyed on before a column could be chosen, so a view
-//! that never opens this dialog folds exactly as it always did. Any other
-//! column, including an enrichment column, supplies its value as-is: nothing is
-//! normalised, and a field the user did not ask about is never replaced. That
-//! is why `Normalisation` is only shown while the key is the derived column —
-//! it is the only thing it can affect.
+//! column.** Any chosen column, including an enrichment column, supplies its
+//! value as-is: nothing is normalised, and a field the user did not ask about
+//! is never replaced. The derived `Message pattern` column — row text with
+//! volatile substrings replaced and the level prefixed — is legacy compat
+//! only: stored pattern folds restore through the engine default, but beside
+//! a configured Run/Filter grouping the picker offers exact columns and the
+//! pattern is not newly selectable. That is why `Normalisation` is only shown
+//! while the key is the derived column — it is the only thing it can affect.
 //!
 //! Folding on *several* fields is therefore not a second mechanism here. The
 //! key column picker offers `[ New column… ]`, which asks which fields to
@@ -345,15 +345,18 @@ impl FoldingDialog {
                     return (rows, 0);
                 }
                 let current = state.and_then(|state| state.fold_key_column.clone());
+                // The derived pattern is restore-only through the engine
+                // default: this picker names exact columns, so normalisation
+                // is never newly selectable here. Recognition belongs in
+                // Enrichment.
                 let selected = match &current {
                     None => 0,
                     Some(name) => columns
                         .iter()
                         .position(|column| column == name)
-                        .map_or(0, |index| index + 1),
+                        .unwrap_or(0),
                 };
-                let mut rows = vec![format!("{PATTERN_COLUMN_LABEL}   (default)")];
-                rows.extend(columns);
+                let mut rows = columns;
                 rows.push("[ New column… ]".to_owned());
                 (rows, selected)
             }
@@ -513,9 +516,9 @@ impl FoldingDialog {
             FoldingDropdown::KeyColumn if self.composing.is_some() => self.compose(ctx),
             FoldingDropdown::KeyColumn => {
                 let columns = fold_columns(ctx.views, ctx.provider);
-                if index == 0 {
-                    self.edit(ctx, |state| state.fold_key_column = None);
-                } else if let Some(column) = columns.get(index - 1).cloned() {
+                // Shares its row layout with `choices()`: exact columns plus
+                // the trailing New row, with no pattern row to select.
+                if let Some(column) = columns.get(index).cloned() {
                     self.edit(ctx, move |state| state.fold_key_column = Some(column));
                 } else if columns.is_empty() {
                     // Nothing to combine: say so rather than opening an empty
