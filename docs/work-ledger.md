@@ -1823,3 +1823,25 @@ cfff82c7c49d1846a36c1e9de42b1753e478a6620838d1374fb9d4858847dc50.
 Log: primary-astra-scratch/viewport-integrated-gate.log; private marked fixture
 root removed on exit. Full release matrix will run on the next complete accepted
 runtime; this focused gate does not claim512MB/RSS/soak/general-thrash coverage.
+
+
+## 2026-09-09 — active feature seams and build isolation incident
+
+Column-role candidate ae4eea2 is a worker-only scaffold: prompts, palette entries
+and unset role fields passed focused tests, but display/persistence wiring is
+not complete or integrated. Narrow persistence and accepted-membership role
+hooks are assigned; grouping and union owners coordinated disjoint paths.
+Union candidate 82ccf03 now consumes frozen accepted values rather than truncated
+display projections; executable registration, publication and UI remain pending.
+
+W22 reports recent bare mise Cargo checks wrote to the primary target. Current
+primary artifacts must be treated as suspect regardless of freshness timestamps.
+Before the next acceptance gate, rebuild affected workspace path crates under
+the lock with an explicit primary target; preserve external dependency caches,
+proof and captures. Prior exact-binary gate results remain historical evidence,
+not proof of the current target contents. Installed v0.1.2 is unchanged.
+Autosave's current dcd83ff run has a misleading primary-target environment probe,
+but /proc confirms explicit --target-dir and rustc output paths use its private
+target. Its current script lacks the claimed marked fixture and reliable outer
+exit propagation; read the recorded GATE_EXIT and test outcomes directly. These
+script shortcomings have been returned to the implementer for correction.
