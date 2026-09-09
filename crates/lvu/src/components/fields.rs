@@ -318,6 +318,31 @@ fn action_buttons(
     } else {
         "&Color"
     };
+    let (severity_role, timestamp_role) = views
+        .active()
+        .map(|state| {
+            (
+                state.severity_column.clone(),
+                state.timestamp_column.clone(),
+            )
+        })
+        .unwrap_or_default();
+    let severity_label = if selected_column
+        .as_deref()
+        .is_some_and(|key| severity_role.as_deref() == Some(key))
+    {
+        "Stop &severity"
+    } else {
+        "&Severity"
+    };
+    let timestamp_label = if selected_column
+        .as_deref()
+        .is_some_and(|key| timestamp_role.as_deref() == Some(key))
+    {
+        "Stop &timestamp"
+    } else {
+        "&Timestamp"
+    };
     let fold_label = if selected_column
         .as_deref()
         .is_some_and(|key| folded_by.as_deref() == Some(key))
@@ -331,6 +356,8 @@ fn action_buttons(
         ("&Filter", C::Filter),
         ("E&xclude", C::Exclude),
         (color_label, C::Color),
+        (severity_label, C::Severity),
+        (timestamp_label, C::Timestamp),
         (fold_label, C::Fold),
         ("Co&rrelate", C::Correlate),
     ]
@@ -431,6 +458,8 @@ impl FieldsDialog {
             FieldPickerControl::Filter,
             FieldPickerControl::Exclude,
             FieldPickerControl::Color,
+            FieldPickerControl::Severity,
+            FieldPickerControl::Timestamp,
             FieldPickerControl::Fold,
             FieldPickerControl::Correlate,
             FieldPickerControl::Context,
@@ -464,6 +493,8 @@ impl FieldsDialog {
             }
             FieldPickerControl::Pin => self.toggle_field(true, ctx),
             FieldPickerControl::Color => self.toggle_field(false, ctx),
+            FieldPickerControl::Severity => self.toggle_role(true, ctx),
+            FieldPickerControl::Timestamp => self.toggle_role(false, ctx),
             FieldPickerControl::Filter => self.filter_to_value(false, ctx),
             FieldPickerControl::Exclude => self.filter_to_value(true, ctx),
             FieldPickerControl::Fold => self.fold_by_field(ctx),
@@ -535,6 +566,57 @@ impl FieldsDialog {
             state.color_field = None;
         } else {
             state.color_field = Some(field);
+        }
+        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+        Outcome::Consumed
+    }
+
+    /// Whether the anchored record proves an accepted enrichment evaluated
+    /// `field`: the same `derived.{name}` marker rendering resolves roles
+    /// through, read here so assignment and consumption cannot disagree.
+    fn role_proven(ctx: &Ctx<'_>, field: &str) -> bool {
+        anchored_row(ctx.views, ctx.provider).is_some_and(|row| {
+            row.details
+                .iter()
+                .any(|(key, _)| key == &format!("derived.{field}"))
+        })
+    }
+
+    /// Name the selected column for a display role, or stop using it when it
+    /// is already the role. Assigning requires the anchored record's
+    /// `derived.{name}` marker — proof the accepted chain evaluated it — so
+    /// a raw same-name field can never be assigned: rendering resolves roles
+    /// through the same marker, and the refusal says why instead of silently
+    /// doing nothing. Naming a timestamp role also stages the authoritative
+    /// Selected time basis for that column through the normal Time candidate
+    /// fences, so the gutter never becomes a second independent time
+    /// selector: the Time dialog still reviews and applies. Clearing the role
+    /// leaves an explicitly chosen basis alone.
+    fn toggle_role(&mut self, severity: bool, ctx: &mut Ctx<'_>) -> Outcome {
+        let Some(field) = Self::selected_column(ctx) else {
+            return Outcome::Consumed;
+        };
+        if !Self::role_proven(ctx, &field) {
+            ctx.notice(format!(
+                "only an accepted enrichment output can feed a role; {field:?} has none"
+            ));
+            return Outcome::Consumed;
+        }
+        let Some(state) = ctx.views.active_mut() else {
+            return Outcome::Consumed;
+        };
+        if severity {
+            let role = &mut state.severity_column;
+            if role.as_deref() == Some(&field) {
+                *role = None;
+            } else {
+                *role = Some(field);
+            }
+        } else if state.timestamp_column.as_deref() == Some(&field) {
+            state.timestamp_column = None;
+        } else {
+            crate::app::stage_timestamp_basis(state, &field);
+            state.timestamp_column = Some(field);
         }
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         Outcome::Consumed
@@ -1095,6 +1177,8 @@ impl Component for FieldsDialog {
         match control {
             FieldPickerControl::Pin => self.toggle_field(true, ctx),
             FieldPickerControl::Color => self.toggle_field(false, ctx),
+            FieldPickerControl::Severity => self.toggle_role(true, ctx),
+            FieldPickerControl::Timestamp => self.toggle_role(false, ctx),
             FieldPickerControl::Filter => self.filter_to_value(false, ctx),
             FieldPickerControl::Exclude => self.filter_to_value(true, ctx),
             FieldPickerControl::Fold => self.fold_by_field(ctx),

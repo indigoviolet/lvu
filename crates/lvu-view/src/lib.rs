@@ -538,6 +538,14 @@ struct Membership {
     budget: Arc<MemoryBudget>,
     enrichment_names: Vec<String>,
     derived: HashMap<(String, u64, String), Option<String>>,
+    /// Per-record enrichment stage failures, keyed like `derived`: `(source,
+    /// sequence, stage name)`. A ready display string can itself read
+    /// `"error: ..."`, so failures are tracked structurally rather than
+    /// inferred from the rendered value. Entries are added when a stage's
+    /// batch projection fails for new records and removed when a later
+    /// projection of the same cell succeeds; consumers proving per-row
+    /// validity read this alongside `derived`, never the value text.
+    derived_errors: HashSet<(String, u64, String)>,
     /// Which colour rule painted each row: `(source, sequence)` to the index of
     /// the first rule whose predicate matched. Only matched rows appear.
     color_matches: HashMap<(String, u64), u16>,
@@ -613,6 +621,7 @@ impl Reservation {
         count: u64,
         enrichment_names: Vec<String>,
         derived: HashMap<(String, u64, String), Option<String>>,
+        derived_errors: HashSet<(String, u64, String)>,
         color_matches: HashMap<(String, u64), u16>,
         color_rules: Vec<lvu::ColorRule>,
         advanced: Option<lvu_query::CompiledDefinition>,
@@ -639,6 +648,7 @@ impl Reservation {
             budget: Arc::clone(&self.budget),
             enrichment_names,
             derived,
+            derived_errors,
             basis,
             color_matches,
             color_rules,
@@ -3460,6 +3470,38 @@ impl NativeViewAdapter {
 /// is the rule's 1-based position, which is also what the dialog lists.
 pub const COLOR_RULE_DETAIL: &str = "color_rule";
 
+/// The presentation-metadata key a row's validated basis instant travels
+/// under, as decimal UTC nanoseconds.
+///
+/// `SourceMatches.times` already holds the active basis's per-record instants
+/// (`NO_BASIS_TIME` where unreadable), computed by the same typed machinery
+/// that filters, orders and bounds the view. Projecting it here reuses that
+/// result instead of parsing display text elsewhere. Capture basis carries no
+/// such detail: capture time is already on the row.
+pub const BASIS_NANOS_DETAIL: &str = "basis_nanos";
+
+/// The presentation-metadata key marking a row's *ready* derived value for
+/// one enrichment output: `derived_ready.{name}`.
+///
+/// Validity travels structurally, never as display-string sniffing. The view
+/// writes this marker exactly when the accepted chain evaluated the output
+/// for the batch serving the row *and* the cell is not a recorded stage
+/// failure; a valid null, a failure, and a missing cell all carry no ready
+/// marker. Display roles consume only ready values through this key. The
+/// long-standing `derived.{name}` marker is still written for every declared
+/// output (ready text, `"null"`, or `"error: ...") so Details and existing
+/// diagnostics keep reading what they always read. The two new literals are
+/// additive and ignored by grouping segmentation, which reads the `derived`
+/// map rather than row details.
+pub const DERIVED_READY_DETAIL_PREFIX: &str = "derived_ready.";
+
+/// The presentation-metadata key marking a row's *failed* derived cell for
+/// one enrichment output: `derived_error.{name}`, carrying the worker's
+/// bounded error text. A ready display string may itself read `"error:
+/// ..."`, so failures are signalled by this key's presence, never by parsing
+/// the value. Rows carrying it never feed display roles.
+pub const DERIVED_ERROR_DETAIL_PREFIX: &str = "derived_error.";
+
 fn with_enrichment(mut row: DisplayRow, membership: &Membership) -> DisplayRow {
     if let Some(index) = membership
         .color_matches
@@ -3470,15 +3512,46 @@ fn with_enrichment(mut row: DisplayRow, membership: &Membership) -> DisplayRow {
             index.saturating_add(1).to_string(),
         ));
     }
+    // Project the row's validated basis instant for display. The sequences
+    // are only documented as a contiguous run where they are read positionally,
+    // so the index is verified against the sequence before its time is used:
+    // a wrong instant here would paint one record's time on another.
+    if membership.basis != lvu::TimeBasis::Capture
+        && let Some(source) = membership
+            .sources
+            .iter()
+            .find(|source| source.source_id == row.id.source_id)
+        && let Ok(index) = source.sequences.binary_search(&row.id.sequence)
+        && source.sequences.get(index) == Some(&row.id.sequence)
+        && let Some(nanos) = source.times.get(index).copied()
+        && nanos != NO_BASIS_TIME
+    {
+        row.details
+            .push((BASIS_NANOS_DETAIL.into(), nanos.to_string()));
+    }
     for name in &membership.enrichment_names {
+        let key = (row.id.source_id.clone(), row.id.sequence, name.clone());
+        let failed = membership.derived_errors.contains(&key);
         let value = membership
             .derived
-            .get(&(row.id.source_id.clone(), row.id.sequence, name.clone()))
+            .get(&key)
             .and_then(Clone::clone)
             .unwrap_or_else(|| "null".into());
         row.fields.retain(|(field, _)| field != name);
         row.fields.push((name.clone(), value.clone()));
-        row.details.push((format!("derived.{name}"), value));
+        row.details.push((format!("derived.{name}"), value.clone()));
+        // Structural validity: readiness is key presence, never value text.
+        // A failure carries the error marker and no ready marker; a valid
+        // null carries neither; only a successfully evaluated cell carries
+        // the ready marker — even when its text reads `"null"` or starts
+        // with `"error:"`, which display roles must not parse.
+        if failed {
+            row.details
+                .push((format!("{DERIVED_ERROR_DETAIL_PREFIX}{name}"), value));
+        } else if membership.derived.get(&key).is_some_and(Option::is_some) {
+            row.details
+                .push((format!("{DERIVED_READY_DETAIL_PREFIX}{name}"), value));
+        }
     }
     row
 }
@@ -4057,6 +4130,9 @@ fn run_query(
     let mut derived = prior_membership
         .as_ref()
         .map_or_else(HashMap::new, |membership| membership.derived.clone());
+    let mut derived_errors = prior_membership
+        .as_ref()
+        .map_or_else(HashSet::new, |membership| membership.derived_errors.clone());
     // Matches carry forward with the rest of the membership, but only while
     // the rules that produced them are unchanged: an edited rule must not
     // leave a row painted by the rule it replaced.
@@ -4123,6 +4199,22 @@ fn run_query(
             )
         });
     if !reservation.add(prior_derived_bytes) {
+        fail(
+            tx,
+            &request,
+            &cancelled,
+            QueryPurpose::Enrichment,
+            "derived value memory cap reached while retaining the applied snapshot",
+            true,
+        );
+        return;
+    }
+    let prior_error_bytes = derived_errors
+        .iter()
+        .fold(0_u64, |total, (source, _, field)| {
+            total.saturating_add(source.len() as u64 + field.len() as u64 + 16)
+        });
+    if !reservation.add(prior_error_bytes) {
         fail(
             tx,
             &request,
@@ -4208,6 +4300,7 @@ fn run_query(
         let prior_source = prior_source_any.filter(|item| item.generation == generation);
         if prior_source_any.is_some_and(|item| item.generation != generation) {
             derived.retain(|(derived_source, _, _), _| derived_source != &source_id);
+            derived_errors.retain(|(derived_source, _, _)| derived_source != &source_id);
             evaluation_batches.retain(|batch| batch.source_id != source_id);
         }
         // A refresh extends what was published; it does not rebuild it. The
@@ -4551,7 +4644,7 @@ fn run_query(
                 return;
             }
             for (stage, values) in projected {
-                let projection = match values {
+                let (projection, failed) = match values {
                     Err(error) => {
                         let message = bounded_text(format!("error: {error}"), 512);
                         let filter_diagnostic = (result.validity == BatchValidity::InvalidFilter)
@@ -4565,7 +4658,7 @@ fn run_query(
                             ),
                             512,
                         ));
-                        records
+                        let projection = records
                             .iter()
                             .map(|record| {
                                 (
@@ -4576,9 +4669,10 @@ fn run_query(
                                     Some(message.clone()),
                                 )
                             })
-                            .collect()
+                            .collect();
+                        (projection, true)
                     }
-                    Ok(values) => values,
+                    Ok(values) => (values, false),
                 };
                 for (id, value) in projection {
                     let bytes = value.as_ref().map_or(1, String::len) as u64
@@ -4596,7 +4690,30 @@ fn run_query(
                         );
                         return;
                     }
-                    derived.insert((id.source_id, id.sequence, stage.name.clone()), value);
+                    let key = (id.source_id, id.sequence, stage.name.clone());
+                    if failed {
+                        // Structural failure record: the display string in
+                        // `derived` stays for Details compat, but validity
+                        // consumers read this set, never the value text — a
+                        // ready string may itself read `"error: ..."`.
+                        if !reservation.add(key.0.len() as u64 + key.2.len() as u64 + 16) {
+                            fail(
+                                tx,
+                                &request,
+                                &cancelled,
+                                QueryPurpose::Enrichment,
+                                "derived value memory cap reached; previous applied view preserved",
+                                true,
+                            );
+                            return;
+                        }
+                        derived_errors.insert(key.clone());
+                    } else {
+                        // A refreshed success retires a prior failure for the
+                        // same cell; stale errors never outlive their fix.
+                        derived_errors.remove(&key);
+                    }
+                    derived.insert(key, value);
                 }
             }
             // Configured grouping consumes engine verdicts computed from the
@@ -4875,19 +4992,37 @@ fn run_query(
                         MAX_GROUP_LINE_PROJECTION_BYTES,
                     );
                     for stage in &enrichment {
+                        // Same structural validity contract as
+                        // `with_enrichment` above: readiness and failure ride
+                        // dedicated detail keys, never value text. Grouping
+                        // segmentation itself is untouched — only the
+                        // per-stage display projection gains the markers.
+                        let key = (
+                            source_id.clone(),
+                            record.record_id.sequence,
+                            stage.name.clone(),
+                        );
+                        let failed = derived_errors.contains(&key);
                         let value = derived
-                            .get(&(
-                                source_id.clone(),
-                                record.record_id.sequence,
-                                stage.name.clone(),
-                            ))
+                            .get(&key)
                             .and_then(Clone::clone)
                             .unwrap_or_else(|| "null".into());
                         projection.fields.retain(|(field, _)| field != &stage.name);
                         projection.fields.push((stage.name.clone(), value.clone()));
                         projection
                             .details
-                            .push((format!("derived.{}", stage.name), value));
+                            .push((format!("derived.{}", stage.name), value.clone()));
+                        if failed {
+                            projection.details.push((
+                                format!("{DERIVED_ERROR_DETAIL_PREFIX}{}", stage.name),
+                                value,
+                            ));
+                        } else if derived.get(&key).is_some_and(Option::is_some) {
+                            projection.details.push((
+                                format!("{DERIVED_READY_DETAIL_PREFIX}{}", stage.name),
+                                value,
+                            ));
+                        }
                     }
                     projection
                 });
@@ -5450,6 +5585,7 @@ fn run_query(
         count,
         enrichment.iter().map(|stage| stage.name.clone()).collect(),
         derived,
+        derived_errors,
         color_matches,
         request.constraints.color_rules.clone(),
         advanced.clone(),
@@ -7036,6 +7172,7 @@ mod gap_tests {
             }),
             enrichment_names: Vec::new(),
             derived: HashMap::new(),
+            derived_errors: HashSet::new(),
             color_matches: HashMap::new(),
             color_rules: Vec::new(),
             advanced: None,
@@ -7200,6 +7337,7 @@ mod order_tests {
             }),
             enrichment_names: Vec::new(),
             derived: HashMap::new(),
+            derived_errors: HashSet::new(),
             color_matches: HashMap::new(),
             color_rules: Vec::new(),
             advanced: None,

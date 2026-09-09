@@ -955,6 +955,16 @@ pub struct PresentationState {
     pub pinned_columns: Vec<String>,
     #[serde(default)]
     pub color_field: Option<String>,
+    /// Accepted enrichment column feeding the severity rung. Explicit and
+    /// unset by default; additive like every other presentation field, so no
+    /// `DB_SCHEMA_VERSION` bump: an older binary ignores the key on read and
+    /// drops it on save, a newer binary defaults it on old rows.
+    #[serde(default)]
+    pub severity_column: Option<String>,
+    /// Accepted enrichment column feeding the event-time display. Explicit
+    /// and unset by default; capture time stays separate metadata regardless.
+    #[serde(default)]
+    pub timestamp_column: Option<String>,
     /// Ordered predicate colour rules. Additive and `serde(default)` like every
     /// other presentation field, so this needs no `DB_SCHEMA_VERSION` bump: an
     /// older binary reading a newer row ignores the key, and a newer binary

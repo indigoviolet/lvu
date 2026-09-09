@@ -2067,3 +2067,18 @@ public isDraft=false and `versions/latest` => `v0.1.3`.
 
 The full volume soak remains unaccepted. Roles candidate `ae449fd` is reviewed
 READY but not integrated; union remains in progress. Neither is in v0.1.3.
+
+
+## 2026-09-09 — column roles integrated for acceptance
+
+Applied independently reviewed `ae449fdebf23d0c890fca74b6ee8d3dfa6b2c079`
+on top of the released grouping source. The Fields merge preserves both role
+assignment and the unified Run grouping action. Severity consumes only a ready
+canonical enrichment value. Timestamp rendering uses structural declaration and
+readiness markers plus the accepted basis nanoseconds and display-zone formatter.
+Removed outputs cannot silently regain authority through same-named raw fields.
+Assistance shortcut intent follows accepted candidate ownership and persistence.
+
+Worker evidence and review are preserved under `roles-ae449fd-*` and
+`roles-ae449fd-delta-review.md` on the build volume. The integrated tree still
+requires its own Rust, bridge and full PTY acceptance; no release includes it yet.

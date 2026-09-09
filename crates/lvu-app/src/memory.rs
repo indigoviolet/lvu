@@ -919,6 +919,8 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 .collect(),
             pinned_columns: request.state.pinned_columns.clone(),
             color_field: request.state.color_field.clone(),
+            severity_column: request.state.severity_column.clone(),
+            timestamp_column: request.state.timestamp_column.clone(),
             color_rules: request
                 .state
                 .color_rules
@@ -1300,6 +1302,8 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         follow: value.navigation.follow,
         pinned_columns: value.presentation.pinned_columns,
         color_field: value.presentation.color_field,
+        severity_column: value.presentation.severity_column,
+        timestamp_column: value.presentation.timestamp_column,
         // An unknown colour token is a rule written by a newer build: keep the
         // predicate and fall back to the default colour rather than dropping
         // the rule the user wrote.

@@ -162,7 +162,14 @@ fn every_action_row_mnemonic_in_the_product_is_accounted_for() {
     // The third column is whether the layer has a text field focused when it
     // opens, which is what decides whether its bare letters are live.
     let expected: Vec<(&str, Vec<char>, bool)> = vec![
-        ("Fields", vec!['p', 'f', 'x', 'c', 'd', 'r'], false),
+        // `s`/`t` are the per-view severity/timestamp role toggles: they
+        // name an enrichment column for a display role, like `c` names the
+        // colour column.
+        (
+            "Fields",
+            vec!['p', 'f', 'x', 'c', 's', 't', 'd', 'r'],
+            false,
+        ),
         ("Storage", vec!['r', 'c'], false),
         ("Time", vec!['c', 't'], false),
         // Help has no action row at all (§8.9), so it has no mnemonic and no

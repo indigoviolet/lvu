@@ -1814,6 +1814,8 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             follow: false,
             pinned_columns: vec![],
             color_field: None,
+            severity_column: None,
+            timestamp_column: None,
             fold_enabled: false,
             fold_minimum_run: 0,
             fold_key_column: None,

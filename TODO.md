@@ -22,7 +22,8 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 
 ## Accepted for the next release
 
-No unreleased changes are integrated yet. Reviewed column roles await integration.
+Column roles are integrated for validation; they remain Working until the
+integrated acceptance gate passes.
 
 ## Upcoming backlog
 

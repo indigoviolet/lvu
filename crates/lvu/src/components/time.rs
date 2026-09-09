@@ -1510,7 +1510,7 @@ impl TimeDialog {
             // `Replace` and the migration-only `Legacy` detour is gone.
             TimeAction::Recognize => {
                 self.open = false;
-                Outcome::Replace(Open::Ask(AskOpen::Task(AskTask::RecognizeTimestamp)))
+                Outcome::Replace(Open::Ask(AskOpen::Task(AskTask::TimestampColumn)))
             }
             TimeAction::Scroll(delta) => {
                 self.scroll_body(delta);

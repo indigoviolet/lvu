@@ -384,7 +384,7 @@ fn the_recognize_button_hands_off_to_the_assistant_and_leaves_the_stack_clean() 
     // The prepared task, not a blank request.
     assert_eq!(
         app.layers.ask.state().and_then(|dialog| dialog.task),
-        Some(lvu::app::AskTask::RecognizeTimestamp)
+        Some(lvu::app::AskTask::TimestampColumn)
     );
     app.handle(
         Action::Raw(RawEvent::Key(KeyEvent::new(
