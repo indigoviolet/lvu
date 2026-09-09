@@ -1361,3 +1361,23 @@ actual bridge-diagnostics PTY pass after correction; no timeout was increased.
 Logs: primary-v0.1.2-final-matrix.log, primary-v012-bridge-diagnostic.log and
 primary-v012-bridge-diagnostic-fixed.log. Full corrected matrix follows; unchanged
 Rust retains the 1,245-pass/seven-ignored gate evidence above.
+
+Corrected release candidate `207b95f6ece127dcfda5870fd86d69586bc90ed9` passed
+71/71 PTY suites in 122 seconds with fresh app/demo binaries and the built
+bridge. Annotated `v0.1.2` was pushed and remote-verified: tag object
+`a80fec2ecda11895c19de3f732ce995870a5d59a` peels to that source. Native four-target
+release run `34303930416` is building the archives. A pushed tag is not yet a
+public downloadable release; archive/hash verification, tap update and undraft
+remain assigned to W26. W22's status/FOLLOW gate hold is released for subsequent
+version work; its pending changes are outside v0.1.2.
+
+W25's instrumented ext4 follow-up found no SQLite lock waiting: all 710 fcntl
+calls succeeded, maximum 0.205 ms. The slowest save transaction was 410.129 ms,
+including 351.004 ms in synchronization and 0.039 ms acquiring the initial write
+lock; the slowest fsync was 286.234 ms. Both shutdowns completed in this traced
+run (maximum 0.448 s), so the earlier 500 ms failure did not reproduce and its
+cause is not conclusively established. Tracing raised capture wall time from
+70.3 to 149.2 seconds and distorted writer CPU/RSS sampling; these are diagnostic
+observations, not performance acceptance. Original binary identity is unchanged.
+Evidence is under `w25-shutdown-diagnosis/`: strace-soak-volume log/report and
+memory-save.3566862 / memory-save.3576922. No timeout or durability change was made.
