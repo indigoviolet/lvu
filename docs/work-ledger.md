@@ -1957,3 +1957,24 @@ Union d327ddb remains worker-only pending exact live-input publication fences,
 cumulative pre-allocation budgets, caller-generation completions and strict
 dtype evidence. Its application UI and downstream query wiring also remain
 in progress. None of these candidates is published or counted as accepted.
+
+
+## 2026-09-09 — grouping release review and final gate preparation
+
+Independent review of d2330a6 identified retained-state accounting defects:
+projections dropped beyond the stored group page were still charged, while
+new group base state and run-key capacity were undercounted. Unsupported
+valid key dtypes also became pending singletons instead of rejecting the
+candidate and preserving last-good grouping. Both corrections and bounded
+regressions are assigned with the normal Run/Filter/Off routing correction.
+The candidate remains unaccepted. Narrow expansion must expose member text
+rather than consume the visible width with full identities.
+
+Primary prepared v013-final-gate.py in primary-astra-scratch: it binds the
+clean source SHA, confirms the primary target, runs workspace Rust and bridge
+checks, builds both executables, records hashes and runs the full PTY matrix
+with durable failure artifacts. It has only been syntax-checked, not run.
+The prepared archive acceptance additionally covers Run/Filter and multiple
+reviewed sources. Roles and union remain outside the pending v0.1.3 scope;
+distribution preparation proceeds while grouping is corrected. No new tag
+or release has been published.
