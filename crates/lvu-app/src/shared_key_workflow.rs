@@ -103,6 +103,7 @@ impl Drop for SharedKeyResolutionJob {
 /// A freeze that reports a different fence is rejected synchronously. No
 /// caller should register/open a union until the returned job settles with
 /// `SharedKeyCompletion::Accepted`.
+#[allow(clippy::result_large_err)] // Stable callable API returns the completion enum directly.
 pub fn begin_shared_key_resolution(
     controller: &mut SharedKeyController,
     adapter: &NativeViewAdapter,
@@ -155,6 +156,7 @@ pub fn begin_shared_key_resolution(
     })
 }
 
+#[allow(clippy::result_large_err)] // Same completion contract as the public begin boundary.
 fn begin_from_frozen_summary(
     controller: &mut SharedKeyController,
     origin: SharedKeyOrigin,

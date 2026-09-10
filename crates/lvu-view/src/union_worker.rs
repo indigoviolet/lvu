@@ -1358,11 +1358,13 @@ enum UnionGroupingFlag {
     KeyOversize,
 }
 
+type UnionGroupingFlags = HashMap<(String, u64), UnionGroupingFlag>;
+
 fn union_configured_grouping_flags(
     frame: &polars::prelude::DataFrame,
     rule: &ContinuationRule,
     accepted_outputs: &[String],
-) -> Result<Option<HashMap<(String, u64), UnionGroupingFlag>>, String> {
+) -> Result<Option<UnionGroupingFlags>, String> {
     let Some(column) = rule.configured_column() else {
         return Ok(None);
     };
@@ -1428,7 +1430,7 @@ fn union_groups(
     members: &[(u64, Option<i64>, i64)],
     indexed_rows: &HashMap<RecordId, &UnionFrozenRow>,
     rule: &ContinuationRule,
-    configured_flags: Option<&HashMap<(String, u64), UnionGroupingFlag>>,
+    configured_flags: Option<&UnionGroupingFlags>,
 ) -> Result<(Appended<GroupRange>, u64, usize), String> {
     let mut built = Vec::<GroupRange>::new();
     let mut charged = 0u64;
@@ -1649,6 +1651,7 @@ fn union_groups(
 /// Merge result publication: fence re-verification and membership install
 /// happen atomically under one lock, so no input can advance between the
 /// check and the install. Any failure leaves the prior union untouched.
+#[allow(clippy::too_many_arguments)] // One owned phase result; bundling would only hide the fence.
 fn publish_union(
     ctx: &UnionJobCtx,
     fence: &[StoredUnionInput],
@@ -2149,6 +2152,7 @@ mod tests {
             test_barrier: None,
             publish_test_barrier: None,
             phase_test_probe: None,
+            transient_test_failure: None,
             dependency_attempt: None,
         };
         let mut remaining_rows = 1_000_000u64;

@@ -125,12 +125,14 @@ fn apply(adapter: &mut NativeViewAdapter, view: &str, revision: u64) {
 }
 
 fn apply_slash_enrichment(adapter: &mut NativeViewAdapter, view: &str, source: &str) {
-    let mut constraints = QueryConstraints::default();
-    constraints.enrichments = vec![lvu::EnrichmentDefinition {
-        id: lvu::EnrichmentStageId(format!("{view}-capture")),
-        source: source.into(),
-        command: None,
-    }];
+    let constraints = QueryConstraints {
+        enrichments: vec![lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId(format!("{view}-capture")),
+            source: source.into(),
+            command: None,
+        }],
+        ..QueryConstraints::default()
+    };
     adapter
         .submit(QueryRequest {
             view_id: view.into(),
