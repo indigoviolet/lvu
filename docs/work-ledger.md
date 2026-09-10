@@ -2635,3 +2635,44 @@ tree, promoted binary/latest, public notes and tap formula. Report:
 `b772a6b98e8db74ae937dfe7267012a76714ce23aa87c5a27939b4842771094f`.
 This closes v0.1.6 delivery acceptance; it does not accept shared-capture or
 paused performance work.
+
+
+### Shared-capture integration review — 2026-09-10
+
+This work remains on separate implementation branches, outside v0.1.6.
+The remote handle at `f793d68` has narrow source clearance. Transport amendment
+`190780f` retires cancelled or malformed exchanges and verifies reply request
+IDs; its owner reported 94 passing tests and clean clippy, independently traced
+by the persistence reviewer. Mechanical read-handle migration `44aff3f` is not
+ordinary-window acceptance: controller acquisition, persistence and lifecycle
+wiring remain under implementation.
+
+Early review of shared-memory blob `c8121749` found that unconditional shared
+Flush success loses the local worker's failure-state contract. A consumed
+SaveFailed or RecipeFailed can otherwise leave no pending acknowledgement yet
+allow a clean shutdown with undurable state. The owner is restoring per-view
+and recipe failure tracking with regressions that consume the event before
+checking Flush. A separate stop_source lock-lifetime defect retained the client
+mutex through an if-let body that reacquired it; current uncommitted source
+uses owned locals and drops guards before awaits. Runtime confirmation and
+final amendment review remain pending. Feeder cancellation during an open poll
+also needs orderly stop/detach coverage without weakening retire-on-fault.
+
+Independent acquisition review of exact `44aff3f` found cross-connection
+admission can race, stopped definitions can be returned as started without
+restarting capture, and worker-level file identity misses symlink aliases.
+Report: `sol-runtime-review-scratch/shared-capture-44aff3f-automatic-reuse-review.md`,
+SHA256 `a5f140fd581caf977d85c96f1b82e841fcbe88fa83b1faa5ac55ae98dbc57c98`.
+A separate worker-side assignment addresses these while controller work
+continues. Final two-window PTY checkpoint `9461790` is source-only; conflict
+and reload acceptance still needs the executable UI contract.
+
+Remote-union commit module `0989d6d` and fixed 32-byte digest/window-bound
+amendment `1a445f4` have narrow source/API clearance. Wording amendment
+`8c7daea` retracts the file-append barrier's unsupported publication-attempt
+claim. A default-off test-support hook is being implemented to observe
+try_write returning WouldBlock at the actual capture publication boundary,
+release the probe before settlement, and retain the real guards until after
+settlement. This append proof does not cover all lifecycle races. Window-side
+commitment and final membership fencing are assigned independently; neither
+module tests nor this hook constitute remote-union app acceptance.
