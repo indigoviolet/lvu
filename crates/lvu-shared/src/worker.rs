@@ -45,6 +45,7 @@ use tokio::{
 };
 
 use crate::{
+    child::admission_key,
     frame::{FrameDecoder, FrameError, encode_frame},
     lifetime::ViewerSet,
     protocol::*,
@@ -189,6 +190,101 @@ struct StdinBinding {
     expected_seq: u64,
 }
 
+/// Settlement of one canonical acquisition-key admission, shared between
+/// the racing starter (leader) and joiners (waiters).
+#[derive(Clone, Debug)]
+enum StartSettlement {
+    /// The winner's source id; its definition is committed and its capture
+    /// is live. Joiners present exactly this identity.
+    Settled(SourceId),
+    /// The attempt failed; joiners surface this instead of starting over
+    /// blindly. A later request may retry and lead anew.
+    Failed(String),
+    /// The leader future was dropped before settling (timeout/cancel); the
+    /// reservation is void and joiners re-evaluate from worker state.
+    Abandoned,
+}
+
+/// One in-flight canonical-key admission, shared by reference. The outcome
+/// travels over a versioned watch channel, so a settle that lands before a
+/// joiner subscribes is still observed: no wakeup can be missed, and every
+/// joiner wakes. Entries live in [`WorkerService::starting`] only while
+/// unsettled-or-unobserved; settle and abandon paths both remove them.
+struct SharedStart {
+    outcome: tokio::sync::watch::Sender<Option<StartSettlement>>,
+}
+
+/// The role one caller takes for one canonical acquisition key.
+enum KeyEntry {
+    /// Sole leader: run admission plus the manager start, then settle.
+    Lead(Arc<SharedStart>),
+    /// Observer: return the leader's settled outcome, or re-evaluate when
+    /// the leader future was dropped unsettled.
+    Join(Arc<SharedStart>),
+}
+
+/// Normalize an incoming definition's file spelling at the worker
+/// boundary: absolute paths canonicalize (symlinks, `.`/`..` resolved
+/// independent of any process cwd); anything uncanonicalizable keeps its
+/// absolute spelling, and relative paths stay lexical — only the
+/// originating window knows the base they resolve against, never whichever
+/// process became worker. Infallible by design: normalization sharpens the
+/// identity key but must never refuse a start.
+fn canonicalize_definition(mut definition: SourceDefinition) -> SourceDefinition {
+    if let lvu_core::Acquisition::File { path, .. } = &mut definition.acquisition
+        && path.is_absolute()
+    {
+        // Single metadata syscall per explicit start; steady-state reads
+        // never touch this.
+        if let Ok(canonical) = std::fs::canonicalize(&path) {
+            *path = canonical;
+        }
+    }
+    definition
+}
+
+/// Removes a start reservation this task never settled (timeout or cancel
+/// dropped the leader future mid-flight) and marks it abandoned so joiners
+/// re-evaluate instead of hanging. Removal is idempotent with the settle
+/// path and with fellow joiners; entries never outlive their observers.
+/// The registry is a plain `std` mutex because no holder ever keeps it
+/// across an await (every critical section below is pointer-sized map
+/// surgery), which is also what lets this cleanup run infallibly inside
+/// `Drop` with no lock gaps for entries to leak through.
+struct StartGuard<'a> {
+    starting: &'a std::sync::Mutex<HashMap<String, Arc<SharedStart>>>,
+    key: String,
+    mine: Arc<SharedStart>,
+    settled: bool,
+}
+
+impl StartGuard<'_> {
+    fn disarm(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // Mark abandoned first so every joiner wakes and re-evaluates even
+        // if this task is being torn down around them.
+        self.mine.outcome.send_modify(|outcome| {
+            if outcome.is_none() {
+                *outcome = Some(StartSettlement::Abandoned);
+            }
+        });
+        let mut starting = self.starting.lock().expect("start registry poisoned");
+        if let Some(current) = starting.get(&self.key)
+            && Arc::ptr_eq(current, &self.mine)
+        {
+            starting.remove(&self.key);
+        }
+    }
+}
+
 /// The executable worker: manager, store, viewers, session set, and stdin
 /// bindings. All shared mutation sits behind short-held mutexes; blocking
 /// store calls run in `spawn_blocking` so the async executors never stall.
@@ -201,6 +297,13 @@ pub struct WorkerService {
     stdin_bindings: Mutex<HashMap<SourceId, StdinBinding>>,
     session: Mutex<Vec<SourceDefinition>>,
     definitions: Mutex<HashMap<SourceId, SourceDefinition>>,
+    /// Canonical acquisition keys with an admission currently in flight
+    /// (leader elected, outcome unsettled). Bounded by concurrent distinct
+    /// in-flight starts: entries are removed on settle, on leader drop, and
+    /// lazily by the first joiner to observe an abandonment. Plain `std`
+    /// mutex: no holder spans an await (see `StartGuard`), so locking here
+    /// can neither stall the executor nor strand an entry.
+    starting: std::sync::Mutex<HashMap<String, Arc<SharedStart>>>,
     shutdown_flag: std::sync::atomic::AtomicBool,
     /// Worker lifetime nonce, minted once per `open` and published in
     /// `Welcome` and every progress answer. Windows key remote epoch on
@@ -240,6 +343,7 @@ impl WorkerService {
                 stdin_bindings: Mutex::new(HashMap::new()),
                 session: Mutex::new(session),
                 definitions: Mutex::new(HashMap::new()),
+                starting: std::sync::Mutex::new(HashMap::new()),
                 shutdown_flag: std::sync::atomic::AtomicBool::new(false),
                 worker_session: uuid::Uuid::new_v4().to_string(),
             }),
@@ -412,8 +516,93 @@ impl WorkerService {
     /// executes, the session records. Stdin definitions bind a forwarded
     /// stream instead of attaching a pipe: the caller gets `StdinOpen` and
     /// must stream chunks (see `note_stdin_chunk`).
+    ///
+    /// Concurrent starts of one canonical acquisition serialize on a
+    /// per-key reservation: exactly one leader runs admission plus the
+    /// manager start, and every joiner receives the winner's identity. The
+    /// reservation never spans an await while held — the map is only
+    /// touched for pointer-sized insert/remove — so no connection can stall
+    /// another, and the per-request dispatch timeout still bounds every
+    /// waiter. Stdin attachments bypass the reservation entirely: each one
+    /// is an independent pipeline by invariant.
     pub async fn request_start(
         self: &Arc<Self>,
+        definition: SourceDefinition,
+    ) -> Result<StartedOutcome, String> {
+        let definition = canonicalize_definition(definition);
+        let Some(key) = admission_key(&definition) else {
+            // Stdin attachments are independent pipelines by invariant:
+            // no shared identity exists to serialize on.
+            return self.settle_start_path(definition).await;
+        };
+        let mut definition = Some(definition);
+        loop {
+            match self.enter_start_key(&key) {
+                KeyEntry::Lead(shared) => {
+                    let mut guard = StartGuard {
+                        starting: &self.starting,
+                        key: key.clone(),
+                        mine: Arc::clone(&shared),
+                        settled: false,
+                    };
+                    let definition = definition.take().expect("leader owns its definition");
+                    let outcome = self.settle_start_path(definition).await;
+                    self.publish_settlement(&key, &shared, &outcome, &mut guard)
+                        .await;
+                    return outcome;
+                }
+                KeyEntry::Join(shared) => {
+                    // Observe-then-wait on the versioned channel: a settle
+                    // that lands before subscribing is still observed, and
+                    // every waiter wakes on advancement, so no wakeup can be
+                    // missed and no wakeup is ever needed twice.
+                    let mut settled = shared.outcome.subscribe();
+                    loop {
+                        if let Some(outcome) = (*settled.borrow()).clone() {
+                            match outcome {
+                                // Revalidate: the winner may have stopped
+                                // between settling and this observation
+                                // (including a leaked entry from a
+                                // cancelled settle). A live winner
+                                // presents; anything else falls through to
+                                // re-evaluation below, which retries the
+                                // start honestly instead of presenting a
+                                // dead capture.
+                                StartSettlement::Settled(live_id) if self.is_live(live_id) => {
+                                    return Ok(StartedOutcome::Present { live_id });
+                                }
+                                StartSettlement::Failed(error) => return Err(error),
+                                _ => {
+                                    let mut starting =
+                                        self.starting.lock().expect("start registry poisoned");
+                                    if let Some(current) = starting.get(&key)
+                                        && Arc::ptr_eq(current, &shared)
+                                    {
+                                        starting.remove(&key);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        // No outcome yet: sleep until the version advances.
+                        // A closed channel is unreachable here (this waiter
+                        // holds an `Arc` keeping the sender alive) but
+                        // re-observes from the map like every other
+                        // inconclusive outcome instead of spinning.
+                        if settled.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Settle one explicit acquisition request against current worker state:
+    /// the hook decides, the manager executes, the session records. Shared
+    /// by leaders (under reservation) and keyless requests (stdin).
+    async fn settle_start_path(
+        &self,
         definition: SourceDefinition,
     ) -> Result<StartedOutcome, String> {
         // Snapshot of live definitions for hooks that dedup against worker
@@ -422,9 +611,115 @@ impl WorkerService {
         let live: Vec<SourceDefinition> = self.definitions.lock().await.values().cloned().collect();
         match self.admission.admit_known(&definition, &live) {
             AdmissionVerdict::Refuse(reason) => Err(reason),
-            AdmissionVerdict::Present { live_id } => Ok(StartedOutcome::Present { live_id }),
+            AdmissionVerdict::Present { live_id } => self.present_or_restart(live_id).await,
             AdmissionVerdict::Admit => self.start_admitted(definition).await,
         }
+    }
+
+    /// A handle counts as live unless its manager progress is terminally
+    /// finished. Synchronous point sample over short-held locks only.
+    fn is_live(&self, id: SourceId) -> bool {
+        self.manager
+            .source(id)
+            .is_some_and(|handle| !handle.progress().state.is_terminal())
+    }
+
+    /// Resolve a structural match against actual capture liveness: only a
+    /// live (or settling) acquisition may present. An exact stopped match
+    /// restarts the original id — preserving its identity, journal path and
+    /// durable cursor with no recapture — and stdin refuses honestly since
+    /// a stopped pipe cannot resume. Never emits `Started` for an unchanged
+    /// terminal handle.
+    async fn present_or_restart(&self, live_id: SourceId) -> Result<StartedOutcome, String> {
+        if self.is_live(live_id) {
+            return Ok(StartedOutcome::Present { live_id });
+        }
+        let definition = self
+            .definitions
+            .lock()
+            .await
+            .get(&live_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown source {}", live_id.0))?;
+        if matches!(definition.acquisition, lvu_core::Acquisition::Stdin) {
+            return Err(format!(
+                "stdin source {} is stopped; attach a fresh pipeline",
+                live_id.0
+            ));
+        }
+        self.restart_original(definition).await
+    }
+
+    /// Stop-if-present then start the same definition under its original id.
+    /// Callers hold the canonical-key leadership (or run keyless), so no
+    /// second capture of the acquisition can interleave; the manager
+    /// resumes the durable cursor under the original id and journal path.
+    async fn restart_original(
+        &self,
+        definition: SourceDefinition,
+    ) -> Result<StartedOutcome, String> {
+        let id = definition.id;
+        if let Some(handle) = self.manager.source(id) {
+            let report = handle
+                .stop()
+                .await
+                .map_err(|error| format!("stop: {error}"))?;
+            if !report.complete {
+                return Err("capture stop incomplete; restart was not attempted".into());
+            }
+        }
+        self.start_admitted(definition).await
+    }
+
+    /// The role this caller takes for one canonical key: sole leader, or a
+    /// joiner observing the leader's settled outcome. Synchronous: the
+    /// registry is never held across an await.
+    fn enter_start_key(&self, key: &str) -> KeyEntry {
+        let mut starting = self.starting.lock().expect("start registry poisoned");
+        match starting.get(key) {
+            Some(shared) => KeyEntry::Join(Arc::clone(shared)),
+            None => {
+                let (outcome, _) = tokio::sync::watch::channel(None::<StartSettlement>);
+                let shared = Arc::new(SharedStart { outcome });
+                starting.insert(key.to_owned(), Arc::clone(&shared));
+                KeyEntry::Lead(shared)
+            }
+        }
+    }
+
+    /// Publish a leader outcome to joiners and release the reservation.
+    /// Removal is unconditional here: no second leader can exist while this
+    /// entry is present, and abandon-observers only remove entries whose
+    /// outcome is still unsettled.
+    async fn publish_settlement(
+        &self,
+        key: &str,
+        shared: &Arc<SharedStart>,
+        outcome: &Result<StartedOutcome, String>,
+        guard: &mut StartGuard<'_>,
+    ) {
+        let settlement = match outcome {
+            Ok(StartedOutcome::Started { source_id, .. })
+            | Ok(StartedOutcome::Present { live_id: source_id }) => {
+                StartSettlement::Settled(*source_id)
+            }
+            // Unreachable through keyed paths (stdin bypasses reservation);
+            // mapped harmlessly rather than panicking: a joiner would
+            // present an identity whose stream it cannot use, exactly like
+            // any stale binding today.
+            Ok(StartedOutcome::StdinBound { source_id, .. }) => {
+                StartSettlement::Settled(*source_id)
+            }
+            Err(error) => StartSettlement::Failed(error.clone()),
+        };
+        shared.outcome.send_modify(|slot| {
+            *slot = Some(settlement);
+        });
+        guard.disarm();
+        self.starting
+            .lock()
+            .expect("start registry poisoned")
+            .remove(key);
     }
 
     async fn start_admitted(
@@ -534,7 +829,12 @@ impl WorkerService {
     /// Explicit restart: stdin refuses per the existing rule (a fresh
     /// pipeline needs a new attachment); anything else stops completely
     /// first and only then starts, so a partial stop never silently
-    /// becomes a second capture.
+    /// becomes a second capture. Against an in-flight start of the same
+    /// canonical acquisition this refuses honestly instead of queueing one
+    /// explicit user action behind another request's whole capture startup;
+    /// the caller retries, and by then the earlier attempt has settled and
+    /// this same call leads. Keyless definitions keep today's unreserved
+    /// behavior.
     pub async fn request_restart(self: &Arc<Self>, id: SourceId) -> Result<StartedOutcome, String> {
         let definition = self
             .definitions
@@ -546,16 +846,25 @@ impl WorkerService {
         if matches!(definition.acquisition, lvu_core::Acquisition::Stdin) {
             return Err("stdin cannot restart; attach a fresh pipeline".into());
         }
-        if let Some(handle) = self.manager.source(id) {
-            let report = handle
-                .stop()
-                .await
-                .map_err(|error| format!("stop: {error}"))?;
-            if !report.complete {
-                return Err("capture stop incomplete; restart was not attempted".into());
-            }
-        }
-        self.start_admitted(definition).await
+        let Some(key) = admission_key(&definition) else {
+            return self.restart_original(definition).await;
+        };
+        let KeyEntry::Lead(shared) = self.enter_start_key(&key) else {
+            return Err(
+                "another start of this acquisition is already in flight; retry after it settles"
+                    .into(),
+            );
+        };
+        let mut guard = StartGuard {
+            starting: &self.starting,
+            key: key.clone(),
+            mine: Arc::clone(&shared),
+            settled: false,
+        };
+        let outcome = self.restart_original(definition).await;
+        self.publish_settlement(&key, &shared, &outcome, &mut guard)
+            .await;
+        outcome
     }
 
     /// Look up the currently committed version of a view for conflict
@@ -2854,6 +3163,9 @@ mod tests {
             service.request_start(definition).await,
             Err(reason) if reason == "nope"
         ));
+        // A hook verdict naming an id the worker never started is not live:
+        // surfacing it as `Present` would re-present a dead capture, so the
+        // worker refuses with that id instead of trusting the verdict.
         let live = SourceId(uuid::Uuid::from_u128(52));
         let presenting = Arc::new(ScriptedAdmission {
             verdict: AdmissionVerdict::Present { live_id: live },
@@ -2862,8 +3174,121 @@ mod tests {
         let definition = file_definition(53, &root.path().join("y.log"));
         assert!(matches!(
             service.request_start(definition).await,
-            Ok(StartedOutcome::Present { live_id }) if live_id == live
+            Err(reason) if reason.contains("unknown source")
         ));
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    async fn wait_terminal(service: &Arc<WorkerService>, id: SourceId) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let terminal = service
+                .manager
+                .source(id)
+                .is_none_or(|handle| handle.progress().state.is_terminal());
+            if terminal {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "capture never reached a terminal state"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn present_resolves_liveness_restart_and_stdin_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let config = test_config(root.path());
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let id = SourceId(uuid::Uuid::from_u128(61));
+        let mut definition = file_definition(61, &log);
+        definition.id = id;
+        // Live structural match presents under the original id.
+        assert!(matches!(
+            service.request_start(definition).await,
+            Ok(StartedOutcome::Started { source_id, .. }) if source_id == id
+        ));
+        assert!(matches!(
+            service.present_or_restart(id).await,
+            Ok(StartedOutcome::Present { live_id }) if live_id == id
+        ));
+        // After an explicit stop the same match restarts the original id
+        // instead of presenting the terminal handle.
+        service.request_stop(id).await.expect("stop works");
+        wait_terminal(&service, id).await;
+        assert!(matches!(
+            service.present_or_restart(id).await,
+            Ok(StartedOutcome::Started { source_id, .. }) if source_id == id
+        ));
+        // A stopped stdin definition refuses honestly: the pipe is gone and
+        // cannot resume, so no id is ever re-presented for it.
+        let stdin_id = SourceId(uuid::Uuid::from_u128(62));
+        let stdin = lvu_core::SourceDefinition {
+            schema_version: 1,
+            id: stdin_id,
+            name: "stdin".into(),
+            acquisition: lvu_core::Acquisition::Stdin,
+            identity_hints: Default::default(),
+            retention: None,
+        };
+        service
+            .definitions
+            .lock()
+            .await
+            .insert(stdin_id, stdin.clone());
+        assert!(matches!(
+            service.present_or_restart(stdin_id).await,
+            Err(reason) if reason.contains("fresh pipeline")
+        ));
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_fresh_id_starts_share_the_first_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let config = test_config(root.path());
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        // Nine parties at the barrier so all eight starters are already
+        // inside `request_start` before any of them can settle: post-fix
+        // every interleaving elects one leader and joins the rest.
+        let barrier = Arc::new(tokio::sync::Barrier::new(9));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let service = Arc::clone(&service);
+            let barrier = Arc::clone(&barrier);
+            let mut definition = file_definition(0, &log);
+            definition.id = SourceId(uuid::Uuid::new_v4());
+            definition.name = format!("window-{}", definition.id.0);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                service.request_start(definition).await
+            }));
+        }
+        barrier.wait().await;
+        let mut ids = Vec::new();
+        for task in tasks {
+            let outcome = task.await.expect("starter joins").expect("start works");
+            match outcome {
+                StartedOutcome::Started { source_id, .. }
+                | StartedOutcome::Present { live_id: source_id } => ids.push(source_id),
+                StartedOutcome::StdinBound { .. } => panic!("file start bound stdin"),
+            }
+        }
+        let first = ids[0];
+        assert!(
+            ids.iter().all(|id| *id == first),
+            "every concurrent start shares the first capture: {ids:?}"
+        );
+        // Exactly one definition committed: no second capture exists.
+        assert_eq!(service.snapshot_definitions().await.len(), 1);
         service.request_shutdown();
         service.shutdown().await;
     }

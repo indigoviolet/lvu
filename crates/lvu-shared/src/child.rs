@@ -98,6 +98,10 @@ pub fn parse_child_args(args: &[OsString]) -> Result<Option<ChildArgs>, String> 
 /// capture keeps), and policy refinements (follow / restart / header-aware
 /// presentation, mirroring the application's acquisition relation) stay
 /// application-side and are follow-up work, not silent worker invention.
+/// Lexical path-alias matching here is deliberately shallow: the worker
+/// boundary normalizes absolute file paths before this hook ever runs (see
+/// `admission_key`), so this comparator keeps working on plain values with
+/// no filesystem access of its own.
 struct ChildAdmission;
 
 impl AdmissionHook for ChildAdmission {
@@ -133,6 +137,47 @@ fn acquisition_identical(live: &lvu_core::Acquisition, proposed: &lvu_core::Acqu
         .ok()
         .zip(serde_json::to_value(proposed).ok())
         .is_some_and(|(live, proposed)| live == proposed)
+}
+
+/// Canonical worker-side identity key for one acquisition definition, or
+/// `None` for attachments with no shared identity (stdin pipelines are
+/// independent by invariant: every attachment needs its own capture).
+///
+/// Absolute file paths canonicalize through the filesystem, so direct,
+/// dot-dot and symlink spellings of one file share one key. Anything the
+/// filesystem cannot canonicalize (missing or unreadable files) keeps its
+/// absolute spelling: two spellings may then start duplicate captures, but
+/// never confuse two different files. Relative paths stay lexical on
+/// purpose: only the originating window knows the base they resolve
+/// against, never whichever process became worker. Non-file acquisitions
+/// key on their whole structural form, exactly as `admit_known` compares
+/// them. Window-local names and ids are never part of the key: sharing one
+/// capture across windows that label it differently is the point. No
+/// behavior-affecting option is dropped: path, follow mode and retention
+/// all participate; the key is in-memory only and never logged, so
+/// credential-bearing fields travel no further than the definitions map
+/// already carries them.
+pub(crate) fn admission_key(definition: &lvu_core::SourceDefinition) -> Option<String> {
+    if matches!(definition.acquisition, lvu_core::Acquisition::Stdin) {
+        return None;
+    }
+    let mut acquisition = serde_json::to_value(&definition.acquisition).ok()?;
+    if let lvu_core::Acquisition::File { path, .. } = &definition.acquisition
+        && path.is_absolute()
+    {
+        // One metadata syscall per explicit start; the steady-state read
+        // path never touches this.
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        // Debug rendering is lossless for non-UTF-8 bytes, where a lossy
+        // conversion could collapse two different files into one key.
+        let text = resolved
+            .to_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{resolved:?}"));
+        acquisition["path"] = serde_json::Value::String(text);
+    }
+    let retention = serde_json::to_value(&definition.retention).ok()?;
+    Some(format!("{acquisition}|{retention}"))
 }
 
 /// Run the child to completion on a fresh single-threaded runtime and
@@ -411,6 +456,99 @@ mod tests {
         );
         // Nothing live: admit.
         assert_eq!(hook.admit_known(&other, &[]), AdmissionVerdict::Admit);
+    }
+
+    #[test]
+    fn admission_key_unifies_absolute_aliases_of_one_file() {
+        let root = tempfile::tempdir().unwrap();
+        let direct = root.path().join("app.log");
+        std::fs::write(&direct, "one\n").unwrap();
+        let dotted = root.path().join(".").join("app.log");
+        let link = root.path().join("alias.log");
+        std::os::unix::fs::symlink(&direct, &link).unwrap();
+
+        let mut base = file_definition(20);
+        let key_of = |path: std::path::PathBuf| {
+            let mut definition = base.clone();
+            if let lvu_core::Acquisition::File { path: slot, .. } = &mut definition.acquisition {
+                *slot = path;
+            }
+            admission_key(&definition).expect("absolute files key")
+        };
+        let direct_key = key_of(direct);
+        // Dot segments and symlinks resolve to the same identity: one
+        // capture, however windows spell the path.
+        assert_eq!(key_of(dotted), direct_key);
+        assert_eq!(key_of(link), direct_key);
+        // Window-local names and fresh ids never split the key.
+        base.id = lvu_core::SourceId(uuid::Uuid::from_u128(21));
+        base.name = "other-window-label".into();
+        assert_eq!(key_of(root.path().join("app.log")), direct_key);
+    }
+
+    #[test]
+    fn admission_key_keeps_behavior_affecting_options_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let direct = root.path().join("app.log");
+        std::fs::write(&direct, "one\n").unwrap();
+        let base = || {
+            let mut definition = file_definition(22);
+            if let lvu_core::Acquisition::File { path: slot, .. } = &mut definition.acquisition {
+                *slot = direct.clone();
+            }
+            definition
+        };
+        let key = admission_key(&base()).expect("absolute files key");
+        // Follow mode changes capture behavior: not the same acquisition.
+        let mut unfollowed = base();
+        if let lvu_core::Acquisition::File { follow, .. } = &mut unfollowed.acquisition {
+            *follow = false;
+        }
+        assert_ne!(
+            admission_key(&unfollowed),
+            Some(key.clone()),
+            "follow mode participates in the key"
+        );
+        // Retention changes what the capture keeps: never shared silently.
+        let mut retained = base();
+        retained.retention = Some(lvu_core::RetentionPolicy {
+            maximum_bytes: Some(1024),
+            maximum_age_seconds: None,
+        });
+        assert_ne!(admission_key(&retained), Some(key.clone()));
+        // A different file is its own capture even under one directory.
+        let mut other = base();
+        if let lvu_core::Acquisition::File { path: slot, .. } = &mut other.acquisition {
+            *slot = root.path().join("other.log");
+        }
+        // Nonexistent files keep their absolute spelling rather than
+        // refusing: spellings may duplicate, never confuse.
+        assert!(admission_key(&other).is_some());
+        assert_ne!(admission_key(&other), Some(key));
+    }
+
+    #[test]
+    fn admission_key_leaves_relative_paths_and_stdin_alone() {
+        // Relative paths stay lexical: only the originating window knows
+        // the base, so the worker must not resolve them against its cwd.
+        let mut relative = file_definition(23);
+        if let lvu_core::Acquisition::File { path: slot, .. } = &mut relative.acquisition {
+            *slot = PathBuf::from("logs/app.log");
+        }
+        let key = admission_key(&relative).expect("relative files still key");
+        let mut dotted = relative.clone();
+        if let lvu_core::Acquisition::File { path: slot, .. } = &mut dotted.acquisition {
+            *slot = PathBuf::from("./logs/app.log");
+        }
+        assert_ne!(
+            admission_key(&dotted),
+            Some(key),
+            "relative spellings are not resolved worker-side"
+        );
+        // Stdin attachments are independent pipelines: no shared key.
+        let mut stdin = file_definition(24);
+        stdin.acquisition = lvu_core::Acquisition::Stdin;
+        assert_eq!(admission_key(&stdin), None);
     }
 
     #[test]
