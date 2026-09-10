@@ -389,6 +389,8 @@ fn a_rule_that_paints_the_log_row_paints_the_details_pane_too() {
             state.color_rules = vec![ColorRule {
                 predicate: "idx".into(),
                 color: RuleColor::Green,
+                column: None,
+                value: None,
             }];
         }
         focus_loud(&provider, &mut app);

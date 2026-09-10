@@ -267,10 +267,14 @@ async fn color_rules_paint_rows_in_order_without_changing_membership() {
         lvu::ColorRule {
             predicate: "error".into(),
             color: lvu::RuleColor::Red,
+            column: None,
+            value: None,
         },
         lvu::ColorRule {
             predicate: r"/\d+/".into(),
             color: lvu::RuleColor::Blue,
+            column: None,
+            value: None,
         },
     ];
     let painted_constraints = painted.constraints.clone();
@@ -299,6 +303,8 @@ async fn color_rules_paint_rows_in_order_without_changing_membership() {
     invalid.constraints.color_rules = vec![lvu::ColorRule {
         predicate: "/(/".into(),
         color: lvu::RuleColor::Green,
+        column: None,
+        value: None,
     }];
     adapter.submit(invalid).unwrap();
     let failure = wait_completion(&mut adapter, 2).await.result.unwrap_err();
@@ -353,6 +359,8 @@ async fn color_match_entries_are_charged_to_the_membership_budget() {
     request.constraints.color_rules = vec![lvu::ColorRule {
         predicate: "event".into(),
         color: lvu::RuleColor::Cyan,
+        column: None,
+        value: None,
     }];
     painted.submit(request).unwrap();
     assert!(wait_completion(&mut painted, 1).await.result.is_ok());
@@ -404,6 +412,8 @@ async fn color_match_cap_rejects_candidate_and_preserves_last_good_rows() {
     candidate.constraints.color_rules = vec![lvu::ColorRule {
         predicate: "event".into(),
         color: lvu::RuleColor::Cyan,
+        column: None,
+        value: None,
     }];
     adapter.submit(candidate).unwrap();
     let failure = wait_completion(&mut adapter, 2).await.result.unwrap_err();
@@ -447,6 +457,8 @@ async fn retained_color_match_clone_obeys_cap_and_keeps_last_good_rows() {
     accepted.constraints.color_rules = vec![lvu::ColorRule {
         predicate: "event".into(),
         color: lvu::RuleColor::Cyan,
+        column: None,
+        value: None,
     }];
     adapter.submit(accepted).unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
@@ -503,6 +515,8 @@ async fn numeric_enrichment_diagnostics_are_never_colour_rule_failures() {
     with_rule.constraints.color_rules = vec![lvu::ColorRule {
         predicate: "ordinary".into(),
         color: lvu::RuleColor::Blue,
+        column: None,
+        value: None,
     }];
     let with_rule_constraints = with_rule.constraints.clone();
     adapter.submit(with_rule).unwrap();

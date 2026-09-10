@@ -932,11 +932,20 @@ pub struct StoredBookmark {
 /// One persisted colour rule: the predicate exactly as the user typed it, and
 /// the colour token. Storing the token rather than an RGB triple keeps the
 /// contrast check with the theme, where it can be re-run when the theme or the
-/// terminal's colour depth changes.
+/// terminal's colour depth changes. A column classification rule additionally
+/// carries its output column and exact value; both default to `None` so rows
+/// written before column rules existed read back as predicate rules, exactly
+/// like every other additive presentation field (no schema bump, and an older
+/// binary saving the workspace drops the binding while keeping predicate and
+/// colour).
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StoredColorRule {
     pub predicate: String,
     pub color: String,
+    #[serde(default)]
+    pub column: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

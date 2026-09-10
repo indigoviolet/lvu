@@ -4022,8 +4022,29 @@ fn run_query(
     // palette mistake. They are named by their position so the terminal can
     // map a match back to the rule the user wrote.
     let mut color_rules: Vec<(String, TextSearch)> = Vec::new();
+    // Column classification rules: `(rule index, output column, exact value)`.
+    // They never reach the predicate compiler below. Their match is an exact
+    // lookup of the worker's ready derived cells where the derived values are
+    // inserted, so slash-shorthand and assignment outputs classify alike and
+    // null/failed cells — which share display text with real values — can
+    // never match. A rule with an empty column or value is skipped rather
+    // than failing the view: the dialog refuses to submit one, and a rule
+    // that can match nothing must not break painting.
+    let mut column_rules: Vec<(u16, String, String)> = Vec::new();
     for (index, rule) in request.constraints.color_rules.iter().enumerate() {
         let position = index + 1;
+        if rule.is_column() {
+            let column = rule.column.clone().unwrap_or_default();
+            let value = rule.value.clone().unwrap_or_default();
+            if column.is_empty() || value.is_empty() {
+                continue;
+            }
+            let Ok(index) = u16::try_from(index) else {
+                continue;
+            };
+            column_rules.push((index, column, value));
+            continue;
+        }
         if rule.predicate.trim().is_empty() {
             fail(
                 tx,
@@ -4713,7 +4734,42 @@ fn run_query(
                         // same cell; stale errors never outlive their fix.
                         derived_errors.remove(&key);
                     }
-                    derived.insert(key, value);
+                    derived.insert(key.clone(), value.clone());
+                    // Column classification consumes the accepted chain's
+                    // outputs by exact ready-cell equality — the same key
+                    // equality grouping uses, computed here rather than in
+                    // the engine because only this worker knows per-cell
+                    // Ready (the frame holds display strings where a ready
+                    // `"error: ..."` collides with failures). Null, failed
+                    // and missing cells never match; first-match-wins merges
+                    // with legacy predicate matches below by rule order.
+                    if !failed
+                        && let Some(matched) = value.as_deref()
+                        && let Some(index) =
+                            column_rules.iter().find_map(|(index, column, want)| {
+                                (column == &key.2 && matched == want).then_some(*index)
+                            })
+                    {
+                        match color_matches.entry((key.0.clone(), key.1)) {
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                *entry.get_mut() = (*entry.get()).min(index);
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                if !reservation.add(color_match_bytes(&key.0)) {
+                                    fail(
+                                        tx,
+                                        &request,
+                                        &cancelled,
+                                        QueryPurpose::Advanced,
+                                        "colour-rule match memory cap reached; previous applied view preserved",
+                                        true,
+                                    );
+                                    return;
+                                }
+                                entry.insert(index);
+                            }
+                        }
+                    }
                 }
             }
             // Configured grouping consumes engine verdicts computed from the

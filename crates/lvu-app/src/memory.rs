@@ -929,6 +929,8 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 .map(|rule| lvu_memory::StoredColorRule {
                     predicate: rule.predicate.clone(),
                     color: rule.color.label().into(),
+                    column: rule.column.clone(),
+                    value: rule.value.clone(),
                 })
                 .collect(),
             fold_enabled: request.state.fold_enabled,
@@ -1315,6 +1317,8 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
             .map(|rule| lvu::ColorRule {
                 predicate: rule.predicate,
                 color: lvu::RuleColor::parse(&rule.color).unwrap_or_default(),
+                column: rule.column,
+                value: rule.value,
             })
             .collect(),
         fold_enabled: value.presentation.fold_enabled,
@@ -1458,10 +1462,20 @@ mod tests {
             lvu::ColorRule {
                 predicate: "level: ERROR".into(),
                 color: lvu::RuleColor::Red,
+                column: None,
+                value: None,
             },
             lvu::ColorRule {
                 predicate: r"/timeout/i".into(),
                 color: lvu::RuleColor::Purple,
+                column: None,
+                value: None,
+            },
+            lvu::ColorRule {
+                predicate: String::new(),
+                color: lvu::RuleColor::Green,
+                column: Some("severity".into()),
+                value: Some("ERROR".into()),
             },
         ];
         let mut store = WorkspaceStore::open(root.path()).unwrap();
