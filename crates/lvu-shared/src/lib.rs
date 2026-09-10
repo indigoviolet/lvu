@@ -21,7 +21,6 @@ pub mod election;
 pub mod frame;
 pub mod lifetime;
 pub mod protocol;
-pub mod remote;
 pub mod session;
 pub mod spawn;
 pub mod tail;
@@ -44,7 +43,6 @@ pub use protocol::{
     base64_decode_bounded, base64_encode, check_stdin_chunk_base64, check_stdin_open,
     check_store_size, decoded_base64_len, validate_inbound,
 };
-pub use remote::{AnySourceHandle, RemoteConfig, RemoteSourceHandle};
 pub use session::SaveBases;
 pub use spawn::{SpawnSpec, WORKER_CHILD_FLAG, exit};
 pub use tail::{Continuity, FileIdentity, FileJournalTail, RecordAnchor, TailStatus, classify};
