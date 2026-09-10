@@ -4056,6 +4056,25 @@ impl Composition {
                 return true;
             }
         };
+        // Restore sequencing: ordinary input restores run as asynchronous
+        // queries on this same tick loop, so an input can still be working
+        // when the union request is taken. Submitting the candidate now lets
+        // the worker fail on unreadable inputs; defer by requeuing instead
+        // and retry once they settle. Only a working-not-done input defers:
+        // every other state keeps the existing submit-or-diagnose behavior,
+        // and query states always settle out of Pending, so a deferred
+        // request cannot stall silently. Nothing was submitted, fenced or
+        // published, so the pending markers still describe this request.
+        let inputs_pending = fences.iter().any(|input| {
+            matches!(
+                adapter.status(&input.view_id).map(|status| status.state),
+                Some(ScanState::Pending)
+            )
+        });
+        if inputs_pending {
+            app.requeue_union_request(request);
+            return false;
+        }
         let candidate = lvu_view::UnionCandidateSpec {
             union_view_id: view_id.clone(),
             union_revision: revision,
@@ -4246,7 +4265,10 @@ impl Composition {
         // revisions. Raw input views intentionally remain 0/0 across append,
         // so an app-only revision comparison cannot observe their growth.
         // One in-flight entry coalesces refreshes and prevents a busy loop or
-        // repeated supersession while a source continues arriving.
+        // repeated supersession while a source continues arriving; a queued
+        // (e.g. deferred) request coalesces the same way — the refresh
+        // enqueues nothing while one is already queued, so its identity
+        // stays stable until the inputs settle and it submits.
         for view in app.views().to_vec() {
             if !app.is_union_view(&view.id) || self.union_inflight.contains_key(&view.id) {
                 continue;
@@ -12875,6 +12897,427 @@ root = \"/tmp/elsewhere\"\n",
         );
         service.request_shutdown();
         service.shutdown().await;
+    }
+
+    /// A union candidate must wait while an input restore is still working,
+    /// and the waiting request must survive the live-append refresh ticks:
+    /// early submission lets the worker fail on unreadable inputs, and a
+    /// refresh that re-mints while the flag stands would churn the queued
+    /// identity every tick so it could never settle and submit. The setup
+    /// runs one queued attempt through the real worker while input B is
+    /// still unreadable, which retains a retryable attempt — the production
+    /// state where the refresh flag stands while the request waits. Every
+    /// tick afterwards is the real shell tick for unions, asserting the
+    /// exact queued identity and payload stay stable; once both inputs'
+    /// completions apply, the same tick path submits and the worker
+    /// actually publishes, with diagnostics recovered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn union_submit_defers_while_input_restore_pending() {
+        use lvu::{
+            ColorRule, PersistentUnion, PersistentUnionInput, PersistentViewState, RuleColor,
+        };
+        use lvu_core::{CommandDefinition, RestartPolicy, SourceDefinition};
+        use lvu_view::{NativeViewAdapter, ScanState, ViewConfig};
+        use std::collections::BTreeMap;
+
+        let BatchFixture {
+            directory,
+            mut app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        let raw = Arc::new(
+            lvu_live::LiveRowProvider::new(lvu_live::LiveConfig::new(
+                directory.path().join("derived2"),
+            ))
+            .unwrap(),
+        );
+        let mut adapter =
+            NativeViewAdapter::new(raw, ViewConfig::new(directory.path().join("view-index2")))
+                .unwrap();
+
+        // Input A serves rows at once; input B never yields within the test.
+        let file_a = directory.path().join("a.log");
+        std::fs::write(&file_a, "one\ntwo\n").unwrap();
+        let handle_a = manager
+            .start(SourceDefinition {
+                schema_version: 1,
+                id: SourceId(uuid::Uuid::from_u128(101)),
+                name: "a".into(),
+                acquisition: Acquisition::File {
+                    path: file_a,
+                    follow: false,
+                },
+                identity_hints: BTreeMap::new(),
+                retention: None,
+            })
+            .await
+            .unwrap();
+        let handle_b = manager
+            .start(SourceDefinition {
+                schema_version: 1,
+                id: SourceId(uuid::Uuid::from_u128(102)),
+                name: "b".into(),
+                acquisition: Acquisition::Command {
+                    command: CommandDefinition {
+                        program: CommandProgram::Shell {
+                            text: "printf 'late\\n'; sleep 5".into(),
+                        },
+                        cwd: None,
+                        environment: BTreeMap::new(),
+                        restart: RestartPolicy::Never,
+                    },
+                },
+                identity_hints: BTreeMap::new(),
+                retention: None,
+            })
+            .await
+            .unwrap();
+        let sid_a = handle_a.source_id().0.to_string();
+        let sid_b = handle_b.source_id().0.to_string();
+        for (handle, view, name, sid) in [
+            (&handle_a, "a", "A events", sid_a.clone()),
+            (&handle_b, "b", "B events", sid_b.clone()),
+        ] {
+            adapter.register_source(handle.clone()).unwrap();
+            adapter
+                .register_view(view, vec![handle.source_id()])
+                .unwrap();
+            app.add_source_view(
+                SourceItem {
+                    id: sid.clone(),
+                    name: name.into(),
+                    health: "starting".into(),
+                },
+                ViewItem {
+                    id: view.into(),
+                    source_id: sid.clone(),
+                    name: name.into(),
+                },
+            );
+            assert!(app.restore_persistent_view(
+                view,
+                PersistentViewState {
+                    source_ids: vec![sid],
+                    view_name: name.into(),
+                    applied_search: "e".into(),
+                    ..Default::default()
+                },
+            ));
+        }
+        // The union restores its reviewed colour rules before either input
+        // has served anything: the exact shape a session restore leaves.
+        adapter
+            .register_union_view("u", vec![handle_a.source_id(), handle_b.source_id()])
+            .unwrap();
+        app.add_view(ViewItem {
+            id: "u".into(),
+            source_id: sid_a.clone(),
+            name: "Union".into(),
+        });
+        assert!(app.restore_persistent_view(
+            "u",
+            PersistentViewState {
+                source_ids: vec![sid_a, sid_b],
+                view_name: "Union".into(),
+                // Legacy predicate rules: the worker executes them without
+                // an enrichment chain, so publication depends only on input
+                // readiness. Ordering uses the same engine path as
+                // enrichment-bound rules; the Vec equality below is order
+                // sensitive, which is the whole precedence claim.
+                color_rules: vec![
+                    ColorRule {
+                        predicate: "one".into(),
+                        color: RuleColor::Red,
+                        column: None,
+                        value: None,
+                    },
+                    ColorRule {
+                        predicate: "two".into(),
+                        color: RuleColor::Blue,
+                        column: None,
+                        value: None,
+                    },
+                ],
+                union: Some(PersistentUnion {
+                    inputs: vec![
+                        PersistentUnionInput {
+                            view_id: "a".into(),
+                            accepted_revision: 0,
+                            applied_generation: 0,
+                        },
+                        PersistentUnionInput {
+                            view_id: "b".into(),
+                            accepted_revision: 0,
+                            applied_generation: 0,
+                        },
+                    ],
+                    filter: String::new(),
+                    advanced_filter: String::new(),
+                    exact_key: None,
+                }),
+                ..Default::default()
+            },
+        ));
+
+        // Ordinary input queries dispatch synchronously. Shared statuses
+        // advance only when worker updates drain, and nothing below drains
+        // until the loops, so the blocked input reads Pending on every
+        // tick below deterministically — no timing is involved.
+        lvu::terminal::submit_query_requests(&mut app, &mut adapter);
+        assert!(matches!(
+            adapter.status("b").map(|status| status.state),
+            Some(ScanState::Pending)
+        ));
+        // The restore queued exactly one union request; read its identity
+        // once and hand it straight back. Every later observation goes
+        // through the real tick below, never around it.
+        let held = app.take_union_requests();
+        assert_eq!(
+            held.len(),
+            1,
+            "restore must queue exactly one union request"
+        );
+        let first = held.into_iter().next().expect("union request");
+        assert_eq!(first.view_id.as_str(), "u");
+        let (revision, generation) = (first.revision, first.generation);
+        app.requeue_union_request(first.clone());
+        // Setup for the refresh race: run the queued attempt through the
+        // real worker while input B is still unreadable. The injected
+        // error is one-shot test instrumentation; the parked job, its
+        // retryable failure, the retained retry attempt and the resulting
+        // refresh flag are all production state — the shape a submit that
+        // races input readability reaches.
+        adapter
+            .arm_union_transient_test_failure("u", "injected transient union failure")
+            .unwrap();
+        let fences = app.union_fence("u").expect("union fences");
+        let graph: std::collections::HashMap<String, Vec<String>> = app
+            .views()
+            .iter()
+            .filter(|view| app.is_union_view(&view.id))
+            .filter_map(|view| {
+                adapter.union_inputs(&view.id).map(|inputs| {
+                    (
+                        view.id.clone(),
+                        inputs.into_iter().map(|input| input.view_id).collect(),
+                    )
+                })
+            })
+            .collect();
+        let resolve = |id: &str| graph.get(id).cloned();
+        adapter
+            .submit_union_candidate(
+                lvu_view::UnionCandidateSpec {
+                    union_view_id: "u".into(),
+                    union_revision: revision,
+                    generation,
+                    inputs: fences
+                        .into_iter()
+                        .map(|input| lvu_view::StoredUnionInput {
+                            view_id: input.view_id,
+                            accepted_revision: input.accepted_revision,
+                            applied_generation: input.applied_generation,
+                        })
+                        .collect(),
+                    filter: lvu_view::UnionFilterSpec {
+                        search: first
+                            .constraints
+                            .text
+                            .map(|text| text.literal)
+                            .unwrap_or_default(),
+                        advanced_polars: first.constraints.advanced_polars.clone(),
+                        exact_key: app.union_candidate_exact_key("u", revision),
+                        grouping: first.constraints.grouping.clone(),
+                    },
+                    color_rules: first.constraints.color_rules.clone(),
+                },
+                &resolve,
+            )
+            .expect("setup attempt must park");
+        // The request under test: identity and payload assertions read the
+        // live queue and hand it straight back, so verification itself
+        // never empties what it just proved full.
+        let stable = |app: &mut App| {
+            let queued = app.take_union_requests();
+            assert_eq!(
+                queued.len(),
+                1,
+                "exactly one union request must stay queued"
+            );
+            assert_eq!(
+                (
+                    queued[0].view_id.as_str(),
+                    queued[0].revision,
+                    queued[0].generation
+                ),
+                ("u", revision, generation),
+                "queued request identity must stay stable across real ticks"
+            );
+            assert_eq!(queued[0].constraints.color_rules.len(), 2);
+            assert_eq!(queued[0].constraints.color_rules[0].predicate, "one");
+            assert_eq!(queued[0].constraints.color_rules[1].predicate, "two");
+            app.requeue_union_request(queued.into_iter().next().expect("requeued"));
+        };
+        let assert_still_racing = |adapter: &NativeViewAdapter, composition: &Composition| {
+            assert!(
+                matches!(
+                    adapter.status("b").map(|status| status.state),
+                    Some(ScanState::Pending)
+                ),
+                "input B must stay working while the race is observed"
+            );
+            assert!(
+                !composition.union_inflight.contains_key("u"),
+                "nothing may submit while an input is still working"
+            );
+        };
+        // Phase A: real ticks until the setup failure lands in editor
+        // state through the tick's own completion drain. No input
+        // poll/drain here: shared statuses advance only on update drain,
+        // so B stays observably working for the whole race while the
+        // worker thread still runs, fails and posts on its own.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                composition.handle_union(&mut app, &mut adapter);
+                assert_still_racing(&adapter, &composition);
+                stable(&mut app);
+                let failed = app
+                    .persistent_view_state("u")
+                    .expect("union snapshot")
+                    .search_error
+                    .is_some();
+                if failed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("setup failure must land through real ticks");
+        assert_eq!(
+            app.persistent_view_state("u")
+                .expect("union snapshot")
+                .search_error
+                .as_deref(),
+            Some("injected transient union failure")
+        );
+        // Phase B: the retry backoff expires with the dependency still
+        // moved, so the flag stands while B works and the request waits.
+        // Pin it TRUE on every tick: without the refresh NOOP the refresh
+        // leg would mint a new generation and revision and replace the
+        // payload on each of these ticks. Still no input drain, so the
+        // whole pinned sequence is synchronous and deterministic.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                composition.handle_union(&mut app, &mut adapter);
+                assert_still_racing(&adapter, &composition);
+                stable(&mut app);
+                if adapter.union_needs_refresh("u") == Some(true) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("refresh flag must stand while the retry is due and an input works");
+        for _ in 0..5 {
+            assert_eq!(
+                adapter.union_needs_refresh("u"),
+                Some(true),
+                "refresh flag must stand across all race ticks"
+            );
+            assert_still_racing(&adapter, &composition);
+            composition.handle_union(&mut app, &mut adapter);
+            assert_still_racing(&adapter, &composition);
+            stable(&mut app);
+        }
+        // Settle: both inputs' completions applied app-side, observed
+        // through accepted state rather than adapter status. Status alone
+        // is not enough: one input can settle while the other's completion
+        // is still queued behind it, and submitting then would fence a
+        // stale revision. Either input erroring instead keeps applied at
+        // zero and trips the cap loudly rather than hanging silently. The
+        // tick runs inside so a settle that lands mid-loop submits on the
+        // real path immediately.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                lvu::terminal::poll_query_completions(&mut app, &mut adapter);
+                adapter.drain_updates(64);
+                composition.handle_union(&mut app, &mut adapter);
+                let settled_a = app.view_accepted_state("a").is_some_and(|(r, _)| r != 0);
+                let settled_b = app.view_accepted_state("b").is_some_and(|(r, _)| r != 0);
+                if settled_a && settled_b {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("input completions must apply once worker updates drain");
+        // Submit through the real tick as well: the next tick takes the
+        // same queued request and submits it. The inflight revision proves
+        // the stable request is what submitted, not a churned replacement:
+        // the refresh leg cannot have replaced it while it was queued.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                lvu::terminal::poll_query_completions(&mut app, &mut adapter);
+                adapter.drain_updates(64);
+                composition.handle_union(&mut app, &mut adapter);
+                if composition.union_inflight.get("u") == Some(&revision) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("settled inputs must let the queued request submit");
+        // Actual publication through the real worker, still on the tick:
+        // union completions have their own queue drained per tick in
+        // production, and the tick's own drain observes them. The setup
+        // attempt's fences went stale while the inputs settled, so the
+        // refresh leg may legitimately resubmit fresher fences once the
+        // queue drains — that supersession is the healing path, not
+        // churn. Publication at any revision at or past the stable one
+        // proves the chain completed.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                lvu::terminal::poll_query_completions(&mut app, &mut adapter);
+                adapter.drain_updates(64);
+                composition.handle_union(&mut app, &mut adapter);
+                let published = app
+                    .view_accepted_state("u")
+                    .map(|(accepted, _)| accepted)
+                    .unwrap_or(0);
+                if published >= revision {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("union must publish once its inputs settle");
+        let published = app
+            .view_accepted_state("u")
+            .map(|(accepted, _)| accepted)
+            .expect("union accepted");
+        assert!(
+            published >= revision,
+            "publication must be at or past the stable request, got {published}"
+        );
+        assert!(app.take_union_requests().is_empty());
+        let snapshot = app.persistent_view_state("u").expect("union snapshot");
+        assert_eq!(snapshot.color_rules.len(), 2);
+        assert_eq!(snapshot.color_rules[0].predicate, "one");
+        assert_eq!(snapshot.color_rules[1].predicate, "two");
+        assert!(snapshot.search_error.is_none());
+        assert!(snapshot.advanced_error.is_none());
+        assert!(snapshot.grouping_error.is_none());
+
+        composition.memory.stop();
+        for (_, stopped) in manager.shutdown().await {
+            assert!(stopped.unwrap().complete);
+        }
     }
 }
 

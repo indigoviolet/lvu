@@ -2828,7 +2828,24 @@ impl Views {
     /// at a new revision for translation into a fenced union candidate. Used
     /// for live-append refresh, never for edits (those flow through the
     /// ordinary editor submits, which land in the same queue).
+    ///
+    /// An automatic refresh must never churn a request already queued for
+    /// this union — a deferred submit waiting on working inputs, or an
+    /// explicit edit that superseded it. Re-minting here would consume a
+    /// generation, advance the desired revision and replace the queued
+    /// payload on every tick while the refresh flag stands, so the queued
+    /// identity could never settle and submit. NOOP without touching
+    /// generation, revision or payload when any purpose is already queued
+    /// (including Search); explicit edits still supersede through the
+    /// ordinary submits, which this path never intercepts.
     pub(crate) fn enqueue_union_refresh(&mut self, view_id: &str) -> Option<u64> {
+        if self
+            .requests
+            .keys()
+            .any(|(queued_id, _)| queued_id.as_str() == view_id)
+        {
+            return None;
+        }
         let key = (view_id.to_owned(), QueryPurpose::Search);
         if !self.requests.contains_key(&key) && self.requests.len() >= MAX_PENDING_QUERY_REQUESTS {
             return None;
@@ -6008,6 +6025,18 @@ impl App {
             .collect()
     }
 
+    /// Return a drained union request to the submit queue unchanged — same
+    /// revision, generation, purpose and constraints. Only the union input
+    /// readiness deferral uses this: the request was taken but nothing was
+    /// submitted, fenced or published, so the pending markers set at apply
+    /// time still describe exactly this request and the next tick retries
+    /// it. At most one unsent request per view and purpose is retained, so
+    /// re-insertion cannot duplicate or reorder the queue.
+    pub fn requeue_union_request(&mut self, request: QueryRequest) {
+        let key = (request.view_id.clone(), request.purpose);
+        self.views.requests.insert(key, request);
+    }
+
     /// Fresh revision+generation fence for a union view's inputs, for the
     /// shell's candidate submissions (creation, resubmit, refresh).
     pub fn union_fence(
@@ -6019,7 +6048,9 @@ impl App {
 
     /// Enqueue a live-append refresh for a union view: current desired
     /// constraints re-submitted for translation into a fenced candidate.
-    /// Returns the new revision, or `None` when the submit queue is full.
+    /// Returns the new revision, or `None` when the submit queue is full or
+    /// a request for the view is already queued (the automatic tick must
+    /// not churn a deferred submit or a superseding edit).
     pub fn enqueue_union_refresh(&mut self, view_id: &str) -> Option<u64> {
         self.views.enqueue_union_refresh(view_id)
     }
@@ -6249,7 +6280,18 @@ impl App {
                     state.pending_color_rules = None;
                     state.color_rules_error = Some(message.clone());
                 }
-                state.desired_constraints = applied_constraints(state);
+                // Roll the desired definition back only when this revision
+                // descends from a previously accepted one. A restored (or
+                // first-attempt) definition whose revision never completed
+                // keeps its pending request: resetting it to the empty
+                // applied state would silently drop reviewed colour rules
+                // the user never un-applied, and a later refresh resubmits
+                // the retained definition once its inputs settle. Revisions
+                // start at one, so an applied revision of zero means no
+                // successful publication has ever happened for this view.
+                if state.applied_query_revision != 0 {
+                    state.desired_constraints = applied_constraints(state);
+                }
             }
         }
         true
@@ -9298,5 +9340,180 @@ mod command_activity_tests {
         assert!(app.command_work_pending());
         app.layers.external_command.clear_pending_runs();
         assert!(!app.command_work_pending());
+    }
+}
+
+#[cfg(test)]
+mod union_restore_tests {
+    use super::*;
+
+    fn ordered_rules() -> Vec<ColorRule> {
+        vec![
+            ColorRule {
+                predicate: "severity = critical".into(),
+                color: RuleColor::Red,
+                column: Some("severity".into()),
+                value: Some("critical".into()),
+            },
+            ColorRule {
+                predicate: "severity = warning".into(),
+                color: RuleColor::Yellow,
+                column: Some("severity".into()),
+                value: Some("warning".into()),
+            },
+        ]
+    }
+
+    /// Install a union view through the real restore path, exactly as a
+    /// session reopen does: persisted colours become the desired definition,
+    /// applied state stays empty, the restore sets the editor pending
+    /// markers, and the first request is queued. Returns the queued
+    /// request's revision and generation — the only values a completion for
+    /// this attempt may carry. Nothing here is hand-settled.
+    fn restore_colours_union(app: &mut App, rules: Vec<ColorRule>) -> (u64, u64) {
+        app.add_view(ViewItem {
+            id: "u".into(),
+            source_id: String::new(),
+            name: "Union".into(),
+        });
+        let persisted = PersistentViewState {
+            view_name: "Union".into(),
+            color_rules: rules,
+            union: Some(PersistentUnion {
+                inputs: vec![
+                    PersistentUnionInput {
+                        view_id: "a".into(),
+                        accepted_revision: 0,
+                        applied_generation: 0,
+                    },
+                    PersistentUnionInput {
+                        view_id: "b".into(),
+                        accepted_revision: 0,
+                        applied_generation: 0,
+                    },
+                ],
+                filter: String::new(),
+                advanced_filter: String::new(),
+                exact_key: None,
+            }),
+            ..Default::default()
+        };
+        assert!(app.restore_persistent_view("u", persisted));
+        let queued = app.take_union_requests();
+        assert_eq!(
+            queued.len(),
+            1,
+            "restore must queue exactly one union request"
+        );
+        let request = &queued[0];
+        assert_eq!(request.view_id, "u");
+        (request.revision, request.generation)
+    }
+
+    /// A failed restore must preserve the pending desired definition
+    /// (ordered rules included) instead of resetting to the empty applied
+    /// state. Editor diagnostics are recorded through the markers the
+    /// restore really set; the colour-error slot stays empty because a
+    /// restore never arms a repaint candidate. The last-good applied view
+    /// stays usable.
+    #[test]
+    fn union_restore_failure_preserves_pending_definition() {
+        let mut app = App::new(Vec::new(), Vec::new(), false);
+        let rules = ordered_rules();
+        let (revision, generation) = restore_colours_union(&mut app, rules.clone());
+        assert!(app.apply_union_completion(
+            "u",
+            revision,
+            generation,
+            Some("inputs not ready".into())
+        ));
+        let state = &app.views.states["u"];
+        assert_eq!(state.desired_constraints.color_rules, rules);
+        assert_eq!(state.search.error.as_deref(), Some("inputs not ready"));
+        assert_eq!(state.advanced.error.as_deref(), Some("inputs not ready"));
+        assert_eq!(state.grouping.error.as_deref(), Some("inputs not ready"));
+        assert!(state.color_rules_error.is_none());
+        assert!(state.color_rules.is_empty());
+        assert_eq!(state.applied_query_revision, 0);
+    }
+
+    /// Once inputs settle, a real refresh resubmits the retained definition
+    /// under a fresh revision: ordered classifiers land intact, markers
+    /// clear, and the editor diagnostics recover. Revision, generation and
+    /// markers all come out of the refresh, never by hand.
+    #[test]
+    fn union_restore_retry_succeeds_after_failure() {
+        let mut app = App::new(Vec::new(), Vec::new(), false);
+        let rules = ordered_rules();
+        let (revision, generation) = restore_colours_union(&mut app, rules.clone());
+        assert!(app.apply_union_completion(
+            "u",
+            revision,
+            generation,
+            Some("inputs not ready".into())
+        ));
+        let refreshed = app
+            .enqueue_union_refresh("u")
+            .expect("refresh must resubmit");
+        assert_ne!(refreshed, revision, "retry must advance the revision");
+        let queued = app.take_union_requests();
+        assert_eq!(queued.len(), 1);
+        let (retry_revision, retry_generation) = (queued[0].revision, queued[0].generation);
+        assert!(app.apply_union_completion("u", retry_revision, retry_generation, None));
+        let state = &app.views.states["u"];
+        assert_eq!(state.color_rules, rules);
+        assert_eq!(state.applied_query_revision, retry_revision);
+        assert!(state.pending_color_rules.is_none());
+        assert!(state.search.error.is_none());
+        assert!(state.advanced.error.is_none());
+        assert!(state.grouping.error.is_none());
+        assert!(state.color_rules_error.is_none());
+    }
+
+    /// A failed repaint on a previously accepted union still rolls back to
+    /// the last-good definition. The repaint flow (not a hand-set marker)
+    /// arms the candidate this failure rejects.
+    #[test]
+    fn union_edit_failure_rolls_back_to_applied() {
+        let mut app = App::new(Vec::new(), Vec::new(), false);
+        let rules = ordered_rules();
+        let (revision, generation) = restore_colours_union(&mut app, rules.clone());
+        assert!(app.apply_union_completion(
+            "u",
+            revision,
+            generation,
+            Some("inputs not ready".into())
+        ));
+        let refreshed = app
+            .enqueue_union_refresh("u")
+            .expect("refresh must resubmit");
+        let queued = app.take_union_requests();
+        assert_eq!(queued.len(), 1);
+        assert!(app.apply_union_completion("u", refreshed, queued[0].generation, None));
+        let repainted = vec![ColorRule {
+            predicate: "severity = info".into(),
+            color: RuleColor::Blue,
+            column: Some("severity".into()),
+            value: Some("info".into()),
+        }];
+        let repainted_revision = app
+            .views
+            .enqueue_presentation("u", repainted)
+            .expect("repaint must queue");
+        let queued = app.take_union_requests();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].revision, repainted_revision);
+        assert!(app.apply_union_completion(
+            "u",
+            repainted_revision,
+            queued[0].generation,
+            Some("bad predicate".into())
+        ));
+        let state = &app.views.states["u"];
+        assert_eq!(state.desired_constraints.color_rules, rules);
+        assert_eq!(state.color_rules, rules);
+        assert_eq!(state.applied_query_revision, refreshed);
+        assert!(state.pending_color_rules.is_none());
+        assert_eq!(state.color_rules_error.as_deref(), Some("bad predicate"));
     }
 }
