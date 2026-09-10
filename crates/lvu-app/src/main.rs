@@ -59,6 +59,7 @@ mod memory;
 mod resources;
 mod session;
 pub mod settings;
+mod shared_capture;
 mod shared_key_controller;
 mod shared_key_workflow;
 mod storage;
@@ -261,6 +262,10 @@ struct Options {
     /// Start with nothing acquired. Captured data is untouched; only the
     /// re-acquisition of the previous session's sources is skipped.
     fresh: bool,
+    /// Shared-capture window (hidden preview flag): attach to the background
+    /// worker for the capture root instead of owning capture locally.
+    /// Session consumption waits for the remote handle seam.
+    shared: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -7418,6 +7423,27 @@ async fn main() {
     }
 }
 
+/// Shared-capture window entry (hidden `--shared`): spawn-or-attach the
+/// background worker for this capture root, verify the handshake, then
+/// drain and detach again. Session consumption (views over worker-owned
+/// captures) plugs in at the marked point once the remote handle seam
+/// lands; until then this proves the real window-side lifecycle end to end
+/// — spawn, handshake, flush, goodbye — with zero split-brain risk, since
+/// no local manager or store ever starts on this path.
+async fn run_shared_capture(capture_root: PathBuf) -> Result<(), String> {
+    let executable = env::current_exe().map_err(|error| format!("current executable: {error}"))?;
+    let window_id = lvu_shared::default_window_id();
+    let shared =
+        shared_capture::SharedStore::startup(&executable, &capture_root, &window_id).await?;
+    // SEAM: session start (StartedSource abstraction over worker-owned
+    // captures; RemoteSource is the adapter input) plugs in here.
+    shared.drain_and_detach().await?;
+    Err(
+        "shared capture sessions need the remote handle seam (pending fc429 paths/signatures)"
+            .into(),
+    )
+}
+
 async fn run() -> Result<(), String> {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
     if arguments
@@ -7450,6 +7476,12 @@ async fn run() -> Result<(), String> {
     // its whole workspace. Every dependent path derives from this decision.
     let choice = select_capture_root(options.capture_dir, &paths.data_dir, &cwd)?;
     let capture_dir = choice.root.clone();
+    if options.shared {
+        // Shared mode diverges before ANY local ownership materialises: no
+        // local manager, store, or TUI session starts here, so the worker
+        // stays the single owner of capture and durable state.
+        return run_shared_capture(capture_dir).await;
+    }
     let record_error = choice
         .record
         .as_ref()
@@ -8691,6 +8723,7 @@ fn parse_args(
     let mut sources = Vec::new();
     let mut fresh = false;
     let mut resume = false;
+    let mut shared = false;
     let mut explicit_stdin = false;
     let mut options_ended = false;
     let mut index = 0;
@@ -8715,6 +8748,9 @@ fn parse_args(
             // only spelling that changes what happens.
             Some("--resume") => resume = true,
             Some("--fresh") => fresh = true,
+            // Hidden preview flag: shared-capture window. No help text
+            // until sessions can start (handle seam pending).
+            Some("--shared") => shared = true,
             Some("--capture-dir") => {
                 index += 1;
                 capture_dir = Some(PathBuf::from(value_os(&arguments, index, "--capture-dir")?));
@@ -8774,6 +8810,7 @@ fn parse_args(
         capture_dir,
         sources,
         fresh,
+        shared,
     }))
 }
 

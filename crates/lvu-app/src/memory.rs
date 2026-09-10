@@ -841,7 +841,10 @@ fn source_metadata(definition: SourceDefinition) -> SourceMetadata {
         missing: false,
     }
 }
-fn working_view(request: &SaveRequest) -> WorkingView {
+/// Project a save request's UI-facing draft onto the durable working view.
+/// Shared by the local worker thread and the shared-capture wiring so both
+/// persist byte-identical state through the same rule (never a remodel).
+pub(crate) fn working_view(request: &SaveRequest) -> WorkingView {
     let selected = request.state.selected.as_ref().and_then(|row| {
         let source_id = SourceId(uuid::Uuid::parse_str(&row.source_id).ok()?);
         (source_id == request.definition.id || request.state.source_ids.contains(&row.source_id))
