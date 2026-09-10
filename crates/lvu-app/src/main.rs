@@ -69,7 +69,7 @@ use agent::{
     MAX_SOURCES_PER_PROPOSAL, OriginatingRevision, ProposalContext, ProposalEnvelope, ProposalKind,
     Request as AgentRequest, SessionPurpose,
 };
-use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest, SuggestionContext};
+use memory::{Event as MemoryEvent, SaveRequest, SuggestionContext};
 use storage::StorageJob;
 
 const SOURCE_NAMESPACE: Uuid = Uuid::from_bytes([
@@ -262,9 +262,11 @@ struct Options {
     /// Start with nothing acquired. Captured data is untouched; only the
     /// re-acquisition of the previous session's sources is skipped.
     fresh: bool,
-    /// Shared-capture window (hidden preview flag): attach to the background
-    /// worker for the capture root instead of owning capture locally.
-    /// Session consumption waits for the remote handle seam.
+    /// Shared-capture window (hidden intermediate diagnostic, NOT the
+    /// acceptance path): attach to the background worker for the capture
+    /// root instead of owning capture locally. Final shape is automatic
+    /// sharing on ordinary launches; session consumption waits for the
+    /// remote handle seam.
     shared: bool,
 }
 
@@ -730,7 +732,7 @@ struct Composition {
     pending_scan: Option<u64>,
     discovery_candidates: HashMap<String, CandidateSelection>,
     recent_sources: Vec<lvu_memory::SourceMetadata>,
-    memory: MemoryWorker,
+    memory: memory::Memory,
     memory_ready: HashSet<SourceId>,
     memory_restoring: HashSet<lvu_core::ViewId>,
     memory_deferred: HashMap<lvu_core::ViewId, lvu_memory::WorkingView>,
@@ -7427,11 +7429,13 @@ async fn main() {
 
 /// Shared-capture window entry (hidden `--shared`): spawn-or-attach the
 /// background worker for this capture root, verify the handshake, then
-/// drain and detach again. Session consumption (views over worker-owned
-/// captures) plugs in at the marked point once the remote handle seam
-/// lands; until then this proves the real window-side lifecycle end to end
-/// — spawn, handshake, flush, goodbye — with zero split-brain risk, since
-/// no local manager or store ever starts on this path.
+/// drain and detach again. Intermediate diagnostic only — the acceptance
+/// path is ordinary launches sharing automatically, not this flag.
+/// Session consumption (views over worker-owned captures) plugs in at the
+/// marked point once the remote handle seam lands; until then this proves
+/// the real window-side lifecycle end to end — spawn, handshake, flush,
+/// goodbye — with zero split-brain risk, since no local manager or store
+/// ever starts on this path.
 async fn run_shared_capture(capture_root: PathBuf) -> Result<(), String> {
     let executable = env::current_exe().map_err(|error| format!("current executable: {error}"))?;
     let window_id = lvu_shared::default_window_id();
@@ -7698,7 +7702,20 @@ async fn run() -> Result<(), String> {
     let (starts_tx, starts_rx) = mpsc::channel(MAX_PENDING_STARTS);
     let (scans_tx, scans_rx) = mpsc::channel(2);
     let (completions_tx, completions_rx) = mpsc::channel(2);
-    let memory = MemoryWorker::start(capture_dir.join("workspace"));
+    let memory: memory::Memory = {
+        // Automatic shared store: attach the background worker first so
+        // it becomes the single workspace writer; the local worker never
+        // starts on this path, so durable state cannot split-brain.
+        // Attach failure is loud (never a silent local fallback that
+        // would fork the workspace behind the user's back, and no hidden
+        // bypass around the single-writer invariant).
+        let executable =
+            env::current_exe().map_err(|error| format!("current executable: {error}"))?;
+        let window_id = lvu_shared::default_window_id();
+        let shared =
+            shared_capture::SharedStore::startup(&executable, &capture_dir, &window_id).await?;
+        memory::Memory::Shared(memory::SharedMemory::wrap(shared))
+    };
     let command_presentation = command_rows::CommandPresentation::default();
     let command_controller = command_controller::CommandController::new(
         capture_dir.join("workspace"),
@@ -9764,7 +9781,7 @@ mod tests {
         let (starts_tx, starts_rx) = tokio::sync::mpsc::channel(8);
         let (scans_tx, scans_rx) = tokio::sync::mpsc::channel(8);
         let (completions_tx, completions_rx) = tokio::sync::mpsc::channel(8);
-        let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let memory = super::memory::MemoryWorker::start(directory.path().join("workspace"));
         let raw = Arc::new(
             lvu_live::LiveRowProvider::new(lvu_live::LiveConfig::new(
                 directory.path().join("derived"),
@@ -9790,7 +9807,7 @@ mod tests {
             pending_scan: None,
             discovery_candidates: HashMap::new(),
             recent_sources: Vec::new(),
-            memory,
+            memory: crate::memory::Memory::Local(memory),
             memory_ready: HashSet::new(),
             memory_restoring: HashSet::new(),
             memory_deferred: HashMap::new(),
@@ -11428,7 +11445,7 @@ for line in sys.stdin:
         let (starts_tx, starts_rx) = tokio::sync::mpsc::channel(2);
         let (scans_tx, scans_rx) = tokio::sync::mpsc::channel(2);
         let (completions_tx, completions_rx) = tokio::sync::mpsc::channel(2);
-        let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let memory = super::memory::MemoryWorker::start(directory.path().join("workspace"));
         let raw = Arc::new(
             lvu_live::LiveRowProvider::new(lvu_live::LiveConfig::new(
                 directory.path().join("derived"),
@@ -11454,7 +11471,7 @@ for line in sys.stdin:
             pending_scan: None,
             discovery_candidates: HashMap::new(),
             recent_sources: Vec::new(),
-            memory,
+            memory: crate::memory::Memory::Local(memory),
             memory_ready: HashSet::new(),
             memory_restoring: HashSet::new(),
             memory_deferred: HashMap::new(),
@@ -11558,7 +11575,7 @@ for line in sys.stdin:
             manifest_path: directory.path().join("manifest.json").display().to_string(),
             question: "new question".into(),
         };
-        let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let memory = super::memory::MemoryWorker::start(directory.path().join("workspace"));
         let raw = Arc::new(
             lvu_live::LiveRowProvider::new(lvu_live::LiveConfig::new(
                 directory.path().join("derived"),
@@ -11584,7 +11601,7 @@ for line in sys.stdin:
             pending_scan: None,
             discovery_candidates: HashMap::new(),
             recent_sources: Vec::new(),
-            memory,
+            memory: crate::memory::Memory::Local(memory),
             memory_ready: HashSet::new(),
             memory_restoring: HashSet::new(),
             memory_deferred: HashMap::new(),
