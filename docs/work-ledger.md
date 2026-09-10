@@ -2373,3 +2373,23 @@ the proof hash and `mise run disk:check` passed at 11G free. Proof:
 `primary-astra-scratch/reclaim-984b-1789008971788034110.jsonl`, SHA256
 `db29b47a952fcfbfd767ebaefa991c11967a76c63e0401cbdfd0e55f52cf39d0`.
 Earlier lock-busy and self-lock-reference refusals performed no deletion.
+
+
+## 2026-09-10 — restored union input readiness repair integrated
+
+Cherry-picked reviewed `5d9a7cff4dfb5c4ad752eaf3c0d87c0611abd62b` as
+`f7a4dc6`. A restored exact-key union can initially see raw input types before
+its accepted enrichments publish. Failed first publication now retains the
+attempted inputs/filter and retries when input publication changes. Provider
+revision affects retry identity only; accepted revision/generation fences remain
+unchanged. Unchanged transient failures retain backoff, and identical terminal
+source-set rejection remains quiet. Independent immutable review found no defect
+in this bounded change.
+
+Owner evidence in `lvu-muse-union-logs/readiness-targeted-5d9a7cff4dfb5c4ad752eaf3c0d87c0611abd62b-20260910.log`
+records three passing focused tests (first-publication retry, transient backoff,
+source-set rejection) and an app build. Its header also records an untracked
+PTY probe; this is targeted evidence, not a clean release gate. The earlier
+shutdown-timeout description was premature: cleanup obscured earlier UI
+assertion failures. Final union PTYs, colour integration and the full v0.1.6
+gate remain pending; no shutdown fix or release acceptance is claimed here.
