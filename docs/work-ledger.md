@@ -2469,3 +2469,30 @@ Evidence: `lvu-muse-union-logs/union-colour-pty-e7a8ccd-r3.log`, exit zero;
 private app SHA256 `d3ec4ea3880fc0246ea0f057191d3e898b1ae284bf967497ff68a9b565d12a99`.
 The wrong-target first run and private r2 synchronization failure are preserved,
 not accepted. The full combined release gate remains pending.
+
+### v0.1.6 first full gate and diagnostic repairs (2026-09-10)
+
+The full release gate at `18ac92ae4f82c17f80545afa47a70ca50387cefc`
+failed during workspace tests; it produced no accepted record. Evidence is
+`primary-astra-scratch/release-gate-18ac92ae4f82-16dfba2d2e624e51925122c0e18a0a30/commands.log`.
+A subsequent diagnostic run with `--no-fail-fast` recorded 1495 passed,
+14 failed and 7 ignored. Thirteen failures concern the former correlation
+dialog routing in three UI test targets; their coverage repair is pending.
+The remaining failure was a test calling blocking union replay inside an async
+runtime. Test-only `19d3a66`, integrated as `410dda0`, uses `block_in_place`;
+the focused test passed with its serialized-output budget assertions unchanged.
+Production already executes replay on the dedicated union worker thread.
+The diagnostic log is
+`primary-astra-scratch/v016-workspace-diagnostic-596322e00a454ca6a8257eaaf5cc705d.log`.
+
+Diagnostic Clippy found two complex type spellings and an oversized command
+controller enum variant. Shared type aliases and a boxed prepared-command
+payload address these without changing command state transitions or union
+authority. Workspace all-target Clippy passed with warnings denied, and all six
+command-controller tests passed under the canonical lock in the existing
+primary diagnostic target. Evidence is
+`primary-astra-scratch/v016-lint-repair-7bd71825eabf46e282f04e0e2f588033.log`.
+Formatting and diff checks passed. The compiler cache limit
+was reduced from 20 GiB to 15 GiB to reserve space for a fresh release target;
+cache eviction preserved binaries, captures and all retained gate evidence.
+Neither the diagnostic runs nor focused repairs constitute release acceptance.

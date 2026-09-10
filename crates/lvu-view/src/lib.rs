@@ -545,6 +545,8 @@ struct MemoryBudget {
     maximum: u64,
 }
 
+type FrozenDerived = HashMap<(String, u64, String), (serde_json::Value, String)>;
+
 struct Membership {
     sources: Vec<SourceMatches>,
     count: u64,
@@ -564,7 +566,7 @@ struct Membership {
     /// `None` means ordinary replay owns the authoritative stage evaluation;
     /// `Some` makes frozen union replay overlay only winning-input accepted
     /// values and suppress raw same-named fields on every other row.
-    frozen_derived: Option<HashMap<(String, u64, String), (serde_json::Value, String)>>,
+    frozen_derived: Option<FrozenDerived>,
     /// Which colour rule painted each row: `(source, sequence)` to the index of
     /// the first rule whose predicate matched. Only matched rows appear.
     color_matches: HashMap<(String, u64), u16>,

@@ -53,7 +53,7 @@ use super::union::{
     union_frozen_inputs, union_row_carrier_bytes, union_workspace_bytes, validate_union_spec,
 };
 use super::{
-    Appended, AutoLine, ContinuationRule, GroupRange, MAX_CONFIGURED_GROUP_STORED,
+    Appended, AutoLine, ContinuationRule, FrozenDerived, GroupRange, MAX_CONFIGURED_GROUP_STORED,
     MAX_GROUP_LINE_DISPLAY_BYTES, MAX_GROUP_LINES, MAX_GROUP_PAYLOAD_BYTES, Membership,
     MemoryBudget, NO_BASIS_TIME, Published, Reservation, SEQUENCE_BYTES, SOURCE_OVERHEAD,
     ScanState, Shared, SourceMatches, SourceTimeBounds, ViewError, ViewQueryStatus,
@@ -1678,7 +1678,11 @@ fn union_derived_workspace_bytes(
         .ok_or_else(|| "union derived workspace size overflow".to_owned())
 }
 
-type FrozenDerived = HashMap<(String, u64, String), (serde_json::Value, String)>;
+type UnionDerivedProjection = (
+    HashMap<(String, u64, String), Option<String>>,
+    FrozenDerived,
+    u64,
+);
 
 fn union_derived_projection(
     frame: &polars::prelude::DataFrame,
@@ -1686,14 +1690,7 @@ fn union_derived_projection(
     metas: &[FrozenUnionMeta],
     outputs: &[String],
     matched_ids: &[lvu_query::StableRecordId],
-) -> Result<
-    (
-        HashMap<(String, u64, String), Option<String>>,
-        FrozenDerived,
-        u64,
-    ),
-    String,
-> {
+) -> Result<UnionDerivedProjection, String> {
     if outputs.is_empty() {
         return Ok((HashMap::new(), HashMap::new(), 0));
     }

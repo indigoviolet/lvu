@@ -71,7 +71,7 @@ enum Active {
         revision: u64,
         native_fingerprint: String,
         token: String,
-        prepared: command_snapshot::PreparedCommand,
+        prepared: Box<command_snapshot::PreparedCommand>,
     },
     Executing {
         generation: u64,
@@ -585,7 +585,7 @@ impl Composition {
                                     revision,
                                     native_fingerprint,
                                     token,
-                                    prepared,
+                                    prepared: Box::new(prepared),
                                 });
                             }
                         }
