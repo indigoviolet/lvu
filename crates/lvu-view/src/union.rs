@@ -817,40 +817,60 @@ pub fn union_workspace_bytes(inputs: &[UnionFrozenInput]) -> Result<u64, UnionEr
             .checked_add(u64::try_from(input.view_id.len()).unwrap_or(u64::MAX))
             .ok_or_else(overflow)?;
         for row in &input.rows {
-            let mut row_bytes = 512u64
-                .checked_add(u64::try_from(row.raw.len()).unwrap_or(u64::MAX))
-                .and_then(|bytes| {
-                    bytes.checked_add(u64::try_from(row.raw_bytes.len()).unwrap_or(u64::MAX))
-                })
+            carrier = carrier
+                .checked_add(union_row_carrier_bytes(
+                    row.raw.len(),
+                    row.raw_bytes.len(),
+                    &row.fields,
+                    &row.field_types,
+                )?)
                 .ok_or_else(overflow)?;
-            for (name, value) in &row.fields {
-                let value_bytes = match value {
-                    serde_json::Value::Null | serde_json::Value::Bool(_) => 8,
-                    serde_json::Value::Number(_) => 32,
-                    serde_json::Value::String(value) => {
-                        u64::try_from(value.len()).unwrap_or(u64::MAX)
-                    }
-                    serde_json::Value::Array(values) => u64::try_from(values.len())
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(128),
-                    serde_json::Value::Object(values) => u64::try_from(values.len())
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(192),
-                };
-                let dtype_bytes = row.field_types.get(name).map_or(0, String::len);
-                row_bytes = row_bytes
-                    .checked_add(u64::try_from(name.len()).unwrap_or(u64::MAX))
-                    .and_then(|bytes| {
-                        bytes.checked_add(u64::try_from(dtype_bytes).unwrap_or(u64::MAX))
-                    })
-                    .and_then(|bytes| bytes.checked_add(value_bytes))
-                    .and_then(|bytes| bytes.checked_add(128))
-                    .ok_or_else(overflow)?;
-            }
-            carrier = carrier.checked_add(row_bytes).ok_or_else(overflow)?;
         }
     }
     carrier.checked_mul(4).ok_or_else(overflow)
+}
+
+/// Conservative retained-carrier charge, usable before a frozen replay row
+/// is cloned into a union job. The replay batch itself is independently
+/// bounded; this charge prevents multiple jobs from accumulating full frozen
+/// carriers outside the shared membership budget.
+pub(crate) fn union_row_carrier_bytes(
+    raw_len: usize,
+    raw_bytes_len: usize,
+    fields: &BTreeMap<String, serde_json::Value>,
+    field_types: &BTreeMap<String, String>,
+) -> Result<u64, UnionError> {
+    let overflow = || UnionError::ByteLimit {
+        bytes: u64::MAX,
+        maximum: u64::MAX,
+    };
+    let mut row_bytes = 512u64
+        .checked_add(u64::try_from(raw_len).unwrap_or(u64::MAX))
+        .and_then(|bytes| bytes.checked_add(u64::try_from(raw_bytes_len).unwrap_or(u64::MAX)))
+        .ok_or_else(overflow)?;
+    for (name, value) in fields {
+        let value_bytes = match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) => 8,
+            serde_json::Value::Number(_) => 32,
+            serde_json::Value::String(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+            serde_json::Value::Array(values) => u64::try_from(values.len())
+                .unwrap_or(u64::MAX)
+                .checked_mul(128)
+                .ok_or_else(overflow)?,
+            serde_json::Value::Object(values) => u64::try_from(values.len())
+                .unwrap_or(u64::MAX)
+                .checked_mul(192)
+                .ok_or_else(overflow)?,
+        };
+        let dtype_bytes = field_types.get(name).map_or(0, String::len);
+        row_bytes = row_bytes
+            .checked_add(u64::try_from(name.len()).unwrap_or(u64::MAX))
+            .and_then(|bytes| bytes.checked_add(u64::try_from(dtype_bytes).unwrap_or(u64::MAX)))
+            .and_then(|bytes| bytes.checked_add(value_bytes))
+            .and_then(|bytes| bytes.checked_add(128))
+            .ok_or_else(overflow)?;
+    }
+    Ok(row_bytes)
 }
 
 /// Decode one frozen input into a typed frame with canonical identity columns.

@@ -48,9 +48,9 @@
 
 use super::export::{FrozenInput, FrozenInputError, FrozenInputLimits};
 use super::union::{
-    StoredUnionInput, UnionCandidateSpec, UnionCompletion, UnionFrozenInput, UnionFrozenRow,
-    UnionLimits, detect_union_cycle, union_frozen_inputs, union_workspace_bytes,
-    validate_union_spec,
+    StoredUnionInput, UnionCandidateSpec, UnionCompletion, UnionFilterSpec, UnionFrozenInput,
+    UnionFrozenRow, UnionLimits, detect_union_cycle, union_frozen_inputs, union_row_carrier_bytes,
+    union_workspace_bytes, validate_union_spec,
 };
 use super::{
     Appended, AutoLine, ContinuationRule, GroupRange, MAX_GROUP_LINE_DISPLAY_BYTES,
@@ -59,7 +59,7 @@ use super::{
     SourceTimeBounds, ViewError, ViewQueryStatus, ViewRegistration, ViewState,
     auto_group_within_span, display_projection_bytes, group_state_bytes, merge_order,
 };
-use lvu_core::SourceId;
+use lvu_core::{RecordId, SourceId};
 use lvu_query::{
     BatchQuery, BatchValidity, CompiledDefinition, TextSearch, exact_column_expr,
     execute_batch_with_native_predicate,
@@ -67,7 +67,7 @@ use lvu_query::{
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
 };
 use std::thread::{self, JoinHandle};
@@ -120,6 +120,15 @@ pub struct UnionPublishTestBarrier {
     pub release: Receiver<()>,
 }
 
+/// One-shot counters for discriminating allocation/complexity regressions.
+/// Production jobs carry no probe.
+pub struct UnionPhaseTestProbe {
+    pub retained_rows: Arc<AtomicUsize>,
+    pub polars_builds: Arc<AtomicUsize>,
+    pub grouping_indexed_rows: Arc<AtomicUsize>,
+    pub grouping_lookups: Arc<AtomicUsize>,
+}
+
 /// Runtime state of one union view. Registration (`inputs`) is the accepted
 /// baseline; `pending` is the parked candidate; the rest is job plumbing.
 pub(crate) struct UnionViewState {
@@ -137,6 +146,7 @@ pub(crate) struct UnionViewState {
     /// the worker at start; production code never sets it.
     test_barrier: Option<UnionTestBarrier>,
     publish_test_barrier: Option<UnionPublishTestBarrier>,
+    phase_test_probe: Option<UnionPhaseTestProbe>,
     completed: VecDeque<UnionCompletion>,
     /// Compiled/parsed predicates become reusable only with the publication
     /// they helped produce. Failed or stale candidates never mutate this.
@@ -145,6 +155,20 @@ pub(crate) struct UnionViewState {
     /// the live-refresh trigger; definition revision/generation alone cannot
     /// observe an append to a raw input, which intentionally stays at 0/0.
     published_source_fences: Vec<(String, Vec<super::union::UnionSourceFence>)>,
+    /// A dependency state that already failed against the accepted union
+    /// definition. Live refresh must not resubmit that identical state on
+    /// every tick; any definition, registration, revision, generation or
+    /// source-progress change produces a different attempt and retries.
+    rejected_attempt: Option<UnionDependencyAttempt>,
+    published_filter: UnionFilterSpec,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnionDependencyAttempt {
+    inputs: Vec<StoredUnionInput>,
+    filter: UnionFilterSpec,
+    registered_sources: Vec<SourceId>,
+    source_fences: Vec<(String, Vec<super::union::UnionSourceFence>)>,
 }
 
 impl UnionViewState {
@@ -162,11 +186,50 @@ impl UnionViewState {
             pending_delivery: None,
             test_barrier: None,
             publish_test_barrier: None,
+            phase_test_probe: None,
             completed: VecDeque::new(),
             prepared_filter: None,
             published_source_fences: Vec::new(),
+            rejected_attempt: None,
+            published_filter: UnionFilterSpec::default(),
         }
     }
+}
+
+fn dependency_attempt(
+    shared: &Shared,
+    union_view_id: &str,
+    inputs: &[StoredUnionInput],
+    filter: &UnionFilterSpec,
+    refresh_input_fences: bool,
+) -> Option<UnionDependencyAttempt> {
+    let registered_sources = shared
+        .views
+        .get(union_view_id)?
+        .registration
+        .sources
+        .clone();
+    let mut current_inputs = Vec::with_capacity(inputs.len());
+    let mut source_fences = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let view = shared.views.get(&input.view_id)?;
+        current_inputs.push(if refresh_input_fences {
+            StoredUnionInput {
+                view_id: input.view_id.clone(),
+                accepted_revision: view.applied_revision,
+                applied_generation: view.applied_generation,
+            }
+        } else {
+            input.clone()
+        });
+        source_fences.push((input.view_id.clone(), current_source_fence(shared, view)));
+    }
+    Some(UnionDependencyAttempt {
+        inputs: current_inputs,
+        filter: filter.clone(),
+        registered_sources,
+        source_fences,
+    })
 }
 
 #[derive(Clone)]
@@ -329,6 +392,7 @@ impl super::NativeViewAdapter {
         if state.inputs.len() != state.published_source_fences.len() {
             return Some(true);
         }
+        let mut needs_refresh = false;
         for input in &state.inputs {
             let Some(view) = shared.views.get(&input.view_id) else {
                 return Some(true);
@@ -336,7 +400,7 @@ impl super::NativeViewAdapter {
             if view.applied_revision != input.accepted_revision
                 || view.applied_generation != input.applied_generation
             {
-                return Some(true);
+                needs_refresh = true;
             }
             let Some((_, published)) = state
                 .published_source_fences
@@ -346,10 +410,20 @@ impl super::NativeViewAdapter {
                 return Some(true);
             };
             if &current_source_fence(&shared, view) != published {
-                return Some(true);
+                needs_refresh = true;
             }
         }
-        Some(false)
+        if !needs_refresh {
+            return Some(false);
+        }
+        let current = dependency_attempt(
+            &shared,
+            union_view_id,
+            &state.inputs,
+            &state.published_filter,
+            true,
+        );
+        Some(current.as_ref() != state.rejected_attempt.as_ref())
     }
 
     /// Park a union candidate and start its background job.
@@ -400,6 +474,13 @@ impl super::NativeViewAdapter {
             {
                 return Err(format!("union input view '{}' is unknown", unknown.view_id));
             }
+            let dependency_attempt = dependency_attempt(
+                &shared,
+                &candidate.union_view_id,
+                &candidate.inputs,
+                &candidate.filter,
+                false,
+            );
             let Some(state) = shared.union_views.get_mut(&candidate.union_view_id) else {
                 return Err("unknown union view".into());
             };
@@ -414,6 +495,7 @@ impl super::NativeViewAdapter {
             let cancel = Arc::clone(&state.cancel);
             let test_barrier = state.test_barrier.take();
             let publish_test_barrier = state.publish_test_barrier.take();
+            let phase_test_probe = state.phase_test_probe.take();
             let ctx = UnionJobCtx {
                 spec: candidate.clone(),
                 generation,
@@ -431,6 +513,8 @@ impl super::NativeViewAdapter {
                 limits: UnionLimits::default(),
                 test_barrier,
                 publish_test_barrier,
+                phase_test_probe,
+                dependency_attempt,
             };
             let handle = thread::Builder::new()
                 .name("lvu-view-union".into())
@@ -483,6 +567,19 @@ impl super::NativeViewAdapter {
             return Err("unknown union view".into());
         };
         state.publish_test_barrier = Some(barrier);
+        Ok(())
+    }
+
+    pub fn arm_union_phase_test_probe(
+        &self,
+        union_view_id: &str,
+        probe: UnionPhaseTestProbe,
+    ) -> Result<(), String> {
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        let Some(state) = shared.union_views.get_mut(union_view_id) else {
+            return Err("unknown union view".into());
+        };
+        state.phase_test_probe = Some(probe);
         Ok(())
     }
 
@@ -601,6 +698,8 @@ struct UnionJobCtx {
     limits: UnionLimits,
     test_barrier: Option<UnionTestBarrier>,
     publish_test_barrier: Option<UnionPublishTestBarrier>,
+    phase_test_probe: Option<UnionPhaseTestProbe>,
+    dependency_attempt: Option<UnionDependencyAttempt>,
 }
 
 /// Per-input frozen metadata for the atomic publication fence. Small scalar
@@ -641,17 +740,27 @@ fn union_job_loop(ctx: UnionJobCtx) {
         error,
     };
     let mut shared = ctx.shared.lock().expect("view state poisoned");
-    let Some(state) = shared.union_views.get_mut(&ctx.spec.union_view_id) else {
+    let Some(state_generation) = shared
+        .union_views
+        .get(&ctx.spec.union_view_id)
+        .map(|state| state.generation)
+    else {
         return;
     };
     // A superseded job's report must not confuse the shell: only the live
     // generation lands. Older threads settle alone (correlation precedent).
-    if state.generation != ctx.generation {
+    if state_generation != ctx.generation {
         return;
     }
     let failed = completion.error.clone();
+    let rejected_attempt = failed.as_ref().and(ctx.dependency_attempt.clone());
+    let state = shared
+        .union_views
+        .get_mut(&ctx.spec.union_view_id)
+        .expect("checked above");
     if failed.is_some() {
         state.pending = None;
+        state.rejected_attempt = rejected_attempt;
     }
     let was_published = state.published_revision;
     state.completed.push_back(completion);
@@ -678,6 +787,8 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
     let prepared_filter = prepare_union_filter(ctx)?;
     check_cancelled(&ctx.cancel, &ctx.shared)?;
     let mut frozen_inputs = Vec::with_capacity(ctx.spec.inputs.len());
+    let mut reservation = Reservation::new(Arc::clone(&ctx.budget));
+    let mut carrier_bytes = 0u64;
     let mut remaining_rows = ctx.limits.maximum_rows as u64;
     let mut remaining_bytes = ctx.limits.maximum_bytes;
     // The submitted definition fence is authority. Live source progress is
@@ -712,6 +823,8 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
             frozen,
             &mut remaining_rows,
             &mut remaining_bytes,
+            &mut reservation,
+            &mut carrier_bytes,
         )?;
         frozen_inputs.push(work);
     }
@@ -768,6 +881,15 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
         .registration
         .sources
         .len() as u64;
+    let retained_rows = decoded_inputs
+        .iter()
+        .try_fold(0u64, |total, input| {
+            total.checked_add(input.rows.len() as u64)
+        })
+        .ok_or_else(|| "union identity index size overflow".to_owned())?;
+    let identity_index_bytes = retained_rows
+        .checked_mul(96)
+        .ok_or_else(|| "union identity index size overflow".to_owned())?;
     let reserved_bytes = source_count
         .checked_mul(
             SOURCE_OVERHEAD
@@ -775,10 +897,16 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
                 .ok_or_else(|| "union workspace size overflow".to_owned())?,
         )
         .and_then(|overhead| workspace.checked_add(overhead))
+        .and_then(|bytes| bytes.checked_add(identity_index_bytes))
         .ok_or_else(|| "union workspace size overflow".to_owned())?;
-    let mut reservation = Reservation::new(Arc::clone(&ctx.budget));
-    if !reservation.add(reserved_bytes) {
+    let additional = reserved_bytes
+        .checked_sub(carrier_bytes)
+        .ok_or_else(|| "union carrier accounting exceeded workspace".to_owned())?;
+    if !reservation.add(additional) {
         return Err("union workspace exceeds the memory budget".into());
+    }
+    if let Some(probe) = &ctx.phase_test_probe {
+        probe.polars_builds.fetch_add(1, Ordering::AcqRel);
     }
     let merged = union_frozen_inputs(&ctx.spec.union_view_id, &decoded_inputs, &ctx.limits)
         .map_err(|error| error.to_string())?;
@@ -942,6 +1070,8 @@ fn visit_union_input(
     frozen: FrozenInput,
     remaining_rows: &mut u64,
     remaining_bytes: &mut u64,
+    reservation: &mut Reservation,
+    carrier_bytes: &mut u64,
 ) -> Result<FrozenUnionWork, String> {
     let summary = frozen.summary().clone();
     if summary.applied_revision != input.accepted_revision
@@ -997,7 +1127,15 @@ fn visit_union_input(
                 // value with no native union encoding: letting it vanish
                 // into nulls would silently change the column, so the
                 // candidate fails explicitly naming field and native type.
-                if let Some((field, reason)) = row.omitted_fields.iter().next() {
+                if let Some((field, reason)) = row
+                    .omitted_fields
+                    .iter()
+                    .find(|(_, reason)| *reason != "field missing from source record")
+                {
+                    // Diagonal union semantics represent a field absent on
+                    // one physical record as typed null. Precise replay still
+                    // carries its column dtype in `field_types`; only lossy
+                    // whole-value omissions reject here.
                     let dtype = row
                         .field_types
                         .get(field)
@@ -1019,6 +1157,22 @@ fn visit_union_input(
                         })?,
                     TimeSource::Capture => Some(row.record.captured_at_unix_nanos),
                 };
+                let retained_bytes = union_row_carrier_bytes(
+                    row.record.bytes.len(),
+                    row.record.bytes.len(),
+                    &row.fields,
+                    &row.field_types,
+                )
+                .map_err(|error| error.to_string())?;
+                if !reservation.add(retained_bytes) {
+                    return Err("union frozen carriers exceed the shared memory budget".into());
+                }
+                *carrier_bytes = carrier_bytes
+                    .checked_add(retained_bytes)
+                    .ok_or_else(|| "union carrier size overflow".to_owned())?;
+                if let Some(probe) = &ctx.phase_test_probe {
+                    probe.retained_rows.fetch_add(1, Ordering::AcqRel);
+                }
                 // Byte accounting uses the replay's own output figure, which
                 // covers serialized fields and dtype evidence — not just the
                 // raw record bytes. The visit itself was already capped by
@@ -1118,32 +1272,42 @@ fn current_source_fence_with_guarded(
     }
 }
 
-fn union_grouping_row<'a>(
-    inputs: &'a [UnionFrozenInput],
-    source: &str,
-    sequence: u64,
-) -> Option<&'a UnionFrozenRow> {
-    inputs.iter().find_map(|input| {
-        input.rows.iter().find(|row| {
-            row.record_id.source_id.0.to_string() == source && row.record_id.sequence == sequence
-        })
-    })
+fn union_grouping_index(inputs: &[UnionFrozenInput]) -> HashMap<RecordId, &UnionFrozenRow> {
+    let rows = inputs.iter().map(|input| input.rows.len()).sum();
+    let mut indexed = HashMap::with_capacity(rows);
+    for input in inputs {
+        for row in &input.rows {
+            // Dedup semantics are first-input precedence. The grouping
+            // projection must resolve the same winning row when an identity
+            // appears in more than one accepted input.
+            indexed.entry(row.record_id).or_insert(row);
+        }
+    }
+    indexed
 }
 
 fn union_groups(
-    source: &str,
+    source_id: SourceId,
     members: &[(u64, Option<i64>, i64)],
-    inputs: &[UnionFrozenInput],
+    indexed_rows: &HashMap<RecordId, &UnionFrozenRow>,
     rule: &ContinuationRule,
-) -> Result<(Appended<GroupRange>, u64), String> {
+) -> Result<(Appended<GroupRange>, u64, usize), String> {
     let mut built = Vec::<GroupRange>::new();
     let mut charged = 0u64;
+    let mut lookups = 0usize;
     for (position, (sequence, _, _)) in members.iter().enumerate() {
-        let row = union_grouping_row(inputs, source, *sequence)
-            .ok_or_else(|| format!("union grouping lost record {source}:{sequence}"))?;
+        lookups = lookups.saturating_add(1);
+        let record_id = RecordId {
+            source_id,
+            sequence: *sequence,
+        };
+        let row = indexed_rows
+            .get(&record_id)
+            .copied()
+            .ok_or_else(|| format!("union grouping lost record {}:{sequence}", source_id.0))?;
         let display_bytes = &row.raw_bytes[..row.raw_bytes.len().min(MAX_GROUP_LINE_DISPLAY_BYTES)];
         let projection = lvu::DisplayRow {
-            id: lvu::RowId::new(source, *sequence),
+            id: lvu::RowId::new(source_id.0.to_string(), *sequence),
             timestamp: String::new(),
             captured_at_unix_nanos: Some(row.captured_at_unix_nanos),
             level: String::new(),
@@ -1232,7 +1396,7 @@ fn union_groups(
     }
     let mut groups = Appended::default();
     groups.extend(built);
-    Ok((groups, charged))
+    Ok((groups, charged, lookups))
 }
 
 /// Merge result publication: fence re-verification and membership install
@@ -1372,6 +1536,18 @@ fn publish_union(
         .first()
         .map(|work| work.basis)
         .unwrap_or_default();
+    // Built once after the global reservation and before grouping. Every
+    // constituent is then one stable-identity hash lookup; no input/row scan
+    // remains in the per-member loop.
+    let grouping_index = prepared_filter.grouping.as_ref().map(|_| {
+        let indexed = union_grouping_index(&decoded_inputs);
+        if let Some(probe) = &ctx.phase_test_probe {
+            probe
+                .grouping_indexed_rows
+                .store(indexed.len(), Ordering::Release);
+        }
+        indexed
+    });
     // Mixed input bases compare as nanos against nanos; coherent unions keep
     // coherent input bases (normalization is the inputs' own enrichment, like
     // schema). The publication records the first input's basis honestly
@@ -1385,7 +1561,16 @@ fn publish_union(
         members.sort_by_key(|member| member.0);
         let groups = match prepared_filter.grouping.as_ref() {
             Some(rule) => {
-                let (groups, bytes) = union_groups(&key, &members, &decoded_inputs, rule)?;
+                let (groups, bytes, lookups) = union_groups(
+                    source_id,
+                    &members,
+                    grouping_index.as_ref().expect("built for grouping"),
+                    rule,
+                )?;
+                debug_assert_eq!(lookups, members.len());
+                if let Some(probe) = &ctx.phase_test_probe {
+                    probe.grouping_lookups.fetch_add(lookups, Ordering::AcqRel);
+                }
                 publication_bytes = publication_bytes
                     .checked_add(bytes)
                     .ok_or_else(|| "union grouping size overflow".to_owned())?;
@@ -1591,6 +1776,8 @@ fn publish_union(
     state.published_revision = ctx.spec.union_revision;
     state.published_generation = ctx.spec.generation;
     state.prepared_filter = Some(prepared_filter);
+    state.published_filter = ctx.spec.filter.clone();
+    state.rejected_attempt = None;
     state.published_source_fences = fence
         .iter()
         .zip(frozen_inputs.iter())
@@ -1699,9 +1886,13 @@ mod tests {
             limits: UnionLimits::default(),
             test_barrier: None,
             publish_test_barrier: None,
+            phase_test_probe: None,
+            dependency_attempt: None,
         };
         let mut remaining_rows = 1_000_000u64;
         let mut remaining_bytes = 1_000_000u64;
+        let mut reservation = Reservation::new(Arc::clone(&adapter.budget));
+        let mut carrier_bytes = 0;
         let input = ctx.spec.inputs[0].clone();
         let work = visit_union_input(
             &ctx,
@@ -1709,6 +1900,8 @@ mod tests {
             frozen,
             &mut remaining_rows,
             &mut remaining_bytes,
+            &mut reservation,
+            &mut carrier_bytes,
         )
         .expect("visit succeeds");
         assert_eq!(work.rows.len(), 2);

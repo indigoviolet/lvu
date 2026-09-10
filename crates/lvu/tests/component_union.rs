@@ -8,10 +8,15 @@
 
 #[path = "../src/components/union.rs"]
 #[allow(dead_code)]
-mod union_dialog;
+mod union_component;
+
+mod union_dialog {
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct SharedKeyUnionOrigin;
+}
 
 use std::collections::HashMap;
-use union_dialog::{AcceptedUnion, UnionDialog};
+use union_component::{AcceptedUnion, UnionDialog};
 
 /// Accepted (revision, generation) per input view.
 fn states(pairs: &[(&str, u64, u64)]) -> HashMap<String, (u64, u64)> {
@@ -73,12 +78,12 @@ fn accept_fences_on_current_revisions() {
         AcceptedUnion {
             union_view_id: "union".into(),
             inputs: vec![
-                union_dialog::UnionInputRef {
+                union_component::UnionInputRef {
                     view_id: "view-a".into(),
                     accepted_revision: 3,
                     applied_generation: 1,
                 },
-                union_dialog::UnionInputRef {
+                union_component::UnionInputRef {
                     view_id: "view-b".into(),
                     accepted_revision: 5,
                     applied_generation: 1,

@@ -81,6 +81,11 @@ impl SharedKeyController {
         self.last_proven.as_ref()
     }
 
+    #[allow(dead_code)]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// Settle a precise frozen lookup against the origin's current accepted
     /// fence. `resolved` carries no alternative scalar representation: the
     /// canonical `ExactFieldConstraint` is validated directly.

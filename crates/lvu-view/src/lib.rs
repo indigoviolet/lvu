@@ -19,7 +19,7 @@ pub use union::{
     detect_union_cycle, frozen_identity_snapshot, merge_union_rows, union_frozen_inputs,
     union_input_stale, union_typed_frames, union_workspace_bytes, validate_union_spec,
 };
-pub use union_worker::{UnionPublishTestBarrier, UnionTestBarrier};
+pub use union_worker::{UnionPhaseTestProbe, UnionPublishTestBarrier, UnionTestBarrier};
 
 mod appended;
 
@@ -585,7 +585,10 @@ impl Reservation {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.bytes += bytes;
+                    self.bytes = self
+                        .bytes
+                        .checked_add(bytes)
+                        .expect("reservation is bounded by the budget maximum");
                     return true;
                 }
                 Err(actual) => used = actual,

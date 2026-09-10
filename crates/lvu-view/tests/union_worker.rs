@@ -15,14 +15,14 @@ use lvu_core::{Acquisition, SourceDefinition, SourceId};
 use lvu_ingest::{RuntimeConfig, RuntimeState, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
 use lvu_view::{
-    NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec,
+    NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec, UnionPhaseTestProbe,
     UnionPublishTestBarrier, UnionTestBarrier, ViewConfig,
 };
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicUsize},
     time::Duration,
 };
 use tempfile::TempDir;
@@ -189,6 +189,46 @@ async fn setup() -> (
     (root, manager, api, worker, adapter)
 }
 
+async fn setup_raw_with_budget(
+    maximum_index_bytes: u64,
+) -> (
+    TempDir,
+    SourceManager,
+    SourceHandle,
+    SourceHandle,
+    NativeViewAdapter,
+) {
+    let root = TempDir::new().unwrap();
+    let api_path = root.path().join("api.log");
+    let worker_path = root.path().join("worker.log");
+    fs::write(&api_path, "api row\n").unwrap();
+    fs::write(&worker_path, "worker row\n").unwrap();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let api = manager
+        .start(source(SourceId::new(), &api_path, true))
+        .await
+        .unwrap();
+    let worker = manager
+        .start(source(SourceId::new(), &worker_path, true))
+        .await
+        .unwrap();
+    wait_runtime(&api, 1).await;
+    wait_runtime(&worker, 1).await;
+    let (live, mut view) = configs(&root);
+    view.maximum_index_bytes = maximum_index_bytes;
+    let raw = Arc::new(LiveRowProvider::new(live).unwrap());
+    let adapter = NativeViewAdapter::new(raw, view).unwrap();
+    adapter.register_source(api.clone()).unwrap();
+    adapter.register_source(worker.clone()).unwrap();
+    adapter
+        .register_view("raw-a", vec![api.source_id()])
+        .unwrap();
+    adapter
+        .register_view("raw-b", vec![worker.source_id()])
+        .unwrap();
+    (root, manager, api, worker, adapter)
+}
+
 /// Pump the tick until the union job for `revision` completes, then return
 /// its error (if any). Freeze traffic rides `drain_updates`; the worker
 /// thread does the replay and merge.
@@ -288,7 +328,7 @@ fn raw_candidate(revision: u64) -> UnionCandidateSpec {
     }
 }
 
-fn union_texts(adapter: &mut NativeViewAdapter) -> Vec<String> {
+fn union_rows(adapter: &mut NativeViewAdapter) -> Vec<lvu::DisplayRow> {
     // Rows page in behind a fresh publication; pump the tick like the
     // product loop does — fetched rows only enter the cache through the
     // drain — and poll briefly.
@@ -299,7 +339,7 @@ fn union_texts(adapter: &mut NativeViewAdapter) -> Vec<String> {
             .rows()
             .page("union", ViewportRequest { start: 0, len: 256 });
         if page.rows.len() >= page.total {
-            return page.rows.iter().map(|row| row.text.clone()).collect();
+            return page.rows;
         }
         assert!(
             started.elapsed() < Duration::from_secs(15),
@@ -311,6 +351,26 @@ fn union_texts(adapter: &mut NativeViewAdapter) -> Vec<String> {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn union_texts(adapter: &mut NativeViewAdapter) -> Vec<String> {
+    union_rows(adapter)
+        .into_iter()
+        .map(|row| row.text)
+        .collect()
+}
+
+fn phase_probe() -> (UnionPhaseTestProbe, [Arc<AtomicUsize>; 4]) {
+    let counters = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+    (
+        UnionPhaseTestProbe {
+            retained_rows: Arc::clone(&counters[0]),
+            polars_builds: Arc::clone(&counters[1]),
+            grouping_indexed_rows: Arc::clone(&counters[2]),
+            grouping_lookups: Arc::clone(&counters[3]),
+        },
+        counters,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -363,6 +423,37 @@ async fn union_publishes_both_sources_in_ts_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_shared_budget_rejects_before_carrier_retention_or_polars() {
+    let (_root, manager, api, worker, mut adapter) = setup_raw_with_budget(128).await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    let (probe, counters) = phase_probe();
+    adapter.arm_union_phase_test_probe("union", probe).unwrap();
+    adapter
+        .submit_union_candidate(raw_candidate(1), &|_| None)
+        .unwrap();
+    let error = wait_union(&mut adapter, 1)
+        .unwrap()
+        .error
+        .expect("the exhausted global budget rejects");
+    assert!(error.contains("shared memory budget"), "{error}");
+    assert_eq!(
+        counters[0].load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "no proportional carrier is retained before global admission"
+    );
+    assert_eq!(
+        counters[1].load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "no Polars builder is entered after admission fails"
+    );
+    assert!(adapter.union_inputs("union").unwrap().is_empty());
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_refreshes_when_an_input_advances() {
     let (root, manager, api, worker, mut adapter) = setup().await;
     adapter
@@ -399,6 +490,110 @@ async fn union_refreshes_when_an_input_advances() {
         texts.iter().any(|text| text.contains("\"n\":99")),
         "the appended record is in the refreshed union"
     );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn union_rejects_input_source_set_drift_and_preserves_last_good() {
+    let (root, manager, api, worker, mut adapter) = setup().await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    adapter
+        .submit_union_candidate(candidate(1, &api, &worker, 1, 1), &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+    let accepted_inputs = adapter.union_inputs("union").unwrap();
+    let accepted_rows = union_texts(&mut adapter);
+
+    let third_path = root.path().join("third.log");
+    fs::write(
+        &third_path,
+        "{\"ts\":\"2026-03-04T05:06:30Z\",\"svc\":\"third\",\"n\":30}\n",
+    )
+    .unwrap();
+    let third = manager
+        .start(source(SourceId::new(), &third_path, true))
+        .await
+        .unwrap();
+    wait_runtime(&third, 1).await;
+    adapter.register_source(third.clone()).unwrap();
+    let constraints = QueryConstraints {
+        text: Some(TextConstraint {
+            literal: "ts".into(),
+            case_insensitive: true,
+        }),
+        time_basis: lvu::TimeBasis::Event,
+        ..QueryConstraints::default()
+    };
+    adapter
+        .submit_source_change(
+            QueryRequest {
+                view_id: "view-a".into(),
+                generation: 1,
+                revision: 2,
+                base_revision: 1,
+                base_constraints: constraints.clone(),
+                purpose: QueryPurpose::Search,
+                constraints,
+            },
+            vec![api.source_id(), third.source_id()],
+        )
+        .unwrap();
+    wait_applied(&mut adapter, 2).await;
+
+    adapter
+        .submit_union_candidate(candidate(2, &api, &worker, 2, 1), &|_| None)
+        .unwrap();
+    let rejected = wait_union(&mut adapter, 2).unwrap();
+    let error = rejected.error.expect("moved source set must reject");
+    assert!(error.contains("source set moved"), "{error}");
+    assert_eq!(adapter.union_inputs("union").unwrap(), accepted_inputs);
+    assert_eq!(union_texts(&mut adapter), accepted_rows);
+    assert!(
+        adapter
+            .rows()
+            .page("union", ViewportRequest { start: 0, len: 256 })
+            .rows
+            .iter()
+            .all(|row| row.id.source_id != third.source_id().0.to_string())
+    );
+    for _ in 0..20 {
+        adapter.drain_updates(64);
+        assert_eq!(
+            adapter.union_needs_refresh("union"),
+            Some(false),
+            "the identical rejected dependency state must not enqueue forever"
+        );
+        assert!(adapter.take_union_completions().is_empty());
+    }
+
+    let mut third_file = OpenOptions::new().append(true).open(&third_path).unwrap();
+    writeln!(
+        third_file,
+        "{{\"ts\":\"2026-03-04T05:06:31Z\",\"svc\":\"third\",\"n\":31}}"
+    )
+    .unwrap();
+    third_file.flush().unwrap();
+    wait_runtime(&third, 2).await;
+    let started = std::time::Instant::now();
+    loop {
+        adapter.drain_updates(64);
+        if adapter.union_needs_refresh("union") == Some(true) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "a real later source update must become retryable"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    adapter
+        .submit_union_candidate(candidate(3, &api, &worker, 2, 1), &|_| None)
+        .unwrap();
+    assert!(wait_union(&mut adapter, 3).unwrap().error.is_some());
+    assert_eq!(adapter.union_needs_refresh("union"), Some(false));
     adapter.shutdown();
     manager.shutdown().await;
 }
@@ -501,6 +696,105 @@ async fn union_applies_its_own_text_search() {
     let mut sorted = texts.clone();
     sorted.sort();
     assert_eq!(texts, sorted);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn union_grouping_collapses_exact_constituents_and_repeats_stably() {
+    let (root, manager, api, worker, mut adapter) = setup().await;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("api.log"))
+        .unwrap();
+    writeln!(file, "  continuation after api event").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&api, 7).await;
+    adapter
+        .register_view("raw-a", vec![api.source_id()])
+        .unwrap();
+    adapter
+        .register_view("raw-b", vec![worker.source_id()])
+        .unwrap();
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+
+    let (probe, counters) = phase_probe();
+    adapter.arm_union_phase_test_probe("union", probe).unwrap();
+    let mut grouped = raw_candidate(1);
+    grouped.filter.grouping = Some(r"^\s+".into());
+    adapter.submit_union_candidate(grouped, &|_| None).unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+    let rows = union_rows(&mut adapter);
+    assert_eq!(rows.len(), 12, "one continuation is collapsed: {rows:#?}");
+    assert_eq!(adapter.status("union").unwrap().matched_records, 13);
+    assert_eq!(
+        counters[2].load(std::sync::atomic::Ordering::Acquire),
+        13,
+        "every late-decoded physical row is indexed once"
+    );
+    assert_eq!(
+        counters[3].load(std::sync::atomic::Ordering::Acquire),
+        13,
+        "grouping performs exactly one hash lookup per physical survivor"
+    );
+    let head = rows
+        .iter()
+        .find(|row| row.id.source_id == api.source_id().0.to_string() && row.id.sequence == 5)
+        .expect("the event immediately before the continuation is the group head");
+    assert_eq!(
+        head.details
+            .iter()
+            .find(|(name, _)| name == "group_record_count")
+            .map(|(_, value)| value.as_str()),
+        Some("2")
+    );
+    let constituents = head
+        .details
+        .iter()
+        .filter(|(name, _)| name.starts_with("group_line_") && name != "group_line_count")
+        .map(|(_, value)| value.split_once(": ").unwrap().0.to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        constituents,
+        [
+            format!("{}:5", api.source_id().0),
+            format!("{}:6", api.source_id().0),
+        ]
+    );
+    let accepted = rows
+        .iter()
+        .map(|row| (row.id.clone(), row.text.clone(), row.details.clone()))
+        .collect::<Vec<_>>();
+
+    let mut repeated = raw_candidate(2);
+    repeated.filter.grouping = Some(r"^\s+".into());
+    adapter.submit_union_candidate(repeated, &|_| None).unwrap();
+    assert_eq!(wait_union(&mut adapter, 2).unwrap().error, None);
+    assert_eq!(
+        union_rows(&mut adapter)
+            .iter()
+            .map(|row| (row.id.clone(), row.text.clone(), row.details.clone()))
+            .collect::<Vec<_>>(),
+        accepted
+    );
+
+    let mut invalid = raw_candidate(3);
+    invalid.filter.grouping = Some(r"(?=lookaround)".into());
+    adapter.submit_union_candidate(invalid, &|_| None).unwrap();
+    let error = wait_union(&mut adapter, 3)
+        .unwrap()
+        .error
+        .expect("invalid grouping must reject");
+    assert!(error.contains("grouping"), "{error}");
+    assert_eq!(
+        union_rows(&mut adapter)
+            .iter()
+            .map(|row| (row.id.clone(), row.text.clone(), row.details.clone()))
+            .collect::<Vec<_>>(),
+        accepted
+    );
     adapter.shutdown();
     manager.shutdown().await;
 }

@@ -1015,17 +1015,21 @@ async fn frozen_inventory_tracks_only_accepted_slash_outputs_not_raw_namesakes()
         frozen.summary().accepted_enrichment_outputs,
         ["request_key"]
     );
-    let mut accepted_rows = Vec::new();
-    frozen
-        .visit_precise(&AtomicBool::new(false), |batch| {
-            accepted_rows.extend(batch.rows);
-            Ok(())
-        })
-        .unwrap();
+    let accepted_rows = std::thread::spawn(move || {
+        let mut rows = Vec::new();
+        frozen
+            .visit_precise(&AtomicBool::new(false), |batch| {
+                rows.extend(batch.rows);
+                Ok(())
+            })
+            .unwrap();
+        rows
+    })
+    .join()
+    .unwrap();
     assert_eq!(accepted_rows.len(), 1);
     assert_eq!(accepted_rows[0].fields["request_key"], "accepted/value");
     assert_eq!(accepted_rows[0].field_types["request_key"], "String");
-    drop(frozen);
 
     let mut rejected = request("view", 2, 2, 1, None, None);
     rejected.purpose = QueryPurpose::Enrichment;
@@ -1063,13 +1067,18 @@ async fn frozen_inventory_tracks_only_accepted_slash_outputs_not_raw_namesakes()
             .accepted_enrichment_outputs
             .is_empty()
     );
-    let mut raw_rows = Vec::new();
-    after_removal
-        .visit_precise(&AtomicBool::new(false), |batch| {
-            raw_rows.extend(batch.rows);
-            Ok(())
-        })
-        .unwrap();
+    let raw_rows = std::thread::spawn(move || {
+        let mut rows = Vec::new();
+        after_removal
+            .visit_precise(&AtomicBool::new(false), |batch| {
+                rows.extend(batch.rows);
+                Ok(())
+            })
+            .unwrap();
+        rows
+    })
+    .join()
+    .unwrap();
     assert_eq!(raw_rows.len(), 1);
     assert_eq!(raw_rows[0].fields["request_key"], "raw-name");
 
