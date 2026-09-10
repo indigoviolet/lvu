@@ -26,7 +26,7 @@ use std::{
     io::Write,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize},
         mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
     },
     time::Duration,
@@ -60,6 +60,7 @@ impl RemoteUnionCommitTransport for TestCommitTransport {
         &self,
         expected_worker_session: &str,
         request: lvu_shared::union_commit::CommitRequest,
+        _deadline: std::time::Instant,
     ) -> Result<Receiver<Result<lvu_shared::union_commit::CommitReceipt, String>>, String> {
         self.requests
             .lock()
@@ -100,6 +101,7 @@ impl RemoteUnionCommitTransport for RendezvousCommitTransport {
         &self,
         expected_worker_session: &str,
         request: lvu_shared::union_commit::CommitRequest,
+        _deadline: std::time::Instant,
     ) -> Result<Receiver<Result<lvu_shared::union_commit::CommitReceipt, String>>, String> {
         let (reply, result) = channel();
         self.calls
@@ -646,6 +648,7 @@ fn phase_probe() -> (UnionPhaseTestProbe, [Arc<AtomicUsize>; 4]) {
             polars_builds: Arc::clone(&counters[1]),
             grouping_indexed_rows: Arc::clone(&counters[2]),
             grouping_lookups: Arc::clone(&counters[3]),
+            completed_budget_bytes: Arc::new(AtomicU64::new(u64::MAX)),
         },
         counters,
     )
@@ -797,6 +800,111 @@ async fn superseded_remote_waiter_cannot_clear_the_new_candidate() {
         adapter.union_inputs("union"),
         Some(remote_raw_candidate(2).inputs)
     );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_commit_total_deadline_drops_candidate_and_ignores_late_receipt() {
+    let (_root, manager, _remote, mut adapter) = setup_remote_raw().await;
+    let baseline_budget = Arc::new(AtomicU64::new(u64::MAX));
+    adapter
+        .arm_union_phase_test_probe(
+            "union",
+            UnionPhaseTestProbe {
+                retained_rows: Arc::new(AtomicUsize::new(0)),
+                polars_builds: Arc::new(AtomicUsize::new(0)),
+                grouping_indexed_rows: Arc::new(AtomicUsize::new(0)),
+                grouping_lookups: Arc::new(AtomicUsize::new(0)),
+                completed_budget_bytes: Arc::clone(&baseline_budget),
+            },
+        )
+        .unwrap();
+    adapter
+        .set_remote_union_commit_transport(
+            "window-test".into(),
+            Arc::new(TestCommitTransport::committing()),
+        )
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(1), &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+    let baseline_budget = baseline_budget.load(std::sync::atomic::Ordering::Acquire);
+    assert!(baseline_budget > 0, "published membership owns its budget");
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+
+    let (calls_tx, calls_rx) = sync_channel(2);
+    adapter
+        .set_remote_union_commit_transport(
+            "window-test".into(),
+            Arc::new(RendezvousCommitTransport { calls: calls_tx }),
+        )
+        .unwrap();
+    let completed_budget = Arc::new(AtomicU64::new(u64::MAX));
+    adapter
+        .arm_union_phase_test_probe(
+            "union",
+            UnionPhaseTestProbe {
+                retained_rows: Arc::new(AtomicUsize::new(0)),
+                polars_builds: Arc::new(AtomicUsize::new(0)),
+                grouping_indexed_rows: Arc::new(AtomicUsize::new(0)),
+                grouping_lookups: Arc::new(AtomicUsize::new(0)),
+                completed_budget_bytes: Arc::clone(&completed_budget),
+            },
+        )
+        .unwrap();
+    adapter
+        .arm_union_remote_commit_test_timeout("union", Duration::from_millis(50))
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(2), &|_| None)
+        .unwrap();
+    let (session, request, late_reply) = wait_commit_call(&mut adapter, &calls_rx);
+    let completion = wait_union(&mut adapter, 2).expect("deadline completion");
+    assert!(
+        completion
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out before a terminal receipt")),
+        "unexpected deadline result: {:?}",
+        completion.error
+    );
+    assert_eq!(adapter.status("union").unwrap().revision, 1);
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+    assert_eq!(
+        completed_budget.load(std::sync::atomic::Ordering::Acquire),
+        baseline_budget,
+        "timed-out candidate charge must be released while last-good stays retained"
+    );
+
+    let late_receipt = lvu_shared::union_commit::CommitReceipt::answer(
+        &session,
+        &request,
+        lvu_shared::union_commit::CommitOutcome::Committed {
+            current: request.frozen.clone(),
+        },
+    );
+    assert!(
+        late_reply.send(Ok(late_receipt)).is_err(),
+        "the deadline must drop the receipt channel"
+    );
+    adapter.drain_updates(64);
+    assert_eq!(adapter.status("union").unwrap().revision, 1);
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+
+    adapter
+        .set_remote_union_commit_transport(
+            "window-test".into(),
+            Arc::new(TestCommitTransport::committing()),
+        )
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(3), &|_| None)
+        .unwrap();
+    let retry = wait_union(&mut adapter, 3).expect("retry completion");
+    assert_eq!(retry.error, None);
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
     adapter.shutdown();
     manager.shutdown().await;
 }

@@ -139,6 +139,9 @@ pub struct UnionPhaseTestProbe {
     pub polars_builds: Arc<AtomicUsize>,
     pub grouping_indexed_rows: Arc<AtomicUsize>,
     pub grouping_lookups: Arc<AtomicUsize>,
+    /// Total shared union budget after the job's owned candidate has dropped.
+    /// A successful publication intentionally retains its membership charge.
+    pub completed_budget_bytes: Arc<AtomicU64>,
 }
 
 /// Runtime state of one union view. Registration (`inputs`) is the accepted
@@ -159,6 +162,7 @@ pub(crate) struct UnionViewState {
     test_barrier: Option<UnionTestBarrier>,
     publish_test_barrier: Option<UnionPublishTestBarrier>,
     phase_test_probe: Option<UnionPhaseTestProbe>,
+    remote_commit_test_timeout: Option<Duration>,
     transient_test_failure: Option<String>,
     completed: VecDeque<UnionCompletion>,
     /// Compiled/parsed predicates become reusable only with the publication
@@ -222,6 +226,7 @@ impl UnionViewState {
             test_barrier: None,
             publish_test_barrier: None,
             phase_test_probe: None,
+            remote_commit_test_timeout: None,
             transient_test_failure: None,
             completed: VecDeque::new(),
             prepared_filter: None,
@@ -589,6 +594,7 @@ impl super::NativeViewAdapter {
             let test_barrier = state.test_barrier.take();
             let publish_test_barrier = state.publish_test_barrier.take();
             let phase_test_probe = state.phase_test_probe.take();
+            let remote_commit_timeout = state.remote_commit_test_timeout.take();
             let transient_test_failure = state.transient_test_failure.take();
             let ctx = UnionJobCtx {
                 spec: candidate.clone(),
@@ -608,6 +614,7 @@ impl super::NativeViewAdapter {
                 test_barrier,
                 publish_test_barrier,
                 phase_test_probe,
+                remote_commit_timeout,
                 transient_test_failure,
                 dependency_attempt,
                 remote_union_commit: self.remote_union_commit.clone(),
@@ -676,6 +683,25 @@ impl super::NativeViewAdapter {
             return Err("unknown union view".into());
         };
         state.phase_test_probe = Some(probe);
+        Ok(())
+    }
+
+    /// Override the total remote-commit wait for the next job only. This is
+    /// deterministic test instrumentation; production always uses the shared
+    /// control round-trip bound.
+    pub fn arm_union_remote_commit_test_timeout(
+        &self,
+        union_view_id: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if timeout.is_zero() {
+            return Err("remote union commit timeout must be positive".into());
+        }
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        let Some(state) = shared.union_views.get_mut(union_view_id) else {
+            return Err("unknown union view".into());
+        };
+        state.remote_commit_test_timeout = Some(timeout);
         Ok(())
     }
 
@@ -810,6 +836,7 @@ struct UnionJobCtx {
     test_barrier: Option<UnionTestBarrier>,
     publish_test_barrier: Option<UnionPublishTestBarrier>,
     phase_test_probe: Option<UnionPhaseTestProbe>,
+    remote_commit_timeout: Option<Duration>,
     transient_test_failure: Option<String>,
     dependency_attempt: Option<UnionDependencyAttempt>,
     remote_union_commit: Option<super::remote_union_commit::RemoteUnionCommitRegistration>,
@@ -864,6 +891,11 @@ struct FrozenUnionWork {
 /// would misroute completions whenever the two differ.
 fn union_job_loop(ctx: UnionJobCtx) {
     let error = run_union_job(&ctx).err();
+    if let Some(probe) = &ctx.phase_test_probe {
+        probe
+            .completed_budget_bytes
+            .store(ctx.budget.used.load(Ordering::Acquire), Ordering::Release);
+    }
     let completion = UnionCompletion {
         union_view_id: ctx.spec.union_view_id.clone(),
         union_revision: ctx.spec.union_revision,
@@ -2205,6 +2237,16 @@ fn hash_exact_scalar(hash: &mut CandidateDigest, value: &lvu_core::ExactScalar) 
     }
 }
 
+fn hash_color_rules(hash: &mut CandidateDigest, rules: &[lvu::ColorRule]) {
+    hash.u64(rules.len() as u64);
+    for rule in rules {
+        hash.string(&rule.predicate);
+        hash.string(rule.color.label());
+        hash_optional_string(hash, rule.column.as_deref());
+        hash_optional_string(hash, rule.value.as_deref());
+    }
+}
+
 fn hash_union_filter(hash: &mut CandidateDigest, spec: &UnionCandidateSpec) {
     hash.string(&spec.filter.search);
     hash_optional_string(hash, spec.filter.advanced_polars.as_deref());
@@ -2217,13 +2259,78 @@ fn hash_union_filter(hash: &mut CandidateDigest, spec: &UnionCandidateSpec) {
         None => hash.tag(0),
     }
     hash_optional_string(hash, spec.filter.grouping.as_deref());
-    hash.u64(spec.color_rules.len() as u64);
-    for rule in &spec.color_rules {
-        hash.string(&rule.predicate);
-        hash.string(rule.color.label());
-        hash_optional_string(hash, rule.column.as_deref());
-        hash_optional_string(hash, rule.value.as_deref());
+    hash_color_rules(hash, &spec.color_rules);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hash_union_membership_extras(
+    hash: &mut CandidateDigest,
+    derived: &HashMap<(String, u64, String), Option<String>>,
+    derived_errors: &HashSet<(String, u64, String)>,
+    frozen_derived: Option<&FrozenDerived>,
+    color_rules: &[lvu::ColorRule],
+    advanced_present: bool,
+    enrichment_count: usize,
+    evaluation_batch_count: usize,
+) -> Result<(), String> {
+    let mut derived = derived.iter().collect::<Vec<_>>();
+    derived.sort_by(|left, right| left.0.cmp(right.0));
+    hash.u64(derived.len() as u64);
+    for ((source, sequence, field), value) in derived {
+        hash.string(source);
+        hash.u64(*sequence);
+        hash.string(field);
+        hash_optional_string(hash, value.as_deref());
     }
+
+    let mut errors = derived_errors.iter().collect::<Vec<_>>();
+    errors.sort();
+    hash.u64(errors.len() as u64);
+    for (source, sequence, field) in errors {
+        hash.string(source);
+        hash.u64(*sequence);
+        hash.string(field);
+    }
+
+    match frozen_derived {
+        None => hash.tag(0),
+        Some(values) => {
+            hash.tag(1);
+            let mut precise = values.iter().collect::<Vec<_>>();
+            precise.sort_by(|left, right| left.0.cmp(right.0));
+            hash.u64(precise.len() as u64);
+            for ((source, sequence, field), (value, dtype)) in precise {
+                hash.string(source);
+                hash.u64(*sequence);
+                hash.string(field);
+                hash.json(value);
+                hash.string(dtype);
+            }
+        }
+    }
+
+    // These are the exact installed display values and rules. Hashing them
+    // binds candidate identity; it does not make display text predicate
+    // authority or re-evaluate any expression.
+    hash_color_rules(hash, color_rules);
+
+    // A union membership is canonical by construction: native filtering and
+    // enrichment were already materialized into the fields above. Reject a
+    // future constructor that tries to smuggle unevaluated engine state into
+    // the remote publication until that state gains a stable commitment.
+    if advanced_present {
+        return Err("remote union membership unexpectedly retains an advanced definition".into());
+    }
+    hash.tag(0);
+    if enrichment_count != 0 {
+        return Err("remote union membership unexpectedly retains enrichment stages".into());
+    }
+    hash.u64(0);
+    if evaluation_batch_count != 0 {
+        return Err("remote union membership unexpectedly retains evaluation batches".into());
+    }
+    hash.u64(0);
+    Ok(())
 }
 
 /// Hash the exact retained candidate after all native evaluation and memory
@@ -2238,7 +2345,7 @@ fn union_candidate_digest(
     frozen_inputs: &[FrozenUnionMeta],
     decoded_inputs: &[UnionFrozenInput],
     membership: &Membership,
-) -> CommitDigest {
+) -> Result<CommitDigest, String> {
     let mut hash = CandidateDigest::new();
     hash.string(&ctx.spec.union_view_id);
     hash.u64(ctx.spec.union_revision);
@@ -2391,21 +2498,16 @@ fn union_candidate_digest(
     for name in &membership.enrichment_names {
         hash.string(name);
     }
-    let mut precise = membership
-        .frozen_derived
-        .as_ref()
-        .into_iter()
-        .flat_map(|values| values.iter())
-        .collect::<Vec<_>>();
-    precise.sort_by(|left, right| left.0.cmp(right.0));
-    hash.u64(precise.len() as u64);
-    for ((source, sequence, field), (value, dtype)) in precise {
-        hash.string(source);
-        hash.u64(*sequence);
-        hash.string(field);
-        hash.json(value);
-        hash.string(dtype);
-    }
+    hash_union_membership_extras(
+        &mut hash,
+        &membership.derived,
+        &membership.derived_errors,
+        membership.frozen_derived.as_ref(),
+        &membership.color_rules,
+        membership.advanced.is_some(),
+        membership.enrichment.len(),
+        membership.evaluation_batches.len(),
+    )?;
     let mut colors = membership.color_matches.iter().collect::<Vec<_>>();
     colors.sort_by(|left, right| left.0.cmp(right.0));
     hash.u64(colors.len() as u64);
@@ -2432,7 +2534,7 @@ fn union_candidate_digest(
     hash.u64(membership.event_time_missing as u64);
     hash.u64(membership.event_time_invalid as u64);
     hash.u64(membership.evaluation_page_bytes as u64);
-    hash.finish()
+    Ok(hash.finish())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3208,7 +3310,7 @@ fn publish_remote_union(
         frozen_inputs,
         decoded_inputs,
         &membership,
-    );
+    )?;
     let identity = RemoteCommitIdentity {
         generation: ctx.generation,
         nonce: nonce.clone(),
@@ -3235,15 +3337,30 @@ fn publish_remote_union(
             .expect("checked");
         state.pending_remote_commit = Some(identity.clone());
     }
+    let timeout = ctx
+        .remote_commit_timeout
+        .unwrap_or(lvu_shared::CONTROL_ROUNDTRIP_TIMEOUT);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "remote union commit deadline overflow".to_owned())?;
     let receipt_rx = registration
         .transport
-        .submit(worker_session, request.clone())?;
+        .submit(worker_session, request.clone(), deadline)?;
     let receipt = loop {
         check_cancelled(&ctx.cancel, &ctx.shared)?;
-        match receipt_rx.recv_timeout(FREEZE_WAIT) {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("remote union commit timed out before a terminal receipt".into());
+        }
+        let wait = FREEZE_WAIT.min(deadline.saturating_duration_since(now));
+        match receipt_rx.recv_timeout(wait) {
             Ok(Ok(receipt)) => break receipt,
             Ok(Err(error)) => return Err(format!("remote union commit failed: {error}")),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    return Err("remote union commit timed out before a terminal receipt".into());
+                }
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("remote union commit transport disconnected".into());
             }
@@ -3351,6 +3468,81 @@ mod tests {
         assert!(raw_publication_authority(&[remote_a, remote_b]).is_err());
     }
 
+    #[test]
+    fn commitment_covers_installed_union_extras_and_rejects_engine_state() {
+        fn digest(
+            derived: &HashMap<(String, u64, String), Option<String>>,
+            errors: &HashSet<(String, u64, String)>,
+            frozen: Option<&FrozenDerived>,
+            colors: &[lvu::ColorRule],
+            advanced: bool,
+            enrichments: usize,
+            batches: usize,
+        ) -> Result<CommitDigest, String> {
+            let mut hash = CandidateDigest::new();
+            hash_union_membership_extras(
+                &mut hash,
+                derived,
+                errors,
+                frozen,
+                colors,
+                advanced,
+                enrichments,
+                batches,
+            )?;
+            Ok(hash.finish())
+        }
+
+        let empty_derived = HashMap::new();
+        let empty_errors = HashSet::new();
+        let empty_frozen = FrozenDerived::new();
+        let baseline = digest(&empty_derived, &empty_errors, None, &[], false, 0, 0).unwrap();
+
+        let mut derived = HashMap::new();
+        derived.insert(
+            ("source".into(), 7, "key".into()),
+            Some("full value".into()),
+        );
+        assert_ne!(
+            baseline,
+            digest(&derived, &empty_errors, None, &[], false, 0, 0).unwrap()
+        );
+        let mut errors = HashSet::new();
+        errors.insert(("source".into(), 7, "key".into()));
+        assert_ne!(
+            baseline,
+            digest(&empty_derived, &errors, None, &[], false, 0, 0).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                &empty_derived,
+                &empty_errors,
+                Some(&empty_frozen),
+                &[],
+                false,
+                0,
+                0,
+            )
+            .unwrap(),
+            "None and Some(empty) are different installed option states"
+        );
+        let colors = [lvu::ColorRule {
+            predicate: "severity == 'error'".into(),
+            color: lvu::RuleColor::Magenta,
+            column: Some("severity".into()),
+            value: Some("error".into()),
+        }];
+        assert_ne!(
+            baseline,
+            digest(&empty_derived, &empty_errors, None, &colors, false, 0, 0,).unwrap()
+        );
+
+        assert!(digest(&empty_derived, &empty_errors, None, &[], true, 0, 0).is_err());
+        assert!(digest(&empty_derived, &empty_errors, None, &[], false, 1, 0).is_err());
+        assert!(digest(&empty_derived, &empty_errors, None, &[], false, 0, 1).is_err());
+    }
+
     /// Byte accounting charges the replay's serialized output — fields plus
     /// dtype evidence — never the raw record bytes alone. A field-heavy input
     /// with tiny raw lines must consume its true share, or later inputs would
@@ -3430,6 +3622,7 @@ mod tests {
             test_barrier: None,
             publish_test_barrier: None,
             phase_test_probe: None,
+            remote_commit_timeout: None,
             transient_test_failure: None,
             dependency_attempt: None,
             remote_union_commit: None,

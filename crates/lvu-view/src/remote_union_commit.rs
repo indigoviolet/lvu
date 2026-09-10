@@ -7,15 +7,26 @@
 
 use lvu_shared::union_commit::{CommitDigest, CommitReceipt, CommitRequest};
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, mpsc::Receiver};
+use std::{
+    sync::{Arc, mpsc::Receiver},
+    time::Instant,
+};
 
 /// Non-blocking submission seam implemented by the window's shared-capture
 /// controller. The returned one-shot is waited only by the union worker.
+///
+/// `deadline` is the window-owned total deadline for this exact request. If
+/// delivery is ambiguous, the transport must recover status with the same
+/// nonce and digest until it can return a terminal receipt or the deadline is
+/// reached; it must never mint a replacement identity. The window enforces
+/// the deadline independently, so transport recovery cannot retain the
+/// candidate indefinitely.
 pub trait RemoteUnionCommitTransport: Send + Sync {
     fn submit(
         &self,
         expected_worker_session: &str,
         request: CommitRequest,
+        deadline: Instant,
     ) -> Result<Receiver<Result<CommitReceipt, String>>, String>;
 }
 
