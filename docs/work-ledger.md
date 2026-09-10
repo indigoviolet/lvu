@@ -2407,3 +2407,23 @@ Evidence: `lvu-muse-union-logs/final-both-pty-fbcb624b1e14fc8734564c8d0f252c95a3
 and `final-rust-fbcb624b1e14fc8734564c8d0f252c95a34e50aa-20260910.log`.
 Validated app SHA256: `901e58205e6a52ac97bef6b507ce883c5a63e33abffc60760352501ccd5cbe51`.
 The combined primary colour integration and release gate are still pending.
+
+
+## 2026-09-10 — union colour release verification prepared
+
+Integrated the prepared heterogeneous union colour PTY as `88b24e2` from
+`a8b5075`. It uses the native Column/Value controls, ordered overlapping
+classifiers, actual terminal attributes, raw-namesake exclusion and restart.
+Python compilation and source review passed; runtime execution awaits the
+colour amendment and is not yet claimed.
+
+The installer now requires eleven suites, including this new test. Independent
+review of consumer `66394e0ce5e3a804b15289257c204e07f5f56529afbbb09ee8c387f00cb828ff`
+passed with only a stale count in the header. Primary verified that the final
+consumer differs by that one comment line only. Final installer SHA256:
+`65db0ead054acd1acc59b860a5fe4c3145cb8179af24fb8dd64b01c481eb2e0c`.
+Producer SHA256 remains
+`380471d5031c90aa66b2d8fc2fc42c9623923cd758b8d38941f61ca0f357f057`.
+Review: `sol-runtime-review-scratch/v016-installer-66394e0-delta-review.md`,
+SHA256 `1b2ceb3753964698d108b9e49f8bca7d4ed030dbc9942f8f8833a27200ce84f6`.
+These are tooling pins, not an acceptance record or release GO.
