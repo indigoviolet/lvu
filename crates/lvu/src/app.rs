@@ -5889,10 +5889,10 @@ impl App {
         match error {
             None => {
                 let constraints = state.desired_constraints.clone();
-                if let Some((revision, key)) = state.union_pending_exact_key.take() {
-                    if revision == union_revision {
-                        state.union_exact_key = Some(key);
-                    }
+                if let Some((revision, key)) = state.union_pending_exact_key.take()
+                    && revision == union_revision
+                {
+                    state.union_exact_key = Some(key);
                 }
                 state.search.applied = constraint_text(&constraints);
                 state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();

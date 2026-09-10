@@ -91,6 +91,10 @@ struct FileCursorWriter {
     durable: Option<DurableFileCursor>,
 }
 
+// Writer startup carries the durable journal/catalog paths, capture policy,
+// progress channel and its publication guard as distinct authorities. Packing
+// them solely to reduce the argument count would obscure those lifetimes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_writer(
     source_id: SourceId,
     journal_path: PathBuf,
