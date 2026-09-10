@@ -2351,3 +2351,11 @@ union worker still needs the new colour query field and actual union colour
 constraint handling. That seam is assigned to the colour integration owner;
 the union owner separately investigates shutdown timeouts in actual union PTYs.
 No full matrix or new release is claimed by this merge.
+
+Primary prepared the app and lockfile version `0.1.6`; locked offline Cargo
+metadata agrees. The new gate producer differs from the preserved v0.1.5
+producer only in its expected version. The proposed installer adds the two
+union PTYs to the eight existing mandatory suites and retains explicit
+producer-hash authentication. Tool review is pending. No acceptance record or
+tag exists for this preparation; union shutdown and colour integration remain
+prerequisites to the combined release gate.

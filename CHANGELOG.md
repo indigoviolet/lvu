@@ -4,6 +4,17 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## Unreleased
+
+### Fixes
+
+- macOS archive staging handles the system Bash's empty-array behavior.
+  Automated arm64 macOS checks now cover installed resources, terminal
+  restoration and command-process cleanup. Intel macOS remains compile-only
+  in those checks; Windows remains unsupported.
+- Build cleanup retains custom targets when their owning worktree cannot be
+  established safely, protecting active builds with nonstandard target names.
+
 ## v0.1.5 — 2026-09-10
 
 - Settings accepts IANA display zones such as `Europe/Berlin`, with the offset

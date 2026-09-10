@@ -31,6 +31,16 @@ time authority. Startup installs the validated effective zone into Appearance.
 
 ## Component map
 
+The working tree also integrates enrichment-based colour classification for
+ordinary views. The dialog selects an accepted output and an exact value;
+native Polars evaluates matching, using the same scalar text representation
+as displayed derived cells. Accepted output authority excludes raw namesakes
+after removal. Existing predicate rules retain their ordering and behavior;
+raw-text rules remain an explicit convenience option. Persistence uses additive
+classifier fields, so older readers retain legacy rules but omit classifiers
+when saving. Union colour threading and combined release acceptance remain
+pending; this does not describe published v0.1.5 behavior.
+
 | Component | Responsibility and starting points |
 | --- | --- |
 | `crates/lvu-app` | Executable/composition root. `src/main.rs` wires sources, views, terminal ticks, snapshots and assistance; `memory.rs`, `settings.rs`, `storage.rs`, `agent.rs` own their application workers and lifecycle. The reviewed command path uses `command_controller.rs`, `command_snapshot.rs`, `command_execution.rs` and `command_rows.rs`. |
