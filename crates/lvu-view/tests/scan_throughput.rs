@@ -120,7 +120,7 @@ async fn a_historical_filter_spends_its_time_scanning() {
     view.maximum_index_bytes = 64 * 1024 * 1024;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter.register_source(lvu_shared::AnySourceHandle::Local(handle.clone())).unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();

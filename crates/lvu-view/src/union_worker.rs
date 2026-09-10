@@ -2391,6 +2391,18 @@ fn publish_union(
                             .ok_or_else(|| "union input source is no longer open".to_owned())?
                             .handle
                             .clone();
+                        // Temporary fail-closed scaffolding: union
+                        // publication needs generation-fenced local inputs,
+                        // and no remote guard may pose as worker publication
+                        // authority. Remote inputs are refused with an
+                        // actionable error until attested cross-process
+                        // fencing exists.
+                        let Some(handle) = handle.as_local().cloned() else {
+                            return Err(format!(
+                                "union input source '{}' is a shared capture: union over shared captures needs the cross-process fence (not yet implemented)",
+                                source_id.0
+                            ));
+                        };
                         handles.push((*source_id, handle));
                     }
                 }
@@ -2566,7 +2578,9 @@ mod tests {
         let raw = Arc::new(LiveRowProvider::new(live).unwrap());
         let view = ViewConfig::new(root.path().join("view-index"));
         let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-        adapter.register_source(handle.clone()).unwrap();
+        adapter
+            .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+            .unwrap();
         adapter
             .register_view("v", vec![handle.source_id()])
             .unwrap();

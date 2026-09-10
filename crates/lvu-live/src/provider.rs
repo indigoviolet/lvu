@@ -3,7 +3,8 @@ use crate::time::{RecognitionOptions, TimeOutcome, recognize_record};
 use fs2::FileExt;
 use lvu::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
 use lvu_core::{ChunkPosition, RawRecord, SourceId};
-use lvu_ingest::{RuntimeState, SourceHandle};
+use lvu_ingest::RuntimeState;
+use lvu_shared::AnySourceHandle;
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -415,7 +416,7 @@ impl LiveRowProvider {
 
     /// Registers one runtime generation. Re-registering the same SourceId fences
     /// old worker updates and invalidates its derived cache without stopping capture.
-    pub fn register_source(&self, handle: SourceHandle) -> Result<(), AdapterError> {
+    pub fn register_source(&self, handle: AnySourceHandle) -> Result<(), AdapterError> {
         let _ownership = self
             .artifact_ownership
             .lock()
@@ -1798,7 +1799,7 @@ struct WorkerInbox {
 }
 
 async fn source_worker(
-    handle: SourceHandle,
+    handle: AnySourceHandle,
     token: WorkerToken,
     artifact_dir: PathBuf,
     config: LiveConfig,
@@ -2144,7 +2145,7 @@ async fn source_worker(
 /// cancelled while waiting.
 #[allow(clippy::type_complexity)]
 async fn open_index(
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     token: WorkerToken,
     artifact: &Path,
     journal_identity: [u8; 16],
@@ -2243,7 +2244,7 @@ fn jittered(backoff: Duration, source: SourceId, attempt: u32) -> Duration {
 }
 
 async fn serve_and_emit(
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     token: WorkerToken,
     config: &LiveConfig,
     disk: &DiskService,
@@ -2293,7 +2294,7 @@ async fn emit(
 }
 
 async fn serve_request(
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     disk: &DiskService,
     config: &LiveConfig,
     request: &Request,
@@ -2359,7 +2360,7 @@ fn settled_index_state(
 }
 
 fn progress_update(
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     generation: u64,
     epoch: u64,
     indexed_records: u64,

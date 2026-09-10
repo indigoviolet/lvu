@@ -125,8 +125,8 @@ async fn merged(root: &TempDir) -> (SourceManager, SourceHandle, SourceHandle, N
     let (live, view) = configs(root);
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(api.clone()).unwrap();
-    adapter.register_source(worker.clone()).unwrap();
+    adapter.register_source(lvu_shared::AnySourceHandle::Local(api.clone())).unwrap();
+    adapter.register_source(lvu_shared::AnySourceHandle::Local(worker.clone())).unwrap();
     adapter
         .register_view("view", vec![api.source_id(), worker.source_id()])
         .unwrap();
@@ -234,8 +234,8 @@ async fn same_service(
     let (live, view) = configs(root);
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(api.clone()).unwrap();
-    adapter.register_source(worker.clone()).unwrap();
+    adapter.register_source(lvu_shared::AnySourceHandle::Local(api.clone())).unwrap();
+    adapter.register_source(lvu_shared::AnySourceHandle::Local(worker.clone())).unwrap();
     adapter
         .register_view("view", vec![api.source_id(), worker.source_id()])
         .unwrap();

@@ -87,7 +87,7 @@ async fn setup(root: &TempDir, contents: &str) -> (SourceManager, NativeViewAdap
     let raw: Arc<dyn RawRowSource> = Arc::new(LiveRowProvider::new(live).unwrap());
     let view = ViewConfig::new(root.path().join("view-index"));
     let mut adapter = NativeViewAdapter::with_raw_rows(Arc::clone(&raw), view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter.register_source(lvu_shared::AnySourceHandle::Local(handle.clone())).unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();

@@ -33,7 +33,7 @@ use lvu::{
     terminal::QueryDispatcher,
 };
 use lvu_core::SourceId;
-use lvu_ingest::SourceHandle;
+use lvu_shared::AnySourceHandle;
 use lvu_live::{IndexState, LiveRowProvider, SourceViewStatus};
 use lvu_query::{
     BatchQuery, BatchValidity, CompiledEnrichment, CompilerHost, CompilerHostConfig, DerivedState,
@@ -173,7 +173,7 @@ pub trait RawRowSource: Send + Sync {
         len: usize,
     ) -> lvu::ContextPage;
     fn revision(&self, view_id: &str) -> u64;
-    fn register_source(&self, handle: SourceHandle) -> Result<(), String>;
+    fn register_source(&self, handle: AnySourceHandle) -> Result<(), String>;
     fn register_raw_view(&self, view_id: &str, sources: Vec<SourceId>) -> Result<(), String>;
     fn drain_ready_updates(&self, maximum: usize) -> usize;
     fn source_status(&self, source_id: SourceId) -> Option<SourceViewStatus>;
@@ -202,7 +202,7 @@ impl RawRowSource for LiveRowProvider {
     fn revision(&self, view_id: &str) -> u64 {
         RowProvider::revision(self, view_id)
     }
-    fn register_source(&self, handle: SourceHandle) -> Result<(), String> {
+    fn register_source(&self, handle: AnySourceHandle) -> Result<(), String> {
         LiveRowProvider::register_source(self, handle).map_err(|error| error.to_string())
     }
     fn register_raw_view(&self, view_id: &str, sources: Vec<SourceId>) -> Result<(), String> {
@@ -344,7 +344,7 @@ pub struct ViewQueryStatus {
 
 #[derive(Clone)]
 struct SourceRegistration {
-    handle: SourceHandle,
+    handle: AnySourceHandle,
 }
 
 #[derive(Clone)]
@@ -1555,7 +1555,7 @@ impl NativeViewAdapter {
         self.refresh_stats.snapshot()
     }
 
-    pub fn register_source(&self, handle: SourceHandle) -> Result<(), ViewError> {
+    pub fn register_source(&self, handle: AnySourceHandle) -> Result<(), ViewError> {
         {
             let shared = self.shared.lock().expect("view state poisoned");
             if !shared.accepting {
@@ -3810,7 +3810,7 @@ fn run_query(
     config: &ViewConfig,
     compiler: &mut Option<CompilerHost>,
     request: QueryRequest,
-    sources: Vec<SourceHandle>,
+    sources: Vec<AnySourceHandle>,
     cancelled: Arc<AtomicBool>,
     command_results: Vec<Arc<CommandColumns>>,
     tx: &mpsc::SyncSender<Update>,
@@ -6747,7 +6747,7 @@ const STATS_AGGREGATE_RECORDS: usize = 65_536;
 fn field_stats_loop(
     request: FieldStatsRequest,
     membership: Option<Arc<Membership>>,
-    handles: Vec<SourceHandle>,
+    handles: Vec<AnySourceHandle>,
     page_records: usize,
     page_bytes: usize,
     tx: mpsc::SyncSender<Update>,
@@ -6797,7 +6797,7 @@ fn field_stats_pass(
     runtime: &tokio::runtime::Runtime,
     request: &FieldStatsRequest,
     membership: Option<&Membership>,
-    handles: &[SourceHandle],
+    handles: &[AnySourceHandle],
     page_records: usize,
     page_bytes: usize,
     cancel: &Arc<AtomicBool>,
@@ -6904,7 +6904,7 @@ fn field_stats_pass(
 
 fn correlation_lookup_loop(
     request: CorrelationLookupRequest,
-    handles: Vec<SourceHandle>,
+    handles: Vec<AnySourceHandle>,
     tx: mpsc::SyncSender<Update>,
     cancel: Arc<AtomicBool>,
 ) {
@@ -6936,7 +6936,7 @@ fn correlation_lookup_loop(
 fn correlation_lookup(
     runtime: &tokio::runtime::Runtime,
     request: &CorrelationLookupRequest,
-    handles: &[SourceHandle],
+    handles: &[AnySourceHandle],
     cancel: &Arc<AtomicBool>,
 ) -> Result<CorrelationCandidate, String> {
     let origin = handles
@@ -6970,7 +6970,7 @@ fn correlation_lookup(
 /// bytes. The displayed string is a projection and is never used here.
 fn correlation_origin_value(
     runtime: &tokio::runtime::Runtime,
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     request: &CorrelationLookupRequest,
     cancel: &Arc<AtomicBool>,
 ) -> Result<lvu_core::ExactScalar, String> {
@@ -7016,7 +7016,7 @@ fn correlation_origin_value(
 /// when the sample stopped early instead of implying it saw everything.
 fn correlation_field_names(
     runtime: &tokio::runtime::Runtime,
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(Vec<String>, bool), String> {
     let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();

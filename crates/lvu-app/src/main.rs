@@ -278,7 +278,7 @@ enum SourceArgument {
 struct StartedSource {
     definition: SourceDefinition,
     view_id: String,
-    handle: SourceHandle,
+    handle: lvu_shared::AnySourceHandle,
     origin: Option<StartOrigin>,
 }
 
@@ -3208,7 +3208,9 @@ impl Composition {
                 .get(&id)
                 .map_or_else(|| id.0.to_string(), |definition| definition.name.clone());
             app.action_notice = Some(match result {
-                Ok(Some(handle)) => match adapter.register_source(handle.clone()) {
+                Ok(Some(handle)) => match adapter
+                    .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+                {
                     Ok(()) => format!("{name}: capture restarted; existing views retained"),
                     Err(error) => {
                         // A launched capture remains manager-owned until graceful cleanup settles.
@@ -5002,7 +5004,7 @@ impl Composition {
                 Ok(handle) => Ok(StartedSource {
                     definition,
                     view_id,
-                    handle,
+                    handle: lvu_shared::AnySourceHandle::Local(handle),
                     origin: Some(origin.clone()),
                 }),
                 Err(error) => Err(StartFailure {
@@ -8026,7 +8028,7 @@ async fn resume_definition(
     Ok(StartedSource {
         definition,
         view_id,
-        handle,
+        handle: lvu_shared::AnySourceHandle::Local(handle),
         origin: None,
     })
 }
@@ -8043,7 +8045,7 @@ async fn start_definition(
     Ok(StartedSource {
         definition,
         view_id,
-        handle,
+        handle: lvu_shared::AnySourceHandle::Local(handle),
         origin: None,
     })
 }
@@ -8061,7 +8063,7 @@ async fn start_stdin_definition(
     Ok(StartedSource {
         definition,
         view_id,
-        handle,
+        handle: lvu_shared::AnySourceHandle::Local(handle),
         origin: None,
     })
 }

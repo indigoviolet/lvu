@@ -5,7 +5,7 @@ pub use assistance::*;
 
 use super::{CommandColumns, Membership, NativeViewAdapter, Published, ViewError};
 use lvu_core::{InvestigationId, RawRecord, SourceId};
-use lvu_ingest::SourceHandle;
+use lvu_shared::AnySourceHandle;
 use lvu_query::{
     AtomicParquetPartWriter, BatchQuery, BatchValidity, DerivedState, EnrichmentStage,
     ParquetWriteBudget, SchemaContext, execute_batch, records_to_batch_with_context,
@@ -283,7 +283,7 @@ struct FrozenSource {
     id: SourceId,
     generation: u64,
     high_watermark: Option<u64>,
-    handle: SourceHandle,
+    handle: AnySourceHandle,
 }
 
 #[derive(Clone)]
