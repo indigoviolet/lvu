@@ -1781,6 +1781,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvu-shared"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "lvu-view"
 version = "0.1.0"
 dependencies = [
