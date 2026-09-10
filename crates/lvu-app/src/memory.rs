@@ -429,7 +429,7 @@ impl SharedMemory {
     /// Serve `store` on a dedicated thread with its own runtime (never a
     /// nested one): the sync method surface below stays callable from any
     /// context, exactly like `MemoryWorker`.
-    pub fn wrap(store: crate::shared_capture::SharedStore) -> Self {
+    pub fn wrap(store: std::sync::Arc<crate::shared_capture::SharedStore>) -> Self {
         let (tx, commands) = mpsc::sync_channel(QUEUE_CAPACITY);
         let (events, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -644,7 +644,7 @@ impl SharedMemory {
 /// sequences) resolves every accepted command exactly once, just later
 /// and elsewhere than local.
 fn shared_worker(
-    store: crate::shared_capture::SharedStore,
+    store: std::sync::Arc<crate::shared_capture::SharedStore>,
     commands: Receiver<Command>,
     events: SyncSender<Event>,
 ) {
@@ -2952,7 +2952,7 @@ mod tests {
     async fn shared_fixture(
         root: &std::path::Path,
         pid: u32,
-    ) -> crate::shared_capture::SharedStore {
+    ) -> std::sync::Arc<crate::shared_capture::SharedStore> {
         let capture_root = root.join("captures");
         let paths = lvu_shared::WorkerPaths::new(&capture_root);
         paths.ensure_directories().unwrap();
@@ -2977,7 +2977,7 @@ mod tests {
         )
         .await
         .expect("window attaches");
-        crate::shared_capture::SharedStore::from_client(client)
+        std::sync::Arc::new(crate::shared_capture::SharedStore::from_client(client))
     }
 
     async fn poll_until(
@@ -2986,10 +2986,10 @@ mod tests {
         mut want: impl FnMut(&Event) -> bool,
     ) -> Event {
         loop {
-            if let Some(event) = memory.poll() {
-                if want(&event) {
-                    return event;
-                }
+            if let Some(event) = memory.poll()
+                && want(&event)
+            {
+                return event;
             }
             assert!(
                 Instant::now() < deadline,

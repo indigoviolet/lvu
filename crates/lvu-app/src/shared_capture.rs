@@ -294,6 +294,17 @@ impl SharedStore {
             .is_some_and(|(task, _)| !task.is_finished())
     }
 
+    /// Whether this session owns the source's capture (worker-started
+    /// and not stopped): the routing predicate for stop/restart paths.
+    /// Locally acquired sources (stdin, or any pre-shared flow) are never
+    /// owned here and keep their manager paths.
+    pub fn owns_source(&self, source_id: SourceId) -> bool {
+        self.handles
+            .lock()
+            .expect("shared handles poisoned")
+            .contains_key(&source_id)
+    }
+
     /// Explicit stop of a worker-owned capture. Its feeder is dropped
     /// first (no more ticks for a dead capture), then the worker stops
     /// it; a final best-effort poll publishes the terminal snapshot into
@@ -378,10 +389,12 @@ impl SharedStore {
     /// Bounded shutdown drain: every feeder aborts first (no ticks race
     /// the goodbye), then flush, goodbye, bounded close wait through the
     /// shared client (no single owner can drop it while feeders reference
-    /// it), viewer lock released on drop. A flush failure returns before
-    /// goodbye (no detach on a failed drain); dropping the store detaches
-    /// via EOF either way.
-    pub async fn drain_and_detach(self) -> Result<(), String> {
+    /// it), viewer lock released on drop. Takes `&self` so session Arc
+    /// holders share one drain path; a repeated call fails honestly at
+    /// the flush against the closed connection. A flush failure returns
+    /// before goodbye (no detach on a failed drain); dropping the store
+    /// detaches via EOF either way.
+    pub async fn drain_and_detach(&self) -> Result<(), String> {
         // Signal every feeder first so no new ticks start; each is then
         // awaited through at most one bounded in-flight exchange. Feeders
         // that will not exit are aborted, and a retired transport then

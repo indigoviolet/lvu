@@ -7714,7 +7714,7 @@ async fn run() -> Result<(), String> {
         let window_id = lvu_shared::default_window_id();
         let shared =
             shared_capture::SharedStore::startup(&executable, &capture_dir, &window_id).await?;
-        memory::Memory::Shared(memory::SharedMemory::wrap(shared))
+        memory::Memory::Shared(memory::SharedMemory::wrap(std::sync::Arc::new(shared)))
     };
     let command_presentation = command_rows::CommandPresentation::default();
     let command_controller = command_controller::CommandController::new(
