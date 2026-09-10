@@ -136,9 +136,9 @@ fn acquisition_identical(live: &lvu_core::Acquisition, proposed: &lvu_core::Acqu
 }
 
 /// Run the child to completion on a fresh single-threaded runtime and
-/// return the process exit code. The caller (`main`) exits with it without
-/// running any application startup: by the time this returns, captures are
-/// stopped and the socket is unlinked.
+/// return the process exit code. For binaries without a runtime (the test
+/// harness). Binaries that already run inside a runtime must call
+/// [`run_child`] instead: building a second runtime inside one panics.
 pub fn run_child_blocking(args: ChildArgs) -> i32 {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -150,13 +150,14 @@ pub fn run_child_blocking(args: ChildArgs) -> i32 {
             return crate::spawn::exit::STARTUP;
         }
     };
-    runtime.block_on(serve_child(args))
+    runtime.block_on(run_child(args))
 }
 
 /// Validate, elect, bind, resume, serve, drain, unlink. Each phase reports
 /// its own exit code; only `CLEAN` means drained viewers, stopped captures,
-/// and an unlinked socket.
-async fn serve_child(args: ChildArgs) -> i32 {
+/// and an unlinked socket. Async so a host binary with its own runtime
+/// (the application) awaits it directly instead of nesting runtimes.
+pub async fn run_child(args: ChildArgs) -> i32 {
     use crate::spawn::exit;
 
     if !args.capture_root.is_absolute() {

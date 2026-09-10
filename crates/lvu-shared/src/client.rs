@@ -46,6 +46,30 @@ pub const STORE_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(60);
 /// reasoning as [`STORE_ROUNDTRIP_TIMEOUT`], one shared bound.
 pub const CONTROL_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Total bound for [`WorkerClient::attach`]: one full handshake plus a
+/// replacement election and child startup when the first attempt meets a
+/// stale socket or a still-starting worker.
+pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How a connect attempt failed: transport trouble (retryable within
+/// [`ATTACH_TIMEOUT`]) or an explicit worker refusal / reply-shape skew
+/// (deterministic, never retried).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectError {
+    Transport(String),
+    Refused(String),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::Transport(reason) | ConnectError::Refused(reason) => {
+                write!(formatter, "{reason}")
+            }
+        }
+    }
+}
+
 /// Default window identity: `window-<pid>`, matching the convention the
 /// worker tests and presence reporting use. Unique per window process.
 pub fn default_window_id() -> String {
@@ -75,8 +99,9 @@ pub enum StartOutcome {
 
 /// Ensure exactly one worker is elected for `capture_root`, spawning the
 /// child when the election is empty, and return the control socket path.
-/// A stale socket file (crashed worker) is unlinked only after proving the
-/// owner dead, so a slow-starting live worker is never robbed of its bind.
+/// The returned path may still be a stale socket file (crashed owner) or
+/// pre-bind: the child unlinks the stale file after winning the election,
+/// and callers confirm liveness with a handshake, never the path alone.
 /// Bounded by [`crate::WORKER_HANDSHAKE_TIMEOUT`]; races between two
 /// spawners resolve through the election (the loser attaches).
 pub async fn ensure_worker(executable: &Path, capture_root: &Path) -> Result<PathBuf, String> {
@@ -168,6 +193,7 @@ pub struct WorkerClient {
     writer: tokio::net::unix::OwnedWriteHalf,
     decoder: FrameDecoder,
     window_id: String,
+    worker_pid: u32,
     next_request: u64,
     read_buf: Vec<u8>,
     _viewer: ViewerGuard,
@@ -175,8 +201,13 @@ pub struct WorkerClient {
 
 impl WorkerClient {
     /// Attach-or-spawn then connect: the full cold-start flow in one call.
-    /// On connect/hello failure the election is re-ensured once (a stale
-    /// socket from a crashed worker resolves this way) before giving up.
+    /// The first attempt is one ensure plus one full-handshake connect.
+    /// Transport failures after that (stale socket from a dead owner, or a
+    /// replacement still binding) re-ensure and retry with short attempts
+    /// until [`ATTACH_TIMEOUT`]: each round re-runs the election, so a dead
+    /// owner yields a freshly spawned worker whose first act is unlinking
+    /// the stale file. Explicit refusals and reply-shape skew return
+    /// immediately — retrying those would only burn the deadline.
     /// `window_pid` identifies this window's viewer slot and handshake;
     /// pass `std::process::id()` unless driving several logical windows
     /// from one process (as integration tests do).
@@ -186,16 +217,40 @@ impl WorkerClient {
         window_id: &str,
         window_pid: u32,
     ) -> Result<(Self, Vec<SourceSummary>), String> {
+        let start = Instant::now();
+        let deadline = start + ATTACH_TIMEOUT;
         let socket = ensure_worker(executable, capture_root).await?;
         match Self::connect(capture_root, &socket, window_id, window_pid).await {
             Ok(attached) => Ok(attached),
-            Err(first) => {
-                // Possibly a stale socket: re-ensure (unblocks election of
-                // a replacement) and retry exactly once, then report both.
-                let socket = ensure_worker(executable, capture_root).await?;
-                Self::connect(capture_root, &socket, window_id, window_pid)
+            Err(ConnectError::Refused(reason)) => Err(reason),
+            Err(ConnectError::Transport(first)) => {
+                let mut last = first;
+                while Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let socket = match ensure_worker(executable, capture_root).await {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            last = error;
+                            continue;
+                        }
+                    };
+                    match Self::connect_with_timeout(
+                        capture_root,
+                        &socket,
+                        window_id,
+                        window_pid,
+                        Duration::from_secs(1),
+                    )
                     .await
-                    .map_err(|second| format!("worker attach failed: {first}; retry: {second}"))
+                    {
+                        Ok(attached) => return Ok(attached),
+                        Err(ConnectError::Refused(reason)) => return Err(reason),
+                        Err(ConnectError::Transport(error)) => last = error,
+                    }
+                }
+                Err(format!(
+                    "worker attach failed within {ATTACH_TIMEOUT:?}: {last}"
+                ))
             }
         }
     }
@@ -208,29 +263,44 @@ impl WorkerClient {
         socket_path: &Path,
         window_id: &str,
         window_pid: u32,
-    ) -> Result<(Self, Vec<SourceSummary>), String> {
-        let paths = WorkerPaths::new(capture_root);
-        let viewer = take_viewer_lock(&paths, window_pid)
-            .map_err(|error| format!("viewer lock: {error}"))?;
-        let stream = tokio::time::timeout(
+    ) -> Result<(Self, Vec<SourceSummary>), ConnectError> {
+        Self::connect_with_timeout(
+            capture_root,
+            socket_path,
+            window_id,
+            window_pid,
             crate::WORKER_HANDSHAKE_TIMEOUT,
-            UnixStream::connect(socket_path),
         )
         .await
-        .map_err(|_| {
-            format!(
-                "no worker answered at {} within {:?}",
-                socket_path.display(),
-                crate::WORKER_HANDSHAKE_TIMEOUT
-            )
-        })?
-        .map_err(|error| format!("connect {}: {error}", socket_path.display()))?;
+    }
+
+    async fn connect_with_timeout(
+        capture_root: &Path,
+        socket_path: &Path,
+        window_id: &str,
+        window_pid: u32,
+        timeout: Duration,
+    ) -> Result<(Self, Vec<SourceSummary>), ConnectError> {
+        use ConnectError::{Refused, Transport};
+        let paths = WorkerPaths::new(capture_root);
+        let viewer = take_viewer_lock(&paths, window_pid)
+            .map_err(|error| Transport(format!("viewer lock: {error}")))?;
+        let stream = tokio::time::timeout(timeout, UnixStream::connect(socket_path))
+            .await
+            .map_err(|_| {
+                Transport(format!(
+                    "no worker answered at {} within {timeout:?}",
+                    socket_path.display()
+                ))
+            })?
+            .map_err(|error| Transport(format!("connect {}: {error}", socket_path.display())))?;
         let (reader, writer) = stream.into_split();
         let mut client = Self {
             reader: BufReader::new(reader),
             writer,
             decoder: FrameDecoder::new(),
             window_id: window_id.to_owned(),
+            worker_pid: 0,
             next_request: 0,
             read_buf: vec![0u8; crate::READ_CHUNK_BYTES],
             _viewer: viewer,
@@ -244,23 +314,36 @@ impl WorkerClient {
                     window_id: window_id.to_owned(),
                     protocol: PROTOCOL_VERSION,
                 },
-                crate::WORKER_HANDSHAKE_TIMEOUT,
+                timeout,
             )
-            .await?;
+            .await
+            .map_err(Transport)?;
         match reply.as_slice() {
             [
                 WorkerEvent::Welcome {
-                    protocol, sources, ..
+                    worker_pid,
+                    protocol,
+                    sources,
+                    ..
                 },
-            ] if *protocol == PROTOCOL_VERSION => Ok((client, sources.clone())),
-            [WorkerEvent::Welcome { protocol, .. }] => Err(format!(
-                "worker speaks protocol {protocol}, this client speaks {PROTOCOL_VERSION}"
-            )),
-            [WorkerEvent::Refused { reason, .. }] => {
-                Err(format!("worker refused attach: {reason}"))
+            ] if *protocol == PROTOCOL_VERSION => {
+                client.worker_pid = *worker_pid;
+                Ok((client, sources.clone()))
             }
-            other => Err(format!("unexpected attach reply: {other:?}")),
+            [WorkerEvent::Welcome { protocol, .. }] => Err(Refused(format!(
+                "worker speaks protocol {protocol}, this client speaks {PROTOCOL_VERSION}"
+            ))),
+            [WorkerEvent::Refused { reason, .. }] => {
+                Err(Refused(format!("worker refused attach: {reason}")))
+            }
+            other => Err(Refused(format!("unexpected attach reply: {other:?}"))),
         }
+    }
+
+    /// The worker process id from the handshake welcome. Useful for
+    /// diagnostics (and for proving a replacement worker took over).
+    pub fn worker_pid(&self) -> u32 {
+        self.worker_pid
     }
 
     fn take_request_id(&mut self) -> String {
@@ -520,10 +603,14 @@ impl WorkerClient {
         }
     }
 
-    /// Bounded shutdown drain: flush, say goodbye, wait for the close
-    /// (bounded), then drop the viewer lock by consuming `self`. The worker
-    /// removes the viewer on EOF either way, so this converges even if the
-    /// goodbye frame is lost — the wait is courtesy, not consensus.
+    /// Bounded shutdown drain: flush first, and a flush failure returns
+    /// BEFORE goodbye is sent — a failed drain does not detach, so the
+    /// caller keeps the client and can surface or retry instead of
+    /// abandoning state the worker may still hold unwritten. On flush
+    /// success, say goodbye and wait for the close (bounded), then drop
+    /// the viewer lock by consuming `self`. Detach needs no goodbye: the
+    /// worker removes the viewer on EOF either way, so dropping the client
+    /// (or crashing) detaches — the wait here is courtesy, not consensus.
     pub async fn shutdown(mut self) -> Result<(), String> {
         self.flush().await?;
         let request_id = self.take_request_id();

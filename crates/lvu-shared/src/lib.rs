@@ -25,10 +25,10 @@ pub mod spawn;
 pub mod tail;
 pub mod worker;
 
-pub use child::{ChildArgs, parse_child_args, run_child_blocking};
+pub use child::{ChildArgs, parse_child_args, run_child, run_child_blocking};
 pub use client::{
-    CONTROL_ROUNDTRIP_TIMEOUT, STORE_ROUNDTRIP_TIMEOUT, StartOutcome, WorkerClient,
-    child_argv_tail, default_window_id, ensure_worker,
+    ATTACH_TIMEOUT, CONTROL_ROUNDTRIP_TIMEOUT, ConnectError, STORE_ROUNDTRIP_TIMEOUT, StartOutcome,
+    WorkerClient, child_argv_tail, default_window_id, ensure_worker,
 };
 pub use election::{
     ElectionError, OwnerGuard, ViewerGuard, WorkerPaths, live_viewers, owner_is_live,

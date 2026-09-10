@@ -271,9 +271,9 @@ async fn two_windows_share_one_capture_through_real_worker() {
         Err(_) => panic!("two-window scenario exceeded 120s"),
     };
     let _scratch = scratch;
-    // Reap is by KillOnDrop in the outer scope is impossible here (moved);
-    // instead poll the socket's owner indirectly: the worker unlinks the
-    // socket on clean shutdown, so wait for that, then confirm the log.
+    // The worker unlinks its socket on clean shutdown: poll for that, then
+    // confirm the log. The owner child is untracked (ensure_worker spawned
+    // it detached); it exits by itself past grace, so no reap is needed.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if !socket_path.exists() {
@@ -289,4 +289,88 @@ async fn two_windows_share_one_capture_through_real_worker() {
         log_text.contains("clean shutdown"),
         "worker log must record clean shutdown: {log_text:?}"
     );
+}
+
+/// A killed worker leaves its socket file stale with no live owner. The
+/// next attach must elect a replacement (which unlinks the stale file and
+/// binds) and come back with a welcome from the NEW worker — not reuse the
+/// dead file, and not fail on the first refused connect. The replacement is
+/// then proven functional with a real start and a mediated save, which also
+/// proves the workspace store recovered from the kill.
+#[tokio::test]
+async fn attach_recovers_stale_socket_after_dead_owner() {
+    let scenario = tokio::time::timeout(Duration::from_secs(120), async {
+        let root = tempfile::tempdir().expect("scratch root");
+        let capture_root = root.path().join("captures");
+        let paths = WorkerPaths::new(&capture_root);
+        let bin = worker_bin();
+
+        // Window A elects and attaches a live worker.
+        let (first, _) = WorkerClient::attach(&bin, &capture_root, "window-a", 4201)
+            .await
+            .expect("window A attaches");
+        let dead_pid = first.worker_pid();
+        assert_ne!(dead_pid, 0);
+
+        // Kill without cleanup: the socket file stays stale while the
+        // election lock releases in-kernel on process death.
+        let killed = unsafe { libc::kill(dead_pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(killed, 0, "kill worker {dead_pid}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if !lvu_shared::owner_is_live(&paths).expect("probe election") {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dead worker still holds the election");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            paths.socket_path().exists(),
+            "dead worker leaves a stale socket file"
+        );
+        // Dropping detaches (EOF): no goodbye is possible to a dead worker.
+        drop(first);
+
+        // Window B attaches through the stale file.
+        let (mut second, _) = WorkerClient::attach(&bin, &capture_root, "window-b", 4202)
+            .await
+            .expect("window B recovers through the stale socket");
+        assert_ne!(
+            second.worker_pid(),
+            dead_pid,
+            "a replacement worker serves, not the dead file"
+        );
+
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\n").expect("seed log");
+        let definition = file_definition(31, &log);
+        match second
+            .request_start(&definition)
+            .await
+            .expect("start on the replacement")
+        {
+            StartOutcome::Started { source_id, .. } => assert_eq!(source_id, definition.id),
+            StartOutcome::StdinBound { .. } => panic!("file start must not bind stdin"),
+        }
+        let view = lvu_core::ViewId(uuid::Uuid::from_u128(32));
+        match second
+            .store(save_method("window-b", 1, &definition, view, None))
+            .await
+            .expect("save on the replacement")
+        {
+            StoreEvent::Saved { version: 0, .. } => {}
+            other => panic!("expected version 0, got {other:?}"),
+        }
+        second.shutdown().await.expect("window B drains");
+        // Hold the scratch tree until the drain lands; the replacement
+        // worker exits on its own grace afterwards.
+        root
+    })
+    .await;
+    let _scratch = match scenario {
+        Ok(root) => root,
+        Err(_) => panic!("stale-socket scenario exceeded 120s"),
+    };
 }
