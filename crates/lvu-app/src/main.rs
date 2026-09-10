@@ -5148,8 +5148,14 @@ impl Composition {
             // acquisition per definition across all windows, with the
             // feeder started alongside. Local manager start otherwise.
             let worker = shared.filter(|_| shared_capture::worker_route(true, &definition));
+            // Originating window cwd for worker-side path resolution; an
+            // unreadable cwd fails closed for relative input inside.
+            let origin_cwd = env::current_dir().ok();
             let result = match worker {
-                Some(session) => match session.start_source(&definition).await {
+                Some(session) => match session
+                    .start_source(&definition, origin_cwd.as_deref())
+                    .await
+                {
                     Ok(started) => Ok(StartedSource {
                         definition,
                         view_id,
@@ -8228,8 +8234,9 @@ async fn resume_definition(
         // the same path and cannot double-acquire. Stdin never routes
         // here (see `worker_route`).
         let shared = shared.expect("worker route needs a session");
+        let origin_cwd = env::current_dir().ok();
         let started = shared
-            .start_source(&definition)
+            .start_source(&definition, origin_cwd.as_deref())
             .await
             .map_err(|error| format!("resume {name} on shared worker: {error}"))?;
         return Ok(StartedSource {
@@ -8258,8 +8265,9 @@ async fn start_definition(
     let view_id = view_id(definition.id);
     if shared_capture::worker_route(shared.is_some(), &definition) {
         let shared = shared.expect("worker route needs a session");
+        let origin_cwd = env::current_dir().ok();
         let started = shared
-            .start_source(&definition)
+            .start_source(&definition, origin_cwd.as_deref())
             .await
             .map_err(|error| format!("start {} on shared worker: {}", definition.name, error))?;
         return Ok(StartedSource {

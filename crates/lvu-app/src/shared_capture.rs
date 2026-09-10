@@ -62,7 +62,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lvu::{RecipeRequestMeta, app::RecipeOutcome};
-use lvu_core::{Acquisition, SourceDefinition, SourceId, ViewId};
+use lvu_core::{Acquisition, CommandProgram, SourceDefinition, SourceId, ViewId};
 use lvu_shared::{
     SaveBases, StartOutcome, StoreEvent, StoreMethod, SuggestionContextShape,
     SuggestionOutcomeShape, WorkerClient,
@@ -81,45 +81,102 @@ pub fn worker_route(session_present: bool, definition: &SourceDefinition) -> boo
 }
 
 /// Window-side path contract for worker acquisition (cross-layer,
-/// coordinated with a8's worker boundary): relative paths resolve against
-/// the ORIGINATING window's cwd BEFORE any RPC, because the worker process
-/// has no window cwd and one worker serves windows with different cwds.
+/// coordinated with the worker/admission owner): relative paths resolve
+/// against the ORIGINATING window's cwd BEFORE any RPC, because the worker
+/// process has no window cwd and one worker serves windows with different
+/// cwds. The wire guarantees the worker can rely on are exact:
+/// - `Acquisition::File.path` is always absolute on the wire, unless the
+///   window itself cannot read its cwd — then the start fails HERE with an
+///   actionable error naming the path (never a cwd-ambiguous RPC for the
+///   worker to guess at).
+/// - `Acquisition::Command.cwd` is always `Some(absolute)` on the wire,
+///   with one degraded exception: `None` stays `None` only when the window
+///   cannot read its cwd (local-spawn parity — a local spawn would inherit
+///   an unreadable cwd too). In particular `None` on the wire never means
+///   "worker cwd preferred"; a worker that cannot accept an unspecified
+///   cwd should reject it rather than spawn worker-relative.
+/// - `CommandProgram::Exec` executables: bare names (`tool`, no separator)
+///   keep PATH semantics verbatim; explicit relative programs with a
+///   separator (`./tool`, `bin/tool`) anchor against the EFFECTIVE command
+///   cwd above (absolute whenever the origin is known); absolute programs
+///   pass through. When the effective cwd is unknown the start fails here
+///   actionably instead of sending a program the worker would interpret
+///   against its own cwd.
+/// - `Shell` text is never rewritten (the shell interprets it under the
+///   effective cwd); `Stdin`/`Http` carry no filesystem path.
+///
 /// The same lexical relative path from different cwds therefore arrives as
 /// different absolute paths and can never reuse the wrong file; the local
 /// spelling is preserved untouched (definitions, notices, session files
 /// keep the user's expression — each acquisition re-resolves in its own
-/// acquiring window). Absolute paths pass through verbatim, so this is
-/// compatible with every worker-side choice: reject-relative validation,
-/// capture-root joins, or identity fingerprinting all see absolute input.
-/// Identity is preserved by construction: resolution never touches
-/// `SourceId` (the worker's Present/dedup answers with the canonical id),
-/// restart addresses the worker-remembered absolute definition by id
-/// (never resends a path), and record identities stay worker-side
-/// journal offsets. `Acquisition::Stdin`/`Http` carry no filesystem path.
-/// NOTE (for a8): `Exec` program paths are deliberately NOT rewritten
-/// here — bare names are PATH lookups and `./x` spellings are spawn
-/// semantics owned worker-side; only the capture file and the command
-/// working directory (plainly "which file/dir") resolve here.
-fn resolve_for_worker(definition: &SourceDefinition, cwd: &Path) -> SourceDefinition {
+/// acquiring window). Identity is preserved by construction: resolution
+/// never touches `SourceId` (the worker's Present/dedup answers with the
+/// canonical id), restart addresses the worker-remembered absolute
+/// definition by id (never resends a path), and record identities stay
+/// worker-side journal offsets.
+fn resolve_for_worker(
+    definition: &SourceDefinition,
+    cwd: Option<&Path>,
+) -> Result<SourceDefinition, String> {
     let mut effective = definition.clone();
     match &mut effective.acquisition {
         Acquisition::File { path, .. } => {
             if path.is_relative() {
-                *path = cwd.join(&*path);
+                match cwd {
+                    Some(origin) => *path = origin.join(&*path),
+                    None => {
+                        return Err(format!(
+                            "shared capture cannot resolve relative file path '{}': originating window cwd is unavailable; retry with an absolute path",
+                            path.display()
+                        ));
+                    }
+                }
             }
         }
         Acquisition::Command { command } => {
-            let resolved = match &command.cwd {
-                Some(dir) if dir.is_relative() => Some(cwd.join(dir)),
-                _ => None,
+            // Effective cwd: explicit absolute kept; explicit relative
+            // joined to the origin; None MEANS the origin window cwd and is
+            // filled in so the wire definition carries it explicitly.
+            let effective_cwd: Option<PathBuf> = match (&command.cwd, cwd) {
+                (Some(dir), _) if !dir.is_relative() => Some(dir.clone()),
+                (Some(dir), Some(origin)) => Some(origin.join(dir)),
+                (None, Some(origin)) => Some(origin.to_path_buf()),
+                (Some(dir), None) => {
+                    return Err(format!(
+                        "shared capture cannot resolve relative command cwd '{}': originating window cwd is unavailable; retry with an absolute cwd",
+                        dir.display()
+                    ));
+                }
+                (None, None) => None,
             };
-            if let Some(dir) = resolved {
-                command.cwd = Some(dir);
+            command.cwd = effective_cwd.clone();
+            // Bare program names keep PATH semantics; only explicit
+            // path-like programs anchor against the effective cwd.
+            if let CommandProgram::Exec { executable, .. } = &mut command.program
+                && executable.is_relative()
+                && has_separator(executable)
+            {
+                match &effective_cwd {
+                    Some(base) => *executable = base.join(&*executable),
+                    None => {
+                        return Err(format!(
+                            "shared capture cannot anchor relative program '{}': command cwd and originating window cwd are both unavailable; retry with an absolute program path",
+                            executable.display()
+                        ));
+                    }
+                }
             }
         }
         Acquisition::Stdin | Acquisition::Http { .. } => {}
     }
-    effective
+    Ok(effective)
+}
+
+/// A path is "explicitly path-like" when it names more than one
+/// component: `./tool` (CurDir + Normal) and `bin/tool` anchor against a
+/// directory, while a bare `tool` is a PATH lookup and stays verbatim.
+fn has_separator(path: &Path) -> bool {
+    path.components().count() > 1
 }
 
 /// A worker-owned capture, ready for adapter input: the identity the worker
@@ -210,19 +267,19 @@ impl SharedStore {
     /// worker-side and the live capture is re-presented, never double-started.
     /// On success a feeder task starts keeping the handle's progress cache
     /// fresh on the blocking lane; stopping replaces it (see `stop_source`).
+    /// `origin` is the originating window's cwd, read by the caller as
+    /// `std::env::current_dir().ok()`: `None` means the origin is unknown
+    /// and only provably independent input proceeds — relative paths fail
+    /// here actionably before any RPC (see `resolve_for_worker`). Threading
+    /// the origin as a parameter instead of reading the process cwd inside
+    /// keeps acquisition parallel-testable: two origins are just two paths,
+    /// never a process-global directory change.
     pub async fn start_source(
         &self,
         definition: &SourceDefinition,
+        origin: Option<&Path>,
     ) -> Result<SharedSource, String> {
-        // The worker never sees a relative path from this window: resolve
-        // first (see `resolve_for_worker`). A window that cannot read its
-        // own cwd forwards the definition unchanged and lets the worker's
-        // absolute-path validation refuse it loudly — failing closed beats
-        // a cwd-ambiguous acquisition.
-        let effective = match std::env::current_dir() {
-            Ok(cwd) => resolve_for_worker(definition, &cwd),
-            Err(_) => definition.clone(),
-        };
+        let effective = resolve_for_worker(definition, origin)?;
         let started = match self.client.lock().await.request_start(&effective).await? {
             StartOutcome::Started {
                 source_id,
@@ -950,12 +1007,13 @@ mod tests {
 
     /// The cross-layer path contract, unit-tested without touching the
     /// process cwd: the pure function takes an explicit originating
-    /// directory, so two windows are just two cwds. The live call site
-    /// passes `current_dir` and fails closed when it cannot read it.
+    /// directory, so two windows are just two cwds. The live call sites
+    /// pass `current_dir().ok()` and fail closed when it is unreadable.
     #[test]
     fn resolve_for_worker_joins_relative_file_against_origin_cwd() {
         let definition = test_definition(11, Path::new("logs/app.log"));
-        let effective = resolve_for_worker(&definition, Path::new("/win/a"));
+        let effective =
+            resolve_for_worker(&definition, Some(Path::new("/win/a"))).expect("resolvable");
         match &effective.acquisition {
             lvu_core::Acquisition::File { path, follow } => {
                 assert_eq!(path, &PathBuf::from("/win/a/logs/app.log"));
@@ -976,8 +1034,10 @@ mod tests {
     #[test]
     fn resolve_for_worker_same_spelling_from_different_cwds_diverges() {
         let definition = test_definition(12, Path::new("f.log"));
-        let from_a = resolve_for_worker(&definition, Path::new("/win/a"));
-        let from_b = resolve_for_worker(&definition, Path::new("/win/b"));
+        let from_a =
+            resolve_for_worker(&definition, Some(Path::new("/win/a"))).expect("resolvable");
+        let from_b =
+            resolve_for_worker(&definition, Some(Path::new("/win/b"))).expect("resolvable");
         let path_a = match &from_a.acquisition {
             lvu_core::Acquisition::File { path, .. } => path.clone(),
             other => panic!("expected file acquisition, saw {other:?}"),
@@ -994,12 +1054,14 @@ mod tests {
     fn resolve_for_worker_leaves_absolute_and_pathless_kinds_verbatim() {
         let dir = std::env::temp_dir();
         let absolute = test_definition(13, &dir.join("abs.log"));
-        let untouched = resolve_for_worker(&absolute, Path::new("/win/a"));
+        let untouched =
+            resolve_for_worker(&absolute, Some(Path::new("/win/a"))).expect("resolvable");
         assert_eq!(absolute.acquisition, untouched.acquisition);
 
         let mut stdin = absolute.clone();
         stdin.acquisition = lvu_core::Acquisition::Stdin;
-        let still_stdin = resolve_for_worker(&stdin, Path::new("/win/a"));
+        let still_stdin =
+            resolve_for_worker(&stdin, Some(Path::new("/win/a"))).expect("resolvable");
         assert_eq!(still_stdin.acquisition, lvu_core::Acquisition::Stdin);
     }
 
@@ -1017,7 +1079,8 @@ mod tests {
                 restart: Default::default(),
             },
         };
-        let effective = resolve_for_worker(&definition, Path::new("/win/a"));
+        let effective =
+            resolve_for_worker(&definition, Some(Path::new("/win/a"))).expect("resolvable");
         match &effective.acquisition {
             lvu_core::Acquisition::Command { command } => {
                 assert_eq!(command.cwd, Some(PathBuf::from("/win/a/subdir")));
@@ -1035,13 +1098,367 @@ mod tests {
         if let lvu_core::Acquisition::Command { command } = &mut absolute_cwd.acquisition {
             command.cwd = Some(PathBuf::from("/elsewhere"));
         }
-        let kept = resolve_for_worker(&absolute_cwd, Path::new("/win/a"));
+        let kept =
+            resolve_for_worker(&absolute_cwd, Some(Path::new("/win/a"))).expect("resolvable");
         match &kept.acquisition {
             lvu_core::Acquisition::Command { command } => {
                 assert_eq!(command.cwd, Some(PathBuf::from("/elsewhere")))
             }
             other => panic!("expected command acquisition, saw {other:?}"),
         }
+    }
+
+    fn test_command_definition(
+        id: u128,
+        program: lvu_core::CommandProgram,
+        cwd: Option<PathBuf>,
+    ) -> SourceDefinition {
+        let dir = std::env::temp_dir();
+        let mut definition = test_definition(id, &dir.join("cmd.log"));
+        definition.acquisition = lvu_core::Acquisition::Command {
+            command: lvu_core::CommandDefinition {
+                program,
+                cwd,
+                environment: Default::default(),
+                restart: Default::default(),
+            },
+        };
+        definition
+    }
+
+    fn test_shell(text: &str) -> lvu_core::CommandProgram {
+        lvu_core::CommandProgram::Shell {
+            text: text.to_owned(),
+        }
+    }
+
+    /// Without an origin only provably independent input proceeds; every
+    /// relative path that would bind to the worker cwd is refused here
+    /// with the offending path named — never forwarded for the worker to
+    /// guess at.
+    #[test]
+    fn resolve_for_worker_without_origin_rejects_unrepresentable_paths() {
+        let relative = test_definition(21, Path::new("logs/app.log"));
+        let error = resolve_for_worker(&relative, None).expect_err("relative file needs an origin");
+        assert!(
+            error.contains("logs/app.log"),
+            "refusal must name the path: {error}"
+        );
+
+        let dir = std::env::temp_dir();
+        let absolute = test_definition(22, &dir.join("abs.log"));
+        let kept = resolve_for_worker(&absolute, None).expect("absolute needs no origin");
+        assert_eq!(kept.acquisition, absolute.acquisition);
+
+        let rel_cwd = test_command_definition(23, test_shell("true"), Some(PathBuf::from("sub")));
+        let error = resolve_for_worker(&rel_cwd, None).expect_err("relative cwd needs an origin");
+        assert!(error.contains("sub"), "refusal must name the cwd: {error}");
+
+        // None cwd with no origin is degraded parity (a local spawn would
+        // inherit the same unreadable cwd): Ok, and still None — never
+        // silently rebound to something else.
+        let none_cwd = test_command_definition(24, test_shell("true"), None);
+        let kept = resolve_for_worker(&none_cwd, None).expect("none cwd is representable");
+        match &kept.acquisition {
+            lvu_core::Acquisition::Command { command } => assert_eq!(command.cwd, None),
+            other => panic!("expected command acquisition, saw {other:?}"),
+        }
+
+        // An explicit relative program is anchorable whenever the EFFECTIVE
+        // cwd is absolute — even with no origin to consult.
+        let anchored = test_command_definition(
+            25,
+            lvu_core::CommandProgram::Exec {
+                executable: PathBuf::from("bin/tool"),
+                args: vec![],
+            },
+            Some(PathBuf::from("/base")),
+        );
+        let effective = resolve_for_worker(&anchored, None).expect("absolute cwd anchors");
+        match &effective.acquisition {
+            lvu_core::Acquisition::Command { command } => match &command.program {
+                lvu_core::CommandProgram::Exec { executable, .. } => {
+                    assert_eq!(executable, &PathBuf::from("/base/bin/tool"))
+                }
+                other => panic!("program kind must survive, saw {other:?}"),
+            },
+            other => panic!("expected command acquisition, saw {other:?}"),
+        }
+
+        // ...but with neither an explicit cwd nor an origin there is
+        // nothing faithful to anchor against: refuse, naming the program.
+        let unanchorable = test_command_definition(
+            26,
+            lvu_core::CommandProgram::Exec {
+                executable: PathBuf::from("./tool"),
+                args: vec![],
+            },
+            None,
+        );
+        let error = resolve_for_worker(&unanchorable, None).expect_err("nothing to anchor against");
+        assert!(
+            error.contains("tool"),
+            "refusal must name the program: {error}"
+        );
+
+        // A bare program name with no origin stays a PATH lookup verbatim.
+        let bare = test_command_definition(
+            27,
+            lvu_core::CommandProgram::Exec {
+                executable: PathBuf::from("tool"),
+                args: vec!["--flag".to_owned()],
+            },
+            None,
+        );
+        let kept = resolve_for_worker(&bare, None).expect("bare program is representable");
+        match &kept.acquisition {
+            lvu_core::Acquisition::Command { command } => match &command.program {
+                lvu_core::CommandProgram::Exec { executable, args } => {
+                    assert_eq!(executable, &PathBuf::from("tool"));
+                    assert_eq!(args, &vec!["--flag".to_owned()]);
+                }
+                other => panic!("program kind must survive, saw {other:?}"),
+            },
+            other => panic!("expected command acquisition, saw {other:?}"),
+        }
+    }
+
+    /// `cwd: None` on the wire would leave the spawn directory to the
+    /// worker; with a known origin the window materializes its own cwd
+    /// instead, so None always means "origin window cwd".
+    #[test]
+    fn resolve_for_worker_materializes_none_command_cwd_as_origin() {
+        let definition = test_command_definition(28, test_shell("tail -F x.log"), None);
+        let effective =
+            resolve_for_worker(&definition, Some(Path::new("/win/a"))).expect("resolvable");
+        match &effective.acquisition {
+            lvu_core::Acquisition::Command { command } => {
+                assert_eq!(command.cwd, Some(PathBuf::from("/win/a")))
+            }
+            other => panic!("expected command acquisition, saw {other:?}"),
+        }
+    }
+
+    /// Bare names keep PATH semantics; separator-bearing relative programs
+    /// anchor at the EFFECTIVE command cwd (after cwd resolution), never
+    /// at the worker cwd; absolute programs pass through byte-identical.
+    #[test]
+    fn resolve_for_worker_anchors_only_separator_relative_programs() {
+        let origin = Path::new("/win/a");
+
+        let bare = test_command_definition(
+            29,
+            lvu_core::CommandProgram::Exec {
+                executable: PathBuf::from("tool"),
+                args: vec![],
+            },
+            Some(PathBuf::from("/base")),
+        );
+        let effective = resolve_for_worker(&bare, Some(origin)).expect("resolvable");
+        match &effective.acquisition {
+            lvu_core::Acquisition::Command { command } => {
+                assert_eq!(command.cwd, Some(PathBuf::from("/base")));
+                match &command.program {
+                    lvu_core::CommandProgram::Exec { executable, .. } => {
+                        assert_eq!(executable, &PathBuf::from("tool"))
+                    }
+                    other => panic!("program kind must survive, saw {other:?}"),
+                }
+            }
+            other => panic!("expected command acquisition, saw {other:?}"),
+        }
+
+        // Explicit relative cwd AND program resolve together: the program
+        // anchors at the JOINED cwd, not at the raw relative spelling.
+        let both = test_command_definition(
+            30,
+            lvu_core::CommandProgram::Exec {
+                executable: PathBuf::from("bin/tool"),
+                args: vec![],
+            },
+            Some(PathBuf::from("sub")),
+        );
+        let effective = resolve_for_worker(&both, Some(origin)).expect("resolvable");
+        match &effective.acquisition {
+            lvu_core::Acquisition::Command { command } => {
+                assert_eq!(command.cwd, Some(PathBuf::from("/win/a/sub")));
+                match &command.program {
+                    lvu_core::CommandProgram::Exec { executable, .. } => {
+                        assert_eq!(executable, &PathBuf::from("/win/a/sub/bin/tool"))
+                    }
+                    other => panic!("program kind must survive, saw {other:?}"),
+                }
+            }
+            other => panic!("expected command acquisition, saw {other:?}"),
+        }
+
+        // Dot-relative programs anchor too (CurDir + Normal is two
+        // components); the join is lexical, the OS resolves the dot.
+        let dot = test_command_definition(
+            31,
+            lvu_core::CommandProgram::Exec {
+                executable: PathBuf::from("./tool"),
+                args: vec![],
+            },
+            Some(PathBuf::from("/base")),
+        );
+        let effective = resolve_for_worker(&dot, Some(origin)).expect("resolvable");
+        match &effective.acquisition {
+            lvu_core::Acquisition::Command { command } => match &command.program {
+                lvu_core::CommandProgram::Exec { executable, .. } => {
+                    assert!(
+                        executable.is_absolute() && executable.ends_with("tool"),
+                        "dot program must anchor absolutely, saw {}",
+                        executable.display()
+                    );
+                }
+                other => panic!("program kind must survive, saw {other:?}"),
+            },
+            other => panic!("expected command acquisition, saw {other:?}"),
+        }
+
+        let absolute_program = test_command_definition(
+            32,
+            lvu_core::CommandProgram::Exec {
+                executable: PathBuf::from("/usr/bin/tool"),
+                args: vec![],
+            },
+            Some(PathBuf::from("sub")),
+        );
+        let effective = resolve_for_worker(&absolute_program, Some(origin)).expect("resolvable");
+        match &effective.acquisition {
+            lvu_core::Acquisition::Command { command } => match &command.program {
+                lvu_core::CommandProgram::Exec { executable, .. } => {
+                    assert_eq!(executable, &PathBuf::from("/usr/bin/tool"))
+                }
+                other => panic!("program kind must survive, saw {other:?}"),
+            },
+            other => panic!("expected command acquisition, saw {other:?}"),
+        }
+    }
+
+    async fn wait_for_records(handle: &lvu_shared::RemoteSourceHandle, at_least: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if handle.progress().records >= at_least {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("feeder never published {at_least} records");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The real acquisition funnel end to end, not the pure mapping, and
+    /// without touching the process cwd (parallel-safe: two origins are
+    /// just two explicit paths). A relative definition crosses
+    /// `start_source` with an explicit origin into a live worker; the
+    /// worker remembers the ABSOLUTE path (reloaded from its persisted
+    /// session set); a second origin with the same spelling gets its own
+    /// capture with its own records (no wrong-file reuse); and a restart
+    /// (id-only RPC) reopens the remembered absolute path. Without the
+    /// window-side resolution the first start already fails — the worker
+    /// would open the relative spelling against its own cwd, where the
+    /// file does not exist — so this test is red without the fix and
+    /// green with it.
+    #[tokio::test]
+    async fn start_source_resolves_relative_file_end_to_end_across_two_origins() {
+        let root = tempfile::tempdir().unwrap();
+        let dir_a = root.path().join("a");
+        let dir_b = root.path().join("b");
+        std::fs::create_dir_all(dir_a.join("logs")).unwrap();
+        std::fs::create_dir_all(dir_b.join("logs")).unwrap();
+        std::fs::write(dir_a.join("logs/app.log"), "a1\na2\n").unwrap();
+        std::fs::write(dir_b.join("logs/app.log"), "b1\nb2\nb3\n").unwrap();
+        let fixture = serving(root.path()).await;
+        let workspace = root.path().join("captures/workspace");
+
+        // Origin A acquires the relative spelling; record count proves the
+        // worker opened A's file, not some worker-cwd-relative one.
+        let store = attach_window(&fixture, "window-a", 6201).await;
+        let definition = test_definition(33, Path::new("logs/app.log"));
+        let started = store
+            .start_source(&definition, Some(&dir_a))
+            .await
+            .expect("start from origin A");
+        assert_eq!(started.remote.source_id, definition.id);
+        wait_for_records(&started.handle, 2).await;
+        // The worker-remembered definition (persisted synchronously on the
+        // start path) carries the absolute path the RPC delivered.
+        let remembered =
+            lvu_shared::load_session_set(&workspace).expect("session persisted on start");
+        let stored = remembered
+            .iter()
+            .find(|stored| stored.id == definition.id)
+            .expect("started definition remembered");
+        match &stored.acquisition {
+            lvu_core::Acquisition::File { path, .. } => {
+                assert_eq!(path, &dir_a.join("logs/app.log"));
+            }
+            other => panic!("worker must remember a file path, saw {other:?}"),
+        }
+
+        // Origin B, same lexical spelling: its own capture with its own
+        // three records — never a Present-reuse of A's file.
+        let store_b = attach_window(&fixture, "window-b", 6202).await;
+        let definition_b = test_definition(34, Path::new("logs/app.log"));
+        let started_b = store_b
+            .start_source(&definition_b, Some(&dir_b))
+            .await
+            .expect("start from origin B");
+        assert_ne!(
+            started_b.remote.source_id, started.remote.source_id,
+            "two origins must not share one capture"
+        );
+        wait_for_records(&started_b.handle, 3).await;
+
+        // Restart of A's capture (id-only RPC, no origin needed) reopens
+        // the remembered absolute path.
+        let restarted = store
+            .restart_source(&definition)
+            .await
+            .expect("restart reopens the remembered absolute path");
+        wait_for_records(&restarted.handle, 2).await;
+    }
+
+    /// Fail-closed means no RPC: a relative start with no origin is
+    /// refused with the resolver's error before the client is touched, so
+    /// the worker never admits (or persists) anything for it — while an
+    /// absolute definition with no origin still proceeds.
+    #[tokio::test]
+    async fn start_source_without_origin_never_reaches_the_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = serving(root.path()).await;
+        let workspace = root.path().join("captures/workspace");
+        let store = attach_window(&fixture, "window-c", 6203).await;
+
+        let relative = test_definition(35, Path::new("logs/app.log"));
+        let error = store
+            .start_source(&relative, None)
+            .await
+            .err()
+            .expect("relative input with no origin must fail");
+        assert!(
+            error.contains("logs/app.log"),
+            "refusal must name the path: {error}"
+        );
+        // Admission persists synchronously on the worker start path, so an
+        // empty session set proves no admission RPC happened.
+        let remembered = lvu_shared::load_session_set(&workspace).expect("session readable");
+        assert!(
+            remembered.iter().all(|stored| stored.id != relative.id),
+            "refused start must leave no worker-side trace"
+        );
+
+        let abs_log = root.path().join("ok.log");
+        std::fs::write(&abs_log, "x\n").unwrap();
+        let absolute = test_definition(36, &abs_log);
+        let started = store
+            .start_source(&absolute, None)
+            .await
+            .expect("absolute input needs no origin");
+        assert_eq!(started.remote.source_id, absolute.id);
     }
 
     /// One serving worker plus its socket: windows attach with distinct
@@ -1282,7 +1699,7 @@ mod tests {
         let definition = test_definition(29, &log);
         // Acquisition through the worker returns adapter-ready input plus
         // a live read handle with a running feeder.
-        let shared = store.start_source(&definition).await.expect("start");
+        let shared = store.start_source(&definition, None).await.expect("start");
         assert_eq!(shared.remote.source_id, definition.id);
         assert!(shared.remote.journal_path.ends_with("capture.journal"));
         // The feeder keeps the cache fresh without any caller polling:
@@ -1461,7 +1878,7 @@ mod tests {
             .expect("connect");
         let store = SharedStore::from_client(client);
         let definition = test_definition(91, &root.path().join("v.log"));
-        let shared = store.start_source(&definition).await.expect("start");
+        let shared = store.start_source(&definition, None).await.expect("start");
         assert_eq!(shared.remote.source_id, source_id);
         assert!(store.feeder_alive(source_id));
         // Let the feeder block in its first tick poll before stopping.
@@ -1541,7 +1958,7 @@ mod tests {
             .expect("connect");
         let store = SharedStore::from_client(client);
         let definition = test_definition(93, &root.path().join("v.log"));
-        let shared = store.start_source(&definition).await.expect("start");
+        let shared = store.start_source(&definition, None).await.expect("start");
         assert!(store.feeder_alive(source_id));
         // Let a tick or two flow so the feeder is genuinely idling (not
         // still starting) when stop arrives.
@@ -1607,7 +2024,7 @@ mod tests {
             .expect("connect");
         let store = SharedStore::from_client(client);
         let definition = test_definition(92, &root.path().join("v.log"));
-        let _shared = store.start_source(&definition).await.expect("start");
+        let _shared = store.start_source(&definition, None).await.expect("start");
         assert!(store.feeder_alive(source_id));
         // Drain consumes the session: no post-drain handle access is
         // possible by construction. Detach is proven by the peer-visible
