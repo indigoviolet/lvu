@@ -81,10 +81,31 @@ pub const MAX_RECEIPTS_PER_WINDOW: usize = 128;
 pub const MAX_COMMIT_WINDOWS: usize = 16;
 
 /// Bounds for peer-supplied routing scalars on the commit path. UUID v4
-/// spellings (36 bytes) and 32-byte digests fit with headroom; anything
-/// larger is a protocol violation, not a realloc.
+/// spellings (36 bytes) and `window-<pid>` ids (~14 bytes, see
+/// `default_window_id`) fit with headroom; anything larger is a protocol
+/// violation, not a realloc. `MAX_WINDOW_ID_BYTES` is canonical for the
+/// commit path and coordinated with the attach control plane: attach
+/// validation should reference this constant rather than mint a second
+/// window bound (proposed shared-file hunk to 5b — this module owns the
+/// definition, no duplicate exists).
 pub const MAX_NONCE_BYTES: usize = 128;
-pub const MAX_DIGEST_BYTES: usize = 128;
+pub const MAX_WINDOW_ID_BYTES: usize = 128;
+
+/// Fixed commitment size: domain/version-separated SHA-256 over the
+/// canonical candidate traversal — length-prefixed candidate identity, each
+/// input kind, ordered registration sources, revisions, generations, fences
+/// and accepted-output inventory, exact retained row carriers, filter/group/
+/// colour sources and every install-bearing membership vector/map in
+/// deterministic key order. Computed window-side (c98 owns the traversal —
+/// traversal only, no evaluator); this table treats digests opaquely as
+/// equality plus this fixed length, nothing else.
+pub const COMMIT_DIGEST_BYTES: usize = 32;
+
+/// Candidate commitment: exactly [`COMMIT_DIGEST_BYTES`] bytes. Fixed-size
+/// so the length contract is type-level; should a wire-compatibility
+/// constraint ever force `Vec<u8>` here, it must require exactly
+/// [`COMMIT_DIGEST_BYTES`] bytes.
+pub type CommitDigest = [u8; COMMIT_DIGEST_BYTES];
 
 /// View ids are already bounded (`MAX_UNION_VIEW_ID_BYTES = 256`,
 /// `lvu-view/src/union.rs`); the commit path enforces the same bound.
@@ -122,7 +143,7 @@ pub struct CommitRequest {
     pub union_view_id: String,
     pub candidate_generation: u64,
     pub nonce: String,
-    pub digest: Vec<u8>,
+    pub digest: CommitDigest,
     pub frozen: Vec<UnionSourceFence>,
 }
 
@@ -171,7 +192,7 @@ pub struct CommitReceipt {
     pub union_view_id: String,
     pub candidate_generation: u64,
     pub nonce: String,
-    pub digest: Vec<u8>,
+    pub digest: CommitDigest,
     pub outcome: CommitOutcome,
 }
 
@@ -184,7 +205,7 @@ impl CommitReceipt {
             union_view_id: request.union_view_id.clone(),
             candidate_generation: request.candidate_generation,
             nonce: request.nonce.clone(),
-            digest: request.digest.clone(),
+            digest: request.digest,
             outcome,
         }
     }
@@ -226,7 +247,7 @@ enum SlotOutcome {
 struct UnionSlot {
     highest_generation: u64,
     nonce: String,
-    digest: Vec<u8>,
+    digest: CommitDigest,
     frozen: Vec<UnionSourceFence>,
     outcome: SlotOutcome,
     attempt_epoch: u64,
@@ -408,7 +429,7 @@ impl CommitTable {
             slot.attempt_epoch = epoch;
             slot.highest_generation = request.candidate_generation;
             slot.nonce = request.nonce.clone();
-            slot.digest = request.digest.clone();
+            slot.digest = request.digest;
             slot.frozen.clone_from(&request.frozen);
             slot.outcome = SlotOutcome::Pending;
         } else {
@@ -417,7 +438,7 @@ impl CommitTable {
                 UnionSlot {
                     highest_generation: request.candidate_generation,
                     nonce: request.nonce.clone(),
-                    digest: request.digest.clone(),
+                    digest: request.digest,
                     frozen: request.frozen.clone(),
                     outcome: SlotOutcome::Pending,
                     attempt_epoch: epoch,
@@ -502,7 +523,7 @@ impl CommitTable {
         union_view_id: &str,
         candidate_generation: u64,
         nonce: &str,
-        digest: &[u8],
+        digest: &CommitDigest,
     ) -> StatusAnswer {
         let state = self.state.lock().expect("commit table poisoned");
         if state.retired {
@@ -521,7 +542,7 @@ impl CommitTable {
         if candidate_generation > slot.highest_generation {
             return StatusAnswer::Unknown;
         }
-        if slot.nonce != nonce || slot.digest != digest {
+        if slot.nonce != nonce || slot.digest != *digest {
             return StatusAnswer::Settled(CommitOutcome::NonceConflict);
         }
         match &slot.outcome {
@@ -537,15 +558,19 @@ impl CommitTable {
 /// union has no remote raw sources and stays on the existing local
 /// transaction instead of taking this path.
 fn check_request_bounds(request: &CommitRequest) -> Result<(), String> {
+    if request.window_id.is_empty() {
+        return Err("window id empty".to_owned());
+    }
+    if request.window_id.len() > MAX_WINDOW_ID_BYTES {
+        return Err("window id oversize".to_owned());
+    }
     if request.union_view_id.len() > MAX_COMMIT_VIEW_ID_BYTES {
         return Err("union view id oversize".to_owned());
     }
     if request.nonce.len() > MAX_NONCE_BYTES {
         return Err("nonce oversize".to_owned());
     }
-    if request.digest.len() > MAX_DIGEST_BYTES {
-        return Err("digest oversize".to_owned());
-    }
+    // Digest length is type-level ([u8; COMMIT_DIGEST_BYTES]); no check here.
     if request.frozen.is_empty() {
         return Err("no remote raw sources".to_owned());
     }
@@ -640,6 +665,19 @@ mod tests {
         vec![fence("a", 1, Some(10)), fence("b", 1, Some(4))]
     }
 
+    /// Deterministic 32-byte test commitment: distinct per tag, fixed-size
+    /// like the production SHA-256 digests (whose computation lives
+    /// window-side; the table only compares).
+    fn digest(tag: &str) -> CommitDigest {
+        assert!(!tag.is_empty(), "digest tag must be non-empty");
+        let bytes = tag.as_bytes();
+        let mut out = [0u8; COMMIT_DIGEST_BYTES];
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot = bytes[index % bytes.len()].wrapping_add(index as u8);
+        }
+        out
+    }
+
     fn commit_request(
         window: &str,
         union_view: &str,
@@ -652,7 +690,7 @@ mod tests {
             union_view_id: union_view.to_owned(),
             candidate_generation: generation,
             nonce: nonce.to_owned(),
-            digest: format!("digest-{nonce}").into_bytes(),
+            digest: digest(nonce),
             frozen: fences,
         }
     }
@@ -787,7 +825,7 @@ mod tests {
         };
         // Same nonce, changed digest.
         let mut changed_digest = first.clone();
-        changed_digest.digest = b"digest-other".to_vec();
+        changed_digest.digest = digest("digest-other");
         assert_eq!(
             table.commit(&changed_digest),
             CommitAdmission::Answer(CommitOutcome::NonceConflict)
@@ -795,7 +833,7 @@ mod tests {
         // Same nonce, changed fences (digest rebound accordingly).
         let mut changed_fences = first.clone();
         changed_fences.frozen[0].high_watermark = Some(99);
-        changed_fences.digest = b"digest-fences".to_vec();
+        changed_fences.digest = digest("digest-fences");
         assert_eq!(
             table.commit(&changed_fences),
             CommitAdmission::Answer(CommitOutcome::NonceConflict)
@@ -813,8 +851,35 @@ mod tests {
         );
         // Status with a mismatched digest at the same generation conflicts.
         assert_eq!(
-            table.status("w-1", "u-1", 7, "n-7", b"digest-other"),
+            table.status("w-1", "u-1", 7, "n-7", &digest("digest-other")),
             StatusAnswer::Settled(CommitOutcome::NonceConflict)
+        );
+    }
+
+    /// A single changed digest byte under the same nonce is a conflict on
+    /// both paths — the digest binds the whole commitment, so any change is
+    /// a different candidate, never a replay.
+    #[test]
+    fn same_nonce_one_byte_digest_change_conflicts() {
+        let table = table("session-a");
+        let first = commit_request("w-1", "u-1", 7, "n-7", sorted_fences());
+        let CommitAdmission::Verify { .. } = table.commit(&first) else {
+            panic!("first commit must be admitted");
+        };
+        let mut off_by_one = first.clone();
+        off_by_one.digest[0] ^= 0x01;
+        assert_ne!(off_by_one.digest, first.digest);
+        assert_eq!(
+            table.commit(&off_by_one),
+            CommitAdmission::Answer(CommitOutcome::NonceConflict)
+        );
+        assert_eq!(
+            table.status("w-1", "u-1", 7, "n-7", &off_by_one.digest),
+            StatusAnswer::Settled(CommitOutcome::NonceConflict)
+        );
+        assert_eq!(
+            table.status("w-1", "u-1", 7, "n-7", &first.digest),
+            StatusAnswer::Pending
         );
     }
 
@@ -979,7 +1044,7 @@ mod tests {
     fn status_unknown_only_for_never_admitted() {
         let table = table("session-a");
         assert_eq!(
-            table.status("w-1", "u-1", 7, "n-7", b"digest-n-7"),
+            table.status("w-1", "u-1", 7, "n-7", &digest("n-7")),
             StatusAnswer::Unknown
         );
         let request = commit_request("w-1", "u-1", 7, "n-7", sorted_fences());
@@ -988,7 +1053,7 @@ mod tests {
         };
         // Higher than the slot's highest: Unknown, never Superseded.
         assert_eq!(
-            table.status("w-1", "u-1", 8, "n-8", b"digest-n-8"),
+            table.status("w-1", "u-1", 8, "n-8", &digest("n-8")),
             StatusAnswer::Unknown
         );
         settle_as(&table, &request, attempt_epoch, sorted_fences());
@@ -1048,6 +1113,14 @@ mod tests {
     fn envelope_bounds_refuse_explicitly() {
         let table = table("session-a");
         let base = commit_request("w-1", "u-1", 1, "n-1", sorted_fences());
+        let mut empty_window = base.clone();
+        empty_window.window_id = String::new();
+        assert_eq!(
+            table.commit(&empty_window),
+            CommitAdmission::Answer(CommitOutcome::Refused {
+                reason: "window id empty".to_owned()
+            })
+        );
         let mut oversize_union = base.clone();
         oversize_union.union_view_id = "u".repeat(MAX_COMMIT_VIEW_ID_BYTES + 1);
         assert!(matches!(
@@ -1060,12 +1133,14 @@ mod tests {
             table.commit(&oversize_nonce),
             CommitAdmission::Answer(CommitOutcome::Refused { .. })
         ));
-        let mut oversize_digest = base.clone();
-        oversize_digest.digest = vec![0u8; MAX_DIGEST_BYTES + 1];
+        let mut oversize_window = base.clone();
+        oversize_window.window_id = "w".repeat(MAX_WINDOW_ID_BYTES + 1);
         assert!(matches!(
-            table.commit(&oversize_digest),
+            table.commit(&oversize_window),
             CommitAdmission::Answer(CommitOutcome::Refused { .. })
         ));
+        // Digest length is type-level ([u8; COMMIT_DIGEST_BYTES]): an
+        // oversize digest is unrepresentable, so no refusal case exists.
         let empty = commit_request("w-1", "u-1", 1, "n-e", Vec::new());
         assert_eq!(
             table.commit(&empty),
@@ -1106,6 +1181,40 @@ mod tests {
         let CommitAdmission::Verify { .. } = table.commit(&base) else {
             panic!("valid commit after refusals must be admitted");
         };
+    }
+
+    /// Wire length contract: 31- and 33-element digest arrays are rejected;
+    /// exactly 32 round-trips for both request and receipt.
+    #[test]
+    fn serde_rejects_off_by_one_digest_lengths() {
+        let request = commit_request("w-1", "u-1", 7, "n-7", sorted_fences());
+        let wire = serde_json::to_value(&request).expect("serialize request");
+        for len in [31usize, 33usize] {
+            let mut tampered = wire.clone();
+            tampered["digest"] = serde_json::Value::Array(
+                (0..len)
+                    .map(|byte| serde_json::Value::from(byte as u64))
+                    .collect(),
+            );
+            assert!(
+                serde_json::from_value::<CommitRequest>(tampered).is_err(),
+                "{len}-byte digest must be rejected"
+            );
+        }
+        let request_back: CommitRequest =
+            serde_json::from_value(wire).expect("32-byte digest round-trips");
+        assert_eq!(request_back, request);
+        let receipt = CommitReceipt::answer(
+            "session-a",
+            &request,
+            CommitOutcome::Committed {
+                current: sorted_fences(),
+            },
+        );
+        let receipt_back: CommitReceipt =
+            serde_json::from_value(serde_json::to_value(&receipt).expect("serialize receipt"))
+                .expect("receipt round-trips");
+        assert_eq!(receipt_back, receipt);
     }
 
     #[test]
@@ -1236,6 +1345,7 @@ mod tests {
     #[cfg(test)]
     mod real_guard_tests {
         use super::super::*;
+        use super::digest;
         use lvu_core::{Acquisition, SourceDefinition, SourceId};
         use lvu_ingest::{RuntimeConfig, RuntimeError, SourceHandle, SourceManager};
         use std::collections::BTreeMap;
@@ -1369,7 +1479,7 @@ mod tests {
                 union_view_id: "u-1".to_owned(),
                 candidate_generation: 7,
                 nonce: "n-real-7".to_owned(),
-                digest: b"digest-real-7".to_vec(),
+                digest: digest("digest-real-7"),
                 frozen: frozen.clone(),
             };
             let CommitAdmission::Verify { attempt_epoch } = table.commit(&request) else {
@@ -1401,7 +1511,7 @@ mod tests {
                 union_view_id: "u-1".to_owned(),
                 candidate_generation: 8,
                 nonce: "n-real-8".to_owned(),
-                digest: b"digest-real-8".to_vec(),
+                digest: digest("digest-real-8"),
                 frozen: diverged,
             };
             let CommitAdmission::Verify {
@@ -1480,7 +1590,7 @@ mod tests {
                             union_view_id: "u-live".to_owned(),
                             candidate_generation: generation,
                             nonce: nonce.clone(),
-                            digest: format!("digest-live-{worker}").into_bytes(),
+                            digest: digest(&nonce),
                             frozen,
                         };
                         match table.commit(&request) {
@@ -1556,7 +1666,7 @@ mod tests {
             wait_for_records(&handle, 23).await;
             // Highest admitted generation wins regardless of interleaving.
             assert_eq!(
-                table.status("w-live", "u-live", 53, "n-live-9", b"digest-live-9"),
+                table.status("w-live", "u-live", 53, "n-live-9", &digest("n-live-9")),
                 StatusAnswer::Unknown
             );
             let _live = freeze_copy(std::slice::from_ref(&handle));
@@ -1566,11 +1676,14 @@ mod tests {
         /// Guard-retention regression (commit-wins): the entire sorted guard
         /// vector stays alive across the copy and the settle while a writer
         /// publish is pending, so the verdict reflects the guard-held state.
-        /// The writer's publish needs the write side, which the retained read
-        /// guards block — the publish is genuinely pending during settle, and
-        /// lands only after the guards drop. Waiting the new high-watermark
-        /// runs with no guards held: waiting under guards would wedge the
-        /// writer's write lock.
+        /// The rendezvous is exact, not merely a released file-writing
+        /// thread: the writer appends and flushes, then both sides meet at
+        /// the barrier with the test's read guards still held — at that
+        /// instant the bytes are on disk but the capture publish (which
+        /// needs the write side) cannot have landed, and the test asserts
+        /// the published count is still the old one before settling.
+        /// Waiting the new high-watermark runs with no guards held: waiting
+        /// under guards would wedge the writer's write lock.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn retained_guards_linearize_before_pending_publish() {
             let root = tempfile::tempdir().expect("capture root");
@@ -1607,32 +1720,42 @@ mod tests {
                 union_view_id: "u-3".to_owned(),
                 candidate_generation: 11,
                 nonce: "n-retain-11".to_owned(),
-                digest: b"digest-retain-11".to_vec(),
+                digest: digest("digest-retain-11"),
                 frozen: frozen.clone(),
             };
             let CommitAdmission::Verify { attempt_epoch } = table.commit(&request) else {
                 panic!("retention commit must be admitted");
             };
-            // Writer side: waits for the go signal, appends one line (file
-            // I/O needs no publication lock), then exits. Its capture
-            // publish is left pending behind our retained read guards.
-            let go = Arc::new(Barrier::new(2));
+            // Writer side: appends and flushes one line (file I/O needs no
+            // publication lock), then meets the test at the barrier. The
+            // append strictly precedes the settle below; the publish cannot
+            // precede it, because the test's read guards are already held.
+            let appended = Arc::new(Barrier::new(2));
             let writer = {
-                let go = go.clone();
+                let appended = appended.clone();
                 let live_path = live_path.clone();
                 std::thread::spawn(move || {
-                    go.wait();
                     let mut file = std::fs::OpenOptions::new()
                         .append(true)
                         .open(&live_path)
                         .expect("append fixture");
                     use std::io::Write;
                     writeln!(file, "r-3").expect("append line");
+                    drop(file);
+                    appended.wait();
                 })
             };
             let outcome = with_pinned(&handles, |current| {
                 assert_eq!(current, frozen);
-                go.wait();
+                appended.wait();
+                // Exact pre-publication rendezvous: the writer flushed new
+                // bytes, yet the published count is still the old one — the
+                // publish is pending behind these held guards.
+                assert_eq!(
+                    live.progress().records,
+                    3,
+                    "publish must be pending behind the retained guards"
+                );
                 table.settle("w-3", "u-3", attempt_epoch, &request, current)
             });
             assert!(
@@ -1699,7 +1822,7 @@ mod tests {
                 union_view_id: "u-4".to_owned(),
                 candidate_generation: 12,
                 nonce: "n-stale-12".to_owned(),
-                digest: b"digest-stale-12".to_vec(),
+                digest: digest("digest-stale-12"),
                 frozen: frozen_old,
             };
             let CommitAdmission::Verify { attempt_epoch } = table.commit(&request) else {
