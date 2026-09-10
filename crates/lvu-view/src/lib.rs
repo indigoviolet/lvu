@@ -3,6 +3,7 @@
 pub mod command_columns;
 mod export;
 pub mod folding;
+mod remote_union_commit;
 pub mod time_basis;
 /// Live union views over accepted input views (Muse union-views worktree).
 /// The worker and all union methods live in `union_worker.rs`; the pure
@@ -11,6 +12,7 @@ pub mod union;
 mod union_worker;
 pub use command_columns::CommandColumns;
 pub use export::*;
+pub use remote_union_commit::RemoteUnionCommitTransport;
 pub use union::{
     INPUT_COLUMN, MAX_UNION_BYTES, MAX_UNION_INPUTS, MAX_UNION_ROWS, MergedUnionRow,
     SEQUENCE_COLUMN, SOURCE_ID_COLUMN, StoredUnionInput, StoredUnionShape, UNION_TS_COLUMN,
@@ -1453,6 +1455,7 @@ pub struct NativeViewAdapter {
     snapshot_jobs: Arc<std::sync::atomic::AtomicUsize>,
     compiler_calls: Arc<AtomicU64>,
     refresh_stats: Arc<RefreshStats>,
+    remote_union_commit: Option<remote_union_commit::RemoteUnionCommitRegistration>,
 }
 
 /// Cloneable read-only half for terminal composition. Keep the adapter itself as
@@ -1541,7 +1544,27 @@ impl NativeViewAdapter {
             snapshot_jobs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             compiler_calls,
             refresh_stats,
+            remote_union_commit: None,
         })
+    }
+
+    /// Installs the non-blocking window-to-worker commit transport used only
+    /// for unions whose raw inputs all belong to one remote worker session.
+    /// Local adapters leave this unset and retain their existing guarded
+    /// publication transaction.
+    pub fn set_remote_union_commit_transport(
+        &mut self,
+        window_id: String,
+        transport: Arc<dyn RemoteUnionCommitTransport>,
+    ) -> Result<(), String> {
+        if window_id.is_empty() || window_id.len() > lvu_shared::union_commit::MAX_WINDOW_ID_BYTES {
+            return Err("remote union commit window id is invalid".into());
+        }
+        self.remote_union_commit = Some(remote_union_commit::RemoteUnionCommitRegistration {
+            window_id,
+            transport,
+        });
+        Ok(())
     }
 
     /// Number of Python definition compilations requested by this adapter.

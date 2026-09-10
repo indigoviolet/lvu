@@ -603,12 +603,7 @@ pub fn union_input_stale(fenced_revision: u64, current_accepted_revision: u64) -
 /// high-watermark one frozen input observed, in plain data so the check is a
 /// pure function. Source identities are UUID spellings, matching both frozen
 /// summaries and published memberships.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UnionSourceFence {
-    pub source_id: String,
-    pub generation: u64,
-    pub high_watermark: Option<u64>,
-}
+pub use lvu_shared::union_commit::UnionSourceFence;
 
 /// Verify frozen per-source metadata against current state, atomically with
 /// publication.
