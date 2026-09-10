@@ -46,9 +46,11 @@ work, but only because the task passes `--workers 4` first and argparse keeps
 the last value; that is a coincidence of argument order, not an interface. Pass
 it only when you mean to override, and expect nothing from it otherwise.
 
-**The PTY suites have never been run on macOS.** `docs/portability.md` reads
-them as Python plus `pty` that "should run unmodified", but that is a reading
-of the source, not a result, and it expects the terminal-capability assertions
+**The full PTY matrix has not been accepted on macOS.** The dedicated arm64
+macOS workflow has passed installed-resource, kernel-PTY, terminal-restoration
+and process-cleanup checks; see `docs/platform-validation.md` for the exact run.
+That bounded result does not cover every suite or a human terminal emulator.
+The portability audit expects the terminal-capability assertions
 (SGR mouse, OSC 52, truecolor) to fail under Terminal.app. So if you are
 cutting a release from a Mac, do not treat a red matrix there as a release
 blocker and do not treat a green one as acceptance. Either run this step on the
@@ -280,25 +282,25 @@ brew install uv node     # or: mise use -g uv node
 
 ## 5. Cutting the next version
 
-`v0.1.2` was completed on 2026-09-09. `0.1.3` is the version now in
-preparation below; use another number only when a different version is intended.
+`v0.1.5` is published. `0.1.6` is the next version being prepared; its
+integrated features still require the checks above before tagging.
 
-For v0.1.3, publication requires all four native archives and their checksums
-to pass verification, as explicitly requested for this release. The historical
-partial-release procedure above is not the acceptance policy for v0.1.3.
+Publication requires all four native archives and their checksums to pass
+verification. The historical partial-release procedure above is not the current
+acceptance policy.
 
 ```sh
 git status --short --branch # use the reviewed integration/release checkout
-# bump `version` in crates/lvu-app/Cargo.toml to 0.1.3
+# bump `version` in crates/lvu-app/Cargo.toml to 0.1.6
 mise exec -- cargo update -p lvu-app --offline    # refresh Cargo.lock
 # Any build or `cargo check` refreshes it just as well. The point is only that
 # Cargo.lock must record the new version before you commit, or the release
 # build fails on --locked.
-git commit -am "lvu 0.1.3"
+git commit -am "lvu 0.1.6"
 git push
 ```
 
-Then repeat steps 1–4 with `0.1.3`. Nothing else changes: the tap formula is
+Then repeat steps 1–4 with `0.1.6`. The tap formula is
 re-rendered from the new release's `SHA256SUMS` and overwrites the old one,
 because `render-formula.sh` writes the whole file.
 
