@@ -2933,3 +2933,18 @@ serialization, stdin deduplication, non-UTF-8 key failure, relative-path origin
 and schema validation before reuse. After the original worker agent errored,
 Sol820 took the same isolated assignment from `2ad1495`; no repaired acceptance
 is claimed. Shared-memory `31b6158` retains its narrow source clearance.
+
+
+Sol4666 subsequently narrowly cleared exact `a6ff2ea` over parent `321f192`.
+The clean candidate contains the required shared API seams. Review confirms
+independent absolute-deadline enforcement, generation-scoped cleanup, last-good
+retention, candidate-budget release, late-receipt refusal and deterministic
+digest coverage/rejection of unsupported retained state. No verified defect
+was found in the three owned view files. Earlier failed fixtures, zero-test
+filters and compile/lint failures remain retained; corrected targeted suites
+resolve those specific attempts. Logs still lack command/commit binding, and
+the empty fmt log supplies no independently inspectable formatting evidence.
+Nonblocking submission and same-nonce/digest recovery remain contracts until
+the real transport is implemented and tested. Controller owner5b received this
+clearance and the deadline/recovery requirements. No primary integration, RPC
+or app acceptance is claimed by this source clearance.
