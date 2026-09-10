@@ -49,15 +49,22 @@
 use super::export::{FrozenInput, FrozenInputError, FrozenInputLimits};
 use super::union::{
     StoredUnionInput, UnionCandidateSpec, UnionCompletion, UnionFrozenInput, UnionFrozenRow,
-    UnionLimits, apply_union_filter, detect_union_cycle, union_frozen_inputs, validate_union_spec,
+    UnionLimits, detect_union_cycle, union_frozen_inputs, union_workspace_bytes,
+    validate_union_spec,
 };
 use super::{
-    Appended, Membership, MemoryBudget, NO_BASIS_TIME, Published, Reservation, SEQUENCE_BYTES,
-    SOURCE_OVERHEAD, ScanState, Shared, SourceMatches, SourceTimeBounds, ViewError,
-    ViewQueryStatus, ViewRegistration, ViewState, merge_order,
+    Appended, AutoLine, ContinuationRule, GroupRange, MAX_GROUP_LINE_DISPLAY_BYTES,
+    MAX_GROUP_LINES, MAX_GROUP_PAYLOAD_BYTES, Membership, MemoryBudget, NO_BASIS_TIME, Published,
+    Reservation, SEQUENCE_BYTES, SOURCE_OVERHEAD, ScanState, Shared, SourceMatches,
+    SourceTimeBounds, ViewError, ViewQueryStatus, ViewRegistration, ViewState,
+    auto_group_within_span, display_projection_bytes, group_state_bytes, merge_order,
 };
 use lvu_core::SourceId;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use lvu_query::{
+    BatchQuery, BatchValidity, CompiledDefinition, TextSearch, exact_column_expr,
+    execute_batch_with_native_predicate,
+};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -105,6 +112,14 @@ pub struct UnionTestBarrier {
     pub release: Receiver<()>,
 }
 
+/// Test-only barrier after guarded raw progress snapshots are read and before
+/// the final shared-state install. A producer racing here must either publish
+/// first (and make the candidate stale) or block until the union installs.
+pub struct UnionPublishTestBarrier {
+    pub checked: SyncSender<()>,
+    pub release: Receiver<()>,
+}
+
 /// Runtime state of one union view. Registration (`inputs`) is the accepted
 /// baseline; `pending` is the parked candidate; the rest is job plumbing.
 pub(crate) struct UnionViewState {
@@ -121,7 +136,15 @@ pub(crate) struct UnionViewState {
     /// One-shot deterministic test barrier for the next job only. Taken by
     /// the worker at start; production code never sets it.
     test_barrier: Option<UnionTestBarrier>,
+    publish_test_barrier: Option<UnionPublishTestBarrier>,
     completed: VecDeque<UnionCompletion>,
+    /// Compiled/parsed predicates become reusable only with the publication
+    /// they helped produce. Failed or stale candidates never mutate this.
+    prepared_filter: Option<PreparedUnionFilter>,
+    /// Per-input source progress accepted by the last publication. This is
+    /// the live-refresh trigger; definition revision/generation alone cannot
+    /// observe an append to a raw input, which intentionally stays at 0/0.
+    published_source_fences: Vec<(String, Vec<super::union::UnionSourceFence>)>,
 }
 
 impl UnionViewState {
@@ -138,9 +161,22 @@ impl UnionViewState {
             frozen_tx: None,
             pending_delivery: None,
             test_barrier: None,
+            publish_test_barrier: None,
             completed: VecDeque::new(),
+            prepared_filter: None,
+            published_source_fences: Vec::new(),
         }
     }
+}
+
+#[derive(Clone)]
+struct PreparedUnionFilter {
+    search_source: String,
+    advanced_source: Option<String>,
+    search: Option<TextSearch>,
+    advanced: Option<CompiledDefinition>,
+    grouping_source: Option<String>,
+    grouping: Option<ContinuationRule>,
 }
 
 /// Union-sized freeze limits from the remaining merge budget.
@@ -279,6 +315,43 @@ impl super::NativeViewAdapter {
             .map(|state| state.inputs.clone())
     }
 
+    /// Whether any accepted input has moved since this union last published.
+    /// Includes raw source generation/high-watermark movement, which does not
+    /// change an input view's accepted definition state. Read-only and
+    /// bounded by union input/source limits; the app coalesces the resulting
+    /// refresh while a union job is in flight.
+    pub fn union_needs_refresh(&self, union_view_id: &str) -> Option<bool> {
+        let shared = self.shared.lock().expect("view state poisoned");
+        let state = shared.union_views.get(union_view_id)?;
+        if state.published_revision == 0 {
+            return Some(false);
+        }
+        if state.inputs.len() != state.published_source_fences.len() {
+            return Some(true);
+        }
+        for input in &state.inputs {
+            let Some(view) = shared.views.get(&input.view_id) else {
+                return Some(true);
+            };
+            if view.applied_revision != input.accepted_revision
+                || view.applied_generation != input.applied_generation
+            {
+                return Some(true);
+            }
+            let Some((_, published)) = state
+                .published_source_fences
+                .iter()
+                .find(|(view_id, _)| view_id == &input.view_id)
+            else {
+                return Some(true);
+            };
+            if &current_source_fence(&shared, view) != published {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     /// Park a union candidate and start its background job.
     ///
     /// Structural validation (count, duplicates, self, view-ID bounds) and
@@ -286,10 +359,10 @@ impl super::NativeViewAdapter {
     /// `resolve` maps a union view ID to its stored inputs (`None` for
     /// ordinary views) and is supplied by the caller, which owns the
     /// dependency graph. The submit-time fence travels with the candidate;
-    /// the worker adopts each input's frozen revisions at freeze time and
-    /// re-verifies the adopted fence atomically at publication, so only
-    /// movement during the job's own visit/merge window aborts as stale
-    /// with the prior union preserved. A newer submit for the same
+    /// the worker requires each input's frozen revision to equal the submitted
+    /// definition fence and re-verifies that fence atomically at publication.
+    /// Legitimate movement is submitted as a new candidate; an older request
+    /// never adopts it opportunistically. A newer submit for the same
     /// union supersedes: the older thread is cancelled and replaced.
     /// Union revisions must strictly increase; anything at or below the
     /// published revision is a no-op `Ok`, mirroring `submit_query`.
@@ -340,6 +413,7 @@ impl super::NativeViewAdapter {
             let generation = state.generation;
             let cancel = Arc::clone(&state.cancel);
             let test_barrier = state.test_barrier.take();
+            let publish_test_barrier = state.publish_test_barrier.take();
             let ctx = UnionJobCtx {
                 spec: candidate.clone(),
                 generation,
@@ -349,8 +423,14 @@ impl super::NativeViewAdapter {
                 budget: Arc::clone(&self.budget),
                 cmd_tx,
                 frozen_rx,
+                compiler_tx: self
+                    .work
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| "view adapter is shut down".to_owned())?,
                 limits: UnionLimits::default(),
                 test_barrier,
+                publish_test_barrier,
             };
             let handle = thread::Builder::new()
                 .name("lvu-view-union".into())
@@ -390,6 +470,19 @@ impl super::NativeViewAdapter {
             return Err("unknown union view".into());
         };
         state.test_barrier = Some(barrier);
+        Ok(())
+    }
+
+    pub fn arm_union_publish_test_barrier(
+        &self,
+        union_view_id: &str,
+        barrier: UnionPublishTestBarrier,
+    ) -> Result<(), String> {
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        let Some(state) = shared.union_views.get_mut(union_view_id) else {
+            return Err("unknown union view".into());
+        };
+        state.publish_test_barrier = Some(barrier);
         Ok(())
     }
 
@@ -504,8 +597,10 @@ struct UnionJobCtx {
     budget: Arc<MemoryBudget>,
     cmd_tx: SyncSender<DriverCmd>,
     frozen_rx: Receiver<FrozenDelivery>,
+    compiler_tx: SyncSender<super::Work>,
     limits: UnionLimits,
     test_barrier: Option<UnionTestBarrier>,
+    publish_test_barrier: Option<UnionPublishTestBarrier>,
 }
 
 /// Per-input frozen metadata for the atomic publication fence. Small scalar
@@ -577,15 +672,20 @@ fn union_job_loop(ctx: UnionJobCtx) {
 /// Every fallible step returns an error with published state untouched; only
 /// the final locked section mutates anything.
 fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
+    // Definition compilation belongs to the one existing CompilerHost and
+    // happens before any input snapshot work. An unchanged successfully
+    // published definition reuses its cached native expression on refresh.
+    let prepared_filter = prepare_union_filter(ctx)?;
+    check_cancelled(&ctx.cancel, &ctx.shared)?;
     let mut frozen_inputs = Vec::with_capacity(ctx.spec.inputs.len());
     let mut remaining_rows = ctx.limits.maximum_rows as u64;
     let mut remaining_bytes = ctx.limits.maximum_bytes;
-    // Working fence, adopted per input at freeze time (see visit_union_input):
-    // a lease is a self-consistent snapshot of exactly one input revision,
-    // so the job fences what it actually froze rather than failing on the
-    // submit-time skew a live tail inevitably opens while the job was queued.
-    let mut fence: Vec<StoredUnionInput> = ctx.spec.inputs.clone();
-    for (index, input) in ctx.spec.inputs.iter().enumerate() {
+    // The submitted definition fence is authority. Live source progress is
+    // tracked separately by source generation/high-watermarks; a later input
+    // definition must produce a new candidate through the controller, never
+    // be adopted opportunistically by this older request.
+    let fence: Vec<StoredUnionInput> = ctx.spec.inputs.clone();
+    for input in &ctx.spec.inputs {
         check_cancelled(&ctx.cancel, &ctx.shared)?;
         let view_id = input.view_id.clone();
         ctx.cmd_tx
@@ -606,12 +706,9 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
                 }
             }
         };
-        let summary = frozen.summary().clone();
-        fence[index].accepted_revision = summary.applied_revision;
-        fence[index].applied_generation = summary.applied_generation;
         let work = visit_union_input(
             ctx,
-            &fence[index],
+            input,
             frozen,
             &mut remaining_rows,
             &mut remaining_bytes,
@@ -654,13 +751,167 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
         }
     }
     check_cancelled(&ctx.cancel, &ctx.shared)?;
+    let workspace = union_workspace_bytes(&decoded_inputs).map_err(|error| error.to_string())?;
+    if workspace > ctx.limits.maximum_bytes {
+        return Err(format!(
+            "union merge needs {workspace} bytes but the limit is {}",
+            ctx.limits.maximum_bytes
+        ));
+    }
+    let source_count = ctx
+        .shared
+        .lock()
+        .expect("view state poisoned")
+        .views
+        .get(&ctx.spec.union_view_id)
+        .ok_or_else(|| "unknown union view".to_owned())?
+        .registration
+        .sources
+        .len() as u64;
+    let reserved_bytes = source_count
+        .checked_mul(
+            SOURCE_OVERHEAD
+                .checked_add(64)
+                .ok_or_else(|| "union workspace size overflow".to_owned())?,
+        )
+        .and_then(|overhead| workspace.checked_add(overhead))
+        .ok_or_else(|| "union workspace size overflow".to_owned())?;
+    let mut reservation = Reservation::new(Arc::clone(&ctx.budget));
+    if !reservation.add(reserved_bytes) {
+        return Err("union workspace exceeds the memory budget".into());
+    }
     let merged = union_frozen_inputs(&ctx.spec.union_view_id, &decoded_inputs, &ctx.limits)
         .map_err(|error| error.to_string())?;
-    // The union's own search filter runs here, after first-input dedup so
-    // precedence survives filtering, and before publication so counts,
-    // order and ranks all describe the filtered stream.
-    let merged = apply_union_filter(merged, &ctx.spec.filter).map_err(|error| error.to_string())?;
-    publish_union(ctx, &fence, metas, merged)
+    let exact = ctx
+        .spec
+        .filter
+        .exact_key
+        .as_ref()
+        .map(|key| exact_column_expr(&merged, key))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    check_cancelled(&ctx.cancel, &ctx.shared)?;
+    let result = execute_batch_with_native_predicate(
+        &merged,
+        BatchQuery {
+            generation: ctx.generation,
+            definition_generation: ctx.spec.union_revision,
+            stages: &[],
+            filter: prepared_filter.advanced.as_ref(),
+            text_search: prepared_filter.search.as_ref(),
+            colors: &[],
+        },
+        exact,
+    );
+    check_cancelled(&ctx.cancel, &ctx.shared)?;
+    if result.generation != ctx.generation
+        || result.definition_generation != ctx.spec.union_revision
+        || result.validity != BatchValidity::Valid
+    {
+        let message = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                if diagnostic.code.is_empty() {
+                    diagnostic.message.clone()
+                } else {
+                    format!("{}: {}", diagnostic.code, diagnostic.message)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(if message.is_empty() {
+            "union filter returned an invalid result".into()
+        } else {
+            message
+        });
+    }
+    publish_union(
+        ctx,
+        &fence,
+        metas,
+        result.enriched_rows,
+        result.matched_ids,
+        decoded_inputs,
+        prepared_filter,
+        reservation,
+    )
+}
+
+fn prepare_union_filter(ctx: &UnionJobCtx) -> Result<PreparedUnionFilter, String> {
+    let cached = {
+        let shared = ctx.shared.lock().expect("view state poisoned");
+        shared
+            .union_views
+            .get(&ctx.spec.union_view_id)
+            .and_then(|state| state.prepared_filter.clone())
+    };
+    if let Some(cached) = cached
+        && cached.search_source == ctx.spec.filter.search
+        && cached.advanced_source == ctx.spec.filter.advanced_polars
+        && cached.grouping_source == ctx.spec.filter.grouping
+    {
+        return Ok(cached);
+    }
+    let search_compiled = if TextSearch::is_polars(&ctx.spec.filter.search) {
+        Some(compile_union_filter(ctx, &ctx.spec.filter.search)?)
+    } else {
+        None
+    };
+    let search = if ctx.spec.filter.search.is_empty() {
+        None
+    } else {
+        Some(TextSearch::parse(
+            ctx.spec.filter.search.clone(),
+            search_compiled.as_ref(),
+        )?)
+    };
+    let advanced = match ctx.spec.filter.advanced_polars.as_deref() {
+        Some(source) if !source.trim().is_empty() => Some(compile_union_filter(ctx, source)?),
+        _ => None,
+    };
+    let grouping = ctx
+        .spec
+        .filter
+        .grouping
+        .as_deref()
+        .map(ContinuationRule::parse)
+        .transpose()?;
+    Ok(PreparedUnionFilter {
+        search_source: ctx.spec.filter.search.clone(),
+        advanced_source: ctx.spec.filter.advanced_polars.clone(),
+        search,
+        advanced,
+        grouping_source: ctx.spec.filter.grouping.clone(),
+        grouping,
+    })
+}
+
+fn compile_union_filter(ctx: &UnionJobCtx, source: &str) -> Result<CompiledDefinition, String> {
+    check_cancelled(&ctx.cancel, &ctx.shared)?;
+    let (reply, result) = sync_channel(1);
+    ctx.compiler_tx
+        .try_send(super::Work::CompileUnionFilter {
+            source: source.to_owned(),
+            cancel: Arc::clone(&ctx.cancel),
+            reply,
+        })
+        .map_err(|error| match error {
+            TrySendError::Full(_) => {
+                String::from("query worker is busy; union filter was not submitted")
+            }
+            TrySendError::Disconnected(_) => String::from("query worker is unavailable"),
+        })?;
+    loop {
+        check_cancelled(&ctx.cancel, &ctx.shared)?;
+        match result.recv_timeout(FREEZE_WAIT) {
+            Ok(compiled) => return compiled,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("query worker dropped the union filter compilation".into());
+            }
+        }
+    }
 }
 
 /// True when the adapter is shutting down or this job was superseded.
@@ -676,10 +927,9 @@ fn check_cancelled(cancel: &Arc<AtomicBool>, shared: &Arc<Mutex<Shared>>) -> Res
 
 /// Freeze-check, timestamp-map and bounded visit for one input.
 ///
-/// The caller adopts the frozen summary's revisions into the working fence
-/// before calling: the lease is a self-consistent snapshot of exactly one
-/// input revision, so submit-time skew from a live tail queued behind this
-/// job is adopted, never failed. Timestamp authority per record is read from
+/// The submitted revision/generation is authoritative. The lease must be a
+/// self-consistent snapshot of exactly that input definition or the candidate
+/// is stale. Timestamp authority per record is read from
 /// the input's published membership: filtered views contribute their basis
 /// vector, raw views contribute capture nanos. Membership only ever appends
 /// under a live tail, so every frozen row is still mapped; a visited record
@@ -694,6 +944,18 @@ fn visit_union_input(
     remaining_bytes: &mut u64,
 ) -> Result<FrozenUnionWork, String> {
     let summary = frozen.summary().clone();
+    if summary.applied_revision != input.accepted_revision
+        || summary.applied_generation != input.applied_generation
+    {
+        return Err(format!(
+            "union input '{}' is stale: submitted revision {} generation {}, current revision {} generation {}",
+            input.view_id,
+            input.accepted_revision,
+            input.applied_generation,
+            summary.applied_revision,
+            summary.applied_generation
+        ));
+    }
     // Timestamp authority per record, read under one lock with the fence.
     enum TimeSource {
         Membership(HashMap<(String, u64), Option<i64>>),
@@ -769,6 +1031,11 @@ fn visit_union_input(
                     fields: row.fields.clone(),
                     field_types: row.field_types.clone(),
                     raw: String::from_utf8_lossy(&row.record.bytes).into_owned(),
+                    raw_bytes: row.record.bytes.as_ref().to_vec(),
+                    captured_at_unix_nanos: row.record.captured_at_unix_nanos,
+                    stream: row.record.stream,
+                    acquisition_id: *row.record.acquisition_id.as_bytes(),
+                    chunk: row.record.chunk,
                 });
             }
             if (rows.len() as u64) > *remaining_rows {
@@ -807,6 +1074,14 @@ fn visit_union_input(
 /// or live source progress for raw views. Read under the publication lock so
 /// the comparison with frozen metadata is atomic with the install.
 fn current_source_fence(shared: &Shared, view: &ViewState) -> Vec<super::union::UnionSourceFence> {
+    current_source_fence_with_guarded(shared, view, &[])
+}
+
+fn current_source_fence_with_guarded(
+    shared: &Shared,
+    view: &ViewState,
+    guarded: &[(SourceId, u64, Option<u64>)],
+) -> Vec<super::union::UnionSourceFence> {
     match &view.published {
         Published::Filtered { membership } => membership
             .sources
@@ -822,16 +1097,142 @@ fn current_source_fence(shared: &Shared, view: &ViewState) -> Vec<super::union::
             .sources
             .iter()
             .filter_map(|id| {
-                let handle = shared.sources.get(id)?.handle.clone();
-                let progress = handle.progress();
+                let guarded_progress = guarded.iter().find(|(source_id, _, _)| source_id == id);
+                let (generation, high_watermark) = match guarded_progress {
+                    Some((_, generation, high_watermark)) => (*generation, *high_watermark),
+                    None => {
+                        let progress = shared.sources.get(id)?.handle.progress();
+                        (
+                            progress.generation,
+                            progress.high_watermark.map(|record| record.sequence),
+                        )
+                    }
+                };
                 Some(super::union::UnionSourceFence {
                     source_id: id.0.to_string(),
-                    generation: progress.generation,
-                    high_watermark: progress.high_watermark.map(|record| record.sequence),
+                    generation,
+                    high_watermark,
                 })
             })
             .collect(),
     }
+}
+
+fn union_grouping_row<'a>(
+    inputs: &'a [UnionFrozenInput],
+    source: &str,
+    sequence: u64,
+) -> Option<&'a UnionFrozenRow> {
+    inputs.iter().find_map(|input| {
+        input.rows.iter().find(|row| {
+            row.record_id.source_id.0.to_string() == source && row.record_id.sequence == sequence
+        })
+    })
+}
+
+fn union_groups(
+    source: &str,
+    members: &[(u64, Option<i64>, i64)],
+    inputs: &[UnionFrozenInput],
+    rule: &ContinuationRule,
+) -> Result<(Appended<GroupRange>, u64), String> {
+    let mut built = Vec::<GroupRange>::new();
+    let mut charged = 0u64;
+    for (position, (sequence, _, _)) in members.iter().enumerate() {
+        let row = union_grouping_row(inputs, source, *sequence)
+            .ok_or_else(|| format!("union grouping lost record {source}:{sequence}"))?;
+        let display_bytes = &row.raw_bytes[..row.raw_bytes.len().min(MAX_GROUP_LINE_DISPLAY_BYTES)];
+        let projection = lvu::DisplayRow {
+            id: lvu::RowId::new(source, *sequence),
+            timestamp: String::new(),
+            captured_at_unix_nanos: Some(row.captured_at_unix_nanos),
+            level: String::new(),
+            text: String::from_utf8_lossy(display_bytes).into_owned(),
+            details: Vec::new(),
+            fields: Vec::new(),
+        };
+        let previous_sequence = position
+            .checked_sub(1)
+            .and_then(|index| members.get(index))
+            .map(|member| member.0);
+        let physically_adjacent =
+            previous_sequence.and_then(|previous| previous.checked_add(1)) == Some(*sequence);
+        let auto_open = built.last().is_some_and(|group| group.auto_open);
+        let auto_line = rule.auto_line(&row.raw_bytes, auto_open);
+        let continuation = rule.custom_matches(&row.raw_bytes).unwrap_or_else(|| {
+            matches!(
+                row.chunk,
+                lvu_core::ChunkPosition::Continue | lvu_core::ChunkPosition::End
+            ) || auto_line == Some(AutoLine::Continuation)
+        });
+        let can_extend = built.last().is_some_and(|group| {
+            continuation
+                && physically_adjacent
+                && group.stream == row.stream
+                && (!rule.is_auto() || group.acquisition_id == row.acquisition_id)
+                && (!rule.is_auto()
+                    || auto_group_within_span(
+                        group.first_capture_nanos,
+                        group.last_capture_nanos,
+                        row.captured_at_unix_nanos,
+                    ))
+                && group.auto_open
+                && group.len < MAX_GROUP_LINES
+                && group.payload_bytes.saturating_add(row.raw_bytes.len())
+                    <= MAX_GROUP_PAYLOAD_BYTES
+        });
+        if can_extend {
+            let group = built.last_mut().expect("checked");
+            group.len += 1;
+            group.logical_lines = group.logical_lines.saturating_add(1);
+            group.payload_bytes = group.payload_bytes.saturating_add(row.raw_bytes.len());
+            group.last_chunk = row.chunk;
+            group.last_capture_nanos = row.captured_at_unix_nanos;
+            group.auto_open = rule.is_auto()
+                && !matches!(auto_line, Some(AutoLine::Ambiguous))
+                && !matches!(row.chunk, lvu_core::ChunkPosition::End);
+            Arc::make_mut(&mut group.projection).push(projection);
+        } else {
+            let credible_start =
+                rule.custom_matches(&row.raw_bytes).is_some() || auto_line == Some(AutoLine::Start);
+            built.push(GroupRange {
+                start: position,
+                len: 1,
+                logical_lines: 1,
+                payload_bytes: row.raw_bytes.len(),
+                stream: row.stream,
+                orphan: continuation,
+                split: false,
+                oversized: row.raw_bytes.len() > MAX_GROUP_PAYLOAD_BYTES,
+                auto_open: !rule.is_auto() || credible_start,
+                auto_structured: false,
+                auto_structure_depth: 0,
+                partial_open: matches!(row.chunk, lvu_core::ChunkPosition::Start),
+                partial_truncated: false,
+                structure_truncated: false,
+                partial_prefix: Vec::new(),
+                structure_prefix: Vec::new(),
+                acquisition_id: row.acquisition_id,
+                last_chunk: row.chunk,
+                first_capture_nanos: row.captured_at_unix_nanos,
+                last_capture_nanos: row.captured_at_unix_nanos,
+                projection: Arc::new(vec![projection]),
+            });
+        }
+    }
+    for group in &built {
+        charged = charged
+            .checked_add(group_state_bytes(group))
+            .and_then(|bytes| {
+                group.projection.iter().try_fold(bytes, |subtotal, row| {
+                    subtotal.checked_add(display_projection_bytes(row))
+                })
+            })
+            .ok_or_else(|| "union grouping size overflow".to_owned())?;
+    }
+    let mut groups = Appended::default();
+    groups.extend(built);
+    Ok((groups, charged))
 }
 
 /// Merge result publication: fence re-verification and membership install
@@ -842,10 +1243,14 @@ fn publish_union(
     fence: &[StoredUnionInput],
     frozen_inputs: Vec<FrozenUnionMeta>,
     merged: polars::prelude::DataFrame,
+    matched_ids: Vec<lvu_query::StableRecordId>,
+    decoded_inputs: Vec<UnionFrozenInput>,
+    prepared_filter: PreparedUnionFilter,
+    mut reservation: Reservation,
 ) -> Result<(), String> {
     use super::union::{SEQUENCE_COLUMN, SOURCE_ID_COLUMN, UNION_TS_COLUMN};
     use polars::prelude::AnyValue;
-    let height = merged.height();
+    let height = matched_ids.len();
     // Display rank per identity, in engine output order.
     let sources = merged
         .column(SOURCE_ID_COLUMN)
@@ -856,11 +1261,52 @@ fn publish_union(
     let times = merged
         .column(UNION_TS_COLUMN)
         .map_err(|error| error.to_string())?;
+    // A raw provider is registered over one fixed source set. Never publish a
+    // count/order containing identities that provider cannot resolve. A moved
+    // input source set requires a newly registered union definition; this
+    // candidate rejects and preserves the previous membership.
+    let (registered_order, registered_sources) = {
+        let shared = ctx.shared.lock().expect("view state poisoned");
+        let view = shared
+            .views
+            .get(&ctx.spec.union_view_id)
+            .ok_or_else(|| "unknown union view".to_owned())?;
+        (
+            view.registration.sources.clone(),
+            view.registration
+                .sources
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>(),
+        )
+    };
+    let frozen_sources = frozen_inputs
+        .iter()
+        .flat_map(|input| input.source_meta.iter().map(|(source, _, _)| *source))
+        .collect::<HashSet<_>>();
+    if frozen_sources != registered_sources {
+        return Err(
+            "a union input source set moved; refresh requires a new union definition".into(),
+        );
+    }
+    for matched in &matched_ids {
+        if !registered_sources
+            .iter()
+            .any(|source| source.0.to_string() == matched.source_id)
+        {
+            return Err(format!(
+                "union engine returned an unregistered source identity {}",
+                matched.source_id
+            ));
+        }
+    }
     // Display rank per identity, in engine output order. This transient map
     // is decode workspace bounded by the already-budgeted row count; the
     // durable publication below is reserved separately before it is built.
     let mut per_source: HashMap<String, Vec<(u64, Option<i64>, i64)>> = HashMap::new();
-    for index in 0..height {
+    let mut next_match = matched_ids.iter().peekable();
+    let mut survivor_rank = 0i64;
+    for index in 0..merged.height() {
         let source = match sources.get(index).map_err(|error| error.to_string())? {
             AnyValue::Null => {
                 return Err("union result carries a null source identity".into());
@@ -872,6 +1318,13 @@ fn publish_union(
             .map_err(|error| error.to_string())?
             .try_extract::<u64>()
             .map_err(|error| error.to_string())?;
+        let is_match = next_match
+            .peek()
+            .is_some_and(|matched| matched.source_id == source && matched.sequence == sequence);
+        if !is_match {
+            continue;
+        }
+        next_match.next();
         let time = match times.get(index).map_err(|error| error.to_string())? {
             AnyValue::Null => None,
             value => Some(
@@ -880,67 +1333,39 @@ fn publish_union(
                     .map_err(|error| error.to_string())?,
             ),
         };
-        let rank = i64::try_from(index).map_err(|error| error.to_string())?;
+        let rank = survivor_rank;
+        survivor_rank = survivor_rank
+            .checked_add(1)
+            .ok_or_else(|| "union survivor rank overflow".to_owned())?;
         per_source
             .entry(source)
             .or_default()
             .push((sequence, time, rank));
     }
-    let mut shared = ctx.shared.lock().expect("view state poisoned");
-    // Atomic fence re-verification against the ADOPTED (frozen) fence: every
-    // input still at the revision the merge actually read, every frozen
-    // per-source generation/high-watermark still current, and this job still
-    // the live generation. An ordinary live incremental publication can
-    // advance a membership underneath a running union without touching
-    // accepted revisions, so the revision fence alone would publish a stale
-    // merge omitting newly accepted rows.
-    let Some(state) = shared.union_views.get(&ctx.spec.union_view_id) else {
-        return Err("unknown union view".into());
-    };
-    if state.generation != ctx.generation || ctx.cancel.load(Ordering::Acquire) {
-        return Err("union superseded".into());
+    if let Some(unconsumed) = next_match.next() {
+        return Err(format!(
+            "union engine returned an unknown or out-of-order identity {}:{}",
+            unconsumed.source_id, unconsumed.sequence
+        ));
     }
-    for (input, work) in fence.iter().zip(frozen_inputs.iter()) {
-        let Some(view) = shared.views.get(&input.view_id) else {
-            return Err(format!("union input view '{}' is unknown", input.view_id));
-        };
-        if view.applied_revision != input.accepted_revision
-            || view.applied_generation != input.applied_generation
-        {
-            return Err(format!(
-                "union input '{}' moved during the merge",
-                input.view_id
-            ));
-        }
-        let current = current_source_fence(&shared, view);
-        let frozen = work
-            .source_meta
-            .iter()
-            .map(|(id, generation, high)| super::union::UnionSourceFence {
-                source_id: id.0.to_string(),
-                generation: *generation,
-                high_watermark: *high,
-            })
-            .collect::<Vec<_>>();
-        super::union::verify_source_fence(&input.view_id, &frozen, &current)
-            .map_err(|error| error.to_string())?;
-    }
-    let Some(view) = shared.views.get(&ctx.spec.union_view_id) else {
-        return Err("unknown union view".into());
-    };
     // Charge the publication like any membership, plus rank keys and map
     // overhead: per-row identity/time/rank plus per-source overhead. The
     // reservation precedes every publication allocation below; over budget
     // fails as limited with the prior union preserved.
-    let mut reservation = Reservation::new(Arc::clone(&ctx.budget));
-    let source_count = view.registration.sources.len();
-    if !reservation.add(
-        (height as u64)
-            .saturating_mul(SEQUENCE_BYTES.saturating_mul(3))
-            .saturating_add(
-                (source_count as u64).saturating_mul(SOURCE_OVERHEAD.saturating_add(64)),
-            ),
-    ) {
+    let source_count = registered_order.len();
+    let mut publication_bytes = (height as u64)
+        .checked_mul(
+            SEQUENCE_BYTES
+                .checked_mul(3)
+                .ok_or_else(|| "union membership size overflow".to_owned())?,
+        )
+        .and_then(|bytes| {
+            (source_count as u64)
+                .checked_mul(SOURCE_OVERHEAD.checked_add(64)?)
+                .and_then(|overhead| bytes.checked_add(overhead))
+        })
+        .ok_or_else(|| "union membership size overflow".to_owned())?;
+    if publication_bytes > reservation.bytes {
         return Err("union membership exceeds the memory budget".into());
     }
     let union_basis = frozen_inputs
@@ -954,10 +1379,20 @@ fn publish_union(
     let mut sources_out = Vec::with_capacity(source_count);
     let mut high_watermarks = Vec::with_capacity(source_count);
     let mut event_time_missing = 0usize;
-    for source_id in view.registration.sources.clone() {
+    for source_id in registered_order {
         let key = source_id.0.to_string();
         let mut members = per_source.remove(&key).unwrap_or_default();
         members.sort_by_key(|member| member.0);
+        let groups = match prepared_filter.grouping.as_ref() {
+            Some(rule) => {
+                let (groups, bytes) = union_groups(&key, &members, &decoded_inputs, rule)?;
+                publication_bytes = publication_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| "union grouping size overflow".to_owned())?;
+                groups
+            }
+            None => Appended::default(),
+        };
         let (generation, high) = frozen_inputs
             .iter()
             .flat_map(|work| work.source_meta.iter())
@@ -990,14 +1425,18 @@ fn publish_union(
             high_watermark: high,
             sequences: sequences_out,
             times: times_out,
-            groups: Appended::default(),
+            groups,
             bounds,
             merge_keys: keys_out,
             ascending,
         });
     }
     let count = height as u64;
-    let (order, result_ranks, max_key) = merge_order(&sources_out, false, true, None);
+    let grouped = prepared_filter.grouping.is_some();
+    let (order, result_ranks, max_key) = merge_order(&sources_out, grouped, true, None);
+    if !reservation.retain(publication_bytes) {
+        return Err("union membership exceeds the reserved workspace".into());
+    }
     let bytes = reservation.bytes;
     reservation.committed = true;
     let membership = Membership {
@@ -1016,11 +1455,108 @@ fn publish_union(
         event_time_missing,
         event_time_invalid: 0,
         basis: union_basis,
-        grouped: false,
+        grouped,
         order,
         ranks: result_ranks,
         max_key,
     };
+    let frozen_fences = fence
+        .iter()
+        .zip(frozen_inputs.iter())
+        .map(|(input, work)| {
+            (
+                input.view_id.clone(),
+                work.source_meta
+                    .iter()
+                    .map(|(id, generation, high)| super::union::UnionSourceFence {
+                        source_id: id.0.to_string(),
+                        generation: *generation,
+                        high_watermark: *high,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Pin only raw source progress publications during the short final fence
+    // check and install. All allocations above completed before these guards;
+    // filtered input publications use `shared` itself.
+    let mut raw_handles = {
+        let shared = ctx.shared.lock().expect("view state poisoned");
+        let mut handles = Vec::new();
+        for input in fence {
+            let Some(view) = shared.views.get(&input.view_id) else {
+                return Err(format!("union input view '{}' is unknown", input.view_id));
+            };
+            if matches!(view.published, Published::Raw) {
+                for source_id in &view.registration.sources {
+                    if handles.iter().all(|(existing, _)| existing != source_id) {
+                        let handle = shared
+                            .sources
+                            .get(source_id)
+                            .ok_or_else(|| "union input source is no longer open".to_owned())?
+                            .handle
+                            .clone();
+                        handles.push((*source_id, handle));
+                    }
+                }
+            }
+        }
+        handles
+    };
+    raw_handles.sort_by_key(|(source_id, _)| source_id.0);
+    let mut raw_guards = Vec::with_capacity(raw_handles.len());
+    let mut guarded_progress = Vec::with_capacity(raw_handles.len());
+    for (source_id, handle) in &raw_handles {
+        let guard = handle.lock_progress();
+        guarded_progress.push((
+            *source_id,
+            guard.generation(),
+            guard.high_watermark().map(|record| record.sequence),
+        ));
+        raw_guards.push(guard);
+    }
+    if let Some(barrier) = &ctx.publish_test_barrier {
+        let _ = barrier.checked.send(());
+        loop {
+            if ctx.cancel.load(Ordering::Acquire) {
+                return Err("union superseded".into());
+            }
+            match barrier.release.recv_timeout(FREEZE_WAIT) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("union publication test barrier is gone".into());
+                }
+            }
+        }
+    }
+    let mut shared = ctx.shared.lock().expect("view state poisoned");
+    let Some(state) = shared.union_views.get(&ctx.spec.union_view_id) else {
+        return Err("unknown union view".into());
+    };
+    if state.generation != ctx.generation || ctx.cancel.load(Ordering::Acquire) {
+        return Err("union superseded".into());
+    }
+    for input in fence {
+        let Some(view) = shared.views.get(&input.view_id) else {
+            return Err(format!("union input view '{}' is unknown", input.view_id));
+        };
+        if view.applied_revision != input.accepted_revision
+            || view.applied_generation != input.applied_generation
+        {
+            return Err(format!(
+                "union input '{}' moved during the merge",
+                input.view_id
+            ));
+        }
+        let current = current_source_fence_with_guarded(&shared, view, &guarded_progress);
+        let frozen = frozen_fences
+            .iter()
+            .find_map(|(view_id, fences)| (view_id == &input.view_id).then_some(fences))
+            .ok_or_else(|| format!("union input '{}' has no frozen fence", input.view_id))?;
+        super::union::verify_source_fence(&input.view_id, frozen, &current)
+            .map_err(|error| error.to_string())?;
+    }
     let view = shared
         .views
         .get_mut(&ctx.spec.union_view_id)
@@ -1054,6 +1590,27 @@ fn publish_union(
     state.pending = None;
     state.published_revision = ctx.spec.union_revision;
     state.published_generation = ctx.spec.generation;
+    state.prepared_filter = Some(prepared_filter);
+    state.published_source_fences = fence
+        .iter()
+        .zip(frozen_inputs.iter())
+        .map(|(input, frozen)| {
+            (
+                input.view_id.clone(),
+                frozen
+                    .source_meta
+                    .iter()
+                    .map(
+                        |(id, generation, high_watermark)| super::union::UnionSourceFence {
+                            source_id: id.0.to_string(),
+                            generation: *generation,
+                            high_watermark: *high_watermark,
+                        },
+                    )
+                    .collect(),
+            )
+        })
+        .collect();
     Ok(())
 }
 
@@ -1138,8 +1695,10 @@ mod tests {
             budget: Arc::clone(&adapter.budget),
             cmd_tx,
             frozen_rx,
+            compiler_tx: adapter.work.as_ref().expect("worker").clone(),
             limits: UnionLimits::default(),
             test_barrier: None,
+            publish_test_barrier: None,
         };
         let mut remaining_rows = 1_000_000u64;
         let mut remaining_bytes = 1_000_000u64;

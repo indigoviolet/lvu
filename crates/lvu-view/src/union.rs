@@ -219,6 +219,11 @@ pub struct UnionFrozenRow {
     pub fields: BTreeMap<String, serde_json::Value>,
     pub field_types: BTreeMap<String, String>,
     pub raw: String,
+    pub raw_bytes: Vec<u8>,
+    pub captured_at_unix_nanos: i64,
+    pub stream: lvu_core::StreamKind,
+    pub acquisition_id: [u8; 16],
+    pub chunk: lvu_core::ChunkPosition,
 }
 
 /// One input view's frozen accepted evaluation that a union candidate merges.
@@ -244,21 +249,26 @@ pub struct UnionFrozenInput {
 /// `/regex/flags`): the worker compiles it with `TextSearch::parse` and no
 /// Python host, exactly like an ordinary view's text search, and filters the
 /// merged frame AFTER first-input dedup so precedence survives filtering.
-/// `exact_key` is the correlation-replacement typed key
+/// `advanced_polars` is the ordinary Advanced editor definition. It is
+/// compiled once through the adapter's existing compiler worker, then run by
+/// the native query engine over the merged frame. `exact_key` is the
+/// correlation-replacement typed key
 /// (`lvu_core::ExactFieldConstraint`, one DTO): native Polars equality over
 /// the actual merged typed column via `lvu_query::union::exact_key_filter`,
-/// applied alongside search after dedup. Empty search and no key mean no
-/// constraint. Advanced (`pl.`) filters, enrichment steps and time windows
-/// over unions are explicitly rejected upstream — never silently
-/// dropped — with follow-up seams named in the module hooks.
+/// applied alongside search and Advanced after dedup. Empty fields mean no
+/// corresponding constraint.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UnionFilterSpec {
     #[serde(default)]
     pub search: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advanced_polars: Option<String>,
     /// Exact typed key filter. Additive (`serde(default)`) so older persisted
     /// rows read as unconstrained: no schema bump, unknown fields ignored.
     #[serde(default)]
     pub exact_key: Option<ExactFieldConstraint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouping: Option<String>,
 }
 
 /// Apply a union's own filter to its merged frame (see [`UnionFilterSpec`]).
@@ -272,7 +282,7 @@ pub fn apply_union_filter(
     frame: DataFrame,
     filter: &UnionFilterSpec,
 ) -> Result<DataFrame, UnionError> {
-    let mut frame = frame;
+    let mut predicate = None;
     if !filter.search.is_empty() {
         if TextSearch::is_polars(&filter.search) {
             return Err(UnionError::Engine {
@@ -281,22 +291,27 @@ pub fn apply_union_filter(
         }
         let search = TextSearch::parse(filter.search.clone(), None)
             .map_err(|error| UnionError::Engine { reason: error })?;
-        if let Some(predicate) = search.expression(&frame) {
-            frame =
-                frame
-                    .lazy()
-                    .filter(predicate)
-                    .collect()
-                    .map_err(|error| UnionError::Engine {
-                        reason: error.to_string(),
-                    })?;
-        }
+        predicate = search.expression(&frame);
     }
     if let Some(key) = &filter.exact_key {
-        frame = lvu_query::union::exact_key_filter(frame, key)
-            .map_err(|reason| UnionError::Engine { reason })?;
+        let exact =
+            lvu_query::exact_column_expr(&frame, key).map_err(|error| UnionError::Engine {
+                reason: error.to_string(),
+            })?;
+        predicate = Some(predicate.map_or(exact.clone(), |existing| existing.and(exact)));
     }
-    Ok(frame)
+    match predicate {
+        None => Ok(frame),
+        Some(predicate) => {
+            frame
+                .lazy()
+                .filter(predicate)
+                .collect()
+                .map_err(|error| UnionError::Engine {
+                    reason: error.to_string(),
+                })
+        }
+    }
 }
 /// The identity-plus-timestamp view of a frozen input for [`merge_union_rows`].
 ///
@@ -740,10 +755,17 @@ pub fn union_frozen_inputs(
             maximum: limits.maximum_rows,
         });
     }
+    // Preflight the complete live workspace before the first frame builder.
+    // Frozen rows, decoded inputs, concat output and filter output overlap in
+    // memory, so a single-frame limit checked after construction is too late.
+    let workspace = union_workspace_bytes(inputs)?;
+    if workspace > limits.maximum_bytes {
+        return Err(UnionError::ByteLimit {
+            bytes: workspace,
+            maximum: limits.maximum_bytes,
+        });
+    }
     let mut frames = Vec::with_capacity(inputs.len());
-    // Cumulative preflight: the merge concatenates everything below, so the
-    // SUM of decoded frames is fenced before Polars allocates it — inputs
-    // that each fit alone can still overflow together.
     let mut cumulative_bytes: u64 = 0;
     for input in inputs {
         let frame = frozen_frame(input)?;
@@ -754,7 +776,12 @@ pub fn union_frozen_inputs(
                 maximum: limits.maximum_bytes,
             });
         }
-        cumulative_bytes = cumulative_bytes.saturating_add(bytes);
+        cumulative_bytes = cumulative_bytes
+            .checked_add(bytes)
+            .ok_or(UnionError::ByteLimit {
+                bytes: u64::MAX,
+                maximum: limits.maximum_bytes,
+            })?;
         if cumulative_bytes > limits.maximum_bytes {
             return Err(UnionError::ByteLimit {
                 bytes: cumulative_bytes,
@@ -772,6 +799,58 @@ pub fn union_frozen_inputs(
         });
     }
     Ok(merged)
+}
+
+/// Conservative bytes simultaneously live while frozen rows become a merged,
+/// filtered typed frame. This performs no proportional allocation and runs
+/// before any Polars builder. The four copies account for frozen carriers,
+/// decoded input frames, concat, and filter output; per-cell slack covers
+/// Arrow offsets, validity and builder capacity.
+pub fn union_workspace_bytes(inputs: &[UnionFrozenInput]) -> Result<u64, UnionError> {
+    let overflow = || UnionError::ByteLimit {
+        bytes: u64::MAX,
+        maximum: u64::MAX,
+    };
+    let mut carrier = 0u64;
+    for input in inputs {
+        carrier = carrier
+            .checked_add(u64::try_from(input.view_id.len()).unwrap_or(u64::MAX))
+            .ok_or_else(overflow)?;
+        for row in &input.rows {
+            let mut row_bytes = 512u64
+                .checked_add(u64::try_from(row.raw.len()).unwrap_or(u64::MAX))
+                .and_then(|bytes| {
+                    bytes.checked_add(u64::try_from(row.raw_bytes.len()).unwrap_or(u64::MAX))
+                })
+                .ok_or_else(overflow)?;
+            for (name, value) in &row.fields {
+                let value_bytes = match value {
+                    serde_json::Value::Null | serde_json::Value::Bool(_) => 8,
+                    serde_json::Value::Number(_) => 32,
+                    serde_json::Value::String(value) => {
+                        u64::try_from(value.len()).unwrap_or(u64::MAX)
+                    }
+                    serde_json::Value::Array(values) => u64::try_from(values.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(128),
+                    serde_json::Value::Object(values) => u64::try_from(values.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(192),
+                };
+                let dtype_bytes = row.field_types.get(name).map_or(0, String::len);
+                row_bytes = row_bytes
+                    .checked_add(u64::try_from(name.len()).unwrap_or(u64::MAX))
+                    .and_then(|bytes| {
+                        bytes.checked_add(u64::try_from(dtype_bytes).unwrap_or(u64::MAX))
+                    })
+                    .and_then(|bytes| bytes.checked_add(value_bytes))
+                    .and_then(|bytes| bytes.checked_add(128))
+                    .ok_or_else(overflow)?;
+            }
+            carrier = carrier.checked_add(row_bytes).ok_or_else(overflow)?;
+        }
+    }
+    carrier.checked_mul(4).ok_or_else(overflow)
 }
 
 /// Decode one frozen input into a typed frame with canonical identity columns.

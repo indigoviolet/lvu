@@ -59,6 +59,8 @@ mod memory;
 mod resources;
 mod session;
 pub mod settings;
+mod shared_key_controller;
+mod shared_key_workflow;
 mod storage;
 mod time_recognition;
 use agent::{
@@ -692,6 +694,12 @@ async fn control_source(
     }
 }
 
+struct PendingSharedKeyUnion {
+    inputs: Vec<String>,
+    origin_view_id: String,
+    job: shared_key_workflow::SharedKeyResolutionJob,
+}
+
 struct Composition {
     /// The field the Fields dialog was last seen describing, so a change is
     /// noticed once rather than asked for on every tick.
@@ -750,6 +758,8 @@ struct Composition {
     /// refresh never resubmits over a running job (each submit would cancel
     /// and restart it, starving publication forever).
     union_inflight: HashMap<String, u64>,
+    shared_key_controller: shared_key_controller::SharedKeyController,
+    shared_key_union: Option<PendingSharedKeyUnion>,
     source_ai_session: Option<(String, u64)>,
     source_ai_session_config: Option<SessionConfig>,
     deferred_owned_lifecycle_events: VecDeque<BridgeEvent>,
@@ -3696,8 +3706,9 @@ impl Composition {
         app: &mut App,
         adapter: &mut NativeViewAdapter,
         inputs: Vec<String>,
+        exact_key: Option<lvu_core::ExactFieldConstraint>,
     ) -> Result<String, String> {
-        eprintln!("UNION-TRACE open_union_view inputs={inputs:?}");
+        let candidate_exact_key = exact_key;
         if inputs.len() < 2 {
             return Err("a union needs at least two input views".into());
         }
@@ -3772,12 +3783,20 @@ impl Composition {
             union: Some(lvu::PersistentUnion {
                 inputs: fenced,
                 filter: String::new(),
+                advanced_filter: String::new(),
+                exact_key: None,
             }),
             ..lvu::PersistentViewState::default()
         };
         if !app.restore_persistent_view(&new_id, restored) {
             adapter.unregister_union_view(&new_id);
             return Err("the union view could not be installed".into());
+        }
+        if let Some(key) = candidate_exact_key
+            && !app.set_union_candidate_exact_key(&new_id, key)
+        {
+            adapter.unregister_union_view(&new_id);
+            return Err("the union key candidate could not be installed".into());
         }
         let memory_id =
             lvu_core::ViewId(Uuid::parse_str(&new_id).expect("generated view identity"));
@@ -3812,13 +3831,6 @@ impl Composition {
         let fail = |app: &mut App, message: String| {
             app.apply_union_completion(&view_id, revision, generation, Some(message));
         };
-        if request.constraints.advanced_polars.is_some() {
-            fail(
-                app,
-                "advanced (pl.) filters are not supported over unions yet; filter the input views instead".into(),
-            );
-            return true;
-        }
         if !request.constraints.enrichments.is_empty() || request.constraints.enrichment.is_some() {
             fail(
                 app,
@@ -3833,6 +3845,14 @@ impl Composition {
         }
         if request.constraints.exact_field.is_some() {
             fail(app, "correlations cannot be combined with unions".into());
+            return true;
+        }
+        if !request.constraints.color_rules.is_empty() {
+            fail(
+                app,
+                "colour rules over unions are not supported yet; the previous union was preserved"
+                    .into(),
+            );
             return true;
         }
         let fences = match app.union_fence(&view_id) {
@@ -3860,11 +3880,13 @@ impl Composition {
                     .text
                     .map(|text| text.literal)
                     .unwrap_or_default(),
+                advanced_polars: request.constraints.advanced_polars.clone(),
                 // The correlation-replacement typed key never travels on the
                 // legacy QueryConstraints.exact_field path (which stays
                 // rejected for unions); its controller submits candidates
                 // carrying exact_key directly.
-                exact_key: None,
+                exact_key: app.union_candidate_exact_key(&view_id, revision),
+                grouping: request.constraints.grouping.clone(),
             },
         };
         let graph: std::collections::HashMap<String, Vec<String>> = app
@@ -3899,17 +3921,115 @@ impl Composition {
     /// advances resubmit through the ordinary refresh path.
     fn handle_union(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = false;
-        for request in app.layers.union.take_requests() {
+        if self.shared_key_union.is_some() && !app.union_dialog_open() {
+            if let Some(mut pending) = self.shared_key_union.take() {
+                pending.job.cancel(&mut self.shared_key_controller);
+            }
             changed = true;
-            let lvu::UnionDialogRequest::Create { inputs } = request;
-            match self.open_union_view(app, adapter, inputs) {
-                Ok(notice) => {
-                    app.action_notice = Some(notice);
-                    app.close_union_dialog();
+        }
+        let settled = if let Some(pending) = self.shared_key_union.as_mut() {
+            let fence = app.view_query_fence(&pending.origin_view_id);
+            match pending.job.poll(&mut self.shared_key_controller, fence) {
+                shared_key_workflow::SharedKeyResolutionPoll::Pending => None,
+                shared_key_workflow::SharedKeyResolutionPoll::Settled(completion) => {
+                    Some(completion)
                 }
-                Err(message) => {
+            }
+        } else {
+            None
+        };
+        if let Some(completion) = settled {
+            let pending = self.shared_key_union.take().expect("polled pending job");
+            changed = true;
+            match completion {
+                shared_key_controller::SharedKeyCompletion::Accepted(proven) => {
+                    // `poll` just compared a freshly read fence. Register only
+                    // now, never while resolution is pending or stale.
+                    match self.open_union_view(
+                        app,
+                        adapter,
+                        pending.inputs,
+                        Some(proven.constraint),
+                    ) {
+                        Ok(notice) => {
+                            app.action_notice = Some(notice);
+                            app.close_union_dialog();
+                        }
+                        Err(message) => app.union_create_failed(message),
+                    }
+                }
+                shared_key_controller::SharedKeyCompletion::Rejected(message) => {
                     app.union_create_failed(message);
                 }
+                shared_key_controller::SharedKeyCompletion::Stale => app.union_create_failed(
+                    "the selected view advanced while resolving its key; choose the row again"
+                        .into(),
+                ),
+                shared_key_controller::SharedKeyCompletion::Ignored => app.union_create_failed(
+                    "the accepted-key resolution was superseded; try again".into(),
+                ),
+            }
+        }
+        for request in app.layers.union.take_requests() {
+            changed = true;
+            let lvu::UnionDialogRequest::Create { inputs, shared_key } = request;
+            let Some(origin) = shared_key else {
+                match self.open_union_view(app, adapter, inputs, None) {
+                    Ok(notice) => {
+                        app.action_notice = Some(notice);
+                        app.close_union_dialog();
+                    }
+                    Err(message) => app.union_create_failed(message),
+                }
+                continue;
+            };
+            if self.shared_key_union.is_some() {
+                app.union_create_failed("an accepted-key resolution is already running".into());
+                continue;
+            }
+            let Some((accepted_revision, applied_generation)) =
+                app.view_query_fence(&origin.origin_view_id)
+            else {
+                app.union_create_failed("the selected origin view is no longer open".into());
+                continue;
+            };
+            let source_id = match Uuid::parse_str(&origin.row_id.source_id) {
+                Ok(source_id) => SourceId(source_id),
+                Err(error) => {
+                    app.union_create_failed(format!("selected record identity: {error}"));
+                    continue;
+                }
+            };
+            let workflow_origin = shared_key_controller::SharedKeyOrigin {
+                view_id: origin.origin_view_id.clone(),
+                accepted_revision,
+                applied_generation,
+                record_id: lvu_core::RecordId {
+                    source_id,
+                    sequence: origin.row_id.sequence,
+                },
+                field: origin.field,
+            };
+            match shared_key_workflow::begin_shared_key_resolution(
+                &mut self.shared_key_controller,
+                adapter,
+                workflow_origin,
+            ) {
+                Ok(job) => {
+                    self.shared_key_union = Some(PendingSharedKeyUnion {
+                        inputs,
+                        origin_view_id: origin.origin_view_id,
+                        job,
+                    });
+                }
+                Err(shared_key_controller::SharedKeyCompletion::Rejected(message)) => {
+                    app.union_create_failed(message);
+                }
+                Err(shared_key_controller::SharedKeyCompletion::Stale) => app.union_create_failed(
+                    "the selected view advanced before its key could be resolved".into(),
+                ),
+                Err(_) => app
+                    .union_create_failed("the accepted-key resolution could not be started".into()),
             }
         }
         for request in app.take_union_requests() {
@@ -3926,31 +4046,19 @@ impl Composition {
                 completion.error,
             );
         }
-        // Live-append refresh: any accepted input that moved past the
-        // published fence resubmits, unless a job is already in flight for
-        // that union (each submit supersedes, so resubmitting over a running
-        // job would starve publication forever).
+        // Live-append refresh: the adapter compares the last-published exact
+        // input source generation/high-watermarks as well as accepted view
+        // revisions. Raw input views intentionally remain 0/0 across append,
+        // so an app-only revision comparison cannot observe their growth.
+        // One in-flight entry coalesces refreshes and prevents a busy loop or
+        // repeated supersession while a source continues arriving.
         for view in app.views().to_vec() {
             if !app.is_union_view(&view.id) || self.union_inflight.contains_key(&view.id) {
                 continue;
             }
-            let Some(accepted) = adapter.union_inputs(&view.id) else {
-                continue;
-            };
-            let current = match app.union_fence(&view.id) {
-                Ok(current) => current,
-                Err(_) => continue,
-            };
-            let moved = accepted.iter().any(|base| {
-                current
-                    .iter()
-                    .find(|live| live.view_id == base.view_id)
-                    .is_none_or(|live| {
-                        live.accepted_revision != base.accepted_revision
-                            || live.applied_generation != base.applied_generation
-                    })
-            }) || current.len() != accepted.len();
-            if moved && app.enqueue_union_refresh(&view.id).is_some() {
+            if adapter.union_needs_refresh(&view.id) == Some(true)
+                && app.enqueue_union_refresh(&view.id).is_some()
+            {
                 changed = true;
             }
         }
@@ -7615,6 +7723,8 @@ async fn run() -> Result<(), String> {
         ai_session_busy: false,
         source_ai_work: None,
         union_inflight: HashMap::new(),
+        shared_key_controller: shared_key_controller::SharedKeyController::default(),
+        shared_key_union: None,
         source_ai_session: None,
         source_ai_session_config: None,
         deferred_owned_lifecycle_events: VecDeque::new(),
@@ -8920,7 +9030,8 @@ mod tests {
         lexical_display_hint, owned_session_start_admission, parse_args, prepare_ai_context,
         prepend_notice, proposal_expression, recipe_incompatibility, reconcile_pending_state,
         record_agent_session, record_capture_root, resources, resume_notice, select_capture_root,
-        validate_recipe_proposal_source, validate_remote_cancellation, view_admission_error,
+        shared_key_controller, validate_recipe_proposal_source, validate_remote_cancellation,
+        view_admission_error,
     };
     use lvu::{
         App, PathCompletionRequest, PersistentViewState, SourceItem, SourceKind,
@@ -9663,6 +9774,8 @@ mod tests {
             ai_session_busy: false,
             source_ai_work: None,
             union_inflight: HashMap::new(),
+            shared_key_controller: shared_key_controller::SharedKeyController::default(),
+            shared_key_union: None,
             source_ai_session: None,
             source_ai_session_config: None,
             deferred_owned_lifecycle_events: VecDeque::new(),
@@ -11325,6 +11438,8 @@ for line in sys.stdin:
             ai_session_busy: false,
             source_ai_work: None,
             union_inflight: HashMap::new(),
+            shared_key_controller: shared_key_controller::SharedKeyController::default(),
+            shared_key_union: None,
             source_ai_session: None,
             source_ai_session_config: None,
             deferred_owned_lifecycle_events: VecDeque::new(),
@@ -11453,6 +11568,8 @@ for line in sys.stdin:
             ai_session_busy: false,
             source_ai_work: None,
             union_inflight: HashMap::new(),
+            shared_key_controller: shared_key_controller::SharedKeyController::default(),
+            shared_key_union: None,
             source_ai_session: None,
             source_ai_session_config: None,
             deferred_owned_lifecycle_events: VecDeque::new(),

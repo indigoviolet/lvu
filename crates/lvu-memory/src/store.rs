@@ -1125,6 +1125,10 @@ pub struct StoredUnion {
     pub inputs: Vec<StoredUnionInput>,
     #[serde(default)]
     pub filter: String,
+    #[serde(default)]
+    pub advanced_filter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_key: Option<lvu_core::ExactFieldConstraint>,
 }
 
 /// One command step's run state: its definition revision and the reference

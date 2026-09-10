@@ -411,6 +411,7 @@ fn stored_shape_round_trips_additively() {
         filter: UnionFilterSpec {
             search: "error".into(),
             exact_key: None,
+            ..UnionFilterSpec::default()
         },
     };
     let json = serde_json::to_string(&shape).unwrap();
@@ -457,6 +458,11 @@ fn frozen_row_text(
             .map(|(name, dtype, _)| ((*name).to_owned(), (*dtype).to_owned()))
             .collect::<BTreeMap<_, _>>(),
         raw: raw.to_owned(),
+        raw_bytes: raw.as_bytes().to_vec(),
+        captured_at_unix_nanos: timestamp_nanos.unwrap_or_default(),
+        stream: lvu_core::StreamKind::File,
+        acquisition_id: [0; 16],
+        chunk: lvu_core::ChunkPosition::Complete,
     }
 }
 
@@ -494,6 +500,11 @@ fn frozen_row_bare(
             .collect::<BTreeMap<_, _>>(),
         field_types: BTreeMap::new(),
         raw: String::new(),
+        raw_bytes: Vec::new(),
+        captured_at_unix_nanos: timestamp_nanos.unwrap_or_default(),
+        stream: lvu_core::StreamKind::File,
+        acquisition_id: [0; 16],
+        chunk: lvu_core::ChunkPosition::Complete,
     }
 }
 
@@ -1022,6 +1033,7 @@ fn filtered_merge(search: &str) -> polars::prelude::DataFrame {
         &UnionFilterSpec {
             search: search.into(),
             exact_key: None,
+            ..UnionFilterSpec::default()
         },
     )
     .unwrap()
@@ -1079,6 +1091,7 @@ fn union_search_rejects_advanced_forms_explicitly() {
         &UnionFilterSpec {
             search: "pl.col(\"n\") .gt(1)".into(),
             exact_key: None,
+            ..UnionFilterSpec::default()
         },
     )
     .unwrap_err();
@@ -1125,6 +1138,7 @@ fn union_filter_preserves_first_input_precedence() {
         &UnionFilterSpec {
             search: "beta".into(),
             exact_key: None,
+            ..UnionFilterSpec::default()
         },
     )
     .unwrap();
@@ -1163,6 +1177,7 @@ fn union_filter_preserves_first_input_precedence() {
         &UnionFilterSpec {
             search: "alpha".into(),
             exact_key: None,
+            ..UnionFilterSpec::default()
         },
     )
     .unwrap();
@@ -1208,6 +1223,7 @@ fn union_exact_key_filters_without_search() {
         &UnionFilterSpec {
             search: String::new(),
             exact_key: Some(string_key("k", "a")),
+            ..UnionFilterSpec::default()
         },
     )
     .unwrap();
@@ -1223,6 +1239,7 @@ fn union_exact_key_combines_with_search_after_dedup() {
         &UnionFilterSpec {
             search: "alpha".into(),
             exact_key: Some(string_key("k", "a")),
+            ..UnionFilterSpec::default()
         },
     )
     .unwrap();
@@ -1238,12 +1255,16 @@ fn union_exact_key_mismatch_rejects_without_coercion() {
         &UnionFilterSpec {
             search: String::new(),
             exact_key: Some(key),
+            ..UnionFilterSpec::default()
         },
     )
     .unwrap_err();
     match error {
         UnionError::Engine { reason } => {
-            assert!(reason.contains("matching column type"), "{reason}");
+            assert!(
+                reason.contains("incompatible with signed integer"),
+                "{reason}"
+            );
         }
         other => panic!("expected a typed-mismatch rejection, got {other:?}"),
     }
@@ -1256,6 +1277,7 @@ fn stored_shape_round_trips_exact_key() {
         filter: UnionFilterSpec {
             search: String::new(),
             exact_key: Some(string_key("req", "r-7")),
+            ..UnionFilterSpec::default()
         },
     };
     let back: StoredUnionShape =
@@ -1289,6 +1311,11 @@ fn evidenced_row(
         fields,
         field_types,
         raw: json!("").to_string(),
+        raw_bytes: Vec::new(),
+        captured_at_unix_nanos: sequence as i64,
+        stream: lvu_core::StreamKind::File,
+        acquisition_id: [0; 16],
+        chunk: lvu_core::ChunkPosition::Complete,
     }
 }
 

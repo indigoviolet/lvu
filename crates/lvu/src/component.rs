@@ -164,9 +164,9 @@ pub enum Open {
     Ask(crate::components::ask::AskOpen),
     Investigation,
     Correlation(crate::components::correlation::CorrelationOpen),
-    /// Union of accepted views. Unit: the dialog pre-selects the active view
-    /// from context, so the palette needs no parameters to open it.
-    Union,
+    /// Union of accepted views, optionally constrained by a selected accepted
+    /// enrichment output.
+    Union(crate::components::union_dialog::UnionOpen),
 }
 
 impl LayerId {
@@ -223,7 +223,7 @@ impl Open {
             Open::Ask(_) => LayerId::Ask,
             Open::Investigation => LayerId::Investigation,
             Open::Correlation(_) => LayerId::Correlation,
-            Open::Union => LayerId::Union,
+            Open::Union(_) => LayerId::Union,
         }
     }
 
@@ -276,7 +276,7 @@ impl Open {
             // completion is fenced against.
             Open::Correlation(_) => true,
             // Union pre-selects the active view as its first input.
-            Open::Union => true,
+            Open::Union(_) => true,
         }
     }
 }

@@ -968,6 +968,8 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                         })
                         .collect(),
                     filter: union.filter,
+                    advanced_filter: union.advanced_filter,
+                    exact_key: union.exact_key,
                 }),
             applied_enrichment: request
                 .state
@@ -1360,6 +1362,8 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
                 })
                 .collect(),
             filter: union.filter,
+            advanced_filter: union.advanced_filter,
+            exact_key: union.exact_key,
         }),
         applied_enrichment: applied_enrichments
             .last()

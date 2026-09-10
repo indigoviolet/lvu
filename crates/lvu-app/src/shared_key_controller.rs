@@ -69,18 +69,16 @@ impl SharedKeyController {
         Ok(generation)
     }
 
+    #[cfg(test)]
     pub fn pending(&self) -> Option<(u64, &SharedKeyOrigin)> {
         self.pending
             .as_ref()
             .map(|(generation, origin)| (*generation, origin))
     }
 
+    #[cfg(test)]
     pub fn last_proven(&self) -> Option<&ProvenSharedKey> {
         self.last_proven.as_ref()
-    }
-
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
     }
 
     /// Settle a precise frozen lookup against the origin's current accepted

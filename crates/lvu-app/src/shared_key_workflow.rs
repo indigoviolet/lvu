@@ -56,10 +56,6 @@ pub struct SharedKeyResolutionJob {
 }
 
 impl SharedKeyResolutionJob {
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
     /// Poll from the app tick. `current_fence` must be read at this tick, not
     /// copied from submission: the controller rejects an origin whose accepted
     /// revision OR applied generation advanced while precise replay ran.

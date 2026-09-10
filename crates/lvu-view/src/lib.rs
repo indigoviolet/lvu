@@ -17,9 +17,9 @@ pub use union::{
     UnionCandidateSpec, UnionCompletion, UnionError, UnionFilterSpec, UnionFrozenInput,
     UnionFrozenRow, UnionInputRow, UnionInputSnapshot, UnionLimits, apply_union_filter,
     detect_union_cycle, frozen_identity_snapshot, merge_union_rows, union_frozen_inputs,
-    union_input_stale, union_typed_frames, validate_union_spec,
+    union_input_stale, union_typed_frames, union_workspace_bytes, validate_union_spec,
 };
-pub use union_worker::UnionTestBarrier;
+pub use union_worker::{UnionPublishTestBarrier, UnionTestBarrier};
 
 mod appended;
 
@@ -591,6 +591,15 @@ impl Reservation {
                 Err(actual) => used = actual,
             }
         }
+    }
+    fn retain(&mut self, bytes: u64) -> bool {
+        if bytes > self.bytes {
+            return false;
+        }
+        let released = self.bytes - bytes;
+        self.bytes = bytes;
+        self.budget.used.fetch_sub(released, Ordering::AcqRel);
+        true
     }
     #[allow(clippy::too_many_arguments)]
     fn finish(
@@ -1226,6 +1235,11 @@ struct Shared {
 enum Work {
     Query(Box<QueryRequest>),
     Incremental(String),
+    CompileUnionFilter {
+        source: String,
+        cancel: Arc<AtomicBool>,
+        reply: mpsc::SyncSender<Result<lvu_query::CompiledDefinition, String>>,
+    },
     Shutdown,
 }
 
@@ -3568,6 +3582,21 @@ fn worker_loop(
         }
         match work {
             Work::Shutdown => break,
+            Work::CompileUnionFilter {
+                source,
+                cancel,
+                reply,
+            } => {
+                let result = match compiler.as_mut() {
+                    Some(host) => {
+                        compiler_calls.fetch_add(1, Ordering::Relaxed);
+                        host.compile(&source, ExpressionKind::Filter, &cancel)
+                            .map_err(|error| error.to_string())
+                    }
+                    None => Err("advanced expression compiler is not configured".into()),
+                };
+                let _ = reply.send(result);
+            }
             Work::Incremental(view_id) => {
                 let snapshot = {
                     let state = shared.lock().expect("view state poisoned");

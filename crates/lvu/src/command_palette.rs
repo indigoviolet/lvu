@@ -1355,7 +1355,9 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Merge two or more views into one timestamp-ordered view",
             "Views",
             &["merge views", "combine", "union", "timestamp order"],
-            Action::Open(crate::component::Open::Union),
+            Action::Open(crate::component::Open::Union(
+                crate::components::union_dialog::UnionOpen::Plain,
+            )),
             view_reason,
         ),
         command(

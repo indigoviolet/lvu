@@ -13,7 +13,7 @@ use std::{
     io::Read,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -98,6 +98,7 @@ pub(crate) async fn spawn_writer(
     file_cursor: Option<FileCursorSetup>,
     config: RuntimeConfig,
     progress: watch::Sender<SourceProgress>,
+    progress_publication: Arc<RwLock<()>>,
     mut initial: SourceProgress,
 ) -> Result<WriterInit, RuntimeError> {
     let open_path = journal_path.clone();
@@ -117,7 +118,12 @@ pub(crate) async fn spawn_writer(
     initial.synced_records = recovery.records;
     initial.state = RuntimeState::Running;
     catalog.record(CatalogEvent::Running)?;
-    let _ = progress.send(initial.clone());
+    {
+        let _publication = progress_publication
+            .write()
+            .expect("source progress publication lock poisoned");
+        let _ = progress.send(initial.clone());
+    }
 
     let capacity = config.writer_queue_capacity.saturating_add(1);
     let (sender, event_receiver) = tokio::sync::mpsc::channel(capacity);
@@ -146,6 +152,7 @@ pub(crate) async fn spawn_writer(
             catalog,
             current: initial,
             progress: progress.clone(),
+            progress_publication: progress_publication.clone(),
             file_cursor,
         };
         let outcome = run_writer(state, config, event_receiver, page_receiver, runtime);
@@ -161,6 +168,9 @@ pub(crate) async fn spawn_writer(
                 failed.state = RuntimeState::Error;
             }
             failed.last_error = Some(error.to_string());
+            let _publication = progress_publication
+                .write()
+                .expect("source progress publication lock poisoned");
             let _ = progress.send(failed);
         }
     });
@@ -246,6 +256,7 @@ struct WriterState {
     catalog: Catalog,
     current: SourceProgress,
     progress: watch::Sender<SourceProgress>,
+    progress_publication: Arc<RwLock<()>>,
     file_cursor: Option<FileCursorWriter>,
     commit: Commit,
 }
@@ -288,6 +299,10 @@ impl WriterState {
     }
 
     fn publish(&self) {
+        let _publication = self
+            .progress_publication
+            .write()
+            .expect("source progress publication lock poisoned");
         let _ = self.progress.send(self.current.clone());
     }
 
@@ -784,6 +799,10 @@ fn handle_non_record(
                 // before cleanup has finished.
                 let mut durable = state.current.clone();
                 durable.state = state.progress.borrow().state;
+                let _publication = state
+                    .progress_publication
+                    .write()
+                    .expect("source progress publication lock poisoned");
                 let _ = state.progress.send(durable);
             }
             let _ = reply.send(result);
@@ -1129,6 +1148,7 @@ mod cpu_accounting_tests {
             catalog,
             current,
             progress,
+            progress_publication: Arc::new(RwLock::new(())),
             file_cursor: None,
             commit: Commit::new(&config),
         };
@@ -1301,6 +1321,7 @@ mod scheduling_tests {
                 catalog,
                 current,
                 progress: progress_tx,
+                progress_publication: Arc::new(RwLock::new(())),
                 file_cursor: None,
                 commit: Commit::new(&config),
             };

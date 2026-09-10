@@ -39,6 +39,7 @@ pub use app::{
 };
 pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
 pub use components::union::UnionDialogRequest;
+pub use components::union_dialog::{SharedKeyUnionOrigin, UnionOpen};
 pub use provider::{
     ContextPage, DisplayRow, FoldNormalisation, FoldRequest, FoldScopeRequest, FoldSummary,
     GapDirection, GapHit, RowId, RowPage, RowProvider, TimeBounds, ViewportRequest,

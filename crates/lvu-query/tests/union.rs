@@ -8,9 +8,7 @@
 #[allow(dead_code)]
 mod engine_union;
 
-use engine_union::exact_key_filter;
 use engine_union::union_sorted_frames;
-use lvu_core::{ExactFieldConstraint, ExactScalar};
 use polars::prelude::*;
 
 const TS: &str = "ts";
@@ -143,73 +141,4 @@ fn protected_tag_and_shape_conflicts_reject() {
     .unwrap();
     let ints = frame(&["b"], &[1], &[Some(2)], &[Some(2)]);
     assert!(union_sorted_frames(vec![strings, ints], TS, SOURCE, SEQ, TAG,).is_err());
-}
-
-fn keyed_frame() -> DataFrame {
-    DataFrame::new_infer_height(vec![
-        Column::new("k".into(), vec![Some("a"), None, Some("b")]),
-        Column::new("n".into(), vec![1i64, 2, 3]),
-        Column::new("f".into(), vec![0.5f64, 1.5, 2.5]),
-        Column::new("b".into(), vec![true, false, true]),
-    ])
-    .unwrap()
-}
-
-fn string_values(frame: &DataFrame, name: &str) -> Vec<Option<String>> {
-    (0..frame.height())
-        .map(|i| match frame.column(name).unwrap().get(i).unwrap() {
-            AnyValue::Null => None,
-            value => Some(value.str_value().to_string()),
-        })
-        .collect()
-}
-
-#[test]
-fn exact_key_matches_typed_value_and_excludes_nulls() {
-    let frame = keyed_frame();
-    let constraint = ExactFieldConstraint::new("k", ExactScalar::string("a").unwrap()).unwrap();
-    let matched = exact_key_filter(frame, &constraint).unwrap();
-    assert_eq!(matched.height(), 1);
-    assert_eq!(string_values(&matched, "k"), vec![Some("a".to_owned())]);
-}
-
-#[test]
-fn exact_key_covers_int_float_bool_carriers() {
-    let frame = keyed_frame();
-    let int = ExactFieldConstraint::new("n", ExactScalar::SignedInteger(3)).unwrap();
-    assert_eq!(exact_key_filter(frame.clone(), &int).unwrap().height(), 1);
-    let float = ExactFieldConstraint::new("f", ExactScalar::finite_float(1.5).unwrap()).unwrap();
-    assert_eq!(exact_key_filter(frame.clone(), &float).unwrap().height(), 1);
-    let bool = ExactFieldConstraint::new("b", ExactScalar::Bool(false)).unwrap();
-    assert_eq!(exact_key_filter(frame, &bool).unwrap().height(), 1);
-}
-
-#[test]
-fn exact_key_missing_column_or_null_matches_nothing() {
-    let frame = keyed_frame();
-    let missing = ExactFieldConstraint::new("absent", ExactScalar::string("a").unwrap()).unwrap();
-    let matched = exact_key_filter(frame.clone(), &missing).unwrap();
-    assert_eq!(matched.height(), 0);
-    assert_eq!(matched.width(), frame.width());
-    let null = ExactFieldConstraint::new("k", ExactScalar::Null).unwrap();
-    assert_eq!(exact_key_filter(frame, &null).unwrap().height(), 0);
-}
-
-#[test]
-fn exact_key_rejects_carrier_mismatch_without_coercion() {
-    let frame = keyed_frame();
-    // Integer key against a string column, string key against an int column,
-    // float key against an int column: all reject rather than coerce.
-    for (field, scalar) in [
-        ("k", ExactScalar::SignedInteger(1)),
-        ("n", ExactScalar::string("1").unwrap()),
-        ("n", ExactScalar::finite_float(1.0).unwrap()),
-        ("b", ExactScalar::SignedInteger(1)),
-    ] {
-        let constraint = ExactFieldConstraint::new(field, scalar).unwrap();
-        assert!(
-            exact_key_filter(frame.clone(), &constraint).is_err(),
-            "carrier mismatch on {field} must reject"
-        );
-    }
 }

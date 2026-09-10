@@ -324,7 +324,10 @@ pub enum UnionDialogRequest {
     /// Create a union view over these input view IDs. The shell fences
     /// revisions, registers the view and submits the first candidate;
     /// failures return through `rejected` with the draft intact.
-    Create { inputs: Vec<String> },
+    Create {
+        inputs: Vec<String>,
+        shared_key: Option<super::union_dialog::SharedKeyUnionOrigin>,
+    },
 }
 
 /// Shared structural rule: no duplicates and never the union view itself.

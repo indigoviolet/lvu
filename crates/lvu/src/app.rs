@@ -708,6 +708,13 @@ pub struct ViewState {
     /// translate to union candidates instead of source scans (the adapter
     /// refuses ordinary queries for union views). `None` is an ordinary view.
     pub union_inputs: Option<Vec<crate::components::union::UnionInputRef>>,
+    /// Accepted canonical exact key for a union. The pending shared-key
+    /// controller keeps candidate state separately and installs this only
+    /// after successful native publication.
+    pub union_exact_key: Option<lvu_core::ExactFieldConstraint>,
+    /// Candidate shared key awaiting the union publication that proves it.
+    /// Persistence and accepted-state readers ignore this slot.
+    union_pending_exact_key: Option<(u64, lvu_core::ExactFieldConstraint)>,
     /// Last query generation this view accepted, for union input fencing.
     /// Recorded from every accepted completion, ordinary or union.
     pub applied_generation: u64,
@@ -927,6 +934,8 @@ pub struct PersistentUnionInput {
 pub struct PersistentUnion {
     pub inputs: Vec<PersistentUnionInput>,
     pub filter: String,
+    pub advanced_filter: String,
+    pub exact_key: Option<lvu_core::ExactFieldConstraint>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -3702,6 +3711,8 @@ impl App {
                     })
                     .collect(),
                 filter: state.search.applied.clone(),
+                advanced_filter: state.advanced.applied.clone(),
+                exact_key: state.union_exact_key.clone(),
             }),
         })
     }
@@ -3722,6 +3733,51 @@ impl App {
             .states
             .get(view_id)
             .map(|state| (state.applied_query_revision, state.applied_generation))
+    }
+
+    pub fn view_query_fence(&self, view_id: &str) -> Option<(u64, u64)> {
+        self.view_accepted_state(view_id)
+    }
+
+    /// The accepted canonical exact key of a union, if it has one. Candidate
+    /// selection lives in the app controller; the query translator reads only
+    /// this last-published value, so a rejected key cannot replace it.
+    pub fn union_exact_key(&self, view_id: &str) -> Option<lvu_core::ExactFieldConstraint> {
+        self.views.states.get(view_id).and_then(|state| {
+            state
+                .union_inputs
+                .as_ref()
+                .and(state.union_exact_key.clone())
+        })
+    }
+
+    pub fn set_union_candidate_exact_key(
+        &mut self,
+        view_id: &str,
+        key: lvu_core::ExactFieldConstraint,
+    ) -> bool {
+        let Some(state) = self.views.states.get_mut(view_id) else {
+            return false;
+        };
+        if state.union_inputs.is_none() {
+            return false;
+        }
+        state.union_pending_exact_key = Some((state.desired_query_revision, key));
+        true
+    }
+
+    pub fn union_candidate_exact_key(
+        &self,
+        view_id: &str,
+        revision: u64,
+    ) -> Option<lvu_core::ExactFieldConstraint> {
+        let state = self.views.states.get(view_id)?;
+        state
+            .union_pending_exact_key
+            .as_ref()
+            .filter(|(pending_revision, _)| *pending_revision == revision)
+            .map(|(_, key)| key.clone())
+            .or_else(|| state.union_exact_key.clone())
     }
 
     pub fn view_definition_revision(&self, view_id: &str) -> Option<u64> {
@@ -3921,6 +3977,10 @@ impl App {
     /// Close the union dialog after the shell created its view.
     pub fn close_union_dialog(&mut self) {
         self.close_layer(LayerId::Union);
+    }
+
+    pub fn union_dialog_open(&self) -> bool {
+        self.layers.stack.contains(&LayerId::Union)
     }
 
     /// The correlated view exists. Close the mapping layer and say so.
@@ -4252,14 +4312,12 @@ impl App {
         state.exact_field = restored.exact_field.clone();
         // A union is accepted state or nothing, like a correlation: the
         // stored input fence reinstalls here, and the request below re-merges
-        // (query work, never capture). Restores carrying editors unions
-        // cannot run yet — enrichment, advanced filters, time windows — are
-        // refused rather than half-installed.
+        // (query work, never capture). Enrichment and time windows remain
+        // unsupported and are refused rather than half-installed.
         let restored_union = restored.union.clone();
         if let Some(union) = restored_union.as_ref() {
             if !restored.applied_enrichments.is_empty()
                 || !restored.applied_enrichment.is_empty()
-                || !restored.applied_advanced.is_empty()
                 || restored.applied_capture_time.is_some()
             {
                 return false;
@@ -4278,8 +4336,12 @@ impl App {
                     })
                     .collect(),
             );
+            state.union_exact_key = union.exact_key.clone();
+            state.union_pending_exact_key = None;
         } else {
             state.union_inputs = None;
+            state.union_exact_key = None;
+            state.union_pending_exact_key = None;
         }
         state.search.draft = restored.search_draft;
         state.search.error = restored.search_error;
@@ -4355,7 +4417,11 @@ impl App {
                 restored.applied_search.as_str()
             }),
             exact_field: restored.exact_field.clone(),
-            advanced_polars: nonempty(&restored.applied_advanced),
+            advanced_polars: nonempty(if let Some(union) = restored_union.as_ref() {
+                &union.advanced_filter
+            } else {
+                &restored.applied_advanced
+            }),
             enrichments: if restored.applied_enrichments.is_empty() {
                 legacy_enrichment(&restored.applied_enrichment)
             } else {
@@ -4369,9 +4435,11 @@ impl App {
             color_rules: restored.color_rules.clone(),
         };
         let purpose = if restored_union.is_some() {
-            // Union restores re-merge through the union pipeline, which runs
-            // text search only; anything fancier was refused above.
-            QueryPurpose::Search
+            if constraints.advanced_polars.is_some() {
+                QueryPurpose::Advanced
+            } else {
+                QueryPurpose::Search
+            }
         } else if !constraints.enrichments.is_empty() {
             QueryPurpose::Enrichment
         } else if constraints.advanced_polars.is_some() {
@@ -4406,9 +4474,6 @@ impl App {
                 .unwrap_or(restored.applied_search),
         );
         if restored_union.is_none() {
-            state.advanced.pending_generation = Some(generation);
-            state.advanced.pending_revision = Some(revision);
-            state.advanced.pending_value = Some(restored.applied_advanced);
             state.enrichment.pending_generation = Some(generation);
             state.enrichment.pending_revision = Some(revision);
             state.enrichment.pending_value = Some(restored.applied_enrichment);
@@ -4420,6 +4485,14 @@ impl App {
                 basis: restored.applied_time_basis,
             });
         }
+        state.advanced.pending_generation = Some(generation);
+        state.advanced.pending_revision = Some(revision);
+        state.advanced.pending_value = Some(
+            restored_union
+                .as_ref()
+                .map(|union| union.advanced_filter.clone())
+                .unwrap_or(restored.applied_advanced),
+        );
         state.grouping.pending_generation = Some(generation);
         state.grouping.pending_revision = Some(revision);
         state.grouping.pending_value = Some(restored.applied_grouping);
@@ -5816,6 +5889,11 @@ impl App {
         match error {
             None => {
                 let constraints = state.desired_constraints.clone();
+                if let Some((revision, key)) = state.union_pending_exact_key.take() {
+                    if revision == union_revision {
+                        state.union_exact_key = Some(key);
+                    }
+                }
                 state.search.applied = constraint_text(&constraints);
                 state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
                 state.grouping.applied = constraints.grouping.clone().unwrap_or_default();
@@ -5843,6 +5921,13 @@ impl App {
                 }
             }
             Some(message) => {
+                if state
+                    .union_pending_exact_key
+                    .as_ref()
+                    .is_some_and(|(revision, _)| *revision == union_revision)
+                {
+                    state.union_pending_exact_key = None;
+                }
                 for editor in [&mut state.search, &mut state.advanced, &mut state.grouping] {
                     if editor.pending_generation == Some(generation) {
                         editor.pending_generation = None;
@@ -6435,7 +6520,7 @@ impl App {
             Open::Ask(params) => layers.ask.open(params, &mut ctx),
             Open::Investigation => layers.investigation.open((), &mut ctx),
             Open::Correlation(params) => layers.correlation.open(params, &mut ctx),
-            Open::Union => layers.union.open((), &mut ctx),
+            Open::Union(params) => layers.union.open(params, &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);

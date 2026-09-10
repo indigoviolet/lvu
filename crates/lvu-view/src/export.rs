@@ -75,6 +75,11 @@ pub struct FrozenInputSummary {
     /// Exact for an applied filtered view. Raw views require a bounded scan.
     pub selected_records: Option<u64>,
     pub sources: Vec<FrozenInputSource>,
+    /// Compiled output names from this exact accepted membership. This is the
+    /// authority for workflows selecting derived cells; raw fields and caller
+    /// inventories are not evidence. Slash captures are already expanded by
+    /// compilation before they reach this list.
+    pub accepted_enrichment_outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -506,6 +511,12 @@ impl NativeViewAdapter {
             .map_err(|_| ViewError::SnapshotCapacity)?;
         let lease = JobLease(Arc::clone(&self.snapshot_jobs));
         let frozen = self.freeze_snapshot_through(view_id, through)?;
+        let mut accepted_enrichment_outputs = frozen
+            .membership
+            .as_ref()
+            .map_or_else(Vec::new, |membership| membership.enrichment_names.clone());
+        accepted_enrichment_outputs.sort();
+        accepted_enrichment_outputs.dedup();
         let summary = FrozenInputSummary {
             view_id: frozen.view_id.clone(),
             applied_revision: frozen.applied_revision,
@@ -523,6 +534,7 @@ impl NativeViewAdapter {
                     high_watermark: source.high_watermark,
                 })
                 .collect(),
+            accepted_enrichment_outputs,
         };
         Ok(FrozenInput {
             frozen,

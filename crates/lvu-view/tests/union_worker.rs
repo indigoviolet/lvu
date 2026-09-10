@@ -15,8 +15,8 @@ use lvu_core::{Acquisition, SourceDefinition, SourceId};
 use lvu_ingest::{RuntimeConfig, RuntimeState, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
 use lvu_view::{
-    NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec, UnionTestBarrier,
-    ViewConfig,
+    NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec,
+    UnionPublishTestBarrier, UnionTestBarrier, ViewConfig,
 };
 use std::{
     collections::BTreeMap,
@@ -262,7 +262,29 @@ fn candidate_filtered(
         filter: UnionFilterSpec {
             search: search.into(),
             exact_key: None,
+            ..UnionFilterSpec::default()
         },
+    }
+}
+
+fn raw_candidate(revision: u64) -> UnionCandidateSpec {
+    UnionCandidateSpec {
+        union_view_id: "union".into(),
+        union_revision: revision,
+        generation: revision,
+        inputs: vec![
+            StoredUnionInput {
+                view_id: "raw-a".into(),
+                accepted_revision: 0,
+                applied_generation: 0,
+            },
+            StoredUnionInput {
+                view_id: "raw-b".into(),
+                accepted_revision: 0,
+                applied_generation: 0,
+            },
+        ],
+        filter: UnionFilterSpec::default(),
     }
 }
 
@@ -382,6 +404,81 @@ async fn union_refreshes_when_an_input_advances() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_source_publication_linearizes_with_final_union_install() {
+    let (root, manager, api, worker, mut adapter) = setup().await;
+    adapter
+        .register_view("raw-a", vec![api.source_id()])
+        .unwrap();
+    adapter
+        .register_view("raw-b", vec![worker.source_id()])
+        .unwrap();
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    adapter
+        .submit_union_candidate(raw_candidate(1), &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+    assert_eq!(union_texts(&mut adapter).len(), 12);
+    let original = lvu::RowId::new(api.source_id().0.to_string(), 0);
+    assert!(adapter.rows().index_of_id("union", &original).is_some());
+
+    let (checked_tx, checked_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    adapter
+        .arm_union_publish_test_barrier(
+            "union",
+            UnionPublishTestBarrier {
+                checked: checked_tx,
+                release: release_rx,
+            },
+        )
+        .unwrap();
+    adapter
+        .submit_union_candidate(raw_candidate(2), &|_| None)
+        .unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        adapter.drain_updates(64);
+        if checked_rx.try_recv().is_ok() {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let path = root.path().join("api.log");
+    let writer = std::thread::spawn(move || {
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(
+            file,
+            "{{\"ts\":\"2026-03-04T05:05:00Z\",\"svc\":\"api\",\"n\":99}}"
+        )
+        .unwrap();
+        file.flush().unwrap();
+    });
+    writer.join().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        api.progress().records,
+        6,
+        "source progress publication must wait behind the final union guard"
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(wait_union(&mut adapter, 2).unwrap().error, None);
+    wait_runtime(&api, 7).await;
+    assert_eq!(union_texts(&mut adapter).len(), 12);
+    assert_eq!(adapter.union_needs_refresh("union"), Some(true));
+    adapter
+        .submit_union_candidate(raw_candidate(3), &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 3).unwrap().error, None);
+    assert_eq!(union_texts(&mut adapter).len(), 13);
+    assert!(adapter.rows().index_of_id("union", &original).is_some());
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_applies_its_own_text_search() {
     let (_root, manager, api, worker, mut adapter) = setup().await;
     adapter
@@ -426,6 +523,42 @@ async fn union_completion_reports_the_candidate_generation() {
     let completion = wait_union(&mut adapter, 1).expect("a completion");
     assert_eq!(completion.error, None);
     assert_eq!(completion.generation, 7);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submitted_definition_revision_and_generation_are_authoritative() {
+    let (_root, manager, api, worker, mut adapter) = setup().await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    adapter
+        .submit_union_candidate(candidate(1, &api, &worker, 1, 1), &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+    let accepted = adapter.union_inputs("union").unwrap();
+    let before = union_texts(&mut adapter);
+
+    let mut stale_revision = candidate(2, &api, &worker, 1, 1);
+    stale_revision.inputs[0].accepted_revision = 0;
+    adapter
+        .submit_union_candidate(stale_revision, &|_| None)
+        .unwrap();
+    let error = wait_union(&mut adapter, 2).unwrap().error.unwrap();
+    assert!(error.contains("submitted revision 0"), "{error}");
+    assert_eq!(adapter.union_inputs("union").unwrap(), accepted);
+    assert_eq!(union_texts(&mut adapter), before);
+
+    let mut stale_generation = candidate(3, &api, &worker, 1, 1);
+    stale_generation.inputs[0].applied_generation = 0;
+    adapter
+        .submit_union_candidate(stale_generation, &|_| None)
+        .unwrap();
+    let error = wait_union(&mut adapter, 3).unwrap().error.unwrap();
+    assert!(error.contains("generation 0"), "{error}");
+    assert_eq!(adapter.union_inputs("union").unwrap(), accepted);
+    assert_eq!(union_texts(&mut adapter), before);
     adapter.shutdown();
     manager.shutdown().await;
 }
