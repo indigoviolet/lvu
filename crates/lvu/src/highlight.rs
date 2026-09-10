@@ -229,6 +229,8 @@ mod tests {
         ColorRule {
             predicate: predicate.into(),
             color: RuleColor::Red,
+            column: None,
+            value: None,
         }
     }
 

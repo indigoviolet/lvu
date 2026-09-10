@@ -62,7 +62,7 @@ fn screen(buffer: &Buffer) -> String {
         .join("\n")
 }
 
-fn key(app: &mut App, provider: &FixtureProvider, code: KeyCode) {
+fn key(app: &mut App, provider: &impl RowProvider, code: KeyCode) {
     app.handle(
         Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))),
         provider,
@@ -81,7 +81,7 @@ fn click(app: &mut App, provider: &FixtureProvider, point: (u16, u16)) {
     );
 }
 
-fn type_text(app: &mut App, provider: &FixtureProvider, text: &str) {
+fn type_text(app: &mut App, provider: &impl RowProvider, text: &str) {
     for character in text.chars() {
         key(app, provider, KeyCode::Char(character));
     }
@@ -167,6 +167,8 @@ fn a_rule_is_added_edited_and_applied_without_narrowing_the_view() {
         vec![ColorRule {
             predicate: "timeout".into(),
             color: RuleColor::Red,
+            column: None,
+            value: None,
         }],
         "the rules travel to the engine as a constraint"
     );
@@ -237,10 +239,14 @@ fn an_engine_rejection_keeps_applied_rules_and_reports_the_rule_in_the_dialog() 
     let accepted = ColorRule {
         predicate: "accepted".into(),
         color: RuleColor::Green,
+        column: None,
+        value: None,
     };
     let candidate = ColorRule {
         predicate: "missing.field: value".into(),
         color: RuleColor::Purple,
+        column: None,
+        value: None,
     };
     let state = app.views.active_mut().unwrap();
     state.color_rules = vec![accepted.clone()];
@@ -348,6 +354,8 @@ fn the_draft_survives_closing_and_seeds_from_the_accepted_rules() {
         state.color_rules = vec![ColorRule {
             predicate: "accepted".into(),
             color: RuleColor::Green,
+            column: None,
+            value: None,
         }];
     }
     app.handle(Action::Open(Open::ColorRules), &provider);
@@ -414,10 +422,14 @@ fn a_matched_rule_paints_the_row_over_the_value_colour() {
             ColorRule {
                 predicate: "never".into(),
                 color: RuleColor::Blue,
+                column: None,
+                value: None,
             },
             ColorRule {
                 predicate: "row".into(),
                 color: RuleColor::Magenta,
+                column: None,
+                value: None,
             },
         ];
         // A colour field would normally decide the row's colour; an explicit
@@ -465,6 +477,8 @@ fn a_rule_index_the_terminal_no_longer_has_paints_nothing() {
         state.color_rules = vec![ColorRule {
             predicate: "stale".into(),
             color: RuleColor::Magenta,
+            column: None,
+            value: None,
         }];
     }
     app.sync_provider(&provider, 10);
@@ -528,11 +542,15 @@ fn a_rule_pattern_is_highlighted_and_a_column_predicate_is_not() {
             ColorRule {
                 predicate: r"/\d+/".into(),
                 color: RuleColor::Red,
+                column: None,
+                value: None,
             },
             // Names a column, so there is no run of characters to underline.
             ColorRule {
                 predicate: "level: INFO".into(),
                 color: RuleColor::Blue,
+                column: None,
+                value: None,
             },
         ];
     }
@@ -583,4 +601,228 @@ fn the_layer_declines_to_open_without_a_view_and_dismisses_to_the_base_focus() {
     key(&mut app, &provider, KeyCode::Esc);
     assert!(app.layers.stack.is_empty());
     assert_eq!(app.focus, Focus::Selector);
+}
+
+/// Rows proving evaluated enrichment outputs through structural markers, as
+/// the view worker serves them: `derived.` declares the output,
+/// `derived_ready.` proves the cell evaluated without failure. The output
+/// inventory rides the provider API rather than paging, so tests can serve
+/// zero rows while the accepted chain still declares outputs.
+struct Classified {
+    rows: Vec<DisplayRow>,
+    outputs: Vec<String>,
+}
+
+fn classified_row(sequence: u64, level: &str, severity: Option<&str>) -> DisplayRow {
+    // Both outputs read as evaluated, as if the accepted chain derived them:
+    // `level` lowercases the raw field, `severity` maps it to a token.
+    let mut details = vec![
+        ("derived.level".to_owned(), level.to_owned()),
+        ("derived_ready.level".to_owned(), level.to_owned()),
+    ];
+    let mut fields = vec![("level".to_owned(), level.to_owned())];
+    if let Some(value) = severity {
+        details.push(("derived.severity".to_owned(), value.to_owned()));
+        details.push(("derived_ready.severity".to_owned(), value.to_owned()));
+        fields.push(("severity".to_owned(), value.to_owned()));
+    }
+    DisplayRow {
+        id: RowId::new("api", sequence),
+        timestamp: "12:00:00".into(),
+        captured_at_unix_nanos: Some(1),
+        level: String::new(),
+        text: format!("level={level} request {sequence:02}"),
+        details,
+        fields,
+    }
+}
+
+impl RowProvider for Classified {
+    fn page(&self, _: &str, request: ViewportRequest) -> RowPage {
+        RowPage {
+            total: self.rows.len(),
+            rows: self
+                .rows
+                .iter()
+                .skip(request.start)
+                .take(request.len.max(1))
+                .cloned()
+                .collect(),
+        }
+    }
+    fn row_by_id(&self, _: &str, id: &RowId) -> Option<DisplayRow> {
+        self.rows.iter().find(|row| &row.id == id).cloned()
+    }
+    fn index_of_id(&self, _: &str, id: &RowId) -> Option<usize> {
+        self.rows.iter().position(|row| &row.id == id)
+    }
+    fn revision(&self, _: &str) -> u64 {
+        1
+    }
+    fn enrichment_outputs(&self, _: &str) -> Vec<String> {
+        self.outputs.clone()
+    }
+}
+
+fn classified_demo() -> (Classified, App) {
+    let (_, sources, views) = FixtureProvider::demo();
+    let provider = Classified {
+        rows: vec![
+            classified_row(1, "warn", Some("WARN")),
+            classified_row(2, "info", Some("INFO")),
+        ],
+        outputs: vec!["level".to_owned(), "severity".to_owned()],
+    };
+    let mut app = App::new(sources, views, true);
+    app.sync_provider(&provider, 10);
+    (provider, app)
+}
+
+#[test]
+fn add_classifies_an_enrichment_column_instead_of_a_raw_pattern() {
+    let (provider, mut app) = classified_demo();
+    app.handle(Action::Open(Open::ColorRules), &provider);
+    draw(&provider, &mut app, 90, 24);
+    // Normal entry starts life as a column rule over a proven output — never
+    // as an independent raw pattern classifier. The seed is the first
+    // classifiable output in order.
+    key(&mut app, &provider, KeyCode::Enter);
+    {
+        let draft = &app.view_state().unwrap().color_rules_draft;
+        assert_eq!(draft.len(), 1);
+        assert!(
+            draft[0].is_column(),
+            "Add with outputs present classifies: {:?}",
+            draft[0]
+        );
+        assert_eq!(draft[0].column.as_deref(), Some("level"));
+    }
+    // An empty-string value is valid: it matches only literal empty-string
+    // ready cells, distinctly from a missing value (which execution
+    // rejects). Authoring text settles the new rule, so clearing it back to
+    // empty reads as an empty edit — not an abandoned addition, which
+    // removes itself instead — and applies as an explicit empty match.
+    type_text(&mut app, &provider, "w");
+    key(&mut app, &provider, KeyCode::Backspace);
+    assert!(
+        app.view_state().unwrap().color_rules_draft[0]
+            .value
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+    );
+    key(&mut app, &provider, KeyCode::Enter);
+    let request = app.take_query_requests().pop().expect("one repaint query");
+    assert_eq!(
+        request.constraints.color_rules,
+        vec![ColorRule::column_rule(
+            "level".into(),
+            String::new(),
+            RuleColor::Red,
+        )],
+        "an empty value travels as an explicit empty match"
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    // The value field takes the exact key; re-applying carries a column rule.
+    type_text(&mut app, &provider, "warn");
+    key(&mut app, &provider, KeyCode::Enter);
+    let request = app.take_query_requests().pop().expect("one repaint query");
+    assert_eq!(
+        request.constraints.color_rules,
+        vec![ColorRule::column_rule(
+            "level".into(),
+            "warn".into(),
+            RuleColor::Red,
+        )],
+        "a column rule travels to the engine as a constraint"
+    );
+}
+
+#[test]
+fn the_column_chooser_repoints_without_rewriting_the_value() {
+    let (provider, mut app) = classified_demo();
+    app.handle(Action::Open(Open::ColorRules), &provider);
+    draw(&provider, &mut app, 90, 24);
+    key(&mut app, &provider, KeyCode::Enter);
+    type_text(&mut app, &provider, "warn");
+    // Tab reaches the Column chooser; Right repoints to the next output.
+    while app.layers.color_rules.control() != ColorRulesControl::Column {
+        key(&mut app, &provider, KeyCode::Tab);
+    }
+    let rendered = screen(&draw(&provider, &mut app, 90, 24));
+    assert!(rendered.contains("Column"), "{rendered}");
+    key(&mut app, &provider, KeyCode::Right);
+    {
+        let rule = &app.view_state().unwrap().color_rules_draft[0];
+        assert_eq!(rule.column.as_deref(), Some("severity"));
+        assert_eq!(
+            rule.value.as_deref(),
+            Some("warn"),
+            "repointing keeps the value"
+        );
+    }
+    key(&mut app, &provider, KeyCode::Left);
+    assert_eq!(
+        app.view_state().unwrap().color_rules_draft[0]
+            .column
+            .as_deref(),
+        Some("level")
+    );
+}
+
+#[test]
+fn pending_or_empty_pages_still_classify_accepted_outputs() {
+    // The inventory is the accepted membership's, not the served page: with
+    // zero rows served but outputs declared, Add must still create the same
+    // column rule — never silently fall back to a raw predicate.
+    for name in ["pending page", "settled zero-row filter"] {
+        let (_, sources, views) = FixtureProvider::demo();
+        let provider = Classified {
+            rows: Vec::new(),
+            outputs: vec!["severity".to_owned()],
+        };
+        let mut app = App::new(sources, views, true);
+        app.sync_provider(&provider, 10);
+        app.handle(Action::Open(Open::ColorRules), &provider);
+        draw(&provider, &mut app, 90, 24);
+        key(&mut app, &provider, KeyCode::Enter);
+        let draft = &app.view_state().unwrap().color_rules_draft;
+        assert_eq!(draft.len(), 1, "{name}");
+        assert!(
+            draft[0].is_column(),
+            "{name} must classify, not match raw: {:?}",
+            draft[0]
+        );
+        assert_eq!(draft[0].column.as_deref(), Some("severity"), "{name}");
+    }
+}
+
+#[test]
+fn raw_text_stays_an_explicit_exception_without_outputs() {
+    // Fixture rows carry no derived markers: there is nothing to classify,
+    // so Add starts the explicit raw-text exception instead of a column rule.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::ColorRules), &provider);
+    draw(&provider, &mut app, 90, 24);
+    key(&mut app, &provider, KeyCode::Enter);
+    {
+        let draft = &app.view_state().unwrap().color_rules_draft;
+        assert_eq!(draft.len(), 1);
+        assert!(
+            !draft[0].is_column(),
+            "no outputs means the raw-text exception: {:?}",
+            draft[0]
+        );
+    }
+    type_text(&mut app, &provider, "timeout");
+    assert_eq!(
+        app.view_state().unwrap().color_rules_draft[0].predicate,
+        "timeout"
+    );
 }

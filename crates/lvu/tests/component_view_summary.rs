@@ -116,10 +116,14 @@ fn apply_everything(app: &mut App) {
         ColorRule {
             predicate: "level:error".into(),
             color: RuleColor::Red,
+            column: None,
+            value: None,
         },
         ColorRule {
             predicate: "/retry/i".into(),
             color: RuleColor::Orange,
+            column: None,
+            value: None,
         },
     ];
 }

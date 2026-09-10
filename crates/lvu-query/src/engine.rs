@@ -416,6 +416,18 @@ pub struct BatchQuery<'a> {
     /// type, parsed by the same function, as the filter itself. There is one
     /// predicate evaluator here and rules go through it.
     pub colors: &'a [(String, TextSearch)],
+    /// Column classification colour rules: `(rule name, output column, exact
+    /// value)`. Evaluated natively over the typed enriched frame by exact
+    /// equality — the same single evaluator as predicates, via
+    /// `predicate_mask_expr` below. Readiness is structural: a failed stage
+    /// contributes no column and a removed output is absent from the frame,
+    /// so both silently match nothing (roles-consistent fallback, never a
+    /// view-breaking error); null mask entries never match. No truncation
+    /// and no display conversion: full typed values decide, so values that
+    /// share a display prefix still discriminate. Union views thread their
+    /// own constraints through this same field rather than inheriting
+    /// ordinary view constraints.
+    pub column_colors: &'a [(String, String, String)],
 }
 
 pub struct BatchResult {
@@ -434,18 +446,36 @@ pub struct BatchResult {
 
 /// Extracts a bounded caller-selected display projection aligned by the
 /// protected stable identity columns. Null values remain null.
+///
+/// One canonical text form is shared with native colour equality: float
+/// cells render through the same Polars cast the engine compares, so a
+/// value copied from display (`1.0`, `-0.0`) always matches the rule it
+/// names, while Rust display (`1`, `-0`) would silently miss. Integers,
+/// booleans and strings already agree between the two spellings.
 pub fn scalar_projection(
     frame: &DataFrame,
     name: &str,
     maximum_bytes: usize,
 ) -> Result<Vec<(StableRecordId, Option<String>)>, String> {
-    let (Ok(sources), Ok(sequences), Ok(values)) = (
+    let (Ok(sources), Ok(sequences), Ok(column)) = (
         frame.column(SOURCE_ID_COLUMN),
         frame.column(SEQUENCE_COLUMN),
         frame.column(name),
     ) else {
         return Err(format!("projection column {name:?} is unavailable"));
     };
+    let mut casted: Option<Column> = None;
+    if matches!(
+        column.dtype(),
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    ) {
+        casted = Some(
+            column
+                .cast(&DataType::String)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let values: &Column = casted.as_ref().unwrap_or(column);
     let mut projected = Vec::with_capacity(frame.height());
     for index in 0..frame.height() {
         let source_id = sources
@@ -862,6 +892,46 @@ fn execute_batch_with_predicates(
                 predicate_mask_expr(&frame, expression)
             }
         };
+        match mask.and_then(|mask| {
+            selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
+        }) {
+            Ok(ids) => {
+                color_matches.insert(name.clone(), ids);
+            }
+            Err(failure) => {
+                color_diagnostics.push(error(Some(name), failure.0, &failure.1));
+            }
+        }
+    }
+    for (name, column, want) in query.column_colors {
+        // Only compiled accepted outputs classify: the frame also projects
+        // raw fields, so a same-named raw column must never satisfy a rule
+        // on its own — after its stage is removed while other stages (and
+        // the raw projection) remain, the lingering rule silently unpaints
+        // instead of falling back to raw. Union callers thread their own
+        // compiled stages through this same field.
+        if !query.stages.iter().any(|stage| stage.name == *column) {
+            continue;
+        }
+        // A failed stage is recorded in `failed_fields` and contributes no
+        // column; both silently match nothing — the caller keeps its last
+        // good view, exactly as roles fall back when their output
+        // disappears.
+        if failed_fields.iter().any(|field| field == column) {
+            continue;
+        }
+        if frame.column(column).is_err() {
+            continue;
+        }
+        // Native exact equality over the typed cell: `cast(String)` keeps
+        // one evaluator for every dtype (numbers and booleans compare by
+        // their canonical text form) while null stays null and therefore
+        // never matches. An empty `want` matches only literal empty-string
+        // ready cells — never nulls, never everything.
+        let mask = predicate_mask_expr(
+            &frame,
+            col(column).cast(DataType::String).eq(lit(want.as_str())),
+        );
         match mask.and_then(|mask| {
             selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
         }) {

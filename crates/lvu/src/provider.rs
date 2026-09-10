@@ -260,6 +260,16 @@ pub trait RowProvider {
     fn row_by_id(&self, view_id: &str, id: &RowId) -> Option<DisplayRow>;
     fn index_of_id(&self, view_id: &str, id: &RowId) -> Option<usize>;
     fn revision(&self, view_id: &str) -> u64;
+    /// Enrichment output names the view's accepted chain declares, in chain
+    /// order — the structural membership inventory, including slash-shorthand
+    /// named captures. Independent of which rows (if any) are currently
+    /// served: a pending page or a settled zero-row filter must not hide
+    /// accepted outputs from callers that bind new display state to them
+    /// (colour rule columns, role toggles). Providers without an accepted
+    /// chain answer empty, like a view with no enrichments.
+    fn enrichment_outputs(&self, _view_id: &str) -> Vec<String> {
+        Vec::new()
+    }
     /// The view's rows with folding not applied, whatever the view's folding
     /// policy is.
     ///

@@ -1194,7 +1194,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
         command(
             CommandId::ColorRules,
             "Colour rules",
-            "Paint rows by predicate, in order, over the value colours",
+            "Paint rows by enrichment column, in order, over the value colours",
             "View",
             &["highlight", "colour", "color", "rules"],
             Action::Open(crate::component::Open::ColorRules),

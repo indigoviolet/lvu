@@ -1,5 +1,5 @@
 //! The Colour rules layer (`c`): an ordered, per-view list of
-//! "when <predicate> then <colour>" rules that decide how a row is painted.
+//! "when <match> then <colour>" rules that decide how a row is painted.
 //!
 //! Everything it edits is view-owned (§2.5). `ViewState.color_rules` is the
 //! accepted list — what the rows on screen were painted with — and
@@ -7,14 +7,24 @@
 //! closing and reopening resumes the edit and a restart restores it. Nothing is
 //! cached here; the layer renders from `ctx.views.active()` every frame.
 //!
+//! A rule is either a column classification or a legacy predicate. Column
+//! rules name an accepted enrichment output and an exact value: patterns and
+//! keys belong in ordinary enrichment definitions, so colour only reads their
+//! outputs — a new rule never starts life as an independent raw pattern
+//! classifier. Raw literal text remains as the explicit exception for views
+//! with nothing to classify yet. Legacy predicate rules restored from earlier
+//! versions keep working unchanged; the dialog no longer offers their syntax.
+//!
 //! Two things this layer deliberately does not do:
 //!
-//! * **It does not evaluate a predicate.** A rule is written in the search
-//!   box's own language and is compiled and run by the query engine, in the
-//!   same batch pass and through the same `TextSearch` the filter uses. What
-//!   this dialog validates is only what can be checked without data — that the
-//!   predicate is non-empty, within the byte cap, and, for a `/regex/`, that it
-//!   compiles. Everything else is the engine's answer.
+//! * **It does not evaluate a match.** A legacy predicate is written in the
+//!   search box's own language and is compiled and run by the query engine,
+//!   in the same batch pass and through the same `TextSearch` the filter
+//!   uses; a column rule is an exact lookup of the worker's ready derived
+//!   cell. What this dialog validates is only what can be checked without
+//!   data — non-empty text, the byte cap, compilable `/regex/` for legacy
+//!   predicates, and a named column plus value for column rules. Everything
+//!   else is the engine's answer.
 //! * **It does not narrow the view.** Rules are presentation. Applying them
 //!   submits one query, exactly as display-only grouping does, and the last
 //!   applied view stays on screen while it settles.
@@ -47,7 +57,11 @@ pub enum ColorRulesControl {
     /// The rule list.
     #[default]
     List,
-    /// The predicate field for the rule being added or edited.
+    /// The enrichment column a column rule classifies. Reached by Tab only
+    /// when the selected rule is a column rule.
+    Column,
+    /// The text field for the rule being added or edited: the exact value
+    /// for a column rule, the predicate for a legacy rule.
     Predicate,
     /// The colour chooser for that rule.
     Color,
@@ -141,15 +155,86 @@ impl ColorRulesDialog {
         }
     }
 
+    /// Accepted enrichment outputs a new or repointed rule may classify: the
+    /// accepted membership's declared output inventory, read through the
+    /// provider rather than by parsing definition source — which is blind to
+    /// slash-shorthand named captures — and independent of which rows (if
+    /// any) are currently served, so a pending page or a settled zero-row
+    /// filter never forces the raw-text exception. Sorted and deduplicated
+    /// for the chooser; empty only when the accepted chain declares nothing.
+    fn classifiable_columns(ctx: &Ctx<'_>) -> Vec<String> {
+        let Some(view_id) = ctx.views.active_id() else {
+            return Vec::new();
+        };
+        let mut columns = ctx.provider.enrichment_outputs(view_id);
+        columns.sort();
+        columns.dedup();
+        columns
+    }
+
+    /// Whether the selected draft rule classifies a column. The text field
+    /// edits its exact value; otherwise it edits a legacy predicate.
+    fn selected_is_column(ctx: &Ctx<'_>, selected: usize) -> bool {
+        Self::draft(ctx)
+            .get(selected)
+            .is_some_and(ColorRule::is_column)
+    }
+
+    /// The text the field edits for the selected rule: exact value or
+    /// legacy predicate.
+    fn selected_text(ctx: &Ctx<'_>, selected: usize) -> String {
+        Self::draft(ctx)
+            .get(selected)
+            .map(|rule| {
+                if rule.is_column() {
+                    rule.value.clone().unwrap_or_default()
+                } else {
+                    rule.predicate.clone()
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    /// Point a column rule at another accepted output, keeping its value:
+    /// re classification never rewrites what it classifies against.
+    fn cycle_column(&mut self, delta: i32, ctx: &mut Ctx<'_>) {
+        let options = Self::classifiable_columns(ctx);
+        if options.is_empty() {
+            return;
+        }
+        let selected = self.selected;
+        Self::with_draft(ctx, |rules| {
+            let Some(rule) = rules.get_mut(selected) else {
+                return;
+            };
+            if !rule.is_column() {
+                return;
+            }
+            let current = rule.column.clone().unwrap_or_default();
+            let at = options
+                .iter()
+                .position(|name| *name == current)
+                .unwrap_or(if delta >= 0 { options.len() - 1 } else { 0 });
+            let next =
+                options[(at as i32 + delta).rem_euclid(options.len() as i32) as usize].clone();
+            rule.column = Some(next);
+        });
+        self.reset_cursor(ctx);
+    }
+
     /// Whether the predicate field currently has the keys, which is what makes
     /// `q` a character rather than a dismissal (§1).
     fn editing(&self) -> bool {
         self.control == ColorRulesControl::Predicate
     }
 
-    fn controls(&self, rules: usize) -> Vec<ColorRulesControl> {
+    fn controls(&self, ctx: &Ctx<'_>) -> Vec<ColorRulesControl> {
+        let rules = Self::draft(ctx).len();
         let mut controls = vec![ColorRulesControl::List];
         if rules > 0 {
+            if Self::selected_is_column(ctx, self.selected) {
+                controls.push(ColorRulesControl::Column);
+            }
             controls.push(ColorRulesControl::Predicate);
             controls.push(ColorRulesControl::Color);
         }
@@ -162,7 +247,7 @@ impl ColorRulesDialog {
     }
 
     fn move_control(&mut self, delta: i32, ctx: &Ctx<'_>) {
-        let controls = self.controls(Self::draft(ctx).len());
+        let controls = self.controls(ctx);
         let at = controls
             .iter()
             .position(|control| *control == self.control)
@@ -174,11 +259,7 @@ impl ColorRulesDialog {
     }
 
     fn reset_cursor(&mut self, ctx: &Ctx<'_>) {
-        let value = Self::draft(ctx)
-            .get(self.selected)
-            .map(|rule| rule.predicate.clone())
-            .unwrap_or_default();
-        reset_cursor_to_end(&value, &mut self.cursor);
+        reset_cursor_to_end(&Self::selected_text(ctx, self.selected), &mut self.cursor);
     }
 
     fn move_selection(&mut self, delta: i32, ctx: &mut Ctx<'_>) {
@@ -196,17 +277,22 @@ impl ColorRulesDialog {
         self.reset_cursor(ctx);
     }
 
-    /// A rule added and then abandoned without a predicate is removed rather
-    /// than left in the list matching nothing.
+    /// A rule added and then abandoned without its match text is removed
+    /// rather than left in the list matching nothing: the exact value for a
+    /// column rule, the predicate for a legacy one.
     fn commit_empty_addition(&mut self, ctx: &mut Ctx<'_>) {
         if !self.adding {
             return;
         }
         self.adding = false;
         let selected = self.selected;
-        let empty = Self::draft(ctx)
-            .get(selected)
-            .is_some_and(|rule| rule.predicate.trim().is_empty());
+        let empty = Self::draft(ctx).get(selected).is_some_and(|rule| {
+            if rule.is_column() {
+                rule.value.as_deref().is_none_or(|value| value.is_empty())
+            } else {
+                rule.predicate.trim().is_empty()
+            }
+        });
         if empty {
             Self::with_draft(ctx, |rules| {
                 if selected < rules.len() {
@@ -229,11 +315,18 @@ impl ColorRulesDialog {
         // A new rule takes the next colour in the palette, so a list built by
         // pressing Add repeatedly is legible without choosing anything.
         let color = RuleColor::ALL[Self::draft(ctx).len() % RuleColor::ALL.len()];
+        // Normal entry classifies an enrichment column: patterns and keys
+        // belong in ordinary enrichment definitions, so a new rule never
+        // starts life as an independent raw pattern classifier. With no
+        // accepted outputs yet there is nothing to classify and the rule
+        // starts as the explicit raw-text exception instead.
+        let column = Self::classifiable_columns(ctx).into_iter().next();
         Self::with_draft(ctx, |rules| {
-            rules.push(ColorRule {
-                predicate: String::new(),
-                color,
-            });
+            if let Some(column) = column {
+                rules.push(ColorRule::column_rule(column, String::new(), color));
+            } else {
+                rules.push(ColorRule::predicate_rule(String::new(), color));
+            }
         });
         self.selected = Self::draft(ctx).len().saturating_sub(1);
         self.control = ColorRulesControl::Predicate;
@@ -276,12 +369,11 @@ impl ColorRulesDialog {
             return Outcome::Ignored;
         }
         let selected = self.selected;
-        let Some(mut value) = Self::draft(ctx)
-            .get(selected)
-            .map(|rule| rule.predicate.clone())
-        else {
+        if Self::draft(ctx).get(selected).is_none() {
             return Outcome::Ignored;
-        };
+        }
+        let column = Self::selected_is_column(ctx, selected);
+        let mut value = Self::selected_text(ctx, selected);
         let mut cursor = self.cursor;
         let outcome = edit(
             &mut value,
@@ -294,9 +386,17 @@ impl ColorRulesDialog {
         );
         self.cursor = cursor;
         if outcome.changed {
+            // Authored text settles the new rule: clearing it afterwards
+            // reads as an (empty, valid) edit rather than an abandoned
+            // addition, which removes itself instead.
+            self.adding = false;
             Self::with_draft(ctx, |rules| {
                 if let Some(rule) = rules.get_mut(selected) {
-                    rule.predicate = value;
+                    if column {
+                        rule.value = Some(value);
+                    } else {
+                        rule.predicate = value;
+                    }
                 }
             });
         }
@@ -313,6 +413,22 @@ impl ColorRulesDialog {
     fn validate(rules: &[ColorRule]) -> Result<(), String> {
         for (index, rule) in rules.iter().enumerate() {
             let position = index + 1;
+            if rule.is_column() {
+                if rule
+                    .column
+                    .as_deref()
+                    .is_some_and(|column| column.trim().is_empty())
+                    || rule.column.is_none()
+                {
+                    return Err(format!(
+                        "rule {position} names no column — pick an enrichment output"
+                    ));
+                }
+                // An empty-string value is valid: it matches only literal
+                // empty-string ready cells. A missing value is malformed and
+                // rejected loudly at execution instead.
+                continue;
+            }
             if rule.predicate.trim().is_empty() {
                 return Err(format!("rule {position} has no predicate"));
             }
@@ -365,6 +481,9 @@ impl ColorRulesDialog {
 
     fn activate(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         match self.control {
+            // Enter on the column chooser applies, like Enter on the colour
+            // chooser: choosing is done with Left/Right.
+            ColorRulesControl::Column => self.apply(ctx),
             ColorRulesControl::Add => {
                 self.add(ctx);
                 Outcome::Consumed
@@ -419,14 +538,23 @@ impl ColorRulesDialog {
                 self.move_control(1, ctx);
                 Outcome::Consumed
             }
-            // Left/Right choose the colour while the chooser has focus, and
-            // move the caret while the field does.
+            // Left/Right choose the colour while the chooser has focus, the
+            // column while its chooser does, and move the caret while the
+            // field does.
             KeyCode::Left if self.control == ColorRulesControl::Color => {
                 self.cycle_color(-1, ctx);
                 Outcome::Consumed
             }
             KeyCode::Right if self.control == ColorRulesControl::Color => {
                 self.cycle_color(1, ctx);
+                Outcome::Consumed
+            }
+            KeyCode::Left if self.control == ColorRulesControl::Column => {
+                self.cycle_column(-1, ctx);
+                Outcome::Consumed
+            }
+            KeyCode::Right if self.control == ColorRulesControl::Column => {
+                self.cycle_column(1, ctx);
                 Outcome::Consumed
             }
             KeyCode::Left if self.editing() => self.text(EditCommand::MoveLeft, ctx),
@@ -471,7 +599,7 @@ impl ColorRulesDialog {
                 return Outcome::Consumed;
             }
             (true, Some(ColorRulesHit::Control(control))) => {
-                if self.controls(Self::draft(ctx).len()).contains(&control) {
+                if self.controls(ctx).contains(&control) {
                     self.control = control;
                     if self.editing() {
                         self.reset_cursor(ctx);
@@ -479,7 +607,9 @@ impl ColorRulesDialog {
                 }
                 if !matches!(
                     control,
-                    ColorRulesControl::List | ColorRulesControl::Predicate
+                    ColorRulesControl::List
+                        | ColorRulesControl::Column
+                        | ColorRulesControl::Predicate
                 ) {
                     return self.activate(ctx);
                 }
@@ -641,13 +771,21 @@ impl Component for ColorRulesDialog {
                 ),
             ),
         };
-        let help = "The first matching rule wins. A predicate is a search: text, field: value, /regex/, or a pl. expression.";
+        let help = "The first matching rule wins. A rule classifies an enrichment column's exact value; raw text is the explicit exception, and earlier predicates keep working.";
         let labels = COLOR_RULES_BUTTONS;
         let visible_rules = rules.len().clamp(1, 8);
+        let selected_column = rules
+            .get(self.selected)
+            .filter(|rule| rule.is_column())
+            .and_then(|rule| rule.column.clone());
         let content = DialogContent {
             header: 0,
-            // rule pane heading + rows, a blank, then the predicate and colour rows
-            body: 1 + u16::try_from(visible_rules).unwrap_or(1) + 3,
+            // rule pane heading + rows, a blank, then the editor rows: column
+            // plus value plus colour for a column rule, predicate plus colour
+            // for a legacy one.
+            body: 1
+                + u16::try_from(visible_rules).unwrap_or(1)
+                + if selected_column.is_some() { 4 } else { 3 },
             message: message_rows(&sentence, width),
             help: help_rows(help, width),
             actions: packed_button_rows(width, &labels),
@@ -747,16 +885,16 @@ impl Component for ColorRulesDialog {
             }
             let text_x = row.x.saturating_add(7);
             if text_x < row.right() {
+                // A column rule reads as what it classifies; a legacy rule
+                // as the predicate it still evaluates.
+                let summary = rule.summary();
                 frame.render_widget(
-                    Paragraph::new(clipped_width(
-                        &rule.predicate,
-                        usize::from(row.right() - text_x),
-                    ))
-                    .style(if chosen {
-                        styles.selection
-                    } else {
-                        styles.description
-                    }),
+                    Paragraph::new(clipped_width(&summary, usize::from(row.right() - text_x)))
+                        .style(if chosen {
+                            styles.selection
+                        } else {
+                            styles.description
+                        }),
                     Rect::new(text_x, row.y, row.right() - text_x, 1),
                 );
             }
@@ -773,28 +911,68 @@ impl Component for ColorRulesDialog {
             );
         }
 
-        // The editor for the selected rule: one labelled field and one chooser.
+        // The editor for the selected rule: column chooser plus value field
+        // plus colour chooser for a column rule; predicate field plus colour
+        // chooser for a legacy one.
         let editor_y = list_area.bottom().saturating_add(1);
         let label_width = u16::try_from(UnicodeWidthStr::width("Predicate")).unwrap_or(9);
+        // The column chooser's hitbox, registered with the action controls
+        // below when a column rule is selected.
+        let mut column_rect: Option<Rect> = None;
         if editor_y < regions.body.bottom() && !rules.is_empty() {
             let field_x = regions
                 .body
                 .x
                 .saturating_add(label_width)
                 .saturating_add(FIELD_GUTTER);
+            let mut field_y = editor_y;
+            if let Some(column) = selected_column.as_deref() {
+                frame.render_widget(
+                    Paragraph::new("Column").style(if self.control == ColorRulesControl::Column {
+                        styles.shortcut.add_modifier(Modifier::BOLD)
+                    } else {
+                        styles.label
+                    }),
+                    Rect::new(regions.body.x, field_y, label_width, 1),
+                );
+                if field_x < regions.body.right() {
+                    let chooser = Rect::new(field_x, field_y, regions.body.right() - field_x, 1);
+                    frame.render_widget(
+                        Paragraph::new(truncated(
+                            &format!("‹ {column} ›"),
+                            usize::from(regions.body.right() - field_x),
+                        ))
+                        .style(styles.description),
+                        chooser,
+                    );
+                    column_rect = Some(chooser);
+                }
+                field_y = field_y.saturating_add(1);
+            }
+            let field_label = if selected_column.is_some() {
+                "Value"
+            } else {
+                "Predicate"
+            };
             frame.render_widget(
-                Paragraph::new("Predicate").style(if self.editing() {
+                Paragraph::new(field_label).style(if self.editing() {
                     styles.shortcut.add_modifier(Modifier::BOLD)
                 } else {
                     styles.label
                 }),
-                Rect::new(regions.body.x, editor_y, label_width, 1),
+                Rect::new(regions.body.x, field_y, label_width, 1),
             );
             if field_x < regions.body.right() {
-                let field = Rect::new(field_x, editor_y, regions.body.right() - field_x, 1);
+                let field = Rect::new(field_x, field_y, regions.body.right() - field_x, 1);
                 let predicate = rules
                     .get(self.selected)
-                    .map(|rule| rule.predicate.clone())
+                    .map(|rule| {
+                        if rule.is_column() {
+                            rule.value.clone().unwrap_or_default()
+                        } else {
+                            rule.predicate.clone()
+                        }
+                    })
                     .unwrap_or_default();
                 if self.editing() {
                     caret = place_input_cursor_at(
@@ -814,7 +992,7 @@ impl Component for ColorRulesDialog {
                     );
                 }
             }
-            let color_y = editor_y.saturating_add(1);
+            let color_y = field_y.saturating_add(1);
             if color_y < regions.body.bottom() {
                 frame.render_widget(
                     Paragraph::new("Colour").style(if self.control == ColorRulesControl::Color {
@@ -881,6 +1059,10 @@ impl Component for ColorRulesDialog {
             Rect::new(list_area.x, list_area.y, list_area.width, 1),
             ColorRulesControl::List,
         ));
+        // The column chooser answers clicks exactly like the colour chooser.
+        if let Some(rect) = column_rect {
+            controls.push((rect, ColorRulesControl::Column));
+        }
         surface.caret = caret;
         self.geometry = ColorRulesGeometry {
             body: regions.body,

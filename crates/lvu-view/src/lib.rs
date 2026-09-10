@@ -2224,6 +2224,10 @@ impl QueryDispatcher for NativeViewAdapter {
 }
 
 impl RowProvider for NativeViewAdapter {
+    fn enrichment_outputs(&self, view_id: &str) -> Vec<String> {
+        self.rows().enrichment_outputs(view_id)
+    }
+
     fn page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
         self.rows().page(view_id, request)
     }
@@ -2985,6 +2989,21 @@ impl RowProvider for NativeViewRows {
                     .wrapping_add(v.rows_retry_revision)
                     .wrapping_add(v.fold.as_ref().map_or(0, |fold| fold.revision))
             })
+    }
+
+    fn enrichment_outputs(&self, view_id: &str) -> Vec<String> {
+        // The accepted membership's declared output inventory, independent of
+        // which rows (if any) are currently served: a pending page or a
+        // settled zero-row filter must not hide accepted outputs from
+        // callers binding new display state to them.
+        let shared = self.shared.lock().expect("view state poisoned");
+        let Some(view) = shared.views.get(view_id) else {
+            return Vec::new();
+        };
+        match &view.published {
+            Published::Raw => Vec::new(),
+            Published::Filtered { membership } => membership.enrichment_names.clone(),
+        }
     }
 
     fn unfolded_page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
@@ -4082,8 +4101,54 @@ fn run_query(
     // palette mistake. They are named by their position so the terminal can
     // map a match back to the rule the user wrote.
     let mut color_rules: Vec<(String, TextSearch)> = Vec::new();
+    // Column classification rules: `(rule index, output column, exact value)`.
+    // They never reach the predicate compiler below. Their match is an exact
+    // lookup of the worker's ready derived cells where the derived values are
+    // inserted, so slash-shorthand and assignment outputs classify alike and
+    // null/failed cells — which share display text with real values — can
+    // never match. A rule with an empty column or value is skipped rather
+    // than failing the view: the dialog refuses to submit one, and a rule
+    // that can match nothing must not break painting.
+    // Column classification rules: `(rule name, output column, exact value)`,
+    // named by position like legacy rules so first-match-wins merging and
+    // indexed failure messages treat both kinds uniformly. They never reach
+    // the predicate compiler below: the engine evaluates them natively over
+    // the typed frame. A column rule is malformed when its column is
+    // missing/blank or its value is missing (an empty-string value is
+    // valid: it matches literal empty-string ready cells); malformed shapes
+    // fail the candidate with an indexed diagnostic like any other rule
+    // defect, so the last good view stays applied instead of silently
+    // keeping a rule that paints nothing.
+    let mut column_rules: Vec<(String, String, String)> = Vec::new();
     for (index, rule) in request.constraints.color_rules.iter().enumerate() {
         let position = index + 1;
+        if rule.is_column() {
+            let column = rule.column.clone().unwrap_or_default();
+            if column.trim().is_empty() {
+                fail(
+                    tx,
+                    &request,
+                    &cancelled,
+                    QueryPurpose::Advanced,
+                    &format!("colour rule {position}: no column to classify"),
+                    false,
+                );
+                return;
+            }
+            let Some(value) = rule.value.clone() else {
+                fail(
+                    tx,
+                    &request,
+                    &cancelled,
+                    QueryPurpose::Advanced,
+                    &format!("colour rule {position}: no value to match"),
+                    false,
+                );
+                return;
+            };
+            column_rules.push((index.to_string(), column, value));
+            continue;
+        }
         if rule.predicate.trim().is_empty() {
             fail(
                 tx,
@@ -4558,6 +4623,7 @@ fn run_query(
                     },
                     text_search: text.as_ref(),
                     colors: &color_rules,
+                    column_colors: &column_rules,
                 },
                 exact.as_ref(),
             );

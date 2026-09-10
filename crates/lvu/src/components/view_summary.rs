@@ -231,7 +231,7 @@ fn colour_value(state: &ViewState, ascii: bool) -> Option<String> {
                 format!(
                     "{} {} {arrow} {}",
                     index + 1,
-                    rule.predicate.replace('\n', " ⏎ "),
+                    rule.summary().replace('\n', " ⏎ "),
                     rule.color.label()
                 )
             })

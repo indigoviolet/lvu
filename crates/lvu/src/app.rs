@@ -1410,21 +1410,78 @@ pub struct QueryConstraints {
     pub time_field: Option<String>,
     /// Display-only continuation prefix-regex. Physical membership is unchanged.
     pub grouping: Option<String>,
-    /// Ordered predicate colour rules. Display-only: a rule decides how a row
+    /// Ordered colour rules. Display-only: a rule decides how a row
     /// is painted, never whether it is in the view. The first rule that matches
     /// a row wins, so the order the user put them in is the precedence.
+    /// Column rules classify accepted enrichment outputs by exact value;
+    /// legacy predicate rules evaluate independently as before.
     pub color_rules: Vec<ColorRule>,
 }
 
-/// One "when <predicate> then <colour>" rule.
+/// One "when <match> then <colour>" rule, in one of two modes.
 ///
-/// The predicate is written in the search box's own language — a literal,
-/// `field: value`, `/regex/flags`, or a `pl.…` expression — and is compiled and
-/// evaluated by the query engine, never by a second matcher in the terminal.
+/// A column rule (`column` names an accepted enrichment output) classifies
+/// that column's exact ready value: the row is painted when the output's
+/// evaluated cell equals `value` exactly. Patterns and keys belong in
+/// ordinary enrichment definitions; colour only reads their outputs. A
+/// legacy predicate rule (no `column`) is evaluated by the query engine in
+/// the search box's own language — a literal, `field: value`, `/regex/flags`,
+/// or a `pl.…` expression — exactly as before. Legacy rules restored from
+/// earlier versions keep working unchanged; the dialog no longer offers
+/// their syntax for new rules, raw literal text excepted.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ColorRule {
     pub predicate: String,
     pub color: RuleColor,
+    /// Accepted enrichment output this rule classifies, or `None` for a
+    /// legacy predicate rule. Additive: older stored rows omit it and read
+    /// back as predicate rules, so no stored view is rewritten.
+    pub column: Option<String>,
+    /// Exact value the column's ready cell must equal. Case-sensitive;
+    /// null, failed and missing cells never match.
+    pub value: Option<String>,
+}
+
+impl ColorRule {
+    /// Whether this rule classifies an enrichment column rather than
+    /// evaluating an independent predicate.
+    pub fn is_column(&self) -> bool {
+        self.column
+            .as_deref()
+            .is_some_and(|column| !column.is_empty())
+    }
+
+    /// A legacy predicate rule: the only kind restored versions can carry
+    /// and the raw-text convenience exception new ones can still be.
+    pub fn predicate_rule(predicate: String, color: RuleColor) -> Self {
+        Self {
+            predicate,
+            color,
+            column: None,
+            value: None,
+        }
+    }
+
+    /// A column classification rule over an accepted enrichment output.
+    pub fn column_rule(column: String, value: String, color: RuleColor) -> Self {
+        Self {
+            predicate: String::new(),
+            color,
+            column: Some(column),
+            value: Some(value),
+        }
+    }
+
+    /// How a rule reads where rules are listed: `column = value` for a
+    /// column classification, the predicate text for a legacy rule.
+    pub fn summary(&self) -> String {
+        match (&self.column, &self.value) {
+            (Some(column), Some(value)) if !column.is_empty() => {
+                format!("{column} = {value}")
+            }
+            _ => self.predicate.clone(),
+        }
+    }
 }
 
 /// At most this many rules per view. Each one is another predicate the engine

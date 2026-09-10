@@ -3251,6 +3251,8 @@ mod presentation_tests {
             &[ColorRule {
                 predicate: "/tail/".into(),
                 color: RuleColor::Red,
+                column: None,
+                value: None,
             }],
         );
         let line = super::styled_event_line_highlighted(
