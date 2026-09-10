@@ -2880,3 +2880,25 @@ Primary has relayed the release of the build hold: assigned bounded validation
 may resume under the shared lock; independent restarts or cap overrides remain
 prohibited. This records the maintenance owner's result, not a second primary
 cache operation.
+
+
+### Disk/cache execution closed — 2026-09-10
+
+Disk agent765 reports its coordinated scope complete: 60,375,490,560 bytes
+(56.229057 GiB) reclaimed, comprising fifteen delegated targets at
+51,151,740,928 bytes, viewport bulk at 1,682,554,880 bytes and compiler-cache
+LRU eviction at 7,541,194,752 bytes. This scope excludes the primary's earlier
+a97/2a/8ca retirement. Final reported lvu-build allocation is 21,295,042,560
+bytes (19.832554 GiB), with 74,942,341,120 bytes (69.795494 GiB) free on the
+volume. These are snapshots, not a promise that ongoing builds cannot grow.
+
+The shared sccache server reports current/max size both 3 GiB and zero errors.
+Multi-source, autosave, remote-window and journal active targets remain;
+captures, investigations and proof were preserved. Report:
+`supervisor-disk-audit-20260910/completed-worktree-review.md`, SHA256
+`5ff3bb1799c234f5cfa5ad3bb3fd9bc714a506808ddb36cf195004e7a60bb7dd`; cache and
+viewport execution proofs sit beside it. Primary records the delegated report
+without repeating cleanup or runtime verification. The report refers to the
+original cache-config commit `13d9a59`, subsequently amended to `33746fe`;
+the pinned 3G setting is unchanged. Cleanup is closed; automated retirement
+policy is a distinct open task. Documentation whitespace checks passed.
