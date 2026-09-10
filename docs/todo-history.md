@@ -157,3 +157,10 @@ remain open in TODO.md.
   Ready canonical severity and accepted timestamp-basis values replace normal
   implicit recognition. Exact-source and installed-archive acceptance are
   recorded in the work ledger.
+
+## v0.1.5 — 2026-09-10
+
+- Named IANA display zones and per-instant daylight saving shipped, including
+  invalid-draft retention, stale-save fencing and saved-zone startup/restart.
+  Exact-source acceptance and all four archives passed; the installed Linux
+  archive passed eight actual PTY suites. See the work ledger for evidence.

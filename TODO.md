@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.4**. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.5**. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -28,6 +28,5 @@ integration and the relevant acceptance evidence.
 | --- | --- |
 | **Working** | Make colour classification consume enrichment outputs rather than define independent pattern predicates. Preserve raw-text search as an explicit convenience exception. |
 | **Working** | Replace raw-only special correlation extraction with enrichment-derived shared keys and ordinary filtering over union views. Preserve existing saved behavior until its replacement is integrated. |
-| **Working** | Named display zones and per-instant daylight saving are integrated for v0.1.5 acceptance. Worker review and focused tests passed, including restart; the integrated release gate remains pending. |
 | **Working** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
-| **Working** | Validate installation/terminal/process behavior on macOS and Windows (audit in docs/portability.md, checklist in docs/mac-test-plan.md; no run yet). arm64 Linux archive is built and CI-executed but has had no human interactive acceptance. |
+| **Working** | Validate installation/terminal/process behavior on macOS and Windows (audit in docs/portability.md, checklist in docs/mac-test-plan.md). Isolated hosted validation is in progress; Windows remains unsupported. arm64 Linux archive is built and CI-executed but has had no human interactive acceptance. |

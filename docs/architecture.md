@@ -1,8 +1,9 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.4` (2026-09-10) is the current public release, including enrichment
-column roles, unified grouping and status/FOLLOW changes. Releases use only the vX.Y.Z scheme.
+`v0.1.5` (2026-09-10) is the current public release, including named display
+zones, enrichment column roles, unified grouping and status/FOLLOW changes.
+Releases use only the vX.Y.Z scheme.
 Historical build numbers below date when behavior arrived; they are not a separate
 release channel.
 
@@ -23,9 +24,8 @@ explicit legacy Event-basis evaluation remains a compatibility path. Assistance
 shortcuts use ordinary reviewed enrichments, with intent transferred to the
 candidate and consumed only by the accepted completion.
 
-Named display zones are integrated for v0.1.5 acceptance, outside the v0.1.4
-tag. Settings validates IANA names through chrono-tz and retains fixed-offset
-compatibility. Formatting maps an established UTC instant to its zone-specific
+Named display zones shipped in v0.1.5. Settings validates IANA names through
+chrono-tz and retains fixed-offset compatibility. Formatting maps an established UTC instant to its zone-specific
 offset and date; it does not resolve ambiguous local clocks or change query
 time authority. Startup installs the validated effective zone into Appearance.
 

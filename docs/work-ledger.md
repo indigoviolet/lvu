@@ -2189,3 +2189,54 @@ all-target clippy for lvu-core and lvu-view. Independent static review found no
 issues. Evidence: `sol-stats-throughput-c339d46/focused-validation.log` and
 `sol-runtime-review-scratch/stats-throughput-c339d46-review.md` on the build
 volume. A fresh full release gate remains required.
+
+
+## 2026-09-10 — v0.1.5 published and installed
+
+Exact source `2a636c02eb27ecb25597cbfb99fe3c403aad760b` passed the fresh full
+release gate: 1392 Rust tests passed (7 ignored), clippy and bridge checks clean,
+and PTY matrix 77/77. The accepted record SHA256 is
+`ac6fefd0adc2daa37f284ccfd396bd06ff66d73709a666b82c639ac080627c6f`;
+commands log SHA256 is
+`e7b8a0269cbb4dded0df21a8ab052be08708c6aad20e34e2f796418c64ef2a58`.
+Evidence remains under build-volume
+`primary-astra-scratch/release-gate-2a636c02eb27-825466a738614d7e9e5bba7816de9bb1/`.
+The failed 22dc294 throughput gate and its partial reruns remain preserved;
+this acceptance does not establish their underlying cause.
+
+Reviewed producer SHA256 is
+`0b618319776c7320f3cc360031dff66ff2315ace8ee175b81f9d27371e2081d5`.
+Gate app SHA256 `bf63a763c3b99a4f574b9c9a74fdc0fd756fd708138e29eb002c6e1c2402ac6e`
+and TUI SHA256 `18b5be3eac5e17c96502de205e62b5bc270721ec99bb9655928449278f2b07a9`
+match the accepted record. Independent consistency review approved the record.
+The host was not exclusively idle during all PTYs; a separately observed
+diagnostics invocation is recorded in the preserved coordination note. No
+exclusive-idleness claim or causation claim follows from passing tests.
+
+Annotated immutable tag object `7c6f3706a3c891aadfdb79fdd20fd9cf32a406e0`
+peels to that source. Workflow 34425230184 passed all four native archive jobs
+and publish. Release 385951844 became public at 01:51:54 UTC. Homebrew tap
+`078724dc1e4e902853d7279121f5986b003babca` was pushed and verified.
+
+Reviewed installer SHA256
+`986ff64a888335a490a58e23c2492d87e5c3fb89e2e6608801635b507ce90fcf`
+ran under the shared lock with the pinned producer and accepted record. It
+verified official archive checksums, exact clean source, bundled helper/bridge,
+full-tree identity and eight mandatory actual PTY suites outside the checkout,
+including column-role, shortcut-role and named-zone restart workflows. It
+activated `versions/v0.1.5`, verified the released launcher and preserved
+exclusive `versions/records/v0.1.5.json` and `v0.1.5.tree.json`. The record's
+draft=true correctly describes acceptance before the subsequent undraft.
+Installer log: `muse-v015-prep/v015-delivery/installer-run.log` on the volume.
+
+Primary independently verified public release state, `latest -> v0.1.5`, and
+installed binary SHA256
+`25b8ff0b6ab9302cc0c0d502a3e7218982a1452141140bc0076385a963fb5d87`
+against the record. Public notes initially carried two stale debug-binary hashes;
+primary corrected only those hashes from the authenticated record and verified
+the readback. Tag and archives were unchanged.
+
+Named zones are now published. The full 512 MiB volume soak remains unaccepted;
+union/shared keys, colour classification, shared capture and platform runtime
+acceptance remain separate unfinished work. No broader performance, durability,
+or platform-support milestone is claimed here.

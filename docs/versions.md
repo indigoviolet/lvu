@@ -4,20 +4,20 @@ lvu has one publication scheme: annotated `vX.Y.Z` tags and matching GitHub
 releases. There is no separate preview channel or preview numbering. Every
 version must agree with `crates/lvu-app/Cargo.toml` and `Cargo.lock`.
 
-Current version: **[v0.1.4](https://github.com/indigoviolet/lvu/releases/tag/v0.1.4)**,
-published 2026-09-10 at 00:20:58 UTC from `984b6f0`. All four native archives
+Current version: **[v0.1.5](https://github.com/indigoviolet/lvu/releases/tag/v0.1.5)**,
+published 2026-09-10 at 01:51:54 UTC from `2a636c0`. All four native archives
 passed release CI. The local installation is the official x86_64 Linux musl
-archive, SHA-256 `9cc1d57892a00fe599f70a941d83c1cde65d7f744b5b95e053151924abd01711`.
+archive, SHA-256 `1ad3dc004214776d6941e03cfef3e72804ca75d6aa28ec69d1ac632b5e2fcf11`.
 Its bundled resources and eight actual terminal suites passed acceptance outside
-the checkout, including column-role and shortcut-role workflows;
-`versions/latest` points to `v0.1.4`. What each version shipped is recorded in
+the checkout, including named-zone save/restart and both role workflows;
+`versions/latest` points to `v0.1.5`. What each version shipped is recorded in
 [CHANGELOG.md](../CHANGELOG.md).
 
-Exact-source acceptance passed 1386 Rust tests (7 ignored), clippy, 105 bridge
-tests and all 77 PTY suites. The volume-backed full soak remains unaccepted:
+Exact-source acceptance passed 1392 Rust tests (7 ignored), clippy, bridge
+checks and all 77 PTY suites. The volume-backed full soak remains unaccepted:
 cold-query latency, autosave-flush shutdown and the broader 512 MB viewport
-investigation remain unresolved. Named zones and live union composition remain
-separate unreleased work.
+investigation remain unresolved. Live union/shared-key composition, enrichment
+colour classification and shared background capture remain separate unreleased work.
 
 See the [release runbook](release-runbook.md) for validation, archive publication,
 Homebrew updates and installation checks. Archives contain the application,
