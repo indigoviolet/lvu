@@ -66,6 +66,31 @@ fn validation_bounds_ids_overflow_and_disk_relationship() {
 }
 
 #[test]
+fn named_display_zones_round_trip_and_invalid_names_are_actionable() {
+    let root = TempDir::new().unwrap();
+    let path = settings_file(&root);
+    let mut named = Settings::default();
+    named.appearance.display_zone = "Europe/Berlin".into();
+    save_settings(&path, &named).unwrap();
+    assert_eq!(
+        load_settings(&path)
+            .unwrap()
+            .validated
+            .settings
+            .appearance
+            .display_zone,
+        "Europe/Berlin"
+    );
+
+    let mut invalid = named;
+    invalid.appearance.display_zone = "Europe/Not_A_Zone".into();
+    let error = invalid.validate().unwrap_err().to_string();
+    assert!(error.contains("appearance.display_zone"), "{error}");
+    assert!(error.contains("unknown time zone"), "{error}");
+    assert!(error.contains("Europe/Berlin"), "{error}");
+}
+
+#[test]
 fn malformed_future_unknown_and_oversized_files_are_never_rewritten() {
     let root = TempDir::new().unwrap();
     let path = settings_file(&root);

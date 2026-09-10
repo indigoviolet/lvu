@@ -919,6 +919,8 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 .collect(),
             pinned_columns: request.state.pinned_columns.clone(),
             color_field: request.state.color_field.clone(),
+            severity_column: request.state.severity_column.clone(),
+            timestamp_column: request.state.timestamp_column.clone(),
             color_rules: request
                 .state
                 .color_rules
@@ -1318,6 +1320,8 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         follow: value.navigation.follow,
         pinned_columns: value.presentation.pinned_columns,
         color_field: value.presentation.color_field,
+        severity_column: value.presentation.severity_column,
+        timestamp_column: value.presentation.timestamp_column,
         // An unknown colour token is a rule written by a newer build: keep the
         // predicate and fall back to the default colour rather than dropping
         // the rule the user wrote.
@@ -2367,6 +2371,8 @@ mod bookmark_tests {
             view_id: id,
             state: PersistentViewState {
                 view_name: "notes".into(),
+                severity_column: Some("severity".into()),
+                timestamp_column: Some("event_time".into()),
                 exact_field: Some(
                     lvu_core::FieldCorrelation::new(
                         "request_id",
@@ -2381,6 +2387,23 @@ mod bookmark_tests {
                     id: lvu::RowId::new(definition.id.0.to_string(), 42),
                     note: "Café retry".into(),
                 }],
+                union: Some(lvu::PersistentUnion {
+                    inputs: vec![
+                        lvu::PersistentUnionInput {
+                            view_id: ViewId::new().0.to_string(),
+                            accepted_revision: 3,
+                            applied_generation: 5,
+                        },
+                        lvu::PersistentUnionInput {
+                            view_id: ViewId::new().0.to_string(),
+                            accepted_revision: 7,
+                            applied_generation: 11,
+                        },
+                    ],
+                    filter: "request".into(),
+                    advanced_filter: "pl.col('severity') == 'error'".into(),
+                    exact_key: None,
+                }),
                 ..Default::default()
             },
         };
@@ -2397,6 +2420,9 @@ mod bookmark_tests {
         let reopened = restored(store.get_view(id).unwrap().unwrap());
         assert_eq!(reopened.bookmarks, request.state.bookmarks);
         assert_eq!(reopened.exact_field, request.state.exact_field);
+        assert_eq!(reopened.severity_column, request.state.severity_column);
+        assert_eq!(reopened.timestamp_column, request.state.timestamp_column);
+        assert_eq!(reopened.union, request.state.union);
         request.state.bookmarks[0].id.source_id = SourceId::new().0.to_string();
         assert!(store.update_view(&working_view(&request), 0).is_err());
         request.state.bookmarks[0].id.source_id = definition.id.0.to_string();

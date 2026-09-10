@@ -4,19 +4,20 @@ lvu has one publication scheme: annotated `vX.Y.Z` tags and matching GitHub
 releases. There is no separate preview channel or preview numbering. Every
 version must agree with `crates/lvu-app/Cargo.toml` and `Cargo.lock`.
 
-Current version: **[v0.1.2](https://github.com/indigoviolet/lvu/releases/tag/v0.1.2)**,
-published 2026-09-09 at 03:02:47 UTC from `207b95f`. All four native archives
-passed release verification. The local installation is the official x86_64 Linux
-musl archive, SHA-256 `7d68e047972e81fa3b057f8ed9e2bdd4dffc5cfe007bf745428645eda14c2cbd`;
-its bundled resources and actual terminal behavior passed acceptance.
-What each version shipped is recorded in
+Current version: **[v0.1.4](https://github.com/indigoviolet/lvu/releases/tag/v0.1.4)**,
+published 2026-09-10 at 00:20:58 UTC from `984b6f0`. All four native archives
+passed release CI. The local installation is the official x86_64 Linux musl
+archive, SHA-256 `9cc1d57892a00fe599f70a941d83c1cde65d7f744b5b95e053151924abd01711`.
+Its bundled resources and eight actual terminal suites passed acceptance outside
+the checkout, including column-role and shortcut-role workflows;
+`versions/latest` points to `v0.1.4`. What each version shipped is recorded in
 [CHANGELOG.md](../CHANGELOG.md).
 
-The volume-backed full soak remains unaccepted: cold-query latency and memory
-autosave-flush shutdown failures remain unresolved. Status/FOLLOW corrections
-and generic multiline grouping are integrated for the next version (v0.1.3
-source in preparation, not published); v0.1.2 remains the current public
-release.
+Exact-source acceptance passed 1386 Rust tests (7 ignored), clippy, 105 bridge
+tests and all 77 PTY suites. The volume-backed full soak remains unaccepted:
+cold-query latency, autosave-flush shutdown and the broader 512 MB viewport
+investigation remain unresolved. Named zones and live union composition remain
+separate unreleased work.
 
 See the [release runbook](release-runbook.md) for validation, archive publication,
 Homebrew updates and installation checks. Archives contain the application,

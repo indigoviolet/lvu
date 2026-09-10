@@ -1051,11 +1051,35 @@ fn render_logs<P: RowProvider>(
         return;
     }
     let selected = app.view_state().and_then(|state| state.selected.clone());
-    let (pinned, color_field, color_rules, applied_search, expanded, top, horizontal) = {
+    let (
+        pinned,
+        color_field,
+        severity_role,
+        timestamp_role,
+        time_basis,
+        time_field,
+        color_rules,
+        applied_search,
+        expanded,
+        top,
+        horizontal,
+    ) = {
         let state = app.view_state().expect("active view state");
+        // Roles render from the stored names against structural row markers,
+        // never from a reparsed output inventory: the assignment-only name
+        // helper is blind to supported slash-shorthand outputs, while the
+        // per-row `derived.` / `derived_ready.` markers the worker publishes
+        // cover every syntax. `role_value` admits only ready cells (so a
+        // removed stage or a raw same-name field feeds nothing) and
+        // `event_stamp` distinguishes removed (capture) from declared-but-
+        // unreadable (placeholder) the same way.
         (
             state.pinned_columns.clone(),
             state.color_field.clone(),
+            state.severity_column.clone(),
+            state.timestamp_column.clone(),
+            state.applied_time_basis,
+            state.applied_time_field.clone(),
             state.color_rules.clone(),
             state.search.applied.clone(),
             state.expanded_groups.clone(),
@@ -1063,6 +1087,13 @@ fn render_logs<P: RowProvider>(
             state.horizontal_offset,
         )
     };
+    // Event time has one authority: the gutter shows the timestamp role only
+    // while the accepted Selected basis reads the same column, so the gutter
+    // can never disagree with sorting, windows, and navigation. Otherwise a
+    // set role shows an explicit placeholder rather than masquerading as
+    // capture time; with no role the gutter stays capture time, as before.
+    let timestamp_converged =
+        crate::app::basis_covers_role(time_basis, time_field.as_deref(), timestamp_role.as_deref());
     // The spans to underline inside each line: the applied search, plus every
     // rule written as a pattern. Compiled once per frame, never per row.
     let highlights = crate::highlight::Highlights::compile(&applied_search, &color_rules);
@@ -1084,19 +1115,38 @@ fn render_logs<P: RowProvider>(
                 &row,
                 selected_row,
                 color_field.as_deref(),
+                severity_role.as_deref(),
                 &color_rules,
                 theme,
             );
-            // The provider formats in UTC; the reader chooses the offset. A
-            // row with no capture time keeps whatever the provider wrote,
-            // because there is nothing to re-format from.
-            let stamp = row.captured_at_unix_nanos.map_or_else(
-                || row.timestamp.clone(),
-                |nanos| crate::app::format_display_time(nanos, &app.appearance.display_zone),
+            // Event time has one authority: the gutter shows the row's
+            // validated basis instant, formatted through the same
+            // display-zone formatter as capture time, and only while the
+            // accepted Selected basis reads the role's own column — so the
+            // gutter can never disagree with sorting, windows, and
+            // navigation. A set role without a converged, readable instant
+            // shows an explicit placeholder rather than masquerading as
+            // capture time. With no role the gutter stays capture time, as
+            // before. A row with no capture time keeps whatever the provider
+            // wrote, because there is nothing to re-format from.
+            let basis_nanos = row
+                .details
+                .iter()
+                .find(|(key, _)| key == lvu_view_basis_nanos_key())
+                .and_then(|(_, value)| value.parse::<i64>().ok());
+            let stamp = event_stamp(
+                timestamp_role.as_deref(),
+                timestamp_converged,
+                basis_nanos,
+                &row,
+                &app.appearance.display_zone,
             );
+            // The level cell shows the proven severity role value, or nothing:
+            // severity is no longer guessed from raw field names on this path.
+            let level = role_value(&row, severity_role.as_deref()).unwrap_or("");
             let mut cells: Vec<Cell<'static>> = vec![
                 crate::ansi::without_ansi(&stamp).into_owned().into(),
-                crate::ansi::without_ansi(&row.level).into_owned().into(),
+                crate::ansi::without_ansi(level).into_owned().into(),
             ];
             if merged {
                 cells.push(
@@ -1113,7 +1163,7 @@ fn render_logs<P: RowProvider>(
                     crate::ansi::without_ansi(field_value(&row, field).unwrap_or("—")).into_owned(),
                 )
             }));
-            let group_lines = row
+            let mut group_lines = row
                 .details
                 .iter()
                 .filter(|(key, _)| {
@@ -1123,6 +1173,16 @@ fn render_logs<P: RowProvider>(
                 })
                 .map(|(_, value)| value.clone())
                 .collect::<Vec<_>>();
+            // A capped group page states its shown/total when expanded: the
+            // collapsed head text (which carries the counts) is replaced by
+            // the member lines, so without this the expansion would imply all
+            // lines are displayed. Remaining members stay in the source view.
+            if expanded.contains(&row.id)
+                && let Some((_, notice)) =
+                    row.details.iter().find(|(key, _)| key == "group_truncated")
+            {
+                group_lines.push(notice.clone());
+            }
             let is_expanded = expanded.contains(&row.id) && group_lines.len() > 1;
             let ascii = app.appearance.ascii;
             let fold = FoldMark::from_details(&row.details).filter(|_| fold_gutter_fits);
@@ -1259,10 +1319,11 @@ fn render_logs<P: RowProvider>(
 /// resolve their colours here rather than each deciding for itself. The ladder
 /// is: the selection highlight, which is a cursor rather than a property of the
 /// record; then the hashed colour of the field the view is coloured by; then
-/// the record's severity. `Style::default()` inherits the surface, which is why
-/// both panes must draw on the same background — the hashed identity colours
-/// are lifted to [`crate::theme::MIN_IDENTITY_CONTRAST`] against `base_bg` and
-/// only read as measured there.
+/// the view's severity role read from the row's enrichment outputs.
+/// `Style::default()` inherits the surface, which is why both panes must draw
+/// on the same background — the hashed identity colours are lifted to
+/// [`crate::theme::MIN_IDENTITY_CONTRAST`] against `base_bg` and only read as
+/// measured there.
 ///
 /// Details passes `selected = false`: the record it shows is by definition the
 /// selected one, and painting the whole pane in the selection colours would
@@ -1277,12 +1338,15 @@ fn record_style(
     row: &crate::provider::DisplayRow,
     selected: bool,
     color_field: Option<&str>,
+    severity_role: Option<&str>,
     color_rules: &[crate::app::ColorRule],
     theme: Theme,
 ) -> Style {
     // Precedence: the selection always wins, then a matched colour rule — the
     // user asked for that one explicitly — then the hashed colour field, then
-    // severity.
+    // the severity role. The role value maps through the canonical-token
+    // table unchanged: anything but a canonical token simply has no colour,
+    // which is what keeps a missing or mistyped role value raw.
     if selected {
         Style::default()
             .fg(theme.selection_fg)
@@ -1295,10 +1359,104 @@ fn record_style(
         // `value_style`, not `value_color`: at sixteen colours an identity may
         // also be bold, because six hues is not enough on its own.
         theme.value_style(value)
-    } else if let Some(color) = theme.severity_color(&row.level) {
+    } else if let Some(color) =
+        role_value(row, severity_role).and_then(|value| theme.severity_color(value))
+    {
         Style::default().fg(color)
     } else {
         Style::default()
+    }
+}
+
+/// Whether a ready derived string may populate the severity cell.
+///
+/// The role contract permits exactly the six canonical uppercase tokens the
+/// assistance prompt demands. Anything else — a number, a boolean, an
+/// unmapped word, even a ready literal reading `"null"` or starting with
+/// `"error:"` — is data, not a severity, and leaves the cell empty. This is
+/// a value contract on ready strings, not validity sniffing: validity is the
+/// ready marker's presence below.
+fn is_canonical_severity(value: &str) -> bool {
+    matches!(
+        value,
+        "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR" | "FATAL"
+    )
+}
+
+/// A display role's value for one row, or nothing.
+///
+/// A role resolves only with structural provenance: the row must carry the
+/// view's `derived_ready.{name}` marker, which the view writes exactly when
+/// the accepted chain successfully evaluated that output for the batch
+/// serving the row. A same-named raw field with no marker — a removed stage,
+/// or a raw field no enrichment ever produced — stays raw data and never
+/// feeds the role, as do valid nulls and stage failures, which carry no
+/// ready marker. An empty or absent role name resolves to nothing. Severity
+/// additionally requires an exact canonical token (see
+/// `is_canonical_severity`): only canonical ready strings populate or colour
+/// the level cell. The timestamp gutter never reads this helper: it formats
+/// the row's validated `basis_nanos` instant through the display-zone
+/// formatter, and shows its placeholder where that instant is missing. The
+/// engine remains the only timestamp interpreter.
+fn role_value<'a>(row: &'a crate::provider::DisplayRow, role: Option<&str>) -> Option<&'a str> {
+    let name = role.filter(|name| !name.is_empty())?;
+    let ready = row
+        .details
+        .iter()
+        .any(|(key, _)| key == &format!("derived_ready.{name}"));
+    if !ready {
+        return None;
+    }
+    row.fields
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+        .filter(|value| is_canonical_severity(value))
+}
+
+/// The log gutter's event-time stamp for one row: the exact decision the
+/// frame renders, extracted so tests exercise production logic rather than a
+/// re-statement of it.
+///
+/// `role` is the stored timestamp role name, resolved per row against the
+/// structural markers the worker publishes — never against a reparsed output
+/// inventory, which is blind to supported slash-shorthand outputs. No
+/// `derived.{name}` marker means no accepted output owns the name on this
+/// row (a removed stage, or a raw field no enrichment ever produced), so the
+/// gutter stays on capture time even when the row carries a readable instant
+/// for the same-named raw column. A declared but unready or unreadable cell
+/// is an explicit placeholder; declared, ready, converged and readable
+/// renders the event instant.
+fn event_stamp(
+    role: Option<&str>,
+    converged: bool,
+    basis_nanos: Option<i64>,
+    row: &crate::provider::DisplayRow,
+    display_zone: &str,
+) -> String {
+    fn capture_stamp(row: &crate::provider::DisplayRow, display_zone: &str) -> String {
+        row.captured_at_unix_nanos.map_or_else(
+            || row.timestamp.clone(),
+            |nanos| crate::app::format_display_time(nanos, display_zone),
+        )
+    }
+    let Some(name) = role.filter(|name| !name.is_empty()) else {
+        return capture_stamp(row, display_zone);
+    };
+    let declared = row
+        .details
+        .iter()
+        .any(|(key, _)| key == &format!("derived.{name}"));
+    if !declared {
+        return capture_stamp(row, display_zone);
+    }
+    let ready = row
+        .details
+        .iter()
+        .any(|(key, _)| key == &format!("derived_ready.{name}"));
+    match (ready, converged, basis_nanos) {
+        (true, true, Some(nanos)) => crate::app::format_display_time(nanos, display_zone),
+        _ => "—".into(),
     }
 }
 
@@ -1421,6 +1579,14 @@ fn matched_rule(
 /// pinned together by `color_rule_detail_key_matches_the_view_crate` below.
 const fn lvu_view_color_rule_key() -> &'static str {
     "color_rule"
+}
+
+/// The `details` key `lvu-view` reports a row's validated basis instant
+/// under, as decimal UTC nanoseconds. Spelled here rather than imported for
+/// the same reason; only engine-validated instants ever arrive, so the gutter
+/// parses an integer here and never interprets time text itself.
+const fn lvu_view_basis_nanos_key() -> &'static str {
+    "basis_nanos"
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1661,13 +1827,28 @@ fn render_details<P: RowProvider>(
     // The record's own colours, resolved by the ladder the log pane uses, so
     // the same record reads the same in both — colour rules included, since a
     // rule paints the record and not the pane.
-    let (color_field, color_rules) = app
+    let (color_field, severity_role, color_rules) = app
         .view_state()
-        .map(|state| (state.color_field.clone(), state.color_rules.clone()))
+        .map(|state| {
+            (
+                state.color_field.clone(),
+                state.severity_column.clone(),
+                state.color_rules.clone(),
+            )
+        })
         .unwrap_or_default();
     let base = row
         .as_ref()
-        .map(|row| record_style(row, false, color_field.as_deref(), &color_rules, theme))
+        .map(|row| {
+            record_style(
+                row,
+                false,
+                color_field.as_deref(),
+                severity_role.as_deref(),
+                &color_rules,
+                theme,
+            )
+        })
         .unwrap_or_default();
     let view = row.as_ref().map(|row| {
         crate::details::details_view(
@@ -2722,7 +2903,8 @@ pub fn clipped_width(text: &str, maximum: usize) -> String {
 #[cfg(test)]
 mod presentation_tests {
     use super::{
-        clip_styled_columns, input_tail, styled_event_line, styled_event_lines, styled_pattern_line,
+        clip_styled_columns, event_stamp, input_tail, is_canonical_severity, record_style,
+        role_value, styled_event_line, styled_event_lines, styled_pattern_line,
     };
     use crate::theme::{Theme, ThemeId};
     use ratatui::{
@@ -2738,6 +2920,265 @@ mod presentation_tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    /// A row as the view worker serves a successfully evaluated cell: the
+    /// long-standing `derived.{name}` marker plus the structural
+    /// `derived_ready.{name}` marker. Mirrors `with_enrichment` for Ready.
+    fn role_row(fields: Vec<(String, String)>, proven: &[&str]) -> crate::provider::DisplayRow {
+        let details: Vec<(String, String)> = proven
+            .iter()
+            .flat_map(|name| {
+                [
+                    (format!("derived.{name}"), "1".into()),
+                    (format!("derived_ready.{name}"), "1".into()),
+                ]
+            })
+            .collect();
+        crate::provider::DisplayRow {
+            id: crate::provider::RowId::new("source", 1),
+            timestamp: "07:34:42.627Z".into(),
+            captured_at_unix_nanos: Some(1_700_000_000_000_000_000),
+            level: String::new(),
+            text: "level=ERROR first".into(),
+            details,
+            fields,
+        }
+    }
+
+    /// A row as the worker serves a valid-null or failed cell: the
+    /// compatibility `derived.{name}` marker with display text, but no ready
+    /// marker. Mirrors `with_enrichment` for Null/Error.
+    fn unready_row(field: &str, value: &str) -> crate::provider::DisplayRow {
+        crate::provider::DisplayRow {
+            id: crate::provider::RowId::new("source", 1),
+            timestamp: "07:34:42.627Z".into(),
+            captured_at_unix_nanos: Some(1_700_000_000_000_000_000),
+            level: String::new(),
+            text: "level=ERROR first".into(),
+            details: vec![(format!("derived.{field}"), value.into())],
+            fields: vec![(field.into(), value.into())],
+        }
+    }
+
+    #[test]
+    fn role_values_need_the_ready_marker() {
+        // Ready: the accepted chain successfully evaluated the output for
+        // this batch, and the value is a canonical severity token.
+        assert_eq!(
+            role_value(
+                &role_row(vec![("severity".into(), "ERROR".into())], &["severity"]),
+                Some("severity"),
+            ),
+            Some("ERROR")
+        );
+        // Same-named raw field, no marker: a removed stage — or a raw field
+        // no enrichment ever produced — stays raw data and never feeds the
+        // role. This is what keeps a removed `severity` stage from silently
+        // falling back to raw severity.
+        assert_eq!(
+            role_value(
+                &role_row(vec![("severity".into(), "low".into())], &[]),
+                Some("severity"),
+            ),
+            None
+        );
+        // Missing column and empty role name resolve to nothing.
+        assert_eq!(role_value(&role_row(vec![], &[]), Some("severity")), None);
+        assert_eq!(
+            role_value(
+                &role_row(vec![("severity".into(), "ERROR".into())], &["severity"]),
+                Some(""),
+            ),
+            None
+        );
+        assert_eq!(
+            role_value(
+                &role_row(vec![("severity".into(), "ERROR".into())], &["severity"]),
+                None,
+            ),
+            None
+        );
+        // A valid null projects as the literal `"null"` and a stage failure
+        // as `"error: ..."` (both still carrying the compatibility marker
+        // for Details): neither carries a ready marker, so the level cell
+        // stays empty without parsing worker sentinel text as data.
+        assert_eq!(
+            role_value(&unready_row("severity", "null"), Some("severity"),),
+            None
+        );
+        assert_eq!(
+            role_value(&unready_row("severity", "error: boom"), Some("severity"),),
+            None
+        );
+    }
+
+    #[test]
+    fn severity_accepts_only_canonical_ready_tokens() {
+        for token in ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"] {
+            assert!(
+                is_canonical_severity(token),
+                "{token} is part of the role contract"
+            );
+            assert_eq!(
+                role_value(
+                    &role_row(vec![("severity".into(), token.into())], &["severity"]),
+                    Some("severity"),
+                ),
+                Some(token)
+            );
+        }
+        // Ready but not severity: numbers, booleans, unmapped words, and
+        // ready literals that collide with the null/error display texts all
+        // leave the cell empty. Readiness is structural (the ready marker);
+        // the token gate is the value contract — neither parses sentinel
+        // text for validity.
+        for value in [
+            "5",
+            "true",
+            "NOTICE",
+            "null",
+            "error: boom",
+            "banana",
+            "",
+            "error",
+            "warn",
+        ] {
+            assert!(
+                !is_canonical_severity(value),
+                "{value:?} must not pass the token gate"
+            );
+            assert_eq!(
+                role_value(
+                    &role_row(vec![("severity".into(), value.into())], &["severity"]),
+                    Some("severity"),
+                ),
+                None,
+                "ready but non-canonical {value:?} must not populate the cell"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_stage_cannot_render_through_its_raw_namesake() {
+        // A removed `event_time` stage while a Selected basis still reads a
+        // same-named raw column: the row carries a readable instant for the
+        // raw column but no declared marker, so the gutter stays on capture
+        // time rather than rendering the raw instant as the role. A declared
+        // but unready cell is a placeholder; declared, ready, converged and
+        // readable renders the event instant. The markers — not a reparsed
+        // output inventory — decide, which is also what admits supported
+        // slash-shorthand outputs the assignment-only parser cannot see.
+        let capture_nanos = 1_700_000_000_000_000_000;
+        let raw_nanos = 1_788_611_145_000_000_000;
+        let removed = crate::provider::DisplayRow {
+            id: crate::provider::RowId::new("source", 1),
+            timestamp: "07:34:42.627Z".into(),
+            captured_at_unix_nanos: Some(capture_nanos),
+            level: String::new(),
+            text: "event_time=2026-09-05T12:30:45Z first".into(),
+            details: vec![("basis_nanos".into(), raw_nanos.to_string())],
+            fields: vec![("event_time".into(), "2026-09-05T12:30:45Z".into())],
+        };
+        let declared = crate::provider::DisplayRow {
+            details: vec![
+                ("derived.event_time".into(), "2026-09-05T12:30:45Z".into()),
+                ("basis_nanos".into(), raw_nanos.to_string()),
+            ],
+            ..removed.clone()
+        };
+        let ready = crate::provider::DisplayRow {
+            details: vec![
+                ("derived.event_time".into(), "2026-09-05T12:30:45Z".into()),
+                (
+                    "derived_ready.event_time".into(),
+                    "2026-09-05T12:30:45Z".into(),
+                ),
+                ("basis_nanos".into(), raw_nanos.to_string()),
+            ],
+            ..removed.clone()
+        };
+        let capture = crate::app::format_display_time(capture_nanos, "UTC");
+        let raw = crate::app::format_display_time(raw_nanos, "UTC");
+        assert_ne!(capture, raw);
+        // No role at all: capture time.
+        assert_eq!(
+            event_stamp(None, false, Some(raw_nanos), &removed, "UTC"),
+            capture
+        );
+        // Stored name but no declared marker (removed stage, raw namesake):
+        // capture time, even converged with a readable instant and a token
+        // that still names the raw column.
+        assert_eq!(
+            event_stamp(Some("event_time"), true, Some(raw_nanos), &removed, "UTC"),
+            capture
+        );
+        // Declared but unready (valid null / stage failure): placeholder.
+        assert_eq!(
+            event_stamp(Some("event_time"), true, Some(raw_nanos), &declared, "UTC"),
+            "—"
+        );
+        // Declared and ready but unconverged: placeholder, never capture
+        // time masquerading as event time.
+        assert_eq!(
+            event_stamp(Some("event_time"), false, Some(raw_nanos), &ready, "UTC"),
+            "—"
+        );
+        // Declared, ready, converged and readable: the event instant.
+        assert_eq!(
+            event_stamp(Some("event_time"), true, Some(raw_nanos), &ready, "UTC"),
+            raw
+        );
+        // Ready and converged without a readable instant: placeholder.
+        assert_eq!(
+            event_stamp(Some("event_time"), true, None, &ready, "UTC"),
+            "—"
+        );
+    }
+
+    #[test]
+    fn severity_role_colours_canonical_tokens_and_nothing_else() {
+        let theme = Theme::TERMINAL;
+        let plain = |fields: Vec<(String, String)>, proven: &[&str]| {
+            record_style(
+                &role_row(fields, proven),
+                false,
+                None,
+                Some("severity"),
+                &[],
+                theme,
+            )
+        };
+        // Canonical token from a proven role column colours the row.
+        assert_eq!(
+            plain(vec![("severity".into(), "ERROR".into())], &["severity"]).fg,
+            Some(theme.severity.error)
+        );
+        // Anything else — unknown token, unproven raw same-name field, absent
+        // column, unset role — renders raw. In particular the raw `level`
+        // field beside it is never read: severity is not guessed from raw
+        // field names on this path.
+        assert_eq!(
+            plain(
+                vec![
+                    ("severity".into(), "banana".into()),
+                    ("level".into(), "ERROR".into()),
+                ],
+                &["severity"],
+            )
+            .fg,
+            None
+        );
+        assert_eq!(
+            plain(vec![("level".into(), "ERROR".into())], &[]).fg,
+            None,
+            "a raw level field without provenance colours nothing"
+        );
+        assert_eq!(
+            record_style(&role_row(vec![], &[]), false, None, None, &[], theme).fg,
+            None,
+            "an unset role colours nothing"
+        );
     }
 
     #[test]

@@ -1928,3 +1928,264 @@ remain exact; only two canonical paths or two identical unresolved spellings
 compare equal. Canonicalization uses a short-lived per-pass cache and retains
 filesystem race limitations; no hardlink/bind-mount identity claim is made.
 Primary integrated Rust/bridge/UI/PTY gate follows. Not yet published.
+
+Primary integrated multi-source gate at 0dc9acf passed bridge105, app source
+checks, source TestBackend suites, formatting, app/lvu all-target clippy and
+a fresh app build. Existing single-source PTY passed at 140x28 and 54x16;
+new multi-source PTY passed batch review, explicit Apply/repeat-confirmation
+and partial failure. Exact app SHA-256:
+1b89ba6caae637e5f000e9b6aca3b9c1a7bac58fe1643a7145cbf16c20f19b76.
+Log/script: primary-astra-scratch/source-integrated-gate.{log,py}; marked
+fixtures cleaned and shared lock released. Concurrent primary changes were
+documentation only (50c3308). Full release matrix awaits corrected grouping.
+
+
+## 2026-09-09 — remaining feature review boundaries
+
+Grouping68fca6d remains worker-only: normal Folding still exposes message
+normalization despite the unified Run/Filter requirement; key encoding must
+respect bounds before allocating and native float equality. The owner is
+correcting all normal entry points and exact-key tests before release review.
+
+Roles f860203 remains worker-only. Independent review found pending role intent
+left armed on a fork origin, projected null/error markers treated as usable
+values, missing display-zone conversion and duplicate timestamp shortcuts.
+The revised gate must identify its source tree and binary exactly; prior roles6
+metadata does not prove the exact f860203 tree. Fixes are assigned together.
+
+Union d327ddb remains worker-only pending exact live-input publication fences,
+cumulative pre-allocation budgets, caller-generation completions and strict
+dtype evidence. Its application UI and downstream query wiring also remain
+in progress. None of these candidates is published or counted as accepted.
+
+
+## 2026-09-09 — grouping release review and final gate preparation
+
+Independent review of d2330a6 identified retained-state accounting defects:
+projections dropped beyond the stored group page were still charged, while
+new group base state and run-key capacity were undercounted. Unsupported
+valid key dtypes also became pending singletons instead of rejecting the
+candidate and preserving last-good grouping. Both corrections and bounded
+regressions are assigned with the normal Run/Filter/Off routing correction.
+The candidate remains unaccepted. Narrow expansion must expose member text
+rather than consume the visible width with full identities.
+
+Primary prepared v013-final-gate.py in primary-astra-scratch: it binds the
+clean source SHA, confirms the primary target, runs workspace Rust and bridge
+checks, builds both executables, records hashes and runs the full PTY matrix
+with durable failure artifacts. It has only been syntax-checked, not run.
+The prepared archive acceptance additionally covers Run/Filter and multiple
+reviewed sources. Roles and union remain outside the pending v0.1.3 scope;
+distribution preparation proceeds while grouping is corrected. No new tag
+or release has been published.
+
+The prepared final gate was corrected after independent script review: separate
+build tasks, explicit bridge installation, a fresh commit-and-UUID target,
+and unique evidence with exclusive acceptance records. The record includes
+source, version, target, script hash, log path/hash and both binary hashes;
+source cleanliness and binary stability are checked again after the matrix.
+Sol static delta review is READY for script SHA-256
+b0f2f0158172f169e7d27b99cab99ae1467af4f33cb00ddfb74ac5c173a5093c.
+This is script review only, not release acceptance. The installer is separately
+being corrected to validate staging, authenticate archive provenance and run
+PTYs outside the checkout before version promotion.
+
+Installer static delta review is READY at SHA-256
+e62609379e9870ca9e60b6ed206a27fcdcc2260ee22eda1dc08657d445292ee9.
+The script fences the checkout, authenticates gate/tag/workflow/archive evidence,
+validates staging outside the checkout, and preserves retryability on promotion
+failure. Control-flow probes cover cleanup after rename and missing/corrupted
+binaries; no actual v0.1.3 archive has been installed.
+
+Grouping ab63a7b engine delta is source-reviewed READY; b74a150 routing is
+sound apart from the retained collapse-all action and required-command list,
+which are assigned with final UI tests. Worker-only roles451c182 has been
+submitted for independent review; union app-flow work continues. These later
+features remain outside v0.1.3.
+
+
+## 2026-09-09 — unified grouping integrated for final acceptance
+
+Integrated the reviewed delta 655d1a1..be577da. Run/Filter/Off now shares normal
+keyboard, palette, Fields and summary routing. Retained group accounting and
+unsupported-key rejection preserve bounds and last-good publication. Independent
+engine and routing delta reviews are clear. The worker's last gate was interrupted
+by a supervisor follow-up during compilation; it is not final acceptance.
+
+Primary corrected the large-view PTY to sample blank frames from dialog close
+through grouping and ungrouping completion, rather than only after completion.
+The exact clean integration commit will now run the reviewed isolated final gate.
+No v0.1.3 tag or archive acceptance is claimed by this entry. Roles and union
+remain separate work in progress outside this release.
+
+The first isolated gate at 0e9ab4c caught an unknown Run-version parser fallthrough.
+The reserved Run/Filter namespaces now reject unsupported versions before legacy
+regex handling; independent review cleared the fix. Workspace tests then exposed
+stale legacy-route assertions and an index-lock fixture acquisition race. Tests
+now await Grouping completion, explicitly enable restored legacy fixtures, and
+acquire the fixture index lock before measuring the unchanged retry window.
+The complete repair workspace run passed (grouping-repair-gate-3.log), followed
+by workspace clippy and bridge105 (grouping-repair-ui-gate.log).
+
+The first integrated PTY matrix passed 69/75. Preserved focused transcripts show
+stale singular-source request, retired folding labels, text-first expansion,
+uncollapsed selection, and hidden narrow-status expectations. Corrected stories
+use accepted enrichment keys and actual grouping counts. All six failed suites
+now pass focused reruns: repair2 real-source/Run, repair3 field-exploration/large
+grouping, repair4 Fields mnemonics, repair5 summary. The large 60k fixture samples
+through transitions and verifies count restoration; no volume-soak claim follows.
+Sol independently cleared the test repairs. Matrix failure output is now printed
+in full into the durable gate log. A fresh exact-commit final gate follows.
+
+
+## 2026-09-09 — v0.1.3 published and archive activated
+
+Exact source `8ca75d0074aa85964f5d493d88d1be3a48fcc0f4` passed the isolated
+final gate: 1349 Rust tests passed (7 ignored), workspace clippy clean, bridge
+105/105, and PTY matrix 75/75. Preserved acceptance is
+`primary-astra-scratch/release-gate-8ca75d0074aa-6f4ad43dbd68449f8ba75d866ea174f2/accepted.json`
+on the build volume. Its source, script, log and preserved binary hashes were
+independently reviewed consistent. Earlier failed gates remain preserved.
+
+Annotated immutable tag `v0.1.3` has object
+`4a0cac74c1af0c7fb38397ae2a9dea5b2f5fba2c` and peels to that source. GitHub run
+34411091946 passed all four native jobs and publish. Distribution checks passed
+73/73; archive files match SHA256SUMS and API digest/size. Tap `67359d3` was pushed
+after exact-tag rendering, style and strict audit.
+
+The installer at SHA256
+`9f3442e6bc682cff4f769c3cba9172cbec555ae61792f285fc7f52f377e99603`
+passed independent review after draft lookup was rebound to both release ID and
+tag. Under the shared lock it verified provenance, exact clean source, bundled
+helper/bridge, full-tree manifest and six actual PTY suites from outside the
+checkout. It activated `versions/v0.1.3`; records are
+`versions/records/v0.1.3.json` and `v0.1.3.tree.json`. Installer log:
+`muse-v013-distribution/v013-delivery/installer-run.log` on the build volume.
+The install record correctly records draft=true at installation time; publication
+followed at 22:58:15 UTC, release ID 385891552. Primary independently verified
+public isDraft=false and `versions/latest` => `v0.1.3`.
+
+The full volume soak remains unaccepted. Roles candidate `ae449fd` is reviewed
+READY but not integrated; union remains in progress. Neither is in v0.1.3.
+
+
+## 2026-09-09 — column roles integrated for acceptance
+
+Applied independently reviewed `ae449fdebf23d0c890fca74b6ee8d3dfa6b2c079`
+on top of the released grouping source. The Fields merge preserves both role
+assignment and the unified Run grouping action. Severity consumes only a ready
+canonical enrichment value. Timestamp rendering uses structural declaration and
+readiness markers plus the accepted basis nanoseconds and display-zone formatter.
+Removed outputs cannot silently regain authority through same-named raw fields.
+Assistance shortcut intent follows accepted candidate ownership and persistence.
+
+Worker evidence and review are preserved under `roles-ae449fd-*` and
+`roles-ae449fd-delta-review.md` on the build volume. The integrated tree still
+requires its own Rust, bridge and full PTY acceptance; no release includes it yet.
+
+
+Column roles integrated acceptance completed at
+`06bd07ae7f078122ab8f3242b834ab4314969111`. Runtime source is unchanged from
+`88cc6e1`, which passed 1386 Rust tests (7 ignored), workspace clippy, and bridge
+105/105. Its first matrix passed 75/77; the preserved transcripts identify stale
+Ask-title and implicit INFO readiness expectations. Two PTY-only repairs retain
+workflow assertions and prevent teardown from masking the save-feedback failure.
+Both focused reruns and the full matrix passed 77/77 with unchanged binary hashes.
+Evidence: `primary-astra-scratch/integration-gate-88cc6e1ad417-9353eddd957e4a75a0de93d9cb646fe5/commands.log`
+and `integration-gate-06bd07ae7f07-0dda6d10b0b346da825c103d7d395f8e/accepted.json`.
+
+Prior integrated test failures and the one test-helper compile correction are
+preserved in dc483d1/f9b3e18/0db5150 gate logs. Sol cleared the resolved Fields and
+group projection seams and the Rust fixture repairs. Column roles are Ready for
+the next release; they are not part of the published v0.1.3 archive.
+
+
+## 2026-09-09 — parallel backlog ownership and v0.1.4 preparation
+
+Version v0.1.4 is prepared for the accepted enrichment column roles; v0.1.3
+remains installed and public until the next archive is accepted. The app crate
+and lock version agree. A fresh exact-source release gate follows.
+
+Remaining TODO ownership is active: union397504aa; viewport/512MB lead8b525718;
+autosave0523e863; journal/cold-queryfc42914a; enrichment-based coloura8f5e7f1;
+shared-capture architecture5b39ecc4; named zones12c3583a; enrichment/union
+correlationc98fb965; distribution/platform evidence9b0f0727. Sol528a1517 reviews
+candidates independently. The three storage investigations share one lead soak
+rather than running competing volume benchmarks. Builds and heavy tests remain
+serialized under the validation lock while design, implementation and review
+proceed in parallel. No new backlog completion is claimed.
+
+
+## 2026-09-10 — v0.1.4 published and archive activated
+
+Exact source `984b6f0dda96c782de3fb7c3e9a9bf169db08eae` passed the isolated
+release gate: 1386 Rust tests passed (7 ignored), formatting and workspace
+clippy clean, bridge 105/105, and PTY matrix 77/77. Both binary hashes were
+checked before and after the matrix. Producer SHA256 is
+`4d1cb5e5ee256fb5317ce79bb6da38799e9384dd79949e9a0ed444f22979ae39`.
+Evidence is under build-volume
+`primary-astra-scratch/release-gate-984b6f0dda96-977250d2a08642b38f8e6b09b38c1bd6/`.
+
+Immutable annotated tag object `ad6664675f8659f3a89b64f38a54c1c3f74c728e`
+peels to that source; workflow 34418420557 passed all four native archive jobs
+and publish. Release 385921636 became public at 00:20:58 UTC. Primary checked
+public release state independently after installation.
+
+Reviewed installer SHA256
+`f14e3c912269bb488f78b5d6199fb3d0162db47b32cbf23224a1bf553c7a07e9`
+ran under the shared lock with the pinned producer hash. It verified official
+assets, exact clean source, full archive layout/tree, bundled helper/bridge,
+and eight mandatory actual PTY suites from a disposable external cwd. The
+archive acceptance includes column-role and shortcut-role workflows. It verified
+the released launcher after promotion and wrote exclusive records at
+`versions/records/v0.1.4.json` and `v0.1.4.tree.json`. The record correctly
+captures draft=true before subsequent publication. Installer log:
+`muse-v014-prep/v014-delivery/installer-run.log` on the build volume.
+
+Primary verified `versions/latest` points to `v0.1.4` and its binary SHA256
+`10b2f8e9c3db925698a1344c06e6edb6e818424a65b1ec0b5b1f84d6973adbd2`
+matches the acceptance record. The full volume soak remains unaccepted; no new
+cold-query, shutdown durability, or managed-memory performance claim follows.
+Named zones, union/shared-key composition, colour classification, shared capture
+and platform validation remain separate assignments.
+
+
+## 2026-09-10 — named zones integrated for v0.1.5 acceptance
+
+Applied the reviewed `9fc7e53..4b9d3b7b2583c1a04cdff70047a0a4ab13da580e`
+runtime/test delta onto the v0.1.4 publication documentation. The app and lock
+versions are now 0.1.5. Worker evidence: lvu 49/49, app settings 16/16, both
+crates all-target clippy, app build and real role PTY including Berlin winter,
+summer, invalid repair, save and restart. Final log SHA256:
+`5d30e583050cbbc1c481742a308fea61bb9cd2de93e62d57af574fb03ea6b167`, under
+`sol-named-timezones-4b9d3b7/final-gate.log` on the build volume.
+
+The earlier 8bf6551 restart failure remains preserved; saved settings were
+correct but startup did not apply the zone to Appearance. The final configuration
+assignment and regression are independently reviewed READY in
+`sol-review-scratch/named-zone-4b9d3b7-delta-review.md`. The full integrated
+release gate and archive validation are still required; no v0.1.5 tag or
+publication is claimed here. The installed release remains v0.1.4.
+
+
+## 2026-09-10 — statistics throughput measurement boundary repaired
+
+The first v0.1.5 gate at `22dc294` failed the unchanged 200,000 records/CPU-second
+floor: 150,005 records, 0.376 s wall, 0.780 s process CPU, 192,314 records/CPU-s.
+An exact-binary rerun passed at 319,157 records/CPU-s with similar wall time.
+These observations support measurement contamination, but do not directly prove
+which concurrent work contributed. Both logs remain preserved. The subsequent
+remaining checks passed clippy, bridge checks, builds and all 77 PTY suites;
+those partial results did not produce release acceptance.
+
+Integrated reviewed `c339d46b3cf8a9675f40fe2817379cf26a5e1d6f`: the test now
+requires terminal durable capture and exact live-index count/high-watermark
+equality, joins the raw index workers, then measures the same production journal
+statistics path. A fallible process CPU utility uses getrusage instead of an
+assumed procfs tick rate. The correctness assertions and throughput floor remain
+unchanged. Focused validation passed the CPU utility test and statistics test
+(150,004 records, 0.341 s wall, 0.435 s CPU, 344,842 records/CPU-s), followed by
+all-target clippy for lvu-core and lvu-view. Independent static review found no
+issues. Evidence: `sol-stats-throughput-c339d46/focused-validation.log` and
+`sol-runtime-review-scratch/stats-throughput-c339d46-review.md` on the build
+volume. A fresh full release gate remains required.

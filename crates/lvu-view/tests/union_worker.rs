@@ -237,11 +237,25 @@ async fn setup_raw_with_budget(
     SourceHandle,
     NativeViewAdapter,
 ) {
+    setup_raw_bytes_with_budget(maximum_index_bytes, b"api row\n", b"worker row\n").await
+}
+
+async fn setup_raw_bytes_with_budget(
+    maximum_index_bytes: u64,
+    api_bytes: &[u8],
+    worker_bytes: &[u8],
+) -> (
+    TempDir,
+    SourceManager,
+    SourceHandle,
+    SourceHandle,
+    NativeViewAdapter,
+) {
     let root = TempDir::new().unwrap();
     let api_path = root.path().join("api.log");
     let worker_path = root.path().join("worker.log");
-    fs::write(&api_path, "api row\n").unwrap();
-    fs::write(&worker_path, "worker row\n").unwrap();
+    fs::write(&api_path, api_bytes).unwrap();
+    fs::write(&worker_path, worker_bytes).unwrap();
     let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
     let api = manager
         .start(source(SourceId::new(), &api_path, true))
@@ -514,6 +528,43 @@ async fn exhausted_shared_budget_rejects_before_carrier_retention_or_polars() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_utf8_expansion_is_charged_before_carrier_retention() {
+    let mut malformed = vec![0xff; 4_096];
+    malformed.push(b'\n');
+    // The obsolete charge (raw bytes twice plus fixed slack) fits in 12 KiB;
+    // retaining exact bytes plus the three-byte replacement string does not.
+    // This makes the phase probe distinguish pre-retention admission from a
+    // later workspace rejection.
+    let (_root, manager, api, worker, mut adapter) =
+        setup_raw_bytes_with_budget(12 * 1_024, &malformed, b"worker row\n").await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    let (probe, counters) = phase_probe();
+    adapter.arm_union_phase_test_probe("union", probe).unwrap();
+    adapter
+        .submit_union_candidate(raw_candidate(1), &|_| None)
+        .unwrap();
+    let error = wait_union(&mut adapter, 1)
+        .unwrap()
+        .error
+        .expect("lossy UTF-8 carrier expansion must exceed the shared budget");
+    assert!(error.contains("shared memory budget"), "{error}");
+    assert_eq!(
+        counters[0].load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the expanding lossy string is admitted before either carrier is retained"
+    );
+    assert_eq!(
+        counters[1].load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "Polars is never entered after carrier admission fails"
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_refreshes_when_an_input_advances() {
     let (root, manager, api, worker, mut adapter) = setup().await;
     adapter
@@ -549,6 +600,70 @@ async fn union_refreshes_when_an_input_advances() {
     assert!(
         texts.iter().any(|text| text.contains("\"n\":99")),
         "the appended record is in the refreshed union"
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_refresh_failure_retries_same_dependency_after_backoff() {
+    let (root, manager, api, worker, mut adapter) = setup_raw_with_budget(8 * 1024 * 1024).await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    adapter
+        .submit_union_candidate(raw_candidate(1), &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+    let original = lvu::RowId::new(api.source_id().0.to_string(), 0);
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("api.log"))
+        .unwrap();
+    writeln!(file, "unique appended row").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&api, 2).await;
+    assert_eq!(adapter.union_needs_refresh("union"), Some(true));
+
+    adapter
+        .arm_union_transient_test_failure("union", "injected transient resource failure")
+        .unwrap();
+    adapter
+        .submit_union_candidate(raw_candidate(2), &|_| None)
+        .unwrap();
+    let failed = wait_union(&mut adapter, 2).unwrap();
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("injected transient resource failure")
+    );
+    assert_eq!(
+        adapter.union_needs_refresh("union"),
+        Some(false),
+        "the retry deadline prevents an every-tick resubmit"
+    );
+
+    let started = std::time::Instant::now();
+    loop {
+        if adapter.union_needs_refresh("union") == Some(true) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the unchanged dependency must become retryable after backoff"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    adapter
+        .submit_union_candidate(raw_candidate(3), &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 3).unwrap().error, None);
+    let rows = union_rows(&mut adapter);
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|row| row.id == original));
+    assert!(
+        rows.iter()
+            .any(|row| row.text.contains("unique appended row"))
     );
     adapter.shutdown();
     manager.shutdown().await;
@@ -883,6 +998,41 @@ async fn native_advanced_filters_post_dedup_and_preserve_last_good() {
         adapter.compiler_calls(),
         compiled_before_refresh,
         "an unchanged published Advanced definition reuses its compiler cache"
+    );
+
+    // Configured grouping uses native flags over the winning typed column.
+    // Every non-null value is an event start under Filter, whereas equal
+    // `choice` values form one Run; a raw/legacy continuation evaluator could
+    // not produce both distinct outcomes from the same records.
+    let mut starts = duplicate_projection_candidate(7, UnionFilterSpec::default());
+    starts.filter.grouping = Some(lvu::grouping::filter_rule("choice"));
+    adapter.submit_union_candidate(starts, &|_| None).unwrap();
+    assert_eq!(wait_union(&mut adapter, 7).unwrap().error, None);
+    assert_eq!(union_rows(&mut adapter).len(), 7);
+
+    let mut run = duplicate_projection_candidate(8, UnionFilterSpec::default());
+    run.filter.grouping = Some(lvu::grouping::run_rule("choice"));
+    adapter.submit_union_candidate(run, &|_| None).unwrap();
+    assert_eq!(wait_union(&mut adapter, 8).unwrap().error, None);
+    let grouped = union_rows(&mut adapter);
+    assert_eq!(grouped.len(), 1);
+    let constituent_ids = grouped[0]
+        .details
+        .iter()
+        .filter(|(name, _)| name.starts_with("group_line_") && name != "group_line_count")
+        .map(|(_, value)| {
+            value
+                .rsplit_once(" [")
+                .and_then(|(_, id)| id.strip_suffix(']'))
+                .expect("configured group details retain the stable ID")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        constituent_ids,
+        (0..7)
+            .map(|sequence| format!("{}:{sequence}", api.source_id().0))
+            .collect::<Vec<_>>()
     );
     adapter.shutdown();
     manager.shutdown().await;

@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use lvu::{
-    Action, App, Focus,
+    Action, App, DisplayRow, Focus, RowId, RowPage, RowProvider, ViewportRequest,
     command_palette::{Palette, PaletteContext},
     component::{Open, RawEvent},
     delight::{ActivityState, DelightConfig, FooterDelight},
@@ -20,7 +20,36 @@ fn demo() -> (FixtureProvider, App) {
     (provider, App::new(sources, views, true))
 }
 
-fn render(provider: &FixtureProvider, app: &mut App, theme: Theme) -> Buffer {
+// Supply an accepted severity projection while leaving the shared raw fixture alone.
+struct ReadySeverity(FixtureProvider);
+impl ReadySeverity {
+    fn project(mut row: DisplayRow) -> DisplayRow {
+        row.fields.push(("severity".into(), row.level.clone()));
+        row.details
+            .push(("derived.severity".into(), row.level.clone()));
+        row.details
+            .push(("derived_ready.severity".into(), "1".into()));
+        row
+    }
+}
+impl RowProvider for ReadySeverity {
+    fn page(&self, view: &str, request: ViewportRequest) -> RowPage {
+        let mut page = self.0.page(view, request);
+        page.rows = page.rows.into_iter().map(Self::project).collect();
+        page
+    }
+    fn row_by_id(&self, view: &str, id: &RowId) -> Option<DisplayRow> {
+        self.0.row_by_id(view, id).map(Self::project)
+    }
+    fn index_of_id(&self, view: &str, id: &RowId) -> Option<usize> {
+        self.0.index_of_id(view, id)
+    }
+    fn revision(&self, view: &str) -> u64 {
+        self.0.revision(view)
+    }
+}
+
+fn render<P: RowProvider>(provider: &P, app: &mut App, theme: Theme) -> Buffer {
     let backend = TestBackend::new(100, 25);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -214,6 +243,8 @@ fn stable_value_slot_is_identical_across_views_and_palettes() {
 fn testbackend_preserves_selected_then_color_by_then_severity_precedence() {
     for theme in ThemeId::ALL.map(Theme::builtin) {
         let (provider, mut app) = demo();
+        let provider = ReadySeverity(provider);
+        app.views.active_mut().unwrap().severity_column = Some("severity".into());
         let severity = render(&provider, &mut app, theme);
         let selected = find(&severity, "fixture request 16 completed");
         assert_eq!(severity[selected].fg, theme.selection_fg);

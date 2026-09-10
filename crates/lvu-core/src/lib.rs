@@ -14,7 +14,7 @@ pub use acquisition::{
     FileContentHasher, FileEncoding, FileIdentity, FileResumeCursor,
 };
 pub use correlation::*;
-pub use cpu::{ThreadCpu, thread_cpu_nanos};
+pub use cpu::{ProcessCpu, ThreadCpu, thread_cpu_nanos};
 pub use http::{HttpAcquisition, capture_http, redact_endpoint};
 pub use journal::{Journal, JournalError, JournalPage, JournalReader, Recovery};
 pub use model::*;

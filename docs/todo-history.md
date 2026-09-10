@@ -129,3 +129,31 @@ Rows marked Done since preview 052, grouped by the area they came from.
 | **Done** | Enrichment persists an unfinished *edit* draft across restart, alongside an unfinished new step. |
 | **Done** | Explain raw-row loading/index failures instead of showing only “query ready.” Wired into the status line; the API alone had shipped with zero callers. |
 | **Done** | Fixed the hang where a resize immediately followed by a keypress wedged the app — process alive, terminal left in the alternate screen. crossterm loops `read(2)` until its parser yields an event and stops only on `WouldBlock`, which the blocking standard input never reports, so a read carrying only the start of an escape sequence slept inside `event::poll` with the poll timeout unexpired and no frame or restoration possible. lvu now hands crossterm a private non-blocking view of the terminal. Not dialog-specific; this was the earlier Settings resize/Enter observation. |
+
+
+## v0.1.3 (2026-09-09, `8ca75d0`)
+
+Published with all four native archives, updated Homebrew tap and accepted local archive.
+Run/Filter/Off grouping uses enrichment columns throughout normal workflows.
+The following bounded fixes shipped; the broader storage and viewport investigations
+remain open in TODO.md.
+
+| Status | Work |
+| --- | --- |
+| **Done** | Source assistance proposes up to eight distinct reviewed sources; Apply reports partial failures, retains all-failed reviews for retry and never runs sources before confirmation. |
+| **Done** | Separate bounded journal page requests from capture scheduling, preserving reciprocal progress, writer closure and cancelled-read bounds. The cold-query performance investigation remains open. |
+| **Done** | Batch queued autosaves with per-entry rollback and durable acknowledgement ordering; full slow-volume shutdown acceptance remains open. |
+| **Done** | Missing enrichment/filter columns report actionable batch-scoped diagnostics; rejected drafts preserve the last accepted rows and live refresh. |
+| **Done** | A requested window exceeding the display-cache byte limit retains its drawable prefix; blank indexed rows show loading. The broader 512 MB viewport/soak investigation remains open. |
+| **Done** | Status prioritizes actionable notices, event-time diagnostics, row ranges and visible return/help controls; wide/combining text fits and optional indicators give way as whole segments. |
+| **Done** | FOLLOW draws the newest servable window while preserving true-tail selection. HISTORY keeps its requested destination separate from retained displayed rows, retries without another keypress, and reports the actual range. |
+| **Done** | Pending raw-context location is visible in narrow status lines: the protected prefix says `locating #N` until the chase resolves or reports its bounded failure. Full origin context remains optional when space fits. |
+
+
+## v0.1.4 — 2026-09-10
+
+- Shipped severity and UTC timestamp assistance shortcuts through ordinary
+  enrichment review, with per-view output roles and persistent selection.
+  Ready canonical severity and accepted timestamp-basis values replace normal
+  implicit recognition. Exact-source and installed-archive acceptance are
+  recorded in the work ledger.

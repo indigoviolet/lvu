@@ -29,10 +29,11 @@ pub struct Appearance {
     pub delight_enabled: bool,
     pub reduced_motion: bool,
     pub ascii: bool,
-    /// Fixed UTC offset the log viewport formats timestamps in, as a token
-    /// (`"Z"`, `"+02:00"`). It belongs to the reader, not to a view: two views
-    /// of one source disagreeing about what `14:30` means would be worse than
-    /// having to set it once (§2.3 exception for `appearance`).
+    /// IANA zone or fixed UTC offset the log viewport formats timestamps in,
+    /// such as `Europe/Berlin`, `Z`, or `+02:00`. It belongs to the reader, not
+    /// to a view: two views of one source disagreeing about what `14:30` means
+    /// would be worse than having to set it once (§2.3 exception for
+    /// `appearance`).
     pub display_zone: String,
 }
 
@@ -555,9 +556,9 @@ pub struct RenderCtx<'a> {
     pub active: bool,
     pub theme: Theme,
     pub ascii: bool,
-    /// The fixed UTC offset the log viewport draws times in. Read-only here:
-    /// it is the reader's setting, and a layer that reports it must report the
-    /// same one the rows behind it are using.
+    /// The IANA zone or fixed UTC offset the log viewport draws times in.
+    /// Read-only here: it is the reader's setting, and a layer that reports it
+    /// must report the same one the rows behind it are using.
     pub display_zone: &'a str,
     pub size: (u16, u16),
     pub clock: Clock,

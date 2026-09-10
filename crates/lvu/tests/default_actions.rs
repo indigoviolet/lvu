@@ -259,7 +259,16 @@ fn fields_fold_reads_unfold_once_the_view_is_folded_by_that_column() {
 
         // Fold by the selected column.
         press(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
-        assert!(app.view_state().unwrap().fold_enabled);
+        let request = app.take_query_requests().pop().expect("grouping request");
+        assert_eq!(request.purpose, QueryPurpose::Grouping);
+        assert!(app.apply_query_completion(QueryCompletion {
+            view_id: request.view_id,
+            generation: request.generation,
+            revision: request.revision,
+            purpose: request.purpose,
+            result: Ok(()),
+        }));
+        assert!(!app.view_state().unwrap().fold_enabled);
         let folded = screen(&draw(&provider, &mut app, width, height, theme));
         assert!(
             folded.contains("Unfold"),
@@ -268,6 +277,19 @@ fn fields_fold_reads_unfold_once_the_view_is_folded_by_that_column() {
 
         // The same key from the same place turns it back off.
         press(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
+        let request = app
+            .take_query_requests()
+            .pop()
+            .expect("grouping off request");
+        assert_eq!(request.purpose, QueryPurpose::Grouping);
+        assert!(app.apply_query_completion(QueryCompletion {
+            view_id: request.view_id,
+            generation: request.generation,
+            revision: request.revision,
+            purpose: request.purpose,
+            result: Ok(()),
+        }));
+        assert!(app.view_state().unwrap().grouping.applied.is_empty());
         assert!(!app.view_state().unwrap().fold_enabled);
         let unfolded = screen(&draw(&provider, &mut app, width, height, theme));
         assert!(

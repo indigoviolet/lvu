@@ -198,14 +198,14 @@ def vertical_navigation(binary: pathlib.Path, source: pathlib.Path, root: pathli
 
 
 def prepared_task(binary: pathlib.Path, source: pathlib.Path, root: pathlib.Path) -> None:
-    """Recognize timestamp states its task, drops the kind and offers the prompt."""
+    """Timestamp column states its task, drops the kind and offers the prompt."""
     app = open_app(binary, source, root, "prepared", width=110, height=30)
     try:
         app.send(b"t")
         app.wait_for("Time window")
         app.send(b"\x1bt")
         prepared = app.wait_until(
-            lambda text: "Recognize timestamp" in text and "Request" in text,
+            lambda text: "Timestamp column" in text and "Request" in text,
             "the prepared timestamp task opens Ask",
         )
         # The task is named in the title and explained in the header.

@@ -176,13 +176,9 @@ fn a_waiting_layer_offers_cancel_and_refuses_a_second_request() {
 #[test]
 fn a_prepared_task_fixes_the_kind_and_keeps_the_request_editable() {
     let (provider, mut app) = demo();
-    open(
-        &mut app,
-        &provider,
-        AskOpen::Task(AskTask::RecognizeTimestamp),
-    );
+    open(&mut app, &provider, AskOpen::Task(AskTask::TimestampColumn));
     let screen = draw(&provider, &mut app, 120, 30);
-    assert!(screen.contains("Recognize timestamp"), "{screen}");
+    assert!(screen.contains("Timestamp column"), "{screen}");
     assert!(!screen.contains("Kind"), "a fixed task offers no choice");
     let dialog = app.layers.ask.state().unwrap();
     assert_eq!(dialog.kind, AskAiKind::Enrichment);
@@ -202,7 +198,7 @@ fn a_prepared_task_fixes_the_kind_and_keeps_the_request_editable() {
     key(&mut app, &provider, KeyCode::Backspace);
     assert!(
         app.layers.ask.state().unwrap().prompt.len()
-            < AskTask::RecognizeTimestamp.object().len() + 1500
+            < AskTask::TimestampColumn.object().len() + 1500
     );
 }
 
@@ -307,11 +303,7 @@ fn the_palette_kind_rows_are_taken_over_by_the_layer_and_say_when_they_cannot_be
     // A prepared task has already decided; the rows say so rather than
     // pretending to work.
     app.handle(Action::CancelEditor, &provider);
-    open(
-        &mut app,
-        &provider,
-        AskOpen::Task(AskTask::RecognizeTimestamp),
-    );
+    open(&mut app, &provider, AskOpen::Task(AskTask::TimestampColumn));
     assert!(
         app.layer_commands()
             .iter()

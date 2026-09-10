@@ -20,20 +20,26 @@ def run(binary: pathlib.Path) -> None:
 
         app.send(b"m")
         # dialog-system.md §7.1 titles are nouns, and §7.4 replaces the
-        # `Applied:` vocabulary with the shared message row.
+        # `Applied:` vocabulary with the shared message row. The normal
+        # control opens on Run: an enrichment column selector, with legacy
+        # Auto kept under Legacy rather than as the default.
         grouping = app.wait_for("Multiline grouping")
-        assert "Mode Auto" in grouping, grouping
-        assert "conservative multiline detection" in grouping, grouping
+        assert "Run" in grouping, grouping
+        assert "Up/Down names the enrichment column" in grouping, grouping
         assert "Applied:" not in grouping, grouping
         # Grouping must expose Apply as an activatable action. The old "Enter Apply"
         # hint was removed with the universal-shortcut cleanup but never replaced,
         # leaving the dialog with no actions region at all. Tracked in TODO.md.
         assert "[ Apply ]" in grouping, grouping
         assert "Scroll status" not in grouping, grouping
-        # Typing replaces Auto with an exact Custom regex draft; the reserved
-        # persistence token is never exposed in ordinary UI.
-        app.send(b"q")
-        app.wait_for("Mode Custom")
+        # Tab reaches the tab control and Right selects Legacy, where the
+        # restored Auto token keeps its exact meaning behind its static
+        # paragraph instead of an exposed token.
+        app.send(b"\t")
+        app.send(b"\x1b[C")
+        app.send(b"\x1b[C")
+        legacy = app.wait_for("Legacy Auto")
+        assert "Run" in legacy and "Filter" in legacy, legacy
         app.send(b"\x1b")
         # Wait for the dialog to actually close: ESC immediately followed by a
         # printable byte is parsed as Alt-<key>, so `e` would land in the field.

@@ -471,18 +471,42 @@ fn the_display_zone_reformats_the_column_and_says_which_zone_it_is() {
 }
 
 #[test]
-fn an_unreadable_zone_token_shows_utc_rather_than_nothing() {
+fn named_zone_uses_the_offset_at_each_instant_and_invalid_tokens_fall_back() {
     // A settings file written by a newer build must not make the log
     // unreadable. `lvu-app` refuses the value at load; if one reaches the
     // renderer anyway, UTC is the honest fallback.
-    assert_eq!(lvu::app::time_zone_offset_minutes("Europe/Berlin"), None);
+    let winter = 1_768_478_400_000_000_000;
+    let summer = 1_784_116_800_000_000_000;
     assert_eq!(
-        lvu::app::format_display_time(1_000_000_000, "Europe/Berlin"),
+        lvu::app::format_display_time(winter, "Europe/Berlin"),
+        "13:00:00.000+01:00"
+    );
+    assert_eq!(
+        lvu::app::format_display_time(summer, "Europe/Berlin"),
+        "14:00:00.000+02:00"
+    );
+    assert!(lvu::app::validate_display_zone("Europe/Berlin").is_ok());
+    assert!(lvu::app::validate_display_zone("Europe/Not_A_Zone").is_err());
+    assert_eq!(
+        lvu::app::format_display_time(1_000_000_000, "Europe/Not_A_Zone"),
         lvu::app::format_display_time(1_000_000_000, "Z")
     );
     for (token, minutes) in [("Z", 0), ("+05:45", 345), ("-03:00", -180)] {
         assert_eq!(lvu::app::time_zone_offset_minutes(token), Some(minutes));
     }
+}
+
+#[test]
+fn named_zone_date_formatting_crosses_local_midnight_at_the_same_instant() {
+    let instant = 1_767_310_200_000_000_000; // 2026-01-01 23:30:00 UTC
+    assert_eq!(
+        lvu::app::format_display_date(instant, "Europe/Berlin"),
+        "2026-01-02"
+    );
+    assert_eq!(
+        lvu::app::format_display_date(instant, "America/New_York"),
+        "2026-01-01"
+    );
 }
 
 #[test]
@@ -536,6 +560,11 @@ fn a_row_with_no_capture_time_keeps_what_the_provider_wrote() {
         lvu::app::display_time_width("+02:00"),
         18,
         "an offset's is six, and the column widens rather than truncating"
+    );
+    assert_eq!(
+        lvu::app::display_time_width("Europe/Berlin"),
+        18,
+        "named zones always show their numeric offset at the instant"
     );
 }
 

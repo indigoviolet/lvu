@@ -257,7 +257,7 @@ fn enter_on_each_row_replaces_the_summary_with_the_owning_layer_and_its_item() {
         (SummaryRow::Search, LayerId::Filter),
         (SummaryRow::Filter, LayerId::Filter),
         (SummaryRow::Grouping, LayerId::Grouping),
-        (SummaryRow::Fold, LayerId::Folding),
+        (SummaryRow::Fold, LayerId::Grouping),
         (SummaryRow::Columns, LayerId::Fields),
         (SummaryRow::Colour, LayerId::ColorRules),
         (SummaryRow::Readiness, LayerId::Enrichment),
@@ -374,7 +374,7 @@ fn the_button_its_mnemonic_and_the_mouse_open_the_selected_row_too() {
         Some(SummaryHit::Control(SummaryControl::Open))
     );
     click(&mut app, &provider, (button_x + 2, button_y));
-    assert_eq!(app.layers.stack, vec![LayerId::Folding]);
+    assert_eq!(app.layers.stack, vec![LayerId::Grouping]);
 }
 
 #[test]

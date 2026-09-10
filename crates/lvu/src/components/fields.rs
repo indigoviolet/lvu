@@ -292,14 +292,16 @@ fn action_buttons(
         .active()
         .map_or_else(Vec::new, |state| state.pinned_columns.clone());
     let color_field = views.active().and_then(|state| state.color_field.clone());
-    // The column this view is folded by right now, if it is folding at all. A
-    // one-key action that only ever turns something on leaves the user looking
-    // for where to turn it off; §8.9's Add/Edit rule is that the button says
-    // what pressing it will do from here.
-    let folded_by = views
-        .active()
-        .filter(|state| state.fold_enabled)
-        .and_then(|state| state.fold_key_column.clone());
+    // The column this view is run-grouped by right now, if it is. A one-key
+    // action that only ever turns something on leaves the user looking for
+    // where to turn it off; §8.9's Add/Edit rule is that the button says what
+    // pressing it will do from here.
+    let folded_by = views.active().and_then(|state| {
+        match crate::grouping::parse_grouping(&state.grouping.applied) {
+            Ok(crate::grouping::GroupingSpec::Run { column }) => Some(column.to_owned()),
+            _ => None,
+        }
+    });
     let pin_label = if selected_column
         .as_ref()
         .is_some_and(|key| pinned.contains(key))
@@ -316,6 +318,31 @@ fn action_buttons(
     } else {
         "&Color"
     };
+    let (severity_role, timestamp_role) = views
+        .active()
+        .map(|state| {
+            (
+                state.severity_column.clone(),
+                state.timestamp_column.clone(),
+            )
+        })
+        .unwrap_or_default();
+    let severity_label = if selected_column
+        .as_deref()
+        .is_some_and(|key| severity_role.as_deref() == Some(key))
+    {
+        "Stop &severity"
+    } else {
+        "&Severity"
+    };
+    let timestamp_label = if selected_column
+        .as_deref()
+        .is_some_and(|key| timestamp_role.as_deref() == Some(key))
+    {
+        "Stop &timestamp"
+    } else {
+        "&Timestamp"
+    };
     let fold_label = if selected_column
         .as_deref()
         .is_some_and(|key| folded_by.as_deref() == Some(key))
@@ -329,6 +356,8 @@ fn action_buttons(
         ("&Filter", C::Filter),
         ("E&xclude", C::Exclude),
         (color_label, C::Color),
+        (severity_label, C::Severity),
+        (timestamp_label, C::Timestamp),
         (fold_label, C::Fold),
         ("Co&rrelate", C::Correlate),
     ]
@@ -429,6 +458,8 @@ impl FieldsDialog {
             FieldPickerControl::Filter,
             FieldPickerControl::Exclude,
             FieldPickerControl::Color,
+            FieldPickerControl::Severity,
+            FieldPickerControl::Timestamp,
             FieldPickerControl::Fold,
             FieldPickerControl::Correlate,
             FieldPickerControl::Context,
@@ -462,6 +493,8 @@ impl FieldsDialog {
             }
             FieldPickerControl::Pin => self.toggle_field(true, ctx),
             FieldPickerControl::Color => self.toggle_field(false, ctx),
+            FieldPickerControl::Severity => self.toggle_role(true, ctx),
+            FieldPickerControl::Timestamp => self.toggle_role(false, ctx),
             FieldPickerControl::Filter => self.filter_to_value(false, ctx),
             FieldPickerControl::Exclude => self.filter_to_value(true, ctx),
             FieldPickerControl::Fold => self.fold_by_field(ctx),
@@ -538,13 +571,66 @@ impl FieldsDialog {
         Outcome::Consumed
     }
 
-    /// §8.12: fold the view by the selected field's column, exactly as
-    /// choosing that column in the Folding dialog does — and, when the view is
-    /// already folded by it, stop folding.
+    /// Whether the anchored record proves an accepted enrichment evaluated
+    /// `field`: the same `derived.{name}` marker rendering resolves roles
+    /// through, read here so assignment and consumption cannot disagree.
+    fn role_proven(ctx: &Ctx<'_>, field: &str) -> bool {
+        anchored_row(ctx.views, ctx.provider).is_some_and(|row| {
+            row.details
+                .iter()
+                .any(|(key, _)| key == &format!("derived.{field}"))
+        })
+    }
+
+    /// Name the selected column for a display role, or stop using it when it
+    /// is already the role. Assigning requires the anchored record's
+    /// `derived.{name}` marker — proof the accepted chain evaluated it — so
+    /// a raw same-name field can never be assigned: rendering resolves roles
+    /// through the same marker, and the refusal says why instead of silently
+    /// doing nothing. Naming a timestamp role also stages the authoritative
+    /// Selected time basis for that column through the normal Time candidate
+    /// fences, so the gutter never becomes a second independent time
+    /// selector: the Time dialog still reviews and applies. Clearing the role
+    /// leaves an explicitly chosen basis alone.
+    fn toggle_role(&mut self, severity: bool, ctx: &mut Ctx<'_>) -> Outcome {
+        let Some(field) = Self::selected_column(ctx) else {
+            return Outcome::Consumed;
+        };
+        if !Self::role_proven(ctx, &field) {
+            ctx.notice(format!(
+                "only an accepted enrichment output can feed a role; {field:?} has none"
+            ));
+            return Outcome::Consumed;
+        }
+        let Some(state) = ctx.views.active_mut() else {
+            return Outcome::Consumed;
+        };
+        if severity {
+            let role = &mut state.severity_column;
+            if role.as_deref() == Some(&field) {
+                *role = None;
+            } else {
+                *role = Some(field);
+            }
+        } else if state.timestamp_column.as_deref() == Some(&field) {
+            state.timestamp_column = None;
+        } else {
+            crate::app::stage_timestamp_basis(state, &field);
+            state.timestamp_column = Some(field);
+        }
+        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+        Outcome::Consumed
+    }
+
+    /// §8.12: run-group the view by the selected field's column through the
+    /// unified grouping control — and, when the view is already run-grouped
+    /// by it, clear the rule again.
     ///
     /// §8.9's rule for Add/Edit: a one-key action follows the state it acts on
-    /// rather than only ever switching it on. Folding from here and then having
-    /// to find the Folding dialog to undo it is the same trap.
+    /// rather than only ever switching it on. Recognition lives in
+    /// Enrichment: the column must be an accepted enrichment output, and the
+    /// worker names any other column actionably while the last-good view
+    /// stays put.
     fn fold_by_field(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         let Some(column) = Self::selected_column(ctx) else {
             return Outcome::Consumed;
@@ -552,42 +638,32 @@ impl FieldsDialog {
         let Some(view_id) = ctx.views.active_id().map(str::to_owned) else {
             return Outcome::Consumed;
         };
-        let mut notice = None;
-        if let Some(state) = ctx.views.state_mut(&view_id) {
-            let folded_by_this =
-                state.fold_enabled && state.fold_key_column.as_deref() == Some(column.as_str());
-            if folded_by_this {
-                state.fold_enabled = false;
-                state.fold_expanded.clear();
-                notice = Some(format!("folding off; was on {column}"));
-            } else {
-                // Say which key is being left behind: switching from one column
-                // to another changes every run on screen, and the count in the
-                // status line moving is otherwise the only sign of it.
-                let previous = state.fold_enabled.then(|| {
-                    state
-                        .fold_key_column
-                        .clone()
-                        .unwrap_or_else(|| "pattern".to_owned())
-                });
-                state.fold_key_column = Some(column.clone());
-                state.fold_expanded.clear();
-                state.fold_enabled = true;
-                if state.fold_minimum_run == 0 {
-                    state.fold_minimum_run = crate::app::DEFAULT_FOLD_MINIMUM_RUN;
-                }
-                notice = Some(match previous {
-                    Some(previous) if previous != column => {
-                        format!("folding by {previous} → {column}")
-                    }
-                    _ => format!("folding on {column}"),
-                });
-            }
+        let grouped_by_this = ctx.views.active().is_some_and(|state| {
+            matches!(
+                crate::grouping::parse_grouping(&state.grouping.applied),
+                Ok(crate::grouping::GroupingSpec::Run { column: applied })
+                    if applied == column.as_str()
+            )
+        });
+        let rule = if grouped_by_this {
+            String::new()
+        } else {
+            crate::grouping::run_rule(&column)
+        };
+        if ctx
+            .views
+            .enqueue(&view_id, QueryPurpose::Grouping, Some(rule))
+            .is_err()
+        {
+            ctx.notice("query submission queue is full; draft was preserved".to_owned());
+            return Outcome::Consumed;
         }
         ctx.views.touch(&view_id);
-        if let Some(notice) = notice {
-            ctx.notice(notice);
-        }
+        ctx.notice(if grouped_by_this {
+            format!("grouping off; runs were on {column}")
+        } else {
+            format!("grouping runs on {column}")
+        });
         Outcome::Consumed
     }
 
@@ -1111,6 +1187,8 @@ impl Component for FieldsDialog {
         match control {
             FieldPickerControl::Pin => self.toggle_field(true, ctx),
             FieldPickerControl::Color => self.toggle_field(false, ctx),
+            FieldPickerControl::Severity => self.toggle_role(true, ctx),
+            FieldPickerControl::Timestamp => self.toggle_role(false, ctx),
             FieldPickerControl::Filter => self.filter_to_value(false, ctx),
             FieldPickerControl::Exclude => self.filter_to_value(true, ctx),
             FieldPickerControl::Fold => self.fold_by_field(ctx),

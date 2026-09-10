@@ -17,6 +17,7 @@ import sys
 import tempfile
 
 from test_lvu_pty import PtyApp
+from test_enrichment_chain_pty import open_step_editor, paste, close_editor
 
 
 def run(binary: pathlib.Path) -> None:
@@ -71,13 +72,19 @@ def run(binary: pathlib.Path) -> None:
             )
             assert '"level": "ERROR"' in membership, membership
             assert '"msg": "line 4"' in membership, membership
+            open_step_editor(app)
+            paste(app, "level = pl.col('level')")
+            app.send(b"\r")
+            app.wait_until(lambda text: "Applied" in text, "level enrichment applied", timeout=20)
+            close_editor(app)
             app.send(b"i")
             app.wait_for("Fields · record", timeout=8.0)
 
             # `d` is Fol&d. On the base screen `d` toggles the Details pane;
             # inside the dialog the dialog's mnemonic wins (§7.5).
             app.send(b"d")
-            folded = app.wait_for("folding on level", timeout=8.0)
+            folded = app.wait_until(lambda text: "grouping runs on" in text and "[ Unfold ]" in text,
+                                    "the selected level is run-grouped", timeout=8.0)
             assert "Details" not in folded.split("Fields · record")[0], (
                 "`d` toggled the base screen's Details pane instead of folding:\n"
                 f"{folded}"

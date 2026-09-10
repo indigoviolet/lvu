@@ -6,7 +6,7 @@ app crate version and lockfile version must agree. Push the specific version tag
 rather than all local tags, and never move an existing version tag.
 See [versions](versions.md) for local installation and retention.
 
-**State: `v0.1.2` is tagged and published, with all four archives and the updated tap.** Steps 1-4
+**State: `v0.1.3` is tagged and published, with all four archives and the updated tap.** Steps 1-4
 retain the historical `v0.1.0` command examples; substitute the version being
 released rather than recreating a published tag.
 A reader arriving now starts at [step 5, cutting the next
@@ -282,6 +282,10 @@ brew install uv node     # or: mise use -g uv node
 
 `v0.1.2` was completed on 2026-09-09. `0.1.3` is the version now in
 preparation below; use another number only when a different version is intended.
+
+For v0.1.3, publication requires all four native archives and their checksums
+to pass verification, as explicitly requested for this release. The historical
+partial-release procedure above is not the acceptance policy for v0.1.3.
 
 ```sh
 git status --short --branch # use the reviewed integration/release checkout

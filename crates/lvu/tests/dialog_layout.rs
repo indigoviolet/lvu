@@ -626,7 +626,7 @@ fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
         ),
         (
             "ask timestamp task",
-            Action::Open(Open::Ask(AskOpen::Task(AskTask::RecognizeTimestamp))),
+            Action::Open(Open::Ask(AskOpen::Task(AskTask::TimestampColumn))),
             DialogClass::L,
         ),
     ]
@@ -644,7 +644,7 @@ fn ask_puts_its_actions_after_its_fields_at_every_size_in_both_themes() {
                 ("generic", Action::Open(Open::Ask(AskOpen::Generic)), false),
                 (
                     "timestamp task",
-                    Action::Open(Open::Ask(AskOpen::Task(AskTask::RecognizeTimestamp))),
+                    Action::Open(Open::Ask(AskOpen::Task(AskTask::TimestampColumn))),
                     true,
                 ),
             ] {
@@ -690,7 +690,7 @@ fn ask_puts_its_actions_after_its_fields_at_every_size_in_both_themes() {
                 }
                 // A prepared task states its task and offers no kind choice.
                 if prepared {
-                    assert!(text.contains("Recognize timestamp"), "{text}");
+                    assert!(text.contains("Timestamp column"), "{text}");
                     assert!(text.contains("timestamp_utc"), "{text}");
                     assert!(!text.contains("Kind"), "{name} keeps a kind row\n{text}");
                 } else {

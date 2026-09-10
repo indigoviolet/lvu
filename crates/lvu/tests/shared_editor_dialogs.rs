@@ -213,9 +213,11 @@ fn grouping_uses_input_only_background_and_explicit_applied_state() {
     let output = screen(&buffer);
     // dialog-system.md §7.4 replaces the `Applied:` vocabulary with the shared
     // message row, and §3 gives the dialog the action row it never had.
-    assert!(output.contains("Mode Auto"), "{output}");
+    // The normal control opens on Run: an enrichment column selector, not a
+    // lexical heuristic.
+    assert!(output.contains("Run"), "{output}");
     assert!(
-        output.contains("conservative multiline detection"),
+        output.contains("Up/Down names the enrichment column"),
         "{output}"
     );
     assert!(output.contains("[ Apply ]"), "{output}");
@@ -226,13 +228,13 @@ fn grouping_uses_input_only_background_and_explicit_applied_state() {
 
     let input_y = output
         .lines()
-        .position(|line| line.contains("Auto — conservative"))
+        .position(|line| line.contains("(?lvu:run:"))
         .unwrap() as u16;
     let input_x = output
         .lines()
         .nth(input_y as usize)
         .unwrap()
-        .find("Auto")
+        .find("(?lvu:run:")
         .unwrap() as u16;
     assert_eq!(buffer[(input_x, input_y)].bg, Theme::LOVE_DARK.input_bg);
     assert_eq!(

@@ -29,7 +29,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     Action, AskAiDialogState, AskAiKind, AskAiRequest, AskAiStage, AskAnswer, AskControl,
-    AskSample, AskSampleTier, AskTask, RecipeConfig, RecipeOutcome, TIMESTAMP_PROMPT,
+    AskSample, AskSampleTier, AskTask, RecipeConfig, RecipeOutcome,
 };
 use crate::command_palette::CommandId;
 use crate::component::{Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface};
@@ -515,6 +515,7 @@ impl AskDialog {
             expression,
             recipe: recipe.map(Box::new),
             outcome,
+            task: dialog.task,
         })
     }
 
@@ -702,7 +703,7 @@ impl AskDialog {
                 KeyCode::Char('t') => {
                     if self.accepts_new_request() {
                         Outcome::Replace(crate::component::Open::Ask(AskOpen::Task(
-                            AskTask::RecognizeTimestamp,
+                            AskTask::TimestampColumn,
                         )))
                     } else {
                         Outcome::Consumed
@@ -845,7 +846,7 @@ impl Component for AskDialog {
                 dialog.task = Some(task);
                 dialog.kind = AskAiKind::Enrichment;
                 dialog.kind_selected = 1;
-                dialog.prompt = TIMESTAMP_PROMPT.into();
+                dialog.prompt = task.prompt().into();
                 dialog.progress = task.message().into();
             }
             AskOpen::Recipe {

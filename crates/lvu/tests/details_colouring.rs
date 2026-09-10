@@ -41,9 +41,14 @@ impl Records {
             captured_at_unix_nanos: Some(sequence as i64),
             level: level.into(),
             text: text.into(),
-            details: vec![("origin".into(), "fixture".into())],
+            details: vec![
+                ("origin".into(), "fixture".into()),
+                ("derived.severity".into(), level.into()),
+                ("derived_ready.severity".into(), "1".into()),
+            ],
             fields: vec![
                 ("svc".into(), service.into()),
+                ("severity".into(), level.into()),
                 ("n".into(), sequence.to_string()),
             ],
         };
@@ -97,6 +102,8 @@ fn app() -> (Records, App) {
         }],
         false,
     );
+    // Model an accepted enrichment projection, then explicitly select its role.
+    app.views.active_mut().unwrap().severity_column = Some("severity".into());
     let provider = Records::new();
     app.sync_provider(&provider, 8);
     (provider, app)

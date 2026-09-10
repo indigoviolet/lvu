@@ -265,7 +265,7 @@ pub struct UnionFilterSpec {
     pub advanced_polars: Option<String>,
     /// Exact typed key filter. Additive (`serde(default)`) so older persisted
     /// rows read as unconstrained: no schema bump, unknown fields ignored.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_key: Option<ExactFieldConstraint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grouping: Option<String>,
@@ -871,6 +871,38 @@ pub(crate) fn union_row_carrier_bytes(
             .ok_or_else(overflow)?;
     }
     Ok(row_bytes)
+}
+
+/// Exact byte length of `String::from_utf8_lossy(bytes)` without allocating.
+/// Each malformed UTF-8 subsequence becomes one three-byte U+FFFD. Union
+/// admission uses this before retaining both the decoded string and original
+/// bytes, so arbitrary captured bytes cannot expand outside the shared budget.
+pub(crate) fn lossy_utf8_len(bytes: &[u8]) -> Result<usize, UnionError> {
+    let overflow = || UnionError::ByteLimit {
+        bytes: u64::MAX,
+        maximum: u64::MAX,
+    };
+    let mut remaining = bytes;
+    let mut length = 0usize;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                length = length.checked_add(valid.len()).ok_or_else(overflow)?;
+                break;
+            }
+            Err(error) => {
+                length = length
+                    .checked_add(error.valid_up_to())
+                    .and_then(|value| value.checked_add(char::REPLACEMENT_CHARACTER.len_utf8()))
+                    .ok_or_else(overflow)?;
+                let invalid = error
+                    .error_len()
+                    .unwrap_or_else(|| remaining.len() - error.valid_up_to());
+                remaining = &remaining[error.valid_up_to() + invalid..];
+            }
+        }
+    }
+    Ok(length)
 }
 
 /// Decode one frozen input into a typed frame with canonical identity columns.

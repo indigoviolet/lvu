@@ -49,20 +49,21 @@
 use super::export::{FrozenInput, FrozenInputError, FrozenInputLimits};
 use super::union::{
     StoredUnionInput, UnionCandidateSpec, UnionCompletion, UnionFilterSpec, UnionFrozenInput,
-    UnionFrozenRow, UnionLimits, detect_union_cycle, union_frozen_inputs, union_row_carrier_bytes,
-    union_workspace_bytes, validate_union_spec,
+    UnionFrozenRow, UnionLimits, detect_union_cycle, lossy_utf8_len, union_frozen_inputs,
+    union_row_carrier_bytes, union_workspace_bytes, validate_union_spec,
 };
 use super::{
-    Appended, AutoLine, ContinuationRule, GroupRange, MAX_GROUP_LINE_DISPLAY_BYTES,
-    MAX_GROUP_LINES, MAX_GROUP_PAYLOAD_BYTES, Membership, MemoryBudget, NO_BASIS_TIME, Published,
-    Reservation, SEQUENCE_BYTES, SOURCE_OVERHEAD, ScanState, Shared, SourceMatches,
-    SourceTimeBounds, ViewError, ViewQueryStatus, ViewRegistration, ViewState,
-    auto_group_within_span, display_projection_bytes, group_state_bytes, merge_order,
+    Appended, AutoLine, ContinuationRule, GroupRange, MAX_CONFIGURED_GROUP_STORED,
+    MAX_GROUP_LINE_DISPLAY_BYTES, MAX_GROUP_LINES, MAX_GROUP_PAYLOAD_BYTES, Membership,
+    MemoryBudget, NO_BASIS_TIME, Published, Reservation, SEQUENCE_BYTES, SOURCE_OVERHEAD,
+    ScanState, Shared, SourceMatches, SourceTimeBounds, ViewError, ViewQueryStatus,
+    ViewRegistration, ViewState, auto_group_within_span, display_projection_bytes,
+    group_state_bytes, merge_order,
 };
 use lvu_core::{RecordId, SourceId};
 use lvu_query::{
-    BatchQuery, BatchValidity, CompiledDefinition, TextSearch, exact_column_expr,
-    execute_batch_with_native_predicate,
+    BatchQuery, BatchValidity, CompiledDefinition, KeyFlag, TextSearch, exact_column_expr,
+    exact_key_flags, execute_batch_with_native_predicate, non_null_flags,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -71,7 +72,7 @@ use std::sync::{
     mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How many freeze requests the tick driver serves per `drain_updates` call.
 ///
@@ -83,6 +84,10 @@ const MAX_FREEZE_PER_TICK: usize = 2;
 /// and shutdown. Bounded like every other provider wait: a closed view or a
 /// stopped adapter releases the thread within this horizon.
 const FREEZE_WAIT: Duration = Duration::from_millis(100);
+const UNION_RETRY_INITIAL: Duration = Duration::from_millis(25);
+const UNION_RETRY_MAXIMUM: Duration = Duration::from_secs(1);
+const SOURCE_SET_MOVED: &str =
+    "a union input source set moved; refresh requires a new union definition";
 
 /// Worker thread to tick-thread driver: freeze one input for the running job.
 pub(crate) struct DriverCmd {
@@ -147,6 +152,7 @@ pub(crate) struct UnionViewState {
     test_barrier: Option<UnionTestBarrier>,
     publish_test_barrier: Option<UnionPublishTestBarrier>,
     phase_test_probe: Option<UnionPhaseTestProbe>,
+    transient_test_failure: Option<String>,
     completed: VecDeque<UnionCompletion>,
     /// Compiled/parsed predicates become reusable only with the publication
     /// they helped produce. Failed or stale candidates never mutate this.
@@ -155,11 +161,16 @@ pub(crate) struct UnionViewState {
     /// the live-refresh trigger; definition revision/generation alone cannot
     /// observe an append to a raw input, which intentionally stays at 0/0.
     published_source_fences: Vec<(String, Vec<super::union::UnionSourceFence>)>,
-    /// A dependency state that already failed against the accepted union
-    /// definition. Live refresh must not resubmit that identical state on
-    /// every tick; any definition, registration, revision, generation or
-    /// source-progress change produces a different attempt and retries.
+    /// A dependency state with a terminal definition/registration failure.
+    /// Live refresh must not resubmit that identical state on every tick;
+    /// transient execution failures use the bounded retry state below.
     rejected_attempt: Option<UnionDependencyAttempt>,
+    /// Transient resource/execution failures retry the identical dependency
+    /// state after a bounded delay. They must not be memoized as permanent,
+    /// but retrying every render tick would be a busy loop.
+    retry_attempt: Option<UnionDependencyAttempt>,
+    retry_not_before: Option<Instant>,
+    retry_delay: Duration,
     published_filter: UnionFilterSpec,
 }
 
@@ -187,10 +198,14 @@ impl UnionViewState {
             test_barrier: None,
             publish_test_barrier: None,
             phase_test_probe: None,
+            transient_test_failure: None,
             completed: VecDeque::new(),
             prepared_filter: None,
             published_source_fences: Vec::new(),
             rejected_attempt: None,
+            retry_attempt: None,
+            retry_not_before: None,
+            retry_delay: UNION_RETRY_INITIAL,
             published_filter: UnionFilterSpec::default(),
         }
     }
@@ -423,7 +438,17 @@ impl super::NativeViewAdapter {
             &state.published_filter,
             true,
         );
-        Some(current.as_ref() != state.rejected_attempt.as_ref())
+        if current.as_ref() == state.rejected_attempt.as_ref() {
+            return Some(false);
+        }
+        if current.as_ref() == state.retry_attempt.as_ref()
+            && state
+                .retry_not_before
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return Some(false);
+        }
+        Some(true)
     }
 
     /// Park a union candidate and start its background job.
@@ -484,6 +509,11 @@ impl super::NativeViewAdapter {
             let Some(state) = shared.union_views.get_mut(&candidate.union_view_id) else {
                 return Err("unknown union view".into());
             };
+            if state.retry_attempt.as_ref() != dependency_attempt.as_ref() {
+                state.retry_attempt = None;
+                state.retry_not_before = None;
+                state.retry_delay = UNION_RETRY_INITIAL;
+            }
             state.cancel.store(true, Ordering::Release);
             state.cancel = Arc::new(AtomicBool::new(false));
             state.pending = Some(candidate.clone());
@@ -496,6 +526,7 @@ impl super::NativeViewAdapter {
             let test_barrier = state.test_barrier.take();
             let publish_test_barrier = state.publish_test_barrier.take();
             let phase_test_probe = state.phase_test_probe.take();
+            let transient_test_failure = state.transient_test_failure.take();
             let ctx = UnionJobCtx {
                 spec: candidate.clone(),
                 generation,
@@ -514,6 +545,7 @@ impl super::NativeViewAdapter {
                 test_barrier,
                 publish_test_barrier,
                 phase_test_probe,
+                transient_test_failure,
                 dependency_attempt,
             };
             let handle = thread::Builder::new()
@@ -580,6 +612,21 @@ impl super::NativeViewAdapter {
             return Err("unknown union view".into());
         };
         state.phase_test_probe = Some(probe);
+        Ok(())
+    }
+
+    /// Inject one retryable worker failure into the next job. Test
+    /// instrumentation only; consuming the value at submit keeps it one-shot.
+    pub fn arm_union_transient_test_failure(
+        &self,
+        union_view_id: &str,
+        message: impl Into<String>,
+    ) -> Result<(), String> {
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        let Some(state) = shared.union_views.get_mut(union_view_id) else {
+            return Err("unknown union view".into());
+        };
+        state.transient_test_failure = Some(message.into());
         Ok(())
     }
 
@@ -699,6 +746,7 @@ struct UnionJobCtx {
     test_barrier: Option<UnionTestBarrier>,
     publish_test_barrier: Option<UnionPublishTestBarrier>,
     phase_test_probe: Option<UnionPhaseTestProbe>,
+    transient_test_failure: Option<String>,
     dependency_attempt: Option<UnionDependencyAttempt>,
 }
 
@@ -708,6 +756,7 @@ struct FrozenUnionMeta {
     basis: lvu::TimeBasis,
     source_meta: Vec<(SourceId, u64, Option<u64>)>,
     scanned_records: u64,
+    accepted_enrichment_outputs: Vec<String>,
 }
 
 /// Per-input frozen data the worker carries between freeze and publication.
@@ -720,6 +769,7 @@ struct FrozenUnionWork {
     /// frozen input covers, straight from its summary.
     source_meta: Vec<(SourceId, u64, Option<u64>)>,
     scanned_records: u64,
+    accepted_enrichment_outputs: Vec<String>,
     rows: Vec<UnionFrozenRow>,
 }
 
@@ -753,14 +803,27 @@ fn union_job_loop(ctx: UnionJobCtx) {
         return;
     }
     let failed = completion.error.clone();
-    let rejected_attempt = failed.as_ref().and(ctx.dependency_attempt.clone());
     let state = shared
         .union_views
         .get_mut(&ctx.spec.union_view_id)
         .expect("checked above");
     if failed.is_some() {
         state.pending = None;
-        state.rejected_attempt = rejected_attempt;
+        if failed.as_deref().is_some_and(terminal_dependency_failure) {
+            state.rejected_attempt = ctx.dependency_attempt.clone();
+            state.retry_attempt = None;
+            state.retry_not_before = None;
+            state.retry_delay = UNION_RETRY_INITIAL;
+        } else {
+            state.rejected_attempt = None;
+            state.retry_attempt = ctx.dependency_attempt.clone();
+            state.retry_not_before = Some(Instant::now() + state.retry_delay);
+            state.retry_delay = state
+                .retry_delay
+                .checked_mul(2)
+                .unwrap_or(UNION_RETRY_MAXIMUM)
+                .min(UNION_RETRY_MAXIMUM);
+        }
     }
     let was_published = state.published_revision;
     state.completed.push_back(completion);
@@ -776,11 +839,21 @@ fn union_job_loop(ctx: UnionJobCtx) {
     }
 }
 
+fn terminal_dependency_failure(error: &str) -> bool {
+    // Registration owns the raw provider's fixed source set. Re-running the
+    // same accepted definition cannot make a newly introduced source
+    // representable; only a definition/registration change can resolve it.
+    error == SOURCE_SET_MOVED
+}
+
 /// Freeze, visit, decode, merge and publish one union candidate.
 ///
 /// Every fallible step returns an error with published state untouched; only
 /// the final locked section mutates anything.
 fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
+    if let Some(error) = &ctx.transient_test_failure {
+        return Err(error.clone());
+    }
     // Definition compilation belongs to the one existing CompilerHost and
     // happens before any input snapshot work. An unchanged successfully
     // published definition reuses its cached native expression on refresh.
@@ -839,6 +912,7 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
             basis: work.basis,
             source_meta: work.source_meta.clone(),
             scanned_records: work.scanned_records,
+            accepted_enrichment_outputs: work.accepted_enrichment_outputs.clone(),
         });
         decoded_inputs.push(UnionFrozenInput {
             view_id: work.view_id,
@@ -1157,8 +1231,9 @@ fn visit_union_input(
                         })?,
                     TimeSource::Capture => Some(row.record.captured_at_unix_nanos),
                 };
+                let raw_len = lossy_utf8_len(&row.record.bytes).map_err(|error| error.to_string())?;
                 let retained_bytes = union_row_carrier_bytes(
-                    row.record.bytes.len(),
+                    raw_len,
                     row.record.bytes.len(),
                     &row.fields,
                     &row.field_types,
@@ -1220,6 +1295,7 @@ fn visit_union_input(
             .map(|source| (source.source_id, source.generation, source.high_watermark))
             .collect(),
         scanned_records: stats.scanned_records,
+        accepted_enrichment_outputs: summary.accepted_enrichment_outputs,
         rows,
     })
 }
@@ -1272,6 +1348,67 @@ fn current_source_fence_with_guarded(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UnionGroupingFlag {
+    Start,
+    Continue,
+    Key(Vec<u8>),
+    KeyNull,
+    KeyNan,
+    KeyOversize,
+}
+
+fn union_configured_grouping_flags(
+    frame: &polars::prelude::DataFrame,
+    rule: &ContinuationRule,
+    accepted_outputs: &[String],
+) -> Result<Option<HashMap<(String, u64), UnionGroupingFlag>>, String> {
+    let Some(column) = rule.configured_column() else {
+        return Ok(None);
+    };
+    if !accepted_outputs.iter().any(|output| output == column) {
+        return Err(format!(
+            "grouping column {column:?} is not an accepted enrichment output; add it in Enrichment first"
+        ));
+    }
+    let mut flags = HashMap::with_capacity(frame.height());
+    match rule {
+        ContinuationRule::Filter { .. } => {
+            for (id, starts) in non_null_flags(frame, column)? {
+                flags.insert(
+                    (id.source_id, id.sequence),
+                    if starts {
+                        UnionGroupingFlag::Start
+                    } else {
+                        UnionGroupingFlag::Continue
+                    },
+                );
+            }
+        }
+        ContinuationRule::Run { .. } => {
+            for (id, key) in exact_key_flags(frame, column).map_err(|error| match error {
+                lvu_query::KeyError::Unavailable(message)
+                | lvu_query::KeyError::Unsupported(message) => message,
+            })? {
+                flags.insert(
+                    (id.source_id, id.sequence),
+                    match key {
+                        KeyFlag::Value(key) => UnionGroupingFlag::Key(key),
+                        KeyFlag::Null => UnionGroupingFlag::KeyNull,
+                        KeyFlag::Nan => UnionGroupingFlag::KeyNan,
+                        KeyFlag::Oversize => UnionGroupingFlag::KeyOversize,
+                    },
+                );
+            }
+        }
+        ContinuationRule::Auto | ContinuationRule::Custom(_) => unreachable!("checked above"),
+    }
+    if flags.len() != frame.height() {
+        return Err("grouping flags do not cover the merged union frame".into());
+    }
+    Ok(Some(flags))
+}
+
 fn union_grouping_index(inputs: &[UnionFrozenInput]) -> HashMap<RecordId, &UnionFrozenRow> {
     let rows = inputs.iter().map(|input| input.rows.len()).sum();
     let mut indexed = HashMap::with_capacity(rows);
@@ -1291,6 +1428,7 @@ fn union_groups(
     members: &[(u64, Option<i64>, i64)],
     indexed_rows: &HashMap<RecordId, &UnionFrozenRow>,
     rule: &ContinuationRule,
+    configured_flags: Option<&HashMap<(String, u64), UnionGroupingFlag>>,
 ) -> Result<(Appended<GroupRange>, u64, usize), String> {
     let mut built = Vec::<GroupRange>::new();
     let mut charged = 0u64;
@@ -1315,6 +1453,111 @@ fn union_groups(
             details: Vec::new(),
             fields: Vec::new(),
         };
+        if rule.is_configured() {
+            // The native engine computed every configured flag from the
+            // actual merged typed column. This loop only segments stable
+            // identities for presentation; it never evaluates field values.
+            let flag = configured_flags
+                .and_then(|flags| flags.get(&(source_id.0.to_string(), *sequence)))
+                .ok_or_else(|| {
+                    format!(
+                        "union grouping has no native flag for {}:{sequence}",
+                        source_id.0
+                    )
+                })?;
+            let previous_sequence = position
+                .checked_sub(1)
+                .and_then(|index| members.get(index))
+                .map(|member| member.0);
+            let physically_adjacent =
+                previous_sequence.and_then(|previous| previous.checked_add(1)) == Some(*sequence);
+            let same_stream = built.last().is_some_and(|group| group.stream == row.stream);
+            let same_acquisition = built
+                .last()
+                .is_some_and(|group| group.acquisition_id == row.acquisition_id);
+            let chunk_join = built.last().is_some_and(|group| {
+                group.partial_open
+                    && group.acquisition_id == row.acquisition_id
+                    && matches!(
+                        (group.last_chunk, row.chunk),
+                        (
+                            lvu_core::ChunkPosition::Start | lvu_core::ChunkPosition::Continue,
+                            lvu_core::ChunkPosition::Continue | lvu_core::ChunkPosition::End
+                        )
+                    )
+            }) && physically_adjacent
+                && same_stream;
+            let join_open = !chunk_join
+                && physically_adjacent
+                && same_stream
+                && same_acquisition
+                && built
+                    .last()
+                    .is_some_and(|group| !group.orphan && !group.pending && !group.split)
+                && match (flag, rule) {
+                    (UnionGroupingFlag::Start, ContinuationRule::Filter { .. }) => false,
+                    (UnionGroupingFlag::Continue, ContinuationRule::Filter { .. }) => true,
+                    (UnionGroupingFlag::Key(key), ContinuationRule::Run { .. }) => built
+                        .last()
+                        .is_some_and(|group| group.run_key.as_ref() == Some(key)),
+                    _ => false,
+                };
+            if chunk_join || join_open {
+                let group = built.last_mut().expect("joinable configured group");
+                group.len += 1;
+                if !chunk_join {
+                    group.logical_lines = group.logical_lines.saturating_add(1);
+                }
+                group.payload_bytes = group.payload_bytes.saturating_add(row.raw_bytes.len());
+                group.last_chunk = row.chunk;
+                group.last_capture_nanos = row.captured_at_unix_nanos;
+                if matches!(row.chunk, lvu_core::ChunkPosition::Start) {
+                    group.partial_open = true;
+                }
+                if matches!(row.chunk, lvu_core::ChunkPosition::End) {
+                    group.partial_open = false;
+                }
+                if group.projection.len() < MAX_CONFIGURED_GROUP_STORED {
+                    Arc::make_mut(&mut group.projection).push(projection);
+                }
+            } else {
+                let (orphan, key_refused, run_key) = match flag {
+                    UnionGroupingFlag::Start => (false, false, None),
+                    UnionGroupingFlag::Key(key) => (false, false, Some(key.clone())),
+                    UnionGroupingFlag::KeyNull | UnionGroupingFlag::KeyNan => (false, false, None),
+                    UnionGroupingFlag::KeyOversize => (false, true, None),
+                    UnionGroupingFlag::Continue => (true, false, None),
+                };
+                built.push(GroupRange {
+                    start: position,
+                    len: 1,
+                    logical_lines: 1,
+                    payload_bytes: row.raw_bytes.len(),
+                    stream: row.stream,
+                    orphan,
+                    split: false,
+                    oversized: false,
+                    pending: false,
+                    run_key,
+                    configured: true,
+                    key_refused,
+                    auto_open: false,
+                    auto_structured: false,
+                    auto_structure_depth: 0,
+                    partial_open: matches!(row.chunk, lvu_core::ChunkPosition::Start),
+                    partial_truncated: false,
+                    structure_truncated: false,
+                    partial_prefix: Vec::new(),
+                    structure_prefix: Vec::new(),
+                    acquisition_id: row.acquisition_id,
+                    last_chunk: row.chunk,
+                    first_capture_nanos: row.captured_at_unix_nanos,
+                    last_capture_nanos: row.captured_at_unix_nanos,
+                    projection: Arc::new(vec![projection]),
+                });
+            }
+            continue;
+        }
         let previous_sequence = position
             .checked_sub(1)
             .and_then(|index| members.get(index))
@@ -1368,6 +1611,10 @@ fn union_groups(
                 orphan: continuation,
                 split: false,
                 oversized: row.raw_bytes.len() > MAX_GROUP_PAYLOAD_BYTES,
+                pending: false,
+                run_key: None,
+                configured: false,
+                key_refused: false,
                 auto_open: !rule.is_auto() || credible_start,
                 auto_structured: false,
                 auto_structure_depth: 0,
@@ -1415,6 +1662,18 @@ fn publish_union(
     use super::union::{SEQUENCE_COLUMN, SOURCE_ID_COLUMN, UNION_TS_COLUMN};
     use polars::prelude::AnyValue;
     let height = matched_ids.len();
+    let mut accepted_enrichment_outputs = frozen_inputs
+        .iter()
+        .flat_map(|input| input.accepted_enrichment_outputs.iter().cloned())
+        .collect::<Vec<_>>();
+    accepted_enrichment_outputs.sort();
+    accepted_enrichment_outputs.dedup();
+    let configured_grouping_flags = prepared_filter
+        .grouping
+        .as_ref()
+        .map(|rule| union_configured_grouping_flags(&merged, rule, &accepted_enrichment_outputs))
+        .transpose()?
+        .flatten();
     // Display rank per identity, in engine output order.
     let sources = merged
         .column(SOURCE_ID_COLUMN)
@@ -1449,9 +1708,7 @@ fn publish_union(
         .flat_map(|input| input.source_meta.iter().map(|(source, _, _)| *source))
         .collect::<HashSet<_>>();
     if frozen_sources != registered_sources {
-        return Err(
-            "a union input source set moved; refresh requires a new union definition".into(),
-        );
+        return Err(SOURCE_SET_MOVED.into());
     }
     for matched in &matched_ids {
         if !registered_sources
@@ -1566,6 +1823,7 @@ fn publish_union(
                     &members,
                     grouping_index.as_ref().expect("built for grouping"),
                     rule,
+                    configured_grouping_flags.as_ref(),
                 )?;
                 debug_assert_eq!(lookups, members.len());
                 if let Some(probe) = &ctx.phase_test_probe {
@@ -1629,8 +1887,9 @@ fn publish_union(
         count,
         bytes,
         budget: Arc::clone(&ctx.budget),
-        enrichment_names: Vec::new(),
+        enrichment_names: accepted_enrichment_outputs,
         derived: HashMap::new(),
+        derived_errors: HashSet::new(),
         color_matches: HashMap::new(),
         color_rules: Vec::new(),
         advanced: None,
@@ -1778,6 +2037,9 @@ fn publish_union(
     state.prepared_filter = Some(prepared_filter);
     state.published_filter = ctx.spec.filter.clone();
     state.rejected_attempt = None;
+    state.retry_attempt = None;
+    state.retry_not_before = None;
+    state.retry_delay = UNION_RETRY_INITIAL;
     state.published_source_fences = fence
         .iter()
         .zip(frozen_inputs.iter())

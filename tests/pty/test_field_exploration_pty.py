@@ -8,7 +8,7 @@ import pathlib
 import sys
 import tempfile
 
-from test_enrichment_chain_pty import stop
+from test_enrichment_chain_pty import stop, open_step_editor, paste, close_editor
 from test_lvu_pty import PtyApp
 
 
@@ -154,6 +154,11 @@ def run(binary: pathlib.Path) -> None:
             # the Folding dialog for the way back.
             app.send(b"[")
             app.wait_until(lambda text: "/41" in text, "back on the unfiltered view")
+            open_step_editor(app)
+            paste(app, "level = pl.col('level')")
+            app.send(b"\r")
+            app.wait_until(lambda text: "Applied" in text, "level enrichment applied", timeout=20)
+            close_editor(app)
             app.send(b"g")
             app.send(b"i")
             app.wait_for("Value · ")
@@ -163,11 +168,11 @@ def run(binary: pathlib.Path) -> None:
             app.send(b"\x1bd")
             folded = app.wait_until(lambda text: "[ Unfold ]" in text,
                                     "the button follows the fold it just made", timeout=15)
-            assert "folding on " in folded, folded
+            assert "grouping runs on " in folded, folded
             app.send(b"\x1bd")
             app.wait_until(lambda text: "[ Fold ]" in text and "[ Unfold ]" not in text,
                            "the same key turns folding back off", timeout=15)
-            app.wait_until(lambda text: "folding off" in text, "and says so", timeout=10)
+            app.wait_until(lambda text: "grouping off" in text, "and says so", timeout=10)
             app.send(b"\x1b")
             app.wait_until(lambda text: "Value · " not in text, "fields closed")
 

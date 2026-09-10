@@ -74,7 +74,7 @@ In the viewer:
 | `b` / `B` | Bookmark the selected record / the bookmarks list with notes |
 | `v` | Views: new, cloned and merged views over open sources |
 | `r` | Recipes: save, apply, export and review a view's setup |
-| `z` / `m` | Folding of repeated patterns / multiline grouping |
+| `z` / `m` | Grouping: Run, Filter or Off using enrichment columns |
 | `f` | Follow the tail; `g` and `G` jump to the ends; `[` and `]` switch views |
 | `?` | Help |
 | `Ctrl-P` | The command palette: every operation, searchable, with its key |

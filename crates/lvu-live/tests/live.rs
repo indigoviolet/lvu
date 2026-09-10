@@ -1247,7 +1247,22 @@ async fn an_index_held_past_the_retry_window_becomes_a_reported_failure() {
         .write(true)
         .open(&artifact)
         .unwrap();
-    FileExt::try_lock_exclusive(&holder).unwrap();
+    // Shutdown joins the async worker; its detached blocking index cleanup
+    // may still be releasing the file. Acquire the fixture lock before
+    // starting the provider whose retry window this test measures.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match FileExt::try_lock_exclusive(&holder) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("fixture index lock: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("fixture index lock released after shutdown");
 
     let mut config = live_config(&root);
     config.index_lock_retry_window = Duration::from_millis(120);

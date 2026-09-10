@@ -106,7 +106,8 @@ impl FoldScope {
 pub enum FoldKey {
     /// The derived `pattern` column: the event text normalised per
     /// [`FoldConfig::aggressiveness`], with a non-empty level prefixed. This is
-    /// the default, and it is what folding did before a key could be chosen.
+    /// the legacy default, and it is what folding did before a key could be
+    /// chosen; new run grouping keys on exact enrichment columns instead.
     #[default]
     Pattern,
     /// A named column of the row. Its value is the key **as-is**: no

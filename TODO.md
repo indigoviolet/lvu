@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.2**. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.4**. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -14,36 +14,20 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 
 | Status | Work |
 | --- | --- |
-| **Working** | Make “give me a UTC timestamp column” and “give me a severity column” assistance shortcuts that propose ordinary enrichment definitions for review; let each view select the output columns for time/severity roles. Replace the separate automatic recognition/normalization paths. Capture time remains acquisition metadata. |
 | **Working** | Compose live union views from existing views across sources, merged in selected timestamp order, with ordinary downstream filters and grouping. Preserve original record identities and capture ownership; define overlap, missing-time and dependency/revision behavior. |
-| **Working** | Unify Grouping with Run and Filter modes over enrichment outputs: consecutive equal keys, or non-null event starts with all intervening records collapsed. Move pattern definition out of grouping, preserve exact key equality and legacy saved meaning. v0.1.3 publication is held for this correction. |
 | **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
 | **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
 | **Working** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no performance or full-soak pass is claimed yet. |
 
-## Accepted for the next release
+## Active parallel assignments
 
-Integrated after v0.1.2; outside the immutable v0.1.2 tag and installed runtime.
-
-| Status | Work |
-| --- | --- |
-| **Ready** | Source assistance proposes up to eight distinct reviewed sources; Apply reports partial failures, retains all-failed reviews for retry and never runs sources before confirmation. |
-| **Ready** | Separate bounded journal page requests from capture scheduling, preserving reciprocal progress, writer closure and cancelled-read bounds. The cold-query performance investigation remains open. |
-| **Ready** | Batch queued autosaves with per-entry rollback and durable acknowledgement ordering; full slow-volume shutdown acceptance remains open. |
-| **Ready** | Missing enrichment/filter columns report actionable batch-scoped diagnostics; rejected drafts preserve the last accepted rows and live refresh. |
-| **Ready** | A requested window exceeding the display-cache byte limit retains its drawable prefix; blank indexed rows show loading. The broader 512 MB viewport/soak investigation remains open. |
-| **Ready** | Status prioritizes actionable notices, event-time diagnostics, row ranges and visible return/help controls; wide/combining text fits and optional indicators give way as whole segments. |
-| **Ready** | FOLLOW draws the newest servable window while preserving true-tail selection. HISTORY keeps its requested destination separate from retained displayed rows, retries without another keypress, and reports the actual range. |
-| **Ready** | Pending raw-context location is visible in narrow status lines: the protected prefix says `locating #N` until the chase resolves or reports its bounded failure. Full origin context remains optional when space fits. |
-
-## Upcoming backlog
-
-Unresolved and not currently assigned. No new product commitments beyond what is listed.
+These remaining items now have workers. Completion still requires executable
+integration and the relevant acceptance evidence.
 
 | Status | Work |
 | --- | --- |
-| **Open** | Make colour classification consume enrichment outputs rather than define independent pattern predicates. Preserve raw-text search as an explicit convenience exception. |
-| **Open** | Replace raw-only special correlation extraction with enrichment-derived shared keys and ordinary filtering over union views. Preserve existing saved behavior until its replacement is integrated. |
-| **Open** | Display time zones are fixed UTC offsets only: no timezone database, so daylight saving is never applied and a named zone (`Europe/Berlin`) cannot be chosen. Every displayed timestamp carries its offset; the Settings help line says so. |
-| **Open** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
-| **Open** | Validate installation/terminal/process behavior on macOS and Windows (audit in docs/portability.md, checklist in docs/mac-test-plan.md; no run yet). arm64 Linux archive is built and CI-executed but has had no human interactive acceptance. |
+| **Working** | Make colour classification consume enrichment outputs rather than define independent pattern predicates. Preserve raw-text search as an explicit convenience exception. |
+| **Working** | Replace raw-only special correlation extraction with enrichment-derived shared keys and ordinary filtering over union views. Preserve existing saved behavior until its replacement is integrated. |
+| **Working** | Named display zones and per-instant daylight saving are integrated for v0.1.5 acceptance. Worker review and focused tests passed, including restart; the integrated release gate remains pending. |
+| **Working** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
+| **Working** | Validate installation/terminal/process behavior on macOS and Windows (audit in docs/portability.md, checklist in docs/mac-test-plan.md; no run yet). arm64 Linux archive is built and CI-executed but has had no human interactive acceptance. |

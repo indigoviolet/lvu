@@ -2433,13 +2433,12 @@ fn build_display(
     text: String,
     decoded_truncated: usize,
 ) -> DisplayRow {
+    // Display fields stay: the Fields dialog, colour rules and completion read
+    // them. Severity colour and event time no longer derive here: severity is
+    // a per-view role over an accepted enrichment column, and event time
+    // comes from the reviewed timestamp enrichment or the explicit Event
+    // basis. Capture time stays metadata below.
     let fields = recognized_fields(&text);
-    let event_time = recognize_record(&record.bytes, &RecognitionOptions::default());
-    let severity = fields
-        .iter()
-        .find(|(key, _)| matches!(key.as_str(), "level" | "severity" | "lvl"))
-        .map(|(_, value)| normalize_severity(value))
-        .unwrap_or_default();
     let mut details = vec![
         (
             "stream".into(),
@@ -2451,26 +2450,6 @@ fn build_display(
             record.captured_at_unix_nanos.to_string(),
         ),
     ];
-    match event_time {
-        TimeOutcome::Valid(reading) => {
-            let note = reading.note();
-            details.push(("event_time_field".into(), reading.field));
-            details.push((
-                "event_time_utc".into(),
-                format_rfc3339_utc(reading.unix_nanos),
-            ));
-            details.push((
-                "event_time_utc_nanos".into(),
-                reading.unix_nanos.to_string(),
-            ));
-            details.push(("event_time_note".into(), note));
-        }
-        TimeOutcome::Invalid { field, diagnostic } => {
-            details.push(("event_time_field".into(), field));
-            details.push(("event_time_invalid".into(), diagnostic));
-        }
-        TimeOutcome::Missing => {}
-    }
     if fragment {
         details.push((
             "fragment".into(),
@@ -2496,10 +2475,10 @@ fn build_display(
         ),
         timestamp: display_timestamp(record.captured_at_unix_nanos),
         captured_at_unix_nanos: Some(record.captured_at_unix_nanos),
+        // Chunk position is record metadata, not a severity: it stays. Any
+        // other level text now arrives through the view's severity role.
         level: if fragment {
             "fragment".into()
-        } else if !severity.is_empty() {
-            severity
         } else {
             String::new()
         },
@@ -2552,10 +2531,6 @@ pub fn recognize_event_time_with(
     options: &RecognitionOptions,
 ) -> EventTimeRecognition {
     recognize_record(bytes, options).into()
-}
-
-fn format_rfc3339_utc(value: i64) -> String {
-    lvu::format_utc_nanos(value)
 }
 
 const MAX_DISPLAY_FIELDS: usize = 32;
@@ -2619,19 +2594,6 @@ fn bounded_field(mut key: String, mut value: String) -> Option<(String, String)>
     truncate_utf8(&mut key, MAX_FIELD_KEY_BYTES);
     truncate_utf8(&mut value, MAX_FIELD_VALUE_BYTES);
     Some((key, value))
-}
-
-fn normalize_severity(value: &str) -> String {
-    match value.to_ascii_lowercase().as_str() {
-        "trace" => "TRACE",
-        "debug" => "DEBUG",
-        "info" | "information" => "INFO",
-        "warn" | "warning" => "WARN",
-        "error" | "err" => "ERROR",
-        "fatal" | "critical" => "FATAL",
-        _ => "",
-    }
-    .into()
 }
 
 /// Clock time as the log pane shows it. Public so a derived projection — a fold
@@ -2919,7 +2881,7 @@ mod diagnostic_state_tests {
 #[cfg(test)]
 mod presentation_tests {
     use super::{
-        EventTimeRecognition, MAX_EVENT_TIME_RECORD_BYTES, display_projection, normalize_severity,
+        EventTimeRecognition, MAX_EVENT_TIME_RECORD_BYTES, display_projection,
         recognize_event_time, recognized_fields,
     };
     use lvu_core::{ChunkPosition, RawRecord, RecordId, SourceId, StreamKind};
@@ -2946,7 +2908,6 @@ mod presentation_tests {
         assert!(fields.contains(&("service".into(), "api".into())));
         assert!(fields.contains(&("missing".into(), "null".into())));
         assert!(fields.iter().all(|(key, _)| key != "nested"));
-        assert_eq!(normalize_severity("Critical"), "FATAL");
 
         let fields = recognized_fields(r#"level=warn service=worker message="two words""#);
         assert!(fields.contains(&("message".into(), "two words".into())));
@@ -2954,8 +2915,8 @@ mod presentation_tests {
     }
 
     #[test]
-    fn display_details_report_the_recognized_basis_and_every_applied_assumption() {
-        let raw = br#"{"timestamp":"2026-09-05T14:30:45.5+02:00","msg":"caf\u00e9 \u2764"}"#;
+    fn display_rows_carry_capture_metadata_without_deriving_severity_or_time() {
+        let raw = br#"{"level":"error","timestamp":"2026-09-05T14:30:45.5+02:00","msg":"hi"}"#;
         let offset = record(raw);
         let row = display_projection(&offset, 4096, 65_536);
         let detail = |key: &str| {
@@ -2964,31 +2925,39 @@ mod presentation_tests {
                 .find(|(name, _)| name == key)
                 .map(|(_, value)| value.clone())
         };
-        assert_eq!(detail("event_time_field").as_deref(), Some("timestamp"));
-        assert_eq!(
-            detail("event_time_utc").as_deref(),
-            Some("2026-09-05T12:30:45.500000000Z")
-        );
-        assert_eq!(
-            detail("event_time_note").as_deref(),
-            Some("explicit offset normalized to UTC")
-        );
-        assert!(detail("event_time_invalid").is_none());
-        assert_eq!(offset.bytes, raw, "recognition never rewrites raw bytes");
-
-        let zoneless = record(b"2026-09-05 12:30:45.123 service=api starting");
-        let row = display_projection(&zoneless, 4096, 65_536);
-        let invalid = row
-            .details
-            .iter()
-            .find(|(name, _)| name == "event_time_invalid")
-            .map(|(_, value)| value.clone())
-            .expect("zone-less prefix is reported, not assumed UTC");
-        assert!(invalid.contains("no timezone"), "{invalid}");
+        // Severity colour and event time arrive through per-view roles over
+        // reviewed enrichments now; the normal display path derives neither,
+        // so `level` keeps no severity at all.
         assert!(
-            row.details
-                .iter()
-                .all(|(name, _)| name != "event_time_utc_nanos")
+            row.level.is_empty(),
+            "no automatic severity: {:?}",
+            row.level
+        );
+        for key in [
+            "event_time_field",
+            "event_time_utc",
+            "event_time_utc_nanos",
+            "event_time_note",
+            "event_time_invalid",
+        ] {
+            assert!(detail(key).is_none(), "no automatic event time: {key}");
+        }
+        // Capture metadata stays: stream, sequence, nanos and the raw bytes.
+        assert_eq!(detail("stream").as_deref(), Some("stdout"));
+        assert_eq!(detail("sequence").as_deref(), Some("1"));
+        assert_eq!(
+            detail("captured_unix_nanos").as_deref(),
+            Some("1700000000000000000")
+        );
+        assert_eq!(
+            offset.bytes, raw,
+            "the display path never rewrites raw bytes"
+        );
+        // Display fields still project for the Fields dialog and completion.
+        assert!(
+            row.fields.contains(&("level".into(), "error".into())),
+            "raw level text stays visible as a field: {:?}",
+            row.fields
         );
     }
 

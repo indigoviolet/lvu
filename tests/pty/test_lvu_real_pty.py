@@ -13,6 +13,7 @@ import termios
 import time
 import subprocess
 
+from test_enrichment_chain_pty import paste
 from test_lvu_pty import ADVANCED_TAB, FILTER_TITLE, open_advanced_filter
 from test_lvu_pty import PtyApp as _HarnessPtyApp
 
@@ -1453,7 +1454,7 @@ for line in sys.stdin:
         session_count += 1
         result = {"session_id": "source-definition-session-" + str(session_count)}
     elif method == "request_proposal":
-        assert request["kind"] == "source"
+        assert request["kind"] == "sources"
         manifest = pathlib.Path(request["context"]["manifest_path"])
         assert manifest.is_absolute() and manifest.is_file()
         assert request["context"]["dataset_paths"] == []
@@ -1820,8 +1821,34 @@ def run_multiline_grouping_story(binary: pathlib.Path) -> None:
         app = PtyApp(binary, arguments, width=150, height=30, cwd=root)
         try:
             app.wait_for("at next.rs:20", timeout=8.0)
+            # Recognition lives in Enrichment: a true-line column whose
+            # non-null values open events. Grouping only selects it.
+            app.send(b"e")
+            app.wait_for("Steps", timeout=10.0)
+            app.send(b"\x1ba")
+            app.wait_for("Enrichment \u203a New step", timeout=10.0)
+            paste(app, "/^(?P<is_start>Error|ERROR)/")
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: "is_start" in text and "Applied" in text,
+                "the start column is applied",
+                timeout=20.0,
+            )
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Steps" not in text,
+                "enrichment closed",
+                timeout=10.0,
+            )
             app.send(b"m")
             app.wait_for("Multiline grouping", timeout=5.0)
+            app.send(b"\t")
+            app.send(b"\x1b[C")
+            app.wait_for("(?lvu:filter:", timeout=5.0)
+            app.send(b"\t")
+            app.send(b"\t")
+            paste(app, "is_start")
+            app.wait_for("(?lvu:filter:v1:column:is_start)", timeout=5.0)
             app.send(b"\r")
             app.wait_for("grouping:display-only", timeout=10.0)
             app.send(b"\x1b")

@@ -4,11 +4,34 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
-## Unreleased
+## v0.1.5 — prepared for release
 
-v0.1.3 remains untagged. Event-start grouping is being corrected to the requested
-configurable boundary model; the existing heuristic behavior below is integrated
-but does not satisfy that requirement.
+- Settings accepts IANA display zones such as `Europe/Berlin`, with the offset
+  determined for each instant, including daylight-saving transitions. UTC and
+  fixed offsets remain available. Timestamps show explicit offsets and dates
+  use the same zone; captured bytes and accepted event instants are unchanged.
+- Invalid custom zone drafts retain the last valid preview. Stale save
+  completions preserve newer drafts, and loaded zones apply at startup.
+
+Publication requires the integrated exact-source gate and archive acceptance.
+
+## v0.1.4 — 2026-09-10
+
+[Published release](https://github.com/indigoviolet/lvu/releases/tag/v0.1.4),
+from `984b6f0`, with all four native archives. The installed Linux archive
+passed all eight mandatory PTY suites, including both role workflows.
+
+- Severity and timestamp roles use reviewed enrichment columns. Fields can assign
+  either role; assistance can propose a severity or UTC timestamp column through
+  the ordinary enrichment review flow. Canonical ready severity values supply
+  styling. Timestamp display uses the accepted time basis and configured zone;
+  pending or invalid derived values show a placeholder. Roles persist across
+  restart. Normal row projection no longer guesses severity or event timestamps.
+
+## v0.1.3 — 2026-09-09
+
+[Published release](https://github.com/indigoviolet/lvu/releases/tag/v0.1.3),
+from `8ca75d0`, with all four native archives and the updated Homebrew tap.
 
 ### Features
 
@@ -18,16 +41,12 @@ but does not satisfy that requirement.
   Admission compares acquisition identities and policies against live and
   pending sources to avoid duplicate starts or silently changed settings.
 
-- Collapse common tracebacks, wrapped log messages and pretty-printed payloads
-  into grouped events with Grouping (`m` → Auto). Each row shows its first line
-  and constituent count; Enter expands or collapses the lines. Custom accepts
-  a continuation rule, and Off restores individual-record presentation.
-  Optional Folding (`z`) can then collapse consecutive similar events.
-  Auto uses conservative recognition, with at most 64 physical records /
-  64 KiB per group and nondecreasing capture times within 30 seconds of its
-  head. An oversized physical record stays standalone; unfamiliar structure
-  may stay ungrouped. Original bytes, identities and filter membership remain
-  unchanged.
+- Grouping (`m` or `z`) offers Run, Filter and Off over enrichment columns.
+  Run collapses consecutive equal keys. Filter starts an event at each non-null
+  value and joins following null-valued records until the next start. Define
+  extraction patterns in Enrichment. Long events retain their full membership
+  with a bounded display page and explicit shown/total counts. Bytes, identities
+  and filter membership are unchanged.
 
 ### Fixes
 
@@ -60,7 +79,8 @@ but does not satisfy that requirement.
 
 ### Breaking changes
 
-- None recorded.
+- Normal folding controls now open the unified Grouping dialog. New rules use
+  enrichment columns; saved legacy rules retain their meaning until changed.
 
 ## [v0.1.2](https://github.com/indigoviolet/lvu/releases/tag/v0.1.2) — 2026-09-09
 

@@ -274,16 +274,18 @@ fn each_editor_keeps_its_own_scroll_caret_and_draft() {
     key(&mut app, &provider, KeyCode::Esc);
 
     app.handle(Action::Open(Open::Grouping), &provider);
+    // The normal control opens on Run with a blank column: Run is the
+    // primary configured path and legacy Auto is never the default.
     assert_eq!(
         app.view_state().unwrap().grouping.draft,
-        lvu::grouping::AUTO_GROUPING_TOKEN,
-        "grouping opens in conservative Auto mode"
+        lvu::grouping::run_rule(""),
+        "grouping opens on Run with a blank column"
     );
     for code in [KeyCode::Home, KeyCode::Left, KeyCode::End] {
         key(&mut app, &provider, code);
         assert_eq!(
             app.view_state().unwrap().grouping.draft,
-            lvu::grouping::AUTO_GROUPING_TOKEN
+            lvu::grouping::run_rule("")
         );
     }
     modified_key(
@@ -294,9 +296,20 @@ fn each_editor_keeps_its_own_scroll_caret_and_draft() {
     );
     assert!(app.view_state().unwrap().grouping.draft.is_empty());
 
-    // The existing segmented mode control reaches Auto, Custom and Off in
-    // either direction; no reserved persistence token is exposed or edited.
+    // The segmented control reaches Run, Filter, Legacy and Off in either
+    // direction. The legacy Auto token itself is never typed on screen: the
+    // Legacy tab renders its static paragraph instead.
     key(&mut app, &provider, KeyCode::Tab);
+    key(&mut app, &provider, KeyCode::Right);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::run_rule("")
+    );
+    key(&mut app, &provider, KeyCode::Right);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::filter_rule("")
+    );
     key(&mut app, &provider, KeyCode::Right);
     assert_eq!(
         app.view_state().unwrap().grouping.draft,
@@ -304,10 +317,7 @@ fn each_editor_keeps_its_own_scroll_caret_and_draft() {
     );
     assert!(!screen(&draw(&provider, &mut app, 100, 30)).contains("(?lvu:auto:"));
     key(&mut app, &provider, KeyCode::Right);
-    assert_eq!(
-        app.view_state().unwrap().grouping.draft,
-        r"^(\s+|Caused by:)"
-    );
+    assert!(app.view_state().unwrap().grouping.draft.is_empty());
     key(&mut app, &provider, KeyCode::Left);
     assert_eq!(
         app.view_state().unwrap().grouping.draft,
@@ -315,30 +325,47 @@ fn each_editor_keeps_its_own_scroll_caret_and_draft() {
     );
     key(&mut app, &provider, KeyCode::BackTab);
     // The caret is the bank's and per draft, so moving it in one editor does
-    // not disturb another's.
-    paste(&mut app, &provider, "!");
-    assert_eq!(app.view_state().unwrap().grouping.draft, "!");
+    // not disturb another's. Pasting into a blank Filter slot names the
+    // column in place, keeping a well-formed rule.
+    key(&mut app, &provider, KeyCode::Tab);
+    key(&mut app, &provider, KeyCode::Left);
+    key(&mut app, &provider, KeyCode::BackTab);
+    paste(&mut app, &provider, "is_start");
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::filter_rule("is_start")
+    );
     assert_eq!(app.search_state().unwrap().draft, "needle");
 
-    // Clicking an already-selected Custom mode is idempotent, and temporary
-    // Auto/Off choices retain this view's exact custom draft without applying
-    // any of them.
+    // Clicking the already-selected Filter mode is idempotent, and temporary
+    // Run/Off choices retain this view's exact legacy Auto draft without
+    // applying any of them.
     draw(&provider, &mut app, 100, 30);
     let modes = app.layers.grouping.tab_rects().to_vec();
+    assert_eq!(modes.len(), 4);
     let applied = app.view_state().unwrap().grouping.applied.clone();
     click(&mut app, &provider, modes[1].x + 1, modes[1].y);
-    assert_eq!(app.view_state().unwrap().grouping.draft, "!");
-    click(&mut app, &provider, modes[0].x + 1, modes[0].y);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::filter_rule("is_start")
+    );
+    click(&mut app, &provider, modes[2].x + 1, modes[2].y);
     assert_eq!(
         app.view_state().unwrap().grouping.draft,
         lvu::grouping::AUTO_GROUPING_TOKEN
     );
-    click(&mut app, &provider, modes[1].x + 1, modes[1].y);
-    assert_eq!(app.view_state().unwrap().grouping.draft, "!");
-    click(&mut app, &provider, modes[2].x + 1, modes[2].y);
+    click(&mut app, &provider, modes[0].x + 1, modes[0].y);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::run_rule("")
+    );
+    click(&mut app, &provider, modes[3].x + 1, modes[3].y);
     assert!(app.view_state().unwrap().grouping.draft.is_empty());
-    click(&mut app, &provider, modes[1].x + 1, modes[1].y);
-    assert_eq!(app.view_state().unwrap().grouping.draft, "!");
+    click(&mut app, &provider, modes[2].x + 1, modes[2].y);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::AUTO_GROUPING_TOKEN
+    );
     assert_eq!(app.view_state().unwrap().grouping.applied, applied);
     key(&mut app, &provider, KeyCode::Esc);
 
@@ -348,6 +375,122 @@ fn each_editor_keeps_its_own_scroll_caret_and_draft() {
     assert_eq!(app.search_state().unwrap().draft, "needles");
     assert_eq!(app.layers.filter.purpose(), QueryPurpose::Search);
     assert_eq!(app.layers.grouping.purpose(), QueryPurpose::Grouping);
+}
+
+#[test]
+fn grouping_column_cycling_names_a_carried_column_and_keeps_a_valid_rule() {
+    let (provider, sources, views) = FixtureProvider::json_demo();
+    let mut app = App::new(sources, views, true);
+    app.handle(Action::Open(Open::Grouping), &provider);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::run_rule("")
+    );
+    // Down names the carried enrichment-like column in place; the rule stays
+    // well-formed and applicable rather than becoming pasted text.
+    key(&mut app, &provider, KeyCode::Down);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::run_rule("request_id")
+    );
+    // A single offered column wraps onto itself instead of clearing.
+    key(&mut app, &provider, KeyCode::Down);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::run_rule("request_id")
+    );
+    key(&mut app, &provider, KeyCode::Up);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::run_rule("request_id")
+    );
+    assert!(app.view_state().unwrap().grouping.applied.is_empty());
+    key(&mut app, &provider, KeyCode::Esc);
+}
+
+#[test]
+fn grouping_legacy_custom_text_survives_temporary_mode_choices() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Grouping), &provider);
+    // Reach Legacy Auto, then type: the token clears into a Custom draft.
+    key(&mut app, &provider, KeyCode::Tab);
+    key(&mut app, &provider, KeyCode::Right);
+    key(&mut app, &provider, KeyCode::Right);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::AUTO_GROUPING_TOKEN
+    );
+    key(&mut app, &provider, KeyCode::BackTab);
+    type_text(&mut app, &provider, "^x");
+    assert_eq!(app.view_state().unwrap().grouping.draft, "^x");
+    // Temporary Run/Off choices retain the exact custom text unapplied.
+    key(&mut app, &provider, KeyCode::Tab);
+    key(&mut app, &provider, KeyCode::Left);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::filter_rule("")
+    );
+    key(&mut app, &provider, KeyCode::Left);
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::run_rule("")
+    );
+    key(&mut app, &provider, KeyCode::Right);
+    key(&mut app, &provider, KeyCode::Right);
+    assert_eq!(app.view_state().unwrap().grouping.draft, "^x");
+    assert!(app.view_state().unwrap().grouping.applied.is_empty());
+    key(&mut app, &provider, KeyCode::Esc);
+}
+
+#[test]
+fn grouping_off_click_applies_empty_and_ungroups() {
+    use lvu::QueryCompletion;
+
+    let (provider, mut app) = demo();
+    // Apply a Run rule first so Off has something to clear.
+    app.handle(Action::Open(Open::Grouping), &provider);
+    paste(&mut app, &provider, "service");
+    assert_eq!(
+        app.view_state().unwrap().grouping.draft,
+        lvu::grouping::run_rule("service")
+    );
+    key(&mut app, &provider, KeyCode::Enter);
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(request.purpose, QueryPurpose::Grouping);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    assert_eq!(
+        app.view_state().unwrap().grouping.applied,
+        lvu::grouping::run_rule("service")
+    );
+    key(&mut app, &provider, KeyCode::Esc);
+
+    // Clicking Off empties the draft; Enter applies the empty rule, which is
+    // no grouping rather than a failed draft.
+    app.handle(Action::Open(Open::Grouping), &provider);
+    draw(&provider, &mut app, 100, 30);
+    let modes = app.layers.grouping.tab_rects().to_vec();
+    assert_eq!(modes.len(), 4);
+    click(&mut app, &provider, modes[3].x + 1, modes[3].y);
+    assert!(app.view_state().unwrap().grouping.draft.is_empty());
+    key(&mut app, &provider, KeyCode::Enter);
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(request.purpose, QueryPurpose::Grouping);
+    assert!(request.constraints.grouping.is_none());
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    assert!(app.view_state().unwrap().grouping.applied.is_empty());
+    key(&mut app, &provider, KeyCode::Esc);
 }
 
 #[test]

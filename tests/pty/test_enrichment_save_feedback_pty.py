@@ -79,10 +79,11 @@ def story(
     binary: pathlib.Path, root: pathlib.Path, log: pathlib.Path, width: int, height: int
 ) -> None:
     app = launch(binary, root, log, width, height)
+    failed = False
     try:
-        # The message text is off the right edge at these widths; the level
-        # column is the first thing every ingested row puts on screen.
-        app.wait_for("INFO", timeout=60)
+        # The raw JSON prefix fits even the narrow event column. A severity
+        # cell stays empty until an enrichment role is explicitly selected.
+        app.wait_for('{"time":', timeout=60)
         open_new_step(app)
         paste(app, "name4 = pl.col('time')")
         app.send(b"\r")
@@ -139,14 +140,17 @@ def story(
     except BaseException:
         # The story's own failure is the interesting one; do not let a
         # shutdown assertion in the exit path hide it.
+        failed = True
         app.process.kill()
         raise
     finally:
-        if app.process.poll() is None:
-            app.send(b"q")
-            code = app.wait_exit(timeout=15)
-            assert code == 0, (code, app.text())
-        app.assert_restored()
+        if not failed:
+            if app.process.poll() is None:
+                app.send(b"q")
+                code = app.wait_exit(timeout=15)
+                assert code == 0, (code, app.text())
+            app.assert_restored()
+        app.close()
 
 
 def run(binary: pathlib.Path) -> None:

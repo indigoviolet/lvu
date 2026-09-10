@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Repeated-pattern folding in the actual application.
+"""Unified grouping at small and large scale, in the actual application.
 
-A retry flood buries two interesting events. Folding collapses the flood into
-one counted line, expanding it restores exactly the original events in their
-original order, the choice survives a restart, and neither filtering nor the
-underlying records change because a fold exists.
+A retry flood buries two interesting events. Recognition lives in
+Enrichment: a flood column marks the retries and Run grouping collapses the
+flood into one event, with no pattern normalisation anywhere. Expanding
+restores exactly the original events in order, the choices survive a
+restart, grouping never changes filter membership, and grouping tens of thousands
+of events never blanks the pane while it settles.
 """
 
 import os
@@ -27,16 +29,6 @@ def source_text() -> str:
     ]
     lines += ["connection established", "ready to serve"]
     return "\n".join(lines) + "\n"
-
-
-def open_palette(app, query, expected):
-    """Folding must be reachable without memorising a key."""
-    app.send(b"\x10")
-    app.wait_for("Command palette")
-    app.send(query.encode())
-    app.wait_for(expected)
-    app.send(b"\r")
-    app.wait_until(lambda text: "Command palette" not in text, "palette dismissed")
 
 
 # --- Folding a large view must never blank the pane -------------------------
@@ -118,64 +110,89 @@ def run_large_view_never_blanks(binary, tooling):
                 raise AssertionError(f"capture never settled; last {seen!r}\n{app.text()}")
             # Partial-flush records make the captured total a little larger
             # than the line count; take it from the view rather than assume it.
-            # Partial-flush records make the captured total a little larger
-            # than the line count; take it from the view rather than assume it.
             assert int(seen.split("/")[-1]) >= BIG_LINES, seen
 
-            # The toggle's own notice occupies the status line, so the fold is
-            # read from the pane itself: a folded view of this fixture is one
-            # collapsed entry per run separated by the unique event between runs,
-            # where an unfolded one is a screen of retries.
             def separators(rows):
                 return sum(1 for row in rows if "connection established" in row)
 
             assert separators(viewport_rows(app.text())) <= 1, app.text()
 
-            open_palette(app, "fold repeated", "Fold repeated events")
-            blank_frames = []
-            folded = None
-            deadline = time.monotonic() + 120
-            while time.monotonic() < deadline:
-                app.drain()
-                text = app.text()
-                rows = viewport_rows(text)
-                # The invariant under test: a presentation-only recompute never
-                # costs the user the rows they already had.
-                if not rows:
-                    blank_frames.append(text)
-                if separators(rows) >= 5:
-                    folded = text
-                    break
-                time.sleep(0.01)
-            assert not blank_frames, (
-                f"{len(blank_frames)} frame(s) between the toggle and the fold showed no "
-                f"rows at all; first was:\n{blank_frames[0]}"
-            )
-            assert folded is not None, f"the visible window never folded:\n{app.text()}"
+            # Recognition lives in Enrichment: mark the flood, then open every
+            # retry as its own Filter event. Grouping tens of thousands of
+            # singletons must never blank the pane while it settles.
+            app.send(b"e")
+            app.wait_for("Steps")
+            app.send(b"\x1ba")
+            app.wait_for("Enrichment \u203a New step")
+            paste(app, "/(?P<flood>retry connect)/")
+            app.send(b"\r")
+            app.wait_until(lambda text: "flood" in text and "Applied" in text,
+                           "the flood column is applied", timeout=60)
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Steps" not in text, "enrichment closed")
+            app.send(b"m")
+            app.wait_for("Multiline grouping")
+            app.send(b"\t")
+            app.send(b"\x1b[C")
+            app.wait_for("(?lvu:filter:", timeout=10)
+            app.send(b"\t")
+            app.send(b"\t")
+            paste(app, "flood")
+            app.wait_for("(?lvu:filter:v1:column:flood)")
+            app.send(b"\r")
+            app.send(b"\x1b")
 
-            # Toggling again cancels the recompute: the stream comes back with
-            # its own length and its own rows, and no frame of that is empty.
-            open_palette(app, "fold repeated", "Fold repeated events")
-            deadline = time.monotonic() + 60
-            restored = None
-            while time.monotonic() < deadline:
-                app.drain()
-                text = app.text()
-                rows = viewport_rows(text)
-                if not rows:
-                    blank_frames.append(text)
-                if rows and separators(rows) <= 1:
-                    restored = text
-                    break
-                time.sleep(0.01)
-            assert not blank_frames, (
-                f"cancelling folding blanked the pane:\n{blank_frames[0]}"
+            def observe_transition(done, description):
+                # Sample before checking completion, from the first visible
+                # viewport after the dialog closes through accepted publication.
+                blank_frames = []
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline:
+                    app.drain()
+                    text = app.text()
+                    if "Multiline grouping" not in text:
+                        if not viewport_rows(text):
+                            blank_frames.append(text)
+                        if done(text):
+                            assert not blank_frames, (
+                                f"{description} blanked the pane:\n{blank_frames[0]}"
+                            )
+                            return text
+                    time.sleep(0.02)
+                raise AssertionError(f"{description} did not complete:\n{app.text()}")
+
+            baseline_total = int(seen.split("/")[-1])
+            def visible_total(text):
+                value = counter(text)
+                return int(value.split("/")[-1]) if value else None
+
+            # At 80 columns optional status tokens are omitted. The accepted
+            # presentation count is observable: null separator rows join the
+            # preceding start, so the count drops without filtering records.
+            observe_transition(
+                lambda text: visible_total(text) is not None
+                and visible_total(text) < baseline_total,
+                "grouping recompute")
+
+            # Clearing the rule ungroups the flood: the pane stays populated
+            # through that recompute as well.
+            app.send(b"m")
+            dialog = app.wait_for("Multiline grouping")
+            tab_row = next(
+                line for line in dialog.splitlines()
+                if "Run" in line and "Legacy" in line and "Off" in line
             )
-            # The pane is a screen of individual retries again, which is what
-            # the view looked like before the toggle. The stream's own length is
-            # asserted at the engine seam, where the toggle's status notice is
-            # not covering the counter.
-            assert restored is not None, f"cancelling never restored:\n{app.text()}"
+            row = dialog.splitlines().index(tab_row) + 1
+            col = tab_row.index("Off") + 1
+            app.send(f"\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m".encode())
+            app.wait_until(lambda text: "(?lvu:" not in text,
+                           "off selected", timeout=10)
+            app.send(b"\r")
+            app.send(b"\x1b")
+            observe_transition(
+                lambda text: visible_total(text) == baseline_total
+                and len(viewport_rows(text)) >= 15,
+                "ungrouping recompute")
             stop(app)
         finally:
             (root / "screen.txt").write_text(app.text())
@@ -213,64 +230,96 @@ def run(binary):
             assert unfolded.count("retry connect to") > 5, unfolded
             assert f"/{FLOOD + 4}" in unfolded, unfolded
 
-            open_palette(app, "fold repeated", "Fold repeated events")
-            folded = app.wait_until(lambda text: f"\u00d7{FLOOD} events" in text,
-                                    "the flood collapses to one counted line", timeout=15)
-            # The interesting events are visible again, and the indicator is honest
-            # about how much is hidden.
-            assert "service started on port 8080" in folded, folded
-            assert "connection established" in folded, folded
-            assert "ready to serve" in folded, folded
-            app.wait_until(lambda text: "fold:1 runs" in text and f"{FLOOD - 1} hidden" in text,
-                           "the status reports the fold", timeout=10)
-            collapsed = app.text()
-            assert "/5" in collapsed, collapsed
-            assert collapsed.count("retry connect to") == 1, collapsed
+            # Recognition lives in Enrichment: mark the flood, then collapse
+            # it with Run grouping on that column.
+            app.send(b"e")
+            app.wait_for("Steps")
+            app.send(b"\x1ba")
+            app.wait_for("Enrichment \u203a New step")
+            paste(app, "/(?P<flood>retry connect)/")
+            app.send(b"\r")
+            app.wait_until(lambda text: "flood" in text and "Applied" in text,
+                           "the flood column is applied", timeout=20)
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Steps" not in text, "enrichment closed")
+            app.send(b"m")
+            app.wait_for("Multiline grouping")
+            app.send(b"\t")
+            app.send(b"\x1b[C")
+            app.wait_for("(?lvu:filter:", timeout=10)
+            app.send(b"\t")
+            app.send(b"\t")
+            paste(app, "flood")
+            app.wait_for("(?lvu:filter:v1:column:flood)")
+            # Starts, not runs: every retry opens its own event here so the
+            # flood stays listed while grouping is proven on it below.
+            app.send(b"\r")
+            app.wait_until(lambda text: "Applied" in text, "grouping applied", timeout=15)
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Multiline grouping" not in text,
+                           "grouping closed", timeout=10)
+            assert app.text().count("retry connect to") > 5, app.text()
 
-            # The collapsed line stands for a real record: Details shows that
-            # record exactly as captured, with no fold decoration on it.
+            # Run grouping is the collapsing half: back to the Run tab, which
+            # keeps a blank column ready, and name the same column there.
+            app.send(b"m")
+            app.wait_for("Multiline grouping")
+            app.send(b"\t")
+            app.send(b"\x1b[D")
+            app.wait_for("(?lvu:run:v1:column:)", timeout=10)
+            app.send(b"\t")
+            app.send(b"\t")
+            paste(app, "flood")
+            app.wait_for("(?lvu:run:v1:column:flood)")
+            app.send(b"\r")
+            app.wait_until(lambda text: "Applied" in text, "run grouping applied", timeout=15)
+            app.send(b"\x1b")
+            collapsed = app.wait_until(
+                lambda text: "Multiline grouping" not in text
+                and text.count("retry connect to") == 1,
+                "the flood collapses to one grouped line", timeout=15)
+            # The interesting events are visible again.
+            assert "service started on port 8080" in collapsed, collapsed
+            assert "connection established" in collapsed, collapsed
+            assert "ready to serve" in collapsed, collapsed
+
+            # The collapsed line stands for real records: Details shows the
+            # head exactly as captured.
             app.send(b"g")
             app.send(b"jj")
             app.send(b"d")
             details = app.wait_for("Selected event details")
             assert "retry connect to 10.0.0.0 failed after 120ms" in details, details
-            assert "repeated]" not in details.split("Selected event details")[1], details
             close_details(app)
 
-            # Enter expands the run back into the original events, in order.
+            # Enter expands the group back into the original events, in order.
             app.send(b"\r")
-            expanded = app.wait_until(lambda text: f"\u00d7{FLOOD} events" not in text,
+            expanded = app.wait_until(lambda text: text.count("retry connect to") > 5,
                                       "the run expands", timeout=10)
             assert f"/{FLOOD + 4}" in expanded, expanded
-            assert expanded.count("retry connect to") > 5, expanded
 
-            open_palette(app, "collapse expanded", "Collapse expanded runs")
-            app.wait_until(lambda text: f"\u00d7{FLOOD} events" in text,
-                           "collapsing again", timeout=10)
+            app.send(b"\r")
+            app.wait_until(lambda text: text.count("retry connect to") == 1,
+                           "collapsed again", timeout=10)
 
-            # A filter matches exactly what it matched before: folding changes
+            # A filter matches exactly what it matched before: grouping changes
             # presentation, never membership.
             app.send(b"/")
             app.wait_for("Search")
             paste(app, "retry connect")
             app.send(b"\r")
             app.wait_until(lambda text: f"search:" in text and "/1" in text,
-                           "the matched flood is one folded line", timeout=15)
+                           "the matched flood is one grouped line", timeout=15)
             app.send(b"\x1b")
             app.wait_until(lambda text: "Search" not in text, "search dismissed")
-            open_palette(app, "fold repeated", "Fold repeated events")
-            app.wait_until(lambda text: f"/{FLOOD}" in text and f"\u00d7{FLOOD} events" not in text,
-                           "unfolded, the same filter still matches every retry", timeout=15)
-            # Restore folding, clear the filter, and leave it on for the restart.
-            open_palette(app, "fold repeated", "Fold repeated events")
-            app.wait_until(lambda text: f"\u00d7{FLOOD} events" in text, "folded again", timeout=15)
             app.send(b"/")
             app.wait_for("Search")
             app.send(b"\x01\x0b\r")
             app.wait_until(lambda text: "search:" not in text, "filter cleared", timeout=15)
             app.send(b"\x1b")
             app.wait_until(lambda text: "Search" not in text, "search dismissed")
-            app.wait_until(lambda text: f"\u00d7{FLOOD} events" in text, "still folded", timeout=15)
+            app.wait_until(lambda text: text.count("retry connect to") == 1,
+                           "still grouped", timeout=15)
             stop(app)
         finally:
             (root / "terminal.ansi").write_bytes(app.transcript)
@@ -282,16 +331,18 @@ def run(binary):
 
         reopened = PtyApp(binary, arguments, width=150, height=40, environment=environment)
         try:
-            # The fold configuration is working-view state and comes back with it.
-            restored = reopened.wait_until(lambda text: f"\u00d7{FLOOD} events" in text,
-                                           "folding survives restart", timeout=25)
-            assert "fold:1 runs" in restored, restored
-            assert restored.count("retry connect to") == 1, restored
+            # The grouping rule is working-view state and comes back with it:
+            # the flood is one grouped line again without re-entering anything.
+            restored = reopened.wait_until(
+                lambda text: text.count("retry connect to") == 1
+                and "service started on port 8080" in text,
+                "grouping survives restart", timeout=25)
+            assert "connection established" in restored, restored
             reopened.send(b"g")
             reopened.send(b"jj")
             reopened.send(b"\r")
-            reopened.wait_until(lambda text: f"\u00d7{FLOOD} events" not in text,
-                                "the restored fold still expands", timeout=10)
+            reopened.wait_until(lambda text: text.count("retry connect to") > 5,
+                                "the restored group still expands", timeout=10)
             stop(reopened)
         finally:
             if reopened.process.poll() is None:
@@ -307,6 +358,6 @@ def run(binary):
 
 if __name__ == "__main__":
     run(pathlib.Path(sys.argv[1]).resolve())
-    print("Folding PTY passed: off by default, palette-discoverable collapse, honest "
-          "indicator, exact expansion, unchanged filtering, restart restoration, and a "
-          "large view that never blanks the pane while it folds")
+    print("Folding PTY passed: unified grouping control, enrichment-defined runs, "
+          "honest expansion, unchanged filtering, restart restoration, and a large "
+          "view that never blanks the pane while grouping settles")

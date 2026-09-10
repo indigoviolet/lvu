@@ -23,6 +23,8 @@ pub const MAX_EDITOR_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_QUERY_REQUESTS: usize = 32;
 pub const TIMESTAMP_PROMPT: &str = "Use the prepared typed schema, sample values and coverage to derive exactly one field named timestamp_utc from an existing usable timestamp column. When that inline evidence is sufficient, do not read files or invoke tools. If no prepared context is supplied, inspect the fixed snapshot schema and bounded samples first. Do not extract a JSON field from raw when its value is available in a usable named column. Fall back to raw extraction only for unstructured timestamps or documented projection/type conflicts and explain why. Do not substitute capture time for an event timestamp. Return a Polars enrichment expression producing UTC RFC3339 strings in the exact format %Y-%m-%dT%H:%M:%S%.6fZ. Use str.extract when needed, str.to_datetime or str.strptime with an explicit input format and strict=False, then dt.convert_time_zone('UTC') and dt.strftime. Preserve raw and prior enrichment stages. Missing, malformed, or ambiguous timestamps must produce null. Never infer a missing year, day/month order, epoch unit, or timezone; explain what user-provided information is needed instead. Explicit numeric offsets must be normalized to UTC. Explain the detected source field/input format, timezone evidence, output format, and unmatched cases. Only propose the enrichment; do not modify files.";
 
+pub const SEVERITY_PROMPT: &str = "Use the prepared typed schema, sample values and coverage to derive exactly one field named severity from an existing usable level-like column. When that inline evidence is sufficient, do not read files or invoke tools. If no prepared context is supplied, inspect the fixed snapshot schema and bounded samples first, and identify the level-like column from schema evidence; do not invent a source column. Fall back to raw extraction only for unstructured log lines or documented projection/type conflicts and explain why. Map values to exactly one of the canonical uppercase tokens TRACE, DEBUG, INFO, WARN, ERROR or FATAL. Preserve raw and prior enrichment stages. Missing, malformed, or unrecognized levels must produce null. Never guess a severity for an unknown value; explain what user-provided information is needed instead. Explain the detected source field, the mapping applied, and unmatched cases. Only propose the enrichment; do not modify files.";
+
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 pub(crate) const MAX_AI_PROMPT_BYTES: usize = 8 * 1024;
 const MAX_INVESTIGATION_MESSAGES: usize = 64;
@@ -117,21 +119,26 @@ pub enum AskControl {
 /// irrelevant choice (`docs/dialog-system.md` §3 header, §12.17).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AskTask {
-    RecognizeTimestamp,
+    SeverityColumn,
+    TimestampColumn,
 }
 
 impl AskTask {
-    /// Title suffix: `Ask 🧠 · Recognize timestamp` (§7.1 `Noun · object`).
+    /// Title suffix: `Ask 🧠 · Timestamp column` (§7.1 `Noun · object`).
     pub fn object(self) -> &'static str {
         match self {
-            AskTask::RecognizeTimestamp => "Recognize timestamp",
+            AskTask::SeverityColumn => "Severity column",
+            AskTask::TimestampColumn => "Timestamp column",
         }
     }
 
     /// The header summary line: what submitting this will actually do.
     pub fn summary(self) -> &'static str {
         match self {
-            AskTask::RecognizeTimestamp => {
+            AskTask::SeverityColumn => {
+                "Derives one severity field with canonical tokens from a level already in the data"
+            }
+            AskTask::TimestampColumn => {
                 "Derives one timestamp_utc field in UTC RFC3339 from a timestamp already in the data"
             }
         }
@@ -141,7 +148,7 @@ impl AskTask {
     /// instruction the user is merely being shown.
     pub fn help(self) -> &'static str {
         match self {
-            AskTask::RecognizeTimestamp => {
+            AskTask::SeverityColumn | AskTask::TimestampColumn => {
                 "The request below is a prepared starting point; edit it before submitting. Nothing changes until you review and apply the proposal."
             }
         }
@@ -149,7 +156,28 @@ impl AskTask {
 
     pub fn message(self) -> &'static str {
         match self {
-            AskTask::RecognizeTimestamp => "review the prepared request, then submit",
+            AskTask::SeverityColumn | AskTask::TimestampColumn => {
+                "review the prepared request, then submit"
+            }
+        }
+    }
+
+    /// The enrichment output this task asks the agent to derive. The role is
+    /// assigned from the accepted chain's outputs, never from this guess: a
+    /// reviewed proposal may name its output differently, and only the name
+    /// the accepted chain actually produces may feed a display role.
+    pub fn intended_column(self) -> &'static str {
+        match self {
+            AskTask::TimestampColumn => "timestamp_utc",
+            AskTask::SeverityColumn => "severity",
+        }
+    }
+
+    /// The prefilled request for the task.
+    pub fn prompt(self) -> &'static str {
+        match self {
+            AskTask::TimestampColumn => TIMESTAMP_PROMPT,
+            AskTask::SeverityColumn => SEVERITY_PROMPT,
         }
     }
 }
@@ -637,6 +665,147 @@ impl EnrichmentStepControl {
     }
 }
 
+/// Stage the authoritative Selected time basis for a timestamp role column.
+///
+/// The role never becomes a second time selector: naming the column stages
+/// the Time dialog's normal Selected draft (same token the dialog would
+/// build), and the Time dialog still reviews and applies it through the
+/// usual candidate fences. Clearing a timestamp role leaves an explicitly
+/// chosen basis alone.
+pub(crate) fn stage_timestamp_basis(state: &mut ViewState, column: &str) {
+    state.time_basis_draft = TimeBasis::Selected;
+    state.time_field_draft = Some(role_time_token(column));
+    state.time_draft_touched = true;
+    state.time_error = None;
+}
+
+/// The Selected-basis token staging a timestamp role column for event time.
+///
+/// The token grammar is `TimeFieldSelection::to_token`: a column reference
+/// with the text interpretation and the recognition flow's own RFC 3339 shape
+/// (`%+`, which reads `Z` and numeric offsets alike), under the conservative
+/// reject assumption for zoneless values. It parses through the same
+/// `parse_token` + `column_selection` path the Time dialog's tokens take, so
+/// a malformed token fails the normal candidate fences with the applied basis
+/// untouched instead of becoming a second timestamp selector.
+pub fn role_time_token(column: &str) -> String {
+    format!("column:{column}|text|reject|-|%+")
+}
+
+/// A shortcut task's intended display role, waiting for its reviewed
+/// enrichment to be accepted. The column is the task's guess
+/// (`AskTask::intended_column`); it becomes a role only when an accepted
+/// chain newer than `after_revision` actually publishes an output of that
+/// name. `severity` selects which role field an assignment writes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRoleIntent {
+    pub column: String,
+    pub severity: bool,
+    pub after_revision: u64,
+}
+
+/// What one enrichment completion means for a pending role intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingRoleOutcome {
+    /// A successful newer completion whose accepted chain publishes the
+    /// intended output: assign its column.
+    Assign(String),
+    /// Failure, rename, or a newer completion without the output: drop the
+    /// intent and leave the previous roles untouched.
+    Clear,
+    /// An older completion that cannot answer this intent: keep waiting.
+    Ignore,
+}
+
+/// Decide a pending role intent against one enrichment completion.
+///
+/// Completions at or below the intent's revision predate it and are ignored.
+/// Anything newer settles it: success with the intended output assigns,
+/// anything else clears. Failure, rejection (which never submits, so the
+/// next completion clears), rename, and staleness therefore can never change
+/// the previous roles.
+pub fn consume_pending_role(
+    pending: &Option<PendingRoleIntent>,
+    completion_revision: u64,
+    succeeded: bool,
+    accepted_outputs: &[String],
+) -> PendingRoleOutcome {
+    let Some(intent) = pending.as_ref() else {
+        return PendingRoleOutcome::Ignore;
+    };
+    if completion_revision <= intent.after_revision {
+        return PendingRoleOutcome::Ignore;
+    }
+    if !succeeded {
+        return PendingRoleOutcome::Clear;
+    }
+    match effective_role(Some(&intent.column), accepted_outputs) {
+        Some(column) => PendingRoleOutcome::Assign(column),
+        None => PendingRoleOutcome::Clear,
+    }
+}
+
+/// The output an enrichment step definition publishes, if its source is in
+/// the assignment form the compiler reads first (`name = expression`).
+/// Anything else — slash shorthand included — fails closed: the step still
+/// applies normally, but no shortcut role is inferred from it and the Fields
+/// dialog remains the way to name it.
+///
+/// This helper exists only for shortcut intent assignment. It must never be
+/// used as the render-time output inventory: it cannot see supported
+/// slash-shorthand outputs, so rendering through it would suppress assigned
+/// roles the worker actually serves. Rendering resolves roles through the
+/// structural row markers (`derived.` / `derived_ready.`) instead.
+pub fn enrichment_output_name(source: &str) -> Option<String> {
+    let (name, _) = source.split_once('=')?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Whether the accepted time basis covers a timestamp role, so the gutter
+/// and the query read event time from one authority. The role column must be
+/// the accepted Selected basis's column; anything else — capture basis, a
+/// different column, a missing or unparsable token — leaves the gutter on its
+/// placeholder rather than disagreeing with sort, window, and navigation.
+pub fn basis_covers_role(
+    applied_time_basis: TimeBasis,
+    applied_time_field: Option<&str>,
+    role: Option<&str>,
+) -> bool {
+    if applied_time_basis != TimeBasis::Selected {
+        return false;
+    }
+    let Some(role) = role.filter(|name| !name.is_empty()) else {
+        return false;
+    };
+    let Some(token) = applied_time_field else {
+        return false;
+    };
+    let Some(rest) = token.strip_prefix("column:") else {
+        return false;
+    };
+    rest.split('|').next() == Some(role)
+}
+
+/// A per-view display role resolved against the accepted enrichment chain.
+///
+/// Returns the role column only while `accepted_outputs` — the output names
+/// the accepted chain declares at its accepted revision — still contains it.
+/// This is name membership only: it detects a removed or renamed output, not
+/// a per-batch failure. Whether the output actually evaluated successfully in
+/// the current batch is resolved by the consumer serving the batch (the view
+/// worker, which knows per-stage success); a role whose output failed there
+/// likewise falls back to raw display instead of erroring, so an invalid role
+/// preserves the last good view. Names match exactly; enrichment outputs are
+/// case-sensitive, and a same-named raw field is never substituted. Values
+/// are never normalized here: the severity rung maps canonical tokens to
+/// colour, and anything else simply has no colour.
+pub fn effective_role(column: Option<&str>, accepted_outputs: &[String]) -> Option<String> {
+    column
+        .filter(|name| accepted_outputs.iter().any(|output| output == name))
+        .map(str::to_owned)
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ViewState {
     pub source_ids: Vec<String>,
@@ -720,6 +889,21 @@ pub struct ViewState {
     pub applied_generation: u64,
     pub pinned_columns: Vec<String>,
     pub color_field: Option<String>,
+    /// Accepted enrichment column feeding the severity rung. Explicit and
+    /// unset by default: nothing is guessed from raw field names, so a view
+    /// that never chose one shows no severity colour. The name must be an
+    /// output of the accepted enrichment chain; see `effective_roles`.
+    pub severity_column: Option<String>,
+    /// Accepted enrichment column feeding the event-time display. Explicit
+    /// and unset by default; capture time stays separate metadata regardless.
+    /// The name must be an output of the accepted enrichment chain.
+    pub timestamp_column: Option<String>,
+    /// A shortcut task's intended role awaiting its reviewed enrichment: the
+    /// output column the task asked for, set down after the proposal review.
+    /// Assigned only when a newer accepted chain actually publishes that
+    /// output; failure, rejection, rename, or staleness clears it without
+    /// touching the previous roles. See `consume_pending_role`.
+    pub pending_role: Option<PendingRoleIntent>,
     /// Accepted predicate colour rules: what the rows on screen were painted
     /// with. Display-only, so an invalid draft can never disturb it.
     pub color_rules: Vec<ColorRule>,
@@ -782,6 +966,18 @@ pub struct ViewState {
 }
 
 impl ViewState {
+    /// This view's display roles as nameable from the accepted chain's
+    /// outputs at its accepted revision. Each role sticks only while the
+    /// chain still declares an output of that name; a role left unset, or
+    /// naming anything else, resolves to unset and the view renders raw.
+    /// Per-batch output success is resolved where the batch is served.
+    pub fn effective_roles(&self, accepted_outputs: &[String]) -> (Option<String>, Option<String>) {
+        (
+            effective_role(self.severity_column.as_deref(), accepted_outputs),
+            effective_role(self.timestamp_column.as_deref(), accepted_outputs),
+        )
+    }
+
     /// The quiet period gap navigation looks for.
     pub fn gap_threshold_seconds(&self) -> u64 {
         match self.time_gap_threshold_seconds {
@@ -903,6 +1099,13 @@ pub struct PersistentViewState {
     pub selected_at: u64,
     pub pinned_columns: Vec<String>,
     pub color_field: Option<String>,
+    /// Accepted enrichment column feeding the severity rung. Explicit and
+    /// unset by default; persisted with the presentation like the colour
+    /// field. Must name an output of the accepted enrichment chain.
+    pub severity_column: Option<String>,
+    /// Accepted enrichment column feeding the event-time display. Explicit
+    /// and unset by default; capture time stays separate metadata regardless.
+    pub timestamp_column: Option<String>,
     /// Accepted predicate colour rules. Persisted per view like the pins and
     /// the colour field, because they are that view's presentation.
     pub color_rules: Vec<ColorRule>,
@@ -1607,6 +1810,8 @@ pub enum FieldPickerControl {
     List,
     Pin,
     Color,
+    Severity,
+    Timestamp,
     /// Follow this field's value into every source that carries it.
     Correlate,
     /// §8.12 one-key actions from the selected value.
@@ -1773,6 +1978,10 @@ pub enum Action {
         expression: String,
         recipe: Option<Box<RecipeConfig>>,
         outcome: Option<RecipeOutcome>,
+        /// The shortcut task this proposal answers, if any. An enrichment
+        /// task carries its intended display role through draft review to the
+        /// accepted chain; anything else leaves roles alone.
+        task: Option<AskTask>,
     },
     Quit,
     CycleFocus,
@@ -1903,7 +2112,7 @@ pub struct SettingsValues {
     pub mode: String,
     pub thinking: String,
     pub theme: ThemeId,
-    /// Fixed UTC offset token the log viewport formats times in.
+    /// IANA zone or fixed UTC offset token the log viewport formats times in.
     pub display_zone: String,
     pub delight_enabled: bool,
     pub reduced_motion: bool,
@@ -3093,6 +3302,10 @@ impl Views {
             state.enrichment.fork_pending = false;
             state.grouping.fork_pending = false;
             state.time_error = None;
+            // The intent was transferred to the candidate at staging time;
+            // the origin must not stay armed after a successful install.
+            // Clearing here also covers intents predating the transfer.
+            state.pending_role = None;
         }
         Some(InstalledFork {
             origin_view_id: fork.origin_view_id,
@@ -3135,6 +3348,9 @@ impl Views {
                     state.time_error = Some(reason);
                 }
             }
+            // A discarded candidate never assigns: its transferred intent dies
+            // with it, and the origin must not stay armed for a later fork.
+            state.pending_role = None;
         }
         true
     }
@@ -3693,6 +3909,8 @@ impl App {
             follow: state.follow,
             pinned_columns: state.pinned_columns.clone(),
             color_field: state.color_field.clone(),
+            severity_column: state.severity_column.clone(),
+            timestamp_column: state.timestamp_column.clone(),
             color_rules: state.color_rules.clone(),
             fold_enabled: state.fold_enabled,
             fold_minimum_run: state.fold_minimum_run,
@@ -3800,6 +4018,7 @@ impl App {
     /// The effective settings `lvu-app` resolved. The Settings component owns
     /// the snapshot (§2.4); this stays as the shell's one-line entry point.
     pub fn configure_settings(&mut self, context: SettingsContext) {
+        self.appearance.display_zone = context.effective_display_zone.clone();
         self.layers.settings.configure(context);
     }
 
@@ -4240,7 +4459,24 @@ impl App {
         if !self.views.states.contains_key(view_id) {
             return false;
         }
-        self.cancel_correlation_for_view(view_id);
+        let restored_union = restored.union.clone();
+        // Restore is transactional from the app's point of view: validate
+        // every persisted definition before cancelling work or changing any
+        // accepted/draft state. In particular, an invalid union must not
+        // advance the definition revision or clear an accepted correlation
+        // that a later autosave would then persist.
+        if !valid_enrichments(&restored.applied_enrichments) {
+            return false;
+        }
+        if let Some(union) = restored_union.as_ref()
+            && (!restored.applied_enrichments.is_empty()
+                || !restored.applied_enrichment.is_empty()
+                || restored.applied_capture_time.is_some()
+                || union.inputs.len() < 2
+                || union.inputs.len() > 8)
+        {
+            return false;
+        }
         let mut source_ids = HashSet::new();
         let primary = self
             .views
@@ -4283,14 +4519,12 @@ impl App {
         {
             return false;
         }
+        self.cancel_correlation_for_view(view_id);
         self.views
             .states
             .get_mut(view_id)
             .expect("checked view")
             .source_ids = restored.source_ids.clone();
-        if !valid_enrichments(&restored.applied_enrichments) {
-            return false;
-        }
         if !restored.view_name.is_empty()
             && let Some(view) = self.views.items.iter_mut().find(|view| view.id == view_id)
         {
@@ -4314,17 +4548,7 @@ impl App {
         // stored input fence reinstalls here, and the request below re-merges
         // (query work, never capture). Enrichment and time windows remain
         // unsupported and are refused rather than half-installed.
-        let restored_union = restored.union.clone();
         if let Some(union) = restored_union.as_ref() {
-            if !restored.applied_enrichments.is_empty()
-                || !restored.applied_enrichment.is_empty()
-                || restored.applied_capture_time.is_some()
-            {
-                return false;
-            }
-            if union.inputs.len() < 2 || union.inputs.len() > 8 {
-                return false;
-            }
             state.union_inputs = Some(
                 union
                     .inputs
@@ -4389,6 +4613,12 @@ impl App {
         state.follow = restored.follow;
         state.pinned_columns = restored.pinned_columns.into_iter().take(8).collect();
         state.color_field = restored.color_field;
+        state.severity_column = restored
+            .severity_column
+            .filter(|column| !column.trim().is_empty());
+        state.timestamp_column = restored
+            .timestamp_column
+            .filter(|column| !column.trim().is_empty());
         state.fold_enabled = restored.fold_enabled;
         state.fold_minimum_run = effective_fold_minimum_run(restored.fold_minimum_run);
         state.fold_key_column = restored
@@ -6044,6 +6274,42 @@ impl App {
                 let appended_enrichment = constraints.enrichments.len() > state.enrichments.len();
                 let previous_chain =
                     std::mem::replace(&mut state.enrichments, constraints.enrichments.clone());
+                // A shortcut task's intended role settles here, against the
+                // chain this completion just accepted: only a successful
+                // enrichment acceptance publishing the intended output
+                // assigns it. Anything else clears the intent and leaves the
+                // previous roles alone; see `consume_pending_role`.
+                if completion.purpose == QueryPurpose::Enrichment {
+                    let outputs = state
+                        .enrichments
+                        .iter()
+                        .filter_map(|step| enrichment_output_name(&step.source))
+                        .collect::<Vec<_>>();
+                    match consume_pending_role(
+                        &state.pending_role,
+                        completion.revision,
+                        true,
+                        &outputs,
+                    ) {
+                        PendingRoleOutcome::Assign(column) => {
+                            let severity = state
+                                .pending_role
+                                .as_ref()
+                                .is_some_and(|pending| pending.severity);
+                            if severity {
+                                state.severity_column = Some(column);
+                            } else {
+                                state.timestamp_column = Some(column.clone());
+                                stage_timestamp_basis(state, &column);
+                            }
+                            state.pending_role = None;
+                        }
+                        PendingRoleOutcome::Clear => {
+                            state.pending_role = None;
+                        }
+                        PendingRoleOutcome::Ignore => {}
+                    }
+                }
                 // §12.5: every command step keeps its own run state. A step
                 // whose definition changed gets a new revision (its last
                 // publication stays readable until a run replaces it); a
@@ -6101,6 +6367,20 @@ impl App {
                     .last()
                     .map_or_else(String::new, |stage| stage.source.clone());
                 state.grouping.applied = constraints.grouping.clone().unwrap_or_default();
+                if accepted_grouping {
+                    // Applying a new Run/Filter/Off rule clears folding: runs
+                    // are defined once, by grouping, so a second collapsing
+                    // layer must be re-chosen, never inherited silently.
+                    // Legacy applies leave folding alone.
+                    let fresh_rule = match constraints.grouping.as_deref() {
+                        None => true,
+                        Some(rule) => !crate::grouping::is_legacy(rule),
+                    };
+                    if fresh_rule {
+                        state.fold_enabled = false;
+                        state.fold_expanded.clear();
+                    }
+                }
                 // Accepted with the query that evaluated them, so the dialog's
                 // "edited" state clears exactly when the rows repaint.
                 state.color_rules = constraints.color_rules.clone();
@@ -6253,6 +6533,17 @@ impl App {
                         command_chain_settled = Some(Err(failure_message.clone()));
                     }
                     state.pending_enrichment_mutation = None;
+                }
+                // A failed enrichment acceptance settles a waiting shortcut
+                // intent the same way a non-matching success does: the flow
+                // that would have published the intended output died, so the
+                // intent clears and the previous roles stand. Older in-flight
+                // failures are not this intent's answer and leave it alone.
+                if failed_purpose == QueryPurpose::Enrichment
+                    && consume_pending_role(&state.pending_role, completion.revision, false, &[])
+                        != PendingRoleOutcome::Ignore
+                {
+                    state.pending_role = None;
                 }
                 let pending_search = (failed_purpose != QueryPurpose::Search
                     && pending_at_or_before(&state.search, completion.revision))
@@ -7246,36 +7537,23 @@ impl App {
                 }
             }
             Action::ToggleFolding => {
-                if let Some(state) = self.view_state_mut() {
-                    state.fold_enabled = !state.fold_enabled;
-                    if state.fold_minimum_run == 0 {
-                        state.fold_minimum_run = DEFAULT_FOLD_MINIMUM_RUN;
-                    }
-                    if !state.fold_enabled {
-                        state.fold_expanded.clear();
-                    }
-                    let enabled = state.fold_enabled;
-                    let run = state.fold_minimum_run;
-                    state.user_interaction_revision =
-                        state.user_interaction_revision.saturating_add(1);
-                    self.action_notice = Some(if enabled {
-                        format!("folding on: runs of {run}+ collapse")
-                    } else {
-                        "folding off; every event is listed individually".into()
-                    });
-                }
+                // The toggle is retired as a second folding layer: every state
+                // routes the unified Grouping UI, which defines runs and
+                // starts once on enrichment columns. Persisted legacy folds
+                // keep rendering until the user edits; nothing here enables,
+                // disables or re-keys them.
+                self.push_layer(crate::component::Open::Grouping, provider);
             }
             Action::CollapseAllFolds => {
+                // Collapse-all covers both expansion kinds without enabling
+                // anything: unified group expansions, plus legacy fold
+                // expansions where a restored fold still renders.
                 if let Some(state) = self.view_state_mut() {
-                    if !state.fold_enabled {
-                        self.action_notice =
-                            Some("folding is off for this view; nothing is collapsed".into());
-                        return;
-                    }
+                    state.expanded_groups.clear();
                     state.fold_expanded.clear();
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
-                    self.action_notice = Some("every repeated run is collapsed again".into());
+                    self.action_notice = Some("every expanded run is collapsed again".into());
                 }
             }
             Action::Open(open) => self.push_layer(open, provider),
@@ -7332,6 +7610,7 @@ impl App {
                 expression,
                 recipe,
                 outcome,
+                task,
             } => {
                 if kind == AskAiKind::Recipe {
                     let mut config = recipe.map(|config| *config).unwrap_or_default();
@@ -7364,6 +7643,31 @@ impl App {
                         editor.draft = expression;
                         editor.error = None;
                     }
+                    // A shortcut task carries its intended display role as
+                    // far as the reviewed draft. Assignment waits for the
+                    // accepted chain: see `consume_pending_role`, which the
+                    // enrichment completions below consult. Only an Apply
+                    // carrying a task installs an intent; a generic proposal
+                    // leaves any older pending intent exactly alone.
+                    let installed_intent = kind == AskAiKind::Enrichment && task.is_some();
+                    let previous_intent = if installed_intent {
+                        self.views
+                            .states
+                            .get(&view_id)
+                            .and_then(|state| state.pending_role.clone())
+                    } else {
+                        None
+                    };
+                    if kind == AskAiKind::Enrichment
+                        && let Some(task) = task
+                        && let Some(state) = self.views.states.get_mut(&view_id)
+                    {
+                        state.pending_role = Some(PendingRoleIntent {
+                            column: task.intended_column().to_owned(),
+                            severity: task == AskTask::SeverityColumn,
+                            after_revision: state.desired_query_revision,
+                        });
+                    }
                     self.views.touch(&view_id);
                     self.layers.ask.finish_apply();
                     self.pop_layer();
@@ -7388,7 +7692,49 @@ impl App {
                         }
                         AskAiKind::Recipe => unreachable!(),
                     }
-                    self.enqueue_query(&view_id, purpose);
+                    let staged = self.enqueue_query(&view_id, purpose);
+                    // The intent is single-owner request state. A fixed
+                    // definition forks on enqueue, so the origin's copy moves
+                    // to that one candidate (rebased onto its zero clock) and
+                    // the origin goes quiet. A refusal stages nothing: a
+                    // shortcut Apply restores whatever its invocation found
+                    // (usually nothing, clearing the intent it just created),
+                    // while a generic task-less proposal — which installed
+                    // nothing — must not mutate an older pending intent that
+                    // a later accepted completion still has to answer. An
+                    // ordinary view keeps its own intent.
+                    if kind == AskAiKind::Enrichment {
+                        if staged.is_none() {
+                            if installed_intent
+                                && let Some(state) = self.views.states.get_mut(&view_id)
+                            {
+                                state.pending_role = previous_intent;
+                            }
+                        } else if let Some(candidate) = self
+                            .views
+                            .pending_forks
+                            .get(&view_id)
+                            .map(|fork| fork.candidate_view_id.clone())
+                        {
+                            let intent = self
+                                .views
+                                .states
+                                .get_mut(&view_id)
+                                .and_then(|state| state.pending_role.take());
+                            if let Some(mut intent) = intent {
+                                // The fork restarts the revision clock at zero,
+                                // so the intent rebases onto it. Without this
+                                // the fork's completions would all predate the
+                                // origin clock and the role could silently
+                                // never assign.
+                                intent.after_revision = 0;
+                                if let Some(candidate_state) = self.views.states.get_mut(&candidate)
+                                {
+                                    candidate_state.pending_role = Some(intent);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Action::StopCapture | Action::RestartCapture => {
@@ -7876,10 +8222,9 @@ pub fn time_zone_choices() -> &'static [(&'static str, &'static str)] {
 /// what every log this tool has ever displayed already showed.
 pub const DEFAULT_DISPLAY_ZONE: &str = "Z";
 
-/// Minutes east of UTC for an offset token, or `None` when the token is not one
-/// this build knows. An unknown token reads as UTC rather than as an error: a
-/// settings file written by a newer version must not stop the log from being
-/// legible.
+/// Minutes east of UTC for a fixed-offset token, or `None` for a named or
+/// invalid zone. Named-zone resolution belongs to the instant formatter;
+/// settings validation distinguishes named zones from invalid input.
 pub fn time_zone_offset_minutes(token: &str) -> Option<i64> {
     if token == "Z" || token.eq_ignore_ascii_case("utc") {
         return Some(0);
@@ -7895,6 +8240,21 @@ pub fn time_zone_offset_minutes(token: &str) -> Option<i64> {
     (hours <= 23 && minutes <= 59).then_some(sign * (hours * 60 + minutes))
 }
 
+/// Validate a display-zone token without interpreting a local wall clock.
+///
+/// Fixed offsets retain their historical spelling and behavior. Named zones
+/// are parsed by `chrono-tz`, whose transition table is consulted later for
+/// each already-established UTC instant.
+pub fn validate_display_zone(token: &str) -> Result<(), String> {
+    if time_zone_offset_minutes(token).is_some() {
+        return Ok(());
+    }
+    token
+        .parse::<chrono_tz::Tz>()
+        .map(|_| ())
+        .map_err(|_| format!("unknown time zone `{token}`; use an IANA name such as Europe/Berlin, Z, or a fixed offset such as +02:00"))
+}
+
 /// The label the settings dropdown and the read-only rows show for a token.
 pub fn time_zone_label(token: &str) -> String {
     time_zone_choices()
@@ -7905,12 +8265,28 @@ pub fn time_zone_label(token: &str) -> String {
 
 /// One row's clock, in the display zone.
 ///
-/// The offset is fixed: this build carries no timezone database, so a named
-/// zone and its daylight-saving transitions cannot be honoured. The suffix is
-/// always shown for that reason — `14:30:00.000+02:00` says exactly what it
-/// means, where a bare `14:30` would not.
+/// The suffix is always explicit — `14:30:00.000+02:00` says exactly what the
+/// already-established instant means in this display zone, where a bare
+/// `14:30` would not. Named zones consult the native timezone database at that
+/// instant, so daylight-saving transitions never reinterpret capture or event
+/// timestamps and never require resolving an ambiguous local wall clock.
 pub fn format_display_time(unix_nanos: i64, zone: &str) -> String {
-    let offset = time_zone_offset_minutes(zone).unwrap_or(0);
+    if time_zone_offset_minutes(zone).is_none()
+        && let Ok(zone) = zone.parse::<chrono_tz::Tz>()
+        && let Some(utc) = chrono::DateTime::from_timestamp(
+            unix_nanos.div_euclid(1_000_000_000),
+            unix_nanos.rem_euclid(1_000_000_000) as u32,
+        )
+    {
+        return utc
+            .with_timezone(&zone)
+            .format("%H:%M:%S%.3f%:z")
+            .to_string();
+    }
+    format_display_time_at_fixed_offset(unix_nanos, time_zone_offset_minutes(zone).unwrap_or(0))
+}
+
+fn format_display_time_at_fixed_offset(unix_nanos: i64, offset: i64) -> String {
     let shifted = unix_nanos.saturating_add(offset.saturating_mul(60_000_000_000));
     let seconds = shifted.div_euclid(1_000_000_000);
     let millis = shifted.rem_euclid(1_000_000_000) / 1_000_000;
@@ -7933,7 +8309,7 @@ pub fn format_display_time(unix_nanos: i64, zone: &str) -> String {
 /// The width the log viewport's time column needs in a zone. UTC's `Z` is one
 /// character; an offset is six.
 pub fn display_time_width(zone: &str) -> u16 {
-    if time_zone_offset_minutes(zone).unwrap_or(0) == 0 {
+    if time_zone_offset_minutes(zone) == Some(0) {
         13
     } else {
         18
@@ -8085,10 +8461,19 @@ fn utc_syntax_error() -> String {
 ///
 /// The column is ten cells wide, so a date and not a timestamp: the moment a
 /// revision was saved is a day, and the revision id is what names it exactly.
-/// The zone matters even so — near midnight a fixed offset moves the date by a
-/// day, and a date column that disagreed with the log's clock would be worse
-/// than no date at all.
+/// The zone matters even so — near midnight its per-instant offset can move the
+/// date by a day, and a date column that disagreed with the log's clock would
+/// be worse than no date at all.
 pub fn format_display_date(unix_nanos: i64, zone: &str) -> String {
+    if time_zone_offset_minutes(zone).is_none()
+        && let Ok(zone) = zone.parse::<chrono_tz::Tz>()
+        && let Some(utc) = chrono::DateTime::from_timestamp(
+            unix_nanos.div_euclid(1_000_000_000),
+            unix_nanos.rem_euclid(1_000_000_000) as u32,
+        )
+    {
+        return utc.with_timezone(&zone).format("%Y-%m-%d").to_string();
+    }
     let shifted =
         unix_nanos.saturating_add(time_zone_offset_minutes(zone).unwrap_or(0) * 60_000_000_000);
     // `format_utc_nanos` is the calendar arithmetic; the date is its first ten
@@ -8169,6 +8554,12 @@ fn fork_candidate_state(base: &ViewState, source_ids: Vec<String>) -> ViewState 
     candidate.grouping.applied.clear();
     candidate.applied_query_revision = 0;
     candidate.desired_query_revision = 0;
+    // A shortcut role intent never crosses by clone: it is single-owner
+    // request state, transferred from the origin to one fork candidate only
+    // after staging succeeds (see the Apply path). Cloning it would leave
+    // the origin armed after install/discard, letting a later unrelated
+    // fork revive a stale intent without a new shortcut.
+    candidate.pending_role = None;
     candidate.provider_revision = 0;
     candidate.last_total = 0;
     candidate.top = 0;
@@ -8747,9 +9138,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('}') => Action::JumpToGap(GapDirection::Forward),
         KeyCode::Char('{') => Action::JumpToGap(GapDirection::Backward),
         KeyCode::Char('i') => Action::Open(Open::Fields),
-        // `z` is vim's fold prefix and is unbound here; the palette-only
-        // `Fold repeated events` toggle keeps working unchanged.
-        KeyCode::Char('z') => Action::Open(Open::Folding),
+        // `z` opens the unified Grouping UI alongside `m`: runs and starts
+        // are defined once, on enrichment columns, so there is a single
+        // normal control instead of two dialogs.
+        KeyCode::Char('z') => Action::Open(crate::component::Open::Grouping),
         KeyCode::Char('c') => Action::Open(crate::component::Open::ColorRules),
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,
