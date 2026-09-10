@@ -2445,3 +2445,15 @@ review found that an unauthorized raw String namesake can conflict with an
 accepted UInt64 column before concatenation. The owner is repairing that
 pre-concatenation projection; the colour allocation finding is cleared.
 No combined build, PTY, matrix or release result is claimed here.
+
+The pre-concatenation amendment `8c20342516fa44b99462afb658cbe604ac372c13`
+is integrated as `7ad1741`. Unauthorized raw namesake fields/types are removed
+from derived frame inputs before concatenation, while original bytes and IDs
+remain intact. Accepted-vs-accepted dtype conflicts still reject. Workspace
+sizing now accounts for precise integer carriers without interpreting values.
+The UInt64 `9007199254740993` versus raw String regression, native dtype-conflict
+test, colour memory-bound test and app test compilation passed in
+`lvu-sol-union-preconcat-targeted-r2.log`; the failed r1 log is preserved.
+Overlap-winner and rule-order regressions passed in
+`lvu-sol-union-preconcat-prior-regressions-r3.log` using `flock --close`.
+Independent final review and the actual union-colour PTY remain pending.
