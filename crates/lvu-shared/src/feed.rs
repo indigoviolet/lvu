@@ -64,18 +64,26 @@ pub async fn feed_once(
         .map_err(|error| format!("progress publish panicked: {error}"))
 }
 
-/// Serve one handle's feed loop until it fails or the task is aborted:
-/// poll, publish, wait the interval, repeat. A fatal transport error ends
-/// the loop with `Err` (caller re-attaches); stale snapshots just skip a
-/// beat. Abort between iterations stops immediately; abort mid-publish
-/// waits out only the bounded blocking call.
+/// Serve one handle's feed loop until it fails, is told to stop, or the
+/// task is aborted: poll, publish, wait the interval, repeat. A fatal
+/// transport error ends the loop with `Err` (caller re-attaches); stale
+/// snapshots just skip a beat. `stop` is checked at the top of every
+/// iteration so cooperative shutdown never waits out a sleep, only the
+/// currently in-flight bounded exchange; abort mid-anything still works
+/// (it just risks retiring the shared client, which is why stoppers
+/// prefer this flag). The flag lives outside so stoppers observe task
+/// end as the quiescence signal.
 pub async fn serve_feed(
     client: Arc<Mutex<WorkerClient>>,
     handle: RemoteSourceHandle,
     worker_session: String,
     interval: Duration,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
     loop {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         feed_once(&client, &handle, &worker_session).await?;
         tokio::time::sleep(interval).await;
     }

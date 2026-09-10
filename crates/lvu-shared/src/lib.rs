@@ -70,6 +70,12 @@ pub const MAX_STDIN_CHUNK_BYTES: usize = 64 * 1024;
 /// admission beyond it is refused with an explicit error, never queued.
 pub const MAX_VIEWERS: usize = 16;
 
+/// Longest window identity (`window_id`) accepted at attach, in bytes.
+/// Window ids route every mediated call and echo in diagnostics; bounding
+/// them keeps handshake, presence, and log lines bounded by construction.
+/// Overlong ids fail attach loudly rather than truncating identity.
+pub const MAX_WINDOW_ID_BYTES: usize = 128;
+
 /// Largest single socket read at the transport layer. Control messages are
 /// at most `MAX_CONTROL_MESSAGE_BYTES`; reads stay well under it so one
 /// `recv` never balloons the connection buffer, while the frame decoder

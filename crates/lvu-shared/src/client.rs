@@ -296,6 +296,13 @@ impl WorkerClient {
         timeout: Duration,
     ) -> Result<(Self, Vec<SourceSummary>), ConnectError> {
         use ConnectError::{Refused, Transport};
+        if window_id.len() > crate::MAX_WINDOW_ID_BYTES {
+            return Err(Refused(format!(
+                "window id is {} bytes; limit is {}",
+                window_id.len(),
+                crate::MAX_WINDOW_ID_BYTES
+            )));
+        }
         let paths = WorkerPaths::new(capture_root);
         let viewer = take_viewer_lock(&paths, window_pid)
             .map_err(|error| Transport(format!("viewer lock: {error}")))?;
@@ -809,6 +816,16 @@ impl WorkerClient {
     /// worker removes the viewer on EOF either way, so dropping the client
     /// (or crashing) detaches — the wait here is courtesy, not consensus.
     pub async fn shutdown(mut self) -> Result<(), String> {
+        self.detach().await
+    }
+
+    /// Bounded shutdown drain without consuming the client: flush, say
+    /// goodbye, wait for the close (bounded). For shared ownership, where
+    /// feeders and store calls hold the same client behind a mutex and no
+    /// single owner can drop it: after `detach` the connection is politely
+    /// closed server-side, and dropping the last clone finishes locally.
+    /// A flush failure returns before goodbye, exactly like `shutdown`.
+    pub async fn detach(&mut self) -> Result<(), String> {
         self.flush().await?;
         let request_id = self.take_request_id();
         let bytes = crate::encode_frame(
