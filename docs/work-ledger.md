@@ -2393,3 +2393,17 @@ PTY probe; this is targeted evidence, not a clean release gate. The earlier
 shutdown-timeout description was premature: cleanup obscured earlier UI
 assertion failures. Final union PTYs, colour integration and the full v0.1.6
 gate remain pending; no shutdown fix or release acceptance is claimed here.
+
+
+The owner then completed the full 16-test union-worker suite, targeted clippy,
+and both actual union PTYs at `fbcb624`. Consolidated `1d37cbf` has an identical
+Git tree; its worker source/tests are byte-identical to the integrated repair.
+The remaining two PTY files were adopted from that checkpoint. They select the
+actual enriched inputs, verify full restored membership and original stable
+IDs, and retain normal shutdown assertions. Both PTYs exited zero, including
+UInt64 keys above f64 precision, live append, rejected-candidate rollback,
+raw-namesake rejection, slash captures and long-prefix discrimination.
+Evidence: `lvu-muse-union-logs/final-both-pty-fbcb624b1e14fc8734564c8d0f252c95a34e50aa-20260910.log`
+and `final-rust-fbcb624b1e14fc8734564c8d0f252c95a34e50aa-20260910.log`.
+Validated app SHA256: `901e58205e6a52ac97bef6b507ce883c5a63e33abffc60760352501ccd5cbe51`.
+The combined primary colour integration and release gate are still pending.

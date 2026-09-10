@@ -37,11 +37,23 @@ def switch_to(app, marker, *, exclude="Union of", attempts=8):
     raise AssertionError((f"view containing {marker!r} was not found", app.text()))
 
 
+def switch_to_enriched(app, marker, attempts=10):
+    """Select the derived view, not its raw input with the same visible row."""
+    for _ in range(attempts):
+        app.drain()
+        text = app.text()
+        if marker in text and "› Enriched" in text:
+            return text
+        app.send(b"]")
+        time.sleep(0.12)
+    raise AssertionError((f"Enriched view containing {marker!r} was not found", app.text()))
+
+
 def switch_to_union(app, marker, attempts=10):
     for _ in range(attempts):
         app.drain()
         text = app.text()
-        if "Union of" in text and marker in text:
+        if "› Union of" in text and marker in text:
             return text
         app.send(b"]")
         time.sleep(0.12)
@@ -87,6 +99,10 @@ def union_stable_id(app, marker, restored_markers):
     )
     app.send(b"\x1b")
     wait_closed(app, "┌ Filter", "identity search closed")
+    # A newly published union has no implicit row cursor. Select the first
+    # (and only) narrowed match before asking Details for its stable identity.
+    app.send(b"g")
+    app.settle()
     stable_id = selected_stable_id(app, marker)
 
     app.send(b"/")
@@ -118,12 +134,29 @@ def select_field(app, field):
 
 def choose_both_views(app):
     app.wait_for("┌ Union views")
-    app.send(b"\x1b[B")
-    app.send(b" ")
-    app.wait_until(
-        lambda text: "2 of " in text and "views selected" in text,
+    text = app.text()
+    for row, line in enumerate(text.splitlines()):
+        column = line.find("[ ] Enriched")
+        if column >= 0:
+            # Candidate ordering may change while restored views settle. Click
+            # the actual rendered unchecked derived row so geometry and input
+            # identity agree instead of relying on a stale arrow offset.
+            app.send(
+                (
+                    f"\x1b[<0;{column + 2};{row + 1}M"
+                    f"\x1b[<0;{column + 2};{row + 1}m"
+                ).encode()
+            )
+            break
+    else:
+        raise AssertionError(("no unchecked Enriched union input is visible", text))
+    selected = app.wait_until(
+        lambda text: re.search(r"\b2 of \d+ views selected\b", text) is not None,
         "both existing views selected",
     )
+    selected_lines = [line for line in selected.splitlines() if "[x]" in line]
+    assert len(selected_lines) == 2, selected
+    assert all("Enriched" in line for line in selected_lines), selected
 
 
 def create_from_selected_key(app, field="request_key"):
@@ -159,11 +192,13 @@ def numeric_restart_live_and_namesake(binary):
         try:
             switch_to(app, "api-selected")
             add_enrichment(app, "request_key = pl.col('api_id').cast(pl.UInt64)")
+            switch_to_enriched(app, "api-selected")
             api_origin_id = selected_stable_id(app, "api-selected")
             switch_to(app, "worker-selected")
             add_enrichment(app, "request_key = pl.col('worker_id').cast(pl.UInt64)")
+            switch_to_enriched(app, "worker-selected")
             worker_origin_id = selected_stable_id(app, "worker-selected")
-            switch_to(app, "api-selected")
+            switch_to_enriched(app, "api-selected")
             create_from_selected_key(app)
 
             merged = app.wait_until(
@@ -214,13 +249,17 @@ def numeric_restart_live_and_namesake(binary):
             stop(app)
             app = PtyApp(binary, args, width=160, height=36, cwd=root, environment=env)
             switch_to_union(app, "live-match")
-            app.wait_until(
-                lambda text: "Union of" in text and "worker-selected" in text,
-                "persisted exact-key union restored",
+            restored = app.wait_until(
+                lambda text: "› Union of" in text
+                and "api-selected" in text
+                and "worker-selected" in text
+                and "live-match" in text
+                and "api-other" not in text
+                and "worker-other" not in text
+                and "live-other" not in text,
+                "persisted exact-key union restored after its enrichments",
                 timeout=25,
             )
-            restored = app.text()
-            assert "api-other" not in restored and "live-other" not in restored, restored
             assert union_stable_id(
                 app, "api-selected", ("api-selected", "worker-selected", "live-match")
             ) == api_origin_id
@@ -231,7 +270,7 @@ def numeric_restart_live_and_namesake(binary):
             # Remove the origin enrichment, leaving the raw namesake in the
             # source. Fields may still show that raw column, but structural
             # accepted-output provenance must reject using it as a shared key.
-            switch_to(app, "api-selected")
+            switch_to_enriched(app, "api-selected")
             app.send(b"e")
             app.wait_for("Steps")
             app.send(b"r")
@@ -253,7 +292,12 @@ def numeric_restart_live_and_namesake(binary):
             stop(app)
         finally:
             if app.process.poll() is None:
-                stop(app)
+                if sys.exc_info()[0] is None:
+                    stop(app)
+                else:
+                    app.process.kill()
+                    app.process.wait(timeout=5)
+                    app.close()
 
 
 def slash_and_long_same_prefix(binary):
@@ -277,9 +321,11 @@ def slash_and_long_same_prefix(binary):
         try:
             switch_to(app, "api-selected")
             add_enrichment(app, pattern)
+            switch_to_enriched(app, "api-selected")
             switch_to(app, "worker-selected")
             add_enrichment(app, pattern)
-            switch_to(app, "api-selected")
+            switch_to_enriched(app, "worker-selected")
+            switch_to_enriched(app, "api-selected")
             create_from_selected_key(app)
             merged = app.wait_until(
                 lambda text: "Union of" in text
@@ -294,7 +340,12 @@ def slash_and_long_same_prefix(binary):
             stop(app)
         finally:
             if app.process.poll() is None:
-                stop(app)
+                if sys.exc_info()[0] is None:
+                    stop(app)
+                else:
+                    app.process.kill()
+                    app.process.wait(timeout=5)
+                    app.close()
 
 
 def run(binary):

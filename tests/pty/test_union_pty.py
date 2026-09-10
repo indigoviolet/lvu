@@ -162,18 +162,31 @@ def run(binary):
             assert '"svc":"worker","n":0' in refreshed, refreshed
 
             # --- Grouping applies over the union without losing rows. ------
+            # These inputs are intentionally raw-only, so the default native
+            # Run rule has no accepted enrichment column to select. Exercise
+            # the segmented control and apply explicit Legacy Auto instead;
+            # the worker tests discriminate native Run/Filter flag execution.
             # Editors stay open on Apply by design, so close explicitly: an
             # open editor would swallow the quit keypress as text.
             app.send(b"m")
             app.wait_for("┌ Multiline grouping")
+            app.send(b"\t")
+            app.send(b"\x1b[C" * 2)
+            app.wait_for("Auto — conservative multiline detection")
+            app.send(b"\t" * 2)
             app.send(b"\r")
+            app.wait_until(
+                lambda text: "Applied" in text and "Legacy Auto" in text,
+                "legacy grouping is accepted",
+                timeout=10,
+            )
+            app.send(b"\x1b")
+            wait_closed(app, "┌ Multiline grouping", "grouping editor closed")
             app.wait_until(
                 lambda text: '"svc":"api"' in text and '"svc":"worker"' in text,
                 "grouping keeps the merged rows",
                 timeout=10,
             )
-            app.send(b"\x1b")
-            wait_closed(app, "┌ Multiline grouping", "grouping editor closed")
 
             # --- The union survives a restart through persisted state. -----
             assert_no_modal(app)
