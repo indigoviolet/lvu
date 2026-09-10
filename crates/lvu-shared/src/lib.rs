@@ -20,6 +20,8 @@ pub mod frame;
 pub mod lifetime;
 pub mod protocol;
 pub mod spawn;
+pub mod tail;
+pub mod worker;
 
 pub use election::{
     ElectionError, OwnerGuard, ViewerGuard, WorkerPaths, live_viewers, owner_is_live,
@@ -28,10 +30,17 @@ pub use election::{
 pub use frame::{FrameDecoder, FrameError, decode_frame, encode_frame};
 pub use lifetime::{ViewerAdmission, ViewerSet};
 pub use protocol::{
-    PROTOCOL_VERSION, ProtocolError, SourceSummary, StoreEvent, StoreMethod, WorkerEvent,
-    WorkerRequest,
+    PROTOCOL_VERSION, ProtocolError, RequestMeta, SourceSummary, StoreEvent, StoreMethod,
+    SuggestionContextShape, SuggestionOutcomeShape, WorkerEvent, WorkerRequest,
+    base64_decode_bounded, base64_encode, check_stdin_chunk_base64, check_stdin_open,
+    check_store_size, decoded_base64_len, validate_inbound,
 };
 pub use spawn::{SpawnSpec, WORKER_CHILD_FLAG, exit};
+pub use tail::{Continuity, FileIdentity, FileJournalTail, RecordAnchor, TailStatus, classify};
+pub use worker::{
+    AdmissionHook, AdmissionVerdict, SessionSet, StartedOutcome, StdinNoteError, WorkerConfig,
+    WorkerService, load_session_set, store_session_set,
+};
 
 /// Largest single control-channel message, including framing. Bulk data
 /// (journal bytes, index pages, snapshots) never flows here; it stays in
@@ -48,6 +57,12 @@ pub const MAX_STDIN_CHUNK_BYTES: usize = 64 * 1024;
 /// admission beyond it is refused with an explicit error, never queued.
 pub const MAX_VIEWERS: usize = 16;
 
+/// Largest single socket read at the transport layer. Control messages are
+/// at most `MAX_CONTROL_MESSAGE_BYTES`; reads stay well under it so one
+/// `recv` never balloons the connection buffer, while the frame decoder
+/// reassembles split messages across reads.
+pub const READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// How long a spawning window waits for the worker socket handshake before
 /// reporting failure explicitly.
 pub const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -55,3 +70,13 @@ pub const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Grace after worker start (and after the last detach) before zero-viewer
 /// shutdown may fire, so spawn-attach races and quick relaunches do not flap.
 pub const WORKER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Duplex buffer per forwarded stdin stream in bytes. Writers await space
+/// instead of growing memory; worst case per stream is this plus one
+/// in-flight chunk, with streams bounded by the source cap.
+pub const STDIN_BUFFER_BYTES: usize = 8 * 64 * 1024;
+
+/// Stdin credit window in chunks: the sender must not exceed the last ack
+/// plus this many chunks. Enforcement is exact sequence order plus the
+/// bounded duplex buffer above.
+pub const STDIN_CREDIT_WINDOW: u32 = 8;

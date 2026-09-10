@@ -1785,9 +1785,14 @@ name = "lvu-shared"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "lvu-core",
+ "lvu-ingest",
+ "lvu-memory",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

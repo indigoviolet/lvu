@@ -1212,7 +1212,7 @@ impl PresentationState {
 ///
 /// This is never derived from the display name: a user may rename any view, and
 /// a rename must not change whether its definition can be edited.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ViewRole {
     /// The source's permanent unfiltered view. Its definition is fixed; its
     /// presentation is not.
@@ -1240,7 +1240,7 @@ impl ViewRole {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkingView {
     pub id: ViewId,
     pub source_id: SourceId,
@@ -1256,7 +1256,7 @@ pub struct WorkingView {
     pub version: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceMetadata {
     pub definition: SourceDefinition,
     pub project: Option<String>,
@@ -1266,7 +1266,7 @@ pub struct SourceMetadata {
     pub missing: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecipeCandidate {
     pub recipe_id: RecipeId,
     pub revision_id: Uuid,
@@ -1282,7 +1282,7 @@ pub struct RecipeRevisionSummary {
     pub content_hash: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SuggestionOutcome {
     Accepted,
     Rejected,

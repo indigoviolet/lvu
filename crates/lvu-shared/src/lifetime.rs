@@ -24,12 +24,14 @@ pub enum ViewerAdmission {
 /// when no viewers remain past the grace deadline, or immediately on an
 /// explicit shutdown request. Any hello cancels a pending drain, so a quick
 /// relaunch never flaps a running worker.
+//
+// Explicit shutdown lives one level up (`WorkerService` flag): this set
+// only decides drain timing, so there is exactly one shutdown authority.
 #[derive(Clone, Debug)]
 pub struct ViewerSet {
     viewers: BTreeSet<u32>,
     grace: Duration,
     drain_until: Option<Instant>,
-    shutdown_requested: bool,
 }
 
 impl ViewerSet {
@@ -38,7 +40,6 @@ impl ViewerSet {
             viewers: BTreeSet::new(),
             grace,
             drain_until: Some(now + grace),
-            shutdown_requested: false,
         }
     }
 
@@ -66,12 +67,6 @@ impl ViewerSet {
         }
     }
 
-    /// An operator/shutdown request: stop at the next decision point
-    /// regardless of viewers.
-    pub fn request_shutdown(&mut self) {
-        self.shutdown_requested = true;
-    }
-
     pub fn viewer_count(&self) -> usize {
         self.viewers.len()
     }
@@ -80,12 +75,8 @@ impl ViewerSet {
         self.drain_until.is_some()
     }
 
-    /// True when the worker should shut down cleanly now: explicit request,
-    /// or no viewers past the grace deadline.
+    /// True when no viewers remain past the grace deadline.
     pub fn should_shutdown(&self, now: Instant) -> bool {
-        if self.shutdown_requested {
-            return true;
-        }
         match self.drain_until {
             Some(deadline) => self.viewers.is_empty() && now >= deadline,
             None => false,
@@ -128,15 +119,6 @@ mod tests {
         assert!(!set.draining());
         assert_eq!(set.viewer_count(), 1);
         assert!(!set.should_shutdown(start + Duration::from_secs(3600)));
-    }
-
-    #[test]
-    fn explicit_shutdown_wins_over_viewers() {
-        let start = Instant::now();
-        let mut set = ViewerSet::new(start, Duration::from_secs(10));
-        assert_eq!(set.hello(100), ViewerAdmission::Admitted);
-        set.request_shutdown();
-        assert!(set.should_shutdown(start));
     }
 
     #[test]

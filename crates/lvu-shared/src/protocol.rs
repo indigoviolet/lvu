@@ -13,6 +13,7 @@
 //! else increments [`PROTOCOL_VERSION`] and refuses older peers.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Wire protocol version. A window refuses a worker on mismatch with an
 /// explicit error rather than guessing field meanings.
@@ -71,7 +72,10 @@ pub enum WorkerRequest {
 }
 
 /// Lifecycle and acquisition traffic: worker to window (replies and events).
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// `Eq` is absent deliberately: embedded store payloads (`WorkingView`)
+/// are `PartialEq`-only, and equality across the wire is never required —
+/// correlation travels in `request_id`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum WorkerEvent {
     Welcome {
@@ -83,6 +87,7 @@ pub enum WorkerEvent {
     Started {
         request_id: String,
         source_id: String,
+        journal_path: String,
     },
     Refused {
         request_id: String,
@@ -108,6 +113,10 @@ pub enum WorkerEvent {
         ack_seq: u64,
         window: u32,
     },
+    /// One mediated store reply, carrying a `StoreEvent` verbatim. Store
+    /// traffic shares the framed connection; each reply still correlates
+    /// by the inner event's own `request_id`.
+    Store(StoreEvent),
     /// Accept a forwarded stdin stream: binds `{source_id}` to this
     /// connection. A replacement worker never inherits these bindings: after
     /// a crash the pipe is gone, and a new attachment needs a fresh source
@@ -120,108 +129,273 @@ pub enum WorkerEvent {
 }
 
 /// Sidebar-grade source presence: identity and health, never bulk data.
+/// `journal_path` lets a window open a read-only tail without knowing the
+/// capture layout; it is derived by the worker that owns the layout.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceSummary {
     pub id: String,
     pub name: String,
     pub kind: String,
     pub health: String,
+    pub journal_path: String,
 }
 
 /// Mediated durable writes: window to worker. Each method mirrors one
-/// `memory::Command` variant 1:1 (see `crates/lvu-app/src/memory.rs`):
+/// `memory::Command` variant 1:1 (see `crates/lvu-app/src/memory.rs`), and
+/// every payload is a canonical DTO, never a remodel:
 ///
-/// - `load` → `Command::Load(Box<SourceDefinition>, ViewId)`
-/// - `save` → `Command::Save(Box<SaveRequest>)` with its
-///   `{sequence, definition, view_id, state}` — the worker keeps the
-///   existing newest-sequence guard, so a stale windowed write is refused
-///   exactly as a stale in-process write is today. Windows restoring the
-///   same view UUID are therefore NOT disjoint: same UUID + newer sequence
-///   wins, older loses with an explicit stale failure, and fork identity
-///   travels in the request for the UI to explain.
-/// - `create_derived_view` → `Command::CreateDerivedView` (reply gates
-///   visibility, unchanged)
-/// - `recent` / `list_recipes` / `recipe_history` → read-only queries
-/// - `save_recipe` → `Command::SaveRecipe` with its `expected_revision`
-///   hesitation, preserved verbatim
-/// - `import_recipe` / `export_recipe` → paths are absolute; the worker
-///   reads/writes them directly
-/// - `record_suggestion` → `Command::RecordSuggestion(RecipeOutcome)`
-/// - `flush` → `Command::Flush` with a bounded reply wait
+/// - `lvu_core::{SourceDefinition, SourceId, ViewId, RecipeId}` and `Uuid`
+///   transfer directly (all `Serialize`).
+/// - `lvu_memory::{WorkingView, SourceMetadata, RecipeFile, SavedRecipe,
+///   RecipeCandidate, SuggestionOutcome}` transfer directly.
+/// - `RequestMeta` is field-identical to `lvu::RecipeRequestMeta` and
+///   `SuggestionOutcomeShape` to `lvu::RecipeOutcome`; both collapse to the
+///   canonical types the moment union adds two `Serialize` derives (no
+///   semantic gap: pure routing scalars, documented here, version-gated).
+/// - `SaveRequest` travels decomposed (`sequence` + `definition` +
+///   `view_id` + `state: WorkingView` + `expected_version`); the wiring
+///   constructs the existing struct 1:1, so no second model exists.
+/// - `SuggestionContext` travels decomposed as native query parameters
+///   (`source`/`project`/`command`/`fields`).
 ///
-/// Payloads are the DTO JSON shapes; replies mirror `memory::Event`
-/// (`Loaded`/`Saved`/`RecipeSaved`/… with their sequence/revision echoes).
-/// Command-enrichment attempt stores and settings writes are explicitly out
-/// of this table until their owners trace a mapping: attempts ride the
-/// SQLite attempt reservation path (`command_execution.rs`), settings ride
-/// the XDG settings save, and neither is smuggled through these methods.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Every method carries `window_id`: the worker keys its newest/ack state
+/// by `(window_id, view_id)`, never by view alone, because sequences reset
+/// per client and two windows routinely share a view UUID. Cross-window
+/// authority is the persisted row version (see `expected_version`); a stale
+/// writer loses with the current version echoed, never silently and never
+/// by last-writer-wins.
+///
+/// Byte budget: the encoded method must fit `MAX_CONTROL_MESSAGE_BYTES`
+/// (see `check_store_size`, enforced on send and receipt). An oversize but
+/// otherwise valid `WorkingView` is refused explicitly, never truncated;
+/// chunked transfer is a follow-up, not a silent fallback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum StoreMethod {
     Load {
         request_id: String,
-        definition: serde_json::Value,
-        view_id: String,
+        window_id: String,
+        definition: lvu_core::SourceDefinition,
+        view_id: lvu_core::ViewId,
     },
     Save {
         request_id: String,
-        save: serde_json::Value,
+        window_id: String,
+        sequence: u64,
+        definition: lvu_core::SourceDefinition,
+        view_id: lvu_core::ViewId,
+        state: lvu_memory::WorkingView,
+        expected_version: Option<u64>,
     },
     CreateDerivedView {
         request_id: String,
-        save: serde_json::Value,
+        window_id: String,
+        sequence: u64,
+        definition: lvu_core::SourceDefinition,
+        view_id: lvu_core::ViewId,
+        state: lvu_memory::WorkingView,
     },
     Recent {
         request_id: String,
+        window_id: String,
     },
     ListRecipes {
         request_id: String,
-        meta: serde_json::Value,
-        context: Option<serde_json::Value>,
+        window_id: String,
+        meta: RequestMeta,
+        context: Option<SuggestionContextShape>,
     },
     RecipeHistory {
         request_id: String,
-        meta: serde_json::Value,
-        recipe_id: String,
+        window_id: String,
+        meta: RequestMeta,
+        recipe_id: lvu_core::RecipeId,
     },
     SaveRecipe {
         request_id: String,
-        meta: serde_json::Value,
-        recipe: serde_json::Value,
-        expected_revision: Option<String>,
+        window_id: String,
+        meta: RequestMeta,
+        recipe: lvu_memory::RecipeFile,
+        expected_revision: Option<uuid::Uuid>,
+        context: Option<SuggestionContextShape>,
     },
     ImportRecipe {
         request_id: String,
-        meta: serde_json::Value,
-        path: String,
+        window_id: String,
+        meta: RequestMeta,
+        path: PathBuf,
     },
     ExportRecipe {
         request_id: String,
-        meta: serde_json::Value,
-        recipe_id: String,
-        revision: String,
-        path: String,
+        window_id: String,
+        meta: RequestMeta,
+        recipe_id: lvu_core::RecipeId,
+        revision: uuid::Uuid,
+        path: PathBuf,
     },
     RecordSuggestion {
         request_id: String,
-        outcome: serde_json::Value,
+        window_id: String,
+        outcome: SuggestionOutcomeShape,
     },
     Flush {
         request_id: String,
+        window_id: String,
     },
 }
 
-/// Mediated-write replies: worker to window. `{request_id}` echoes; sequence
-/// and revision echoes preserve the existing stale/conflict semantics so a
-/// losing window learns exactly what won.
+/// Field-identical to `lvu::RecipeRequestMeta`; collapses to it when union
+/// adds `Serialize`/`Deserialize` there. Pure routing scalars, no semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RequestMeta {
+    pub request_id: u64,
+    pub dialog_id: u64,
+    pub dialog_revision: u64,
+}
+
+/// Field-identical to `memory::SuggestionContext` (`lvu-app/src/memory.rs`);
+/// native query parameters, so no DTO import is needed to route them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SuggestionContextShape {
+    pub source: lvu_core::SourceId,
+    pub project: Option<String>,
+    pub command: Option<String>,
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+/// Field-identical to `lvu::RecipeOutcome`; same collapse note as above.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
+pub struct SuggestionOutcomeShape {
+    pub source_id: String,
+    pub recipe_id: String,
+    pub revision: String,
+    pub accepted: bool,
+}
+
+/// Mediated-write replies: worker to window, mirroring `memory::Event` 1:1
+/// (`crates/lvu-app/src/memory.rs`). `{request_id}` echoes for routing;
+/// sequence and version echoes preserve the existing stale/conflict
+/// semantics so a losing window learns exactly what won: a `SaveFailed`
+/// carries the currently committed version, and the window keeps its local
+/// draft, surfaces the conflict, and retries only after an explicit user
+/// rebase — never a silent reload-overwrite, never an unbounded retry loop.
+///
+/// Wire shape is deliberately *externally* tagged (`{"Saved": {...}}`):
+/// these events always travel inside `WorkerEvent::Store`, which is itself
+/// internally tagged on `event`, and two internal tags collide on that key
+/// (found by test: the inner `saved` overwrote the outer `store`).
+/// Consumers match the outer envelope first, then this enum.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoreEvent {
-    StoreReply {
+    Loaded {
         request_id: String,
-        ok: bool,
-        payload: serde_json::Value,
+        source_id: lvu_core::SourceId,
+        view_id: lvu_core::ViewId,
+        views: Vec<lvu_memory::WorkingView>,
     },
+    LoadFailed {
+        request_id: String,
+        source_id: lvu_core::SourceId,
+        view_id: lvu_core::ViewId,
+        reason: String,
+    },
+    Saved {
+        request_id: String,
+        source_id: lvu_core::SourceId,
+        view_id: lvu_core::ViewId,
+        sequence: u64,
+        version: u64,
+    },
+    SaveFailed {
+        request_id: String,
+        source_id: lvu_core::SourceId,
+        view_id: lvu_core::ViewId,
+        sequence: u64,
+        reason: String,
+        current_version: Option<u64>,
+    },
+    DerivedViewCreated {
+        request_id: String,
+        view_id: lvu_core::ViewId,
+        error: Option<String>,
+    },
+    Recent {
+        request_id: String,
+        sources: Vec<lvu_memory::SourceMetadata>,
+    },
+    RecentFailed {
+        request_id: String,
+        reason: String,
+    },
+    Recipes {
+        request_id: String,
+        meta: RequestMeta,
+        recipes: Vec<(lvu_memory::RecipeFile, String)>,
+        candidates: Vec<lvu_memory::RecipeCandidate>,
+    },
+    RecipeHistory {
+        request_id: String,
+        meta: RequestMeta,
+        revisions: Vec<lvu_memory::RecipeFile>,
+    },
+    RecipeSaved {
+        request_id: String,
+        meta: RequestMeta,
+        saved: lvu_memory::SavedRecipe,
+    },
+    RecipeExported {
+        request_id: String,
+        meta: RequestMeta,
+        saved: lvu_memory::SavedRecipe,
+    },
+    RecipeFailed {
+        request_id: String,
+        meta: RequestMeta,
+        reason: String,
+    },
+    SuggestionRecorded {
+        request_id: String,
+    },
+    SuggestionFailed {
+        request_id: String,
+        reason: String,
+    },
+    Flushed {
+        request_id: String,
+    },
+    Fatal {
+        reason: String,
+    },
+}
+
+/// Enforce the transport byte budget on an encoded store method, on send
+/// *and* receipt. A valid but oversize value (a huge `WorkingView` draft)
+/// is refused explicitly with its size, never truncated; chunked transfer
+/// is a follow-up, not a silent fallback.
+pub fn check_store_size(method: &StoreMethod) -> Result<(), ProtocolError> {
+    let bytes = serde_json::to_vec(method)
+        .map_err(|error| ProtocolError::Unserializable(error.to_string()))?;
+    if bytes.len() + 1 > crate::MAX_CONTROL_MESSAGE_BYTES {
+        return Err(ProtocolError::StoreTooLarge {
+            bytes: bytes.len() + 1,
+        });
+    }
+    Ok(())
+}
+
+/// Receive-boundary validation for inbound control requests: every
+/// `StdinChunk` payload is base64- and size-checked, even though the
+/// constructor checks first — a peer may not run our constructors. Windows
+/// apply `check_stdin_open` to inbound `StdinOpen` the same way. A violation
+/// drops the connection; callers run these before dispatching.
+pub fn validate_inbound(request: &WorkerRequest) -> Result<(), ProtocolError> {
+    match request {
+        WorkerRequest::StdinChunk { base64, .. } => {
+            check_stdin_chunk_base64(base64)?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Failures validating control payloads before they are admitted. Endpoints
@@ -232,6 +406,8 @@ pub enum ProtocolError {
     BadBase64(String),
     ChunkTooLarge { decoded: usize },
     InvalidChunkSize(u32),
+    StoreTooLarge { bytes: usize },
+    Unserializable(String),
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -248,6 +424,14 @@ impl std::fmt::Display for ProtocolError {
                 "stdin chunk size {size} exceeds {}",
                 crate::MAX_STDIN_CHUNK_BYTES
             ),
+            ProtocolError::StoreTooLarge { bytes } => write!(
+                formatter,
+                "store command is {bytes} bytes; limit is {}",
+                crate::MAX_CONTROL_MESSAGE_BYTES
+            ),
+            ProtocolError::Unserializable(reason) => {
+                write!(formatter, "store command failed to serialize: {reason}")
+            }
         }
     }
 }
@@ -313,6 +497,46 @@ pub fn decoded_base64_len(encoded: &str) -> Result<usize, ProtocolError> {
         ));
     }
     Ok(bytes.len() / 4 * 3 - padding)
+}
+
+/// Decode base64 that [`decoded_base64_len`] already measured: spelling and
+/// size validated, so this only materializes bytes. Returns `None` on any
+/// inconsistency rather than trusting the precomputed length.
+pub fn base64_decode_bounded(encoded: &str, decoded: usize) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = encoded.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(decoded);
+    let (quanta, _) = bytes.as_chunks::<4>();
+    for quantum in quanta {
+        let mut triple = 0u32;
+        let mut padding = 0usize;
+        for byte in quantum {
+            triple <<= 6;
+            if *byte == b'=' {
+                padding += 1;
+            } else {
+                let value = ALPHABET.iter().position(|candidate| candidate == byte)?;
+                if padding > 0 {
+                    return None;
+                }
+                triple |= value as u32;
+            }
+        }
+        if padding > 2 {
+            return None;
+        }
+        out.push((triple >> 16) as u8);
+        if padding < 2 {
+            out.push((triple >> 8) as u8);
+        }
+        if padding == 0 {
+            out.push(triple as u8);
+        }
+    }
+    (out.len() == decoded).then_some(out)
 }
 
 /// Validate an inbound `StdinChunk` payload: well-formed base64 decoding to
@@ -381,26 +605,131 @@ mod tests {
         assert_eq!(back, event);
     }
 
+    fn test_working_view() -> lvu_memory::WorkingView {
+        lvu_memory::WorkingView {
+            id: lvu_core::ViewId(uuid::Uuid::from_u128(1)),
+            source_id: lvu_core::SourceId(uuid::Uuid::from_u128(2)),
+            name: "All events".into(),
+            role: lvu_memory::ViewRole::Derived,
+            applied_revision_id: None,
+            applied_search: String::new(),
+            search_draft: None,
+            applied_advanced_filter: None,
+            advanced_filter_draft: None,
+            navigation: lvu_memory::NavigationState {
+                selected: None,
+                anchor: None,
+                follow: true,
+            },
+            presentation: lvu_memory::PresentationState::default(),
+            version: 3,
+        }
+    }
+
+    fn test_definition() -> lvu_core::SourceDefinition {
+        lvu_core::SourceDefinition {
+            schema_version: 1,
+            id: lvu_core::SourceId(uuid::Uuid::from_u128(9)),
+            name: "fixture".into(),
+            acquisition: lvu_core::Acquisition::File {
+                path: "/tmp/fixture.log".into(),
+                follow: true,
+            },
+            identity_hints: Default::default(),
+            retention: None,
+        }
+    }
+
     #[test]
     fn store_and_stdin_shapes_roundtrip() {
         let save = StoreMethod::Save {
             request_id: "r-2".into(),
-            save: serde_json::json!({"sequence": 7, "view_id": "v-1"}),
+            window_id: "w-1".into(),
+            sequence: 7,
+            definition: test_definition(),
+            view_id: lvu_core::ViewId(uuid::Uuid::from_u128(1)),
+            state: test_working_view(),
+            expected_version: Some(3),
         };
+        check_store_size(&save).unwrap();
         let wire = encode_frame(&serde_json::to_value(&save).unwrap()).unwrap();
         let back: StoreMethod =
             serde_json::from_value(decode_frame(&wire[..wire.len() - 1]).unwrap()).unwrap();
         assert_eq!(back, save);
+        let saved = StoreEvent::Saved {
+            request_id: "r-2".into(),
+            source_id: lvu_core::SourceId(uuid::Uuid::from_u128(2)),
+            view_id: lvu_core::ViewId(uuid::Uuid::from_u128(1)),
+            sequence: 7,
+            version: 4,
+        };
+        let wire = encode_frame(&serde_json::to_value(&saved).unwrap()).unwrap();
+        let back: StoreEvent =
+            serde_json::from_value(decode_frame(&wire[..wire.len() - 1]).unwrap()).unwrap();
+        assert_eq!(back, saved);
         let chunk = WorkerRequest::StdinChunk {
             request_id: "r-3".into(),
             source_id: "s-1".into(),
             seq: 41,
             base64: "aGk=".into(),
         };
+        validate_inbound(&chunk).unwrap();
         let wire = encode_frame(&serde_json::to_value(&chunk).unwrap()).unwrap();
         let back: WorkerRequest =
             serde_json::from_value(decode_frame(&wire[..wire.len() - 1]).unwrap()).unwrap();
         assert_eq!(back, chunk);
+    }
+
+    #[test]
+    fn receive_boundary_rejects_hostile_payloads_despite_constructors() {
+        // A peer need not run our constructors: oversized base64 and
+        // malformed spelling fail here, before dispatch.
+        let hostile = WorkerRequest::StdinChunk {
+            request_id: "r-9".into(),
+            source_id: "s-9".into(),
+            seq: 0,
+            base64: "A".repeat(192 * 1024),
+        };
+        assert!(matches!(
+            validate_inbound(&hostile),
+            Err(ProtocolError::ChunkTooLarge { .. })
+        ));
+        let malformed = WorkerRequest::StdinChunk {
+            request_id: "r-9".into(),
+            source_id: "s-9".into(),
+            seq: 0,
+            base64: "!!!not-base64!!!".into(),
+        };
+        assert!(matches!(
+            validate_inbound(&malformed),
+            Err(ProtocolError::BadBase64(_))
+        ));
+        let benign = WorkerRequest::Hello {
+            request_id: "r-9".into(),
+            window_pid: 1,
+            window_id: "w".into(),
+            protocol: PROTOCOL_VERSION,
+        };
+        validate_inbound(&benign).unwrap();
+    }
+
+    #[test]
+    fn oversize_valid_working_view_is_refused_never_truncated() {
+        let mut view = test_working_view();
+        view.search_draft = Some("x".repeat(300 * 1024));
+        let save = StoreMethod::Save {
+            request_id: "r-4".into(),
+            window_id: "w-1".into(),
+            sequence: 1,
+            definition: test_definition(),
+            view_id: lvu_core::ViewId(uuid::Uuid::from_u128(1)),
+            state: view,
+            expected_version: Some(0),
+        };
+        assert!(matches!(
+            check_store_size(&save),
+            Err(ProtocolError::StoreTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -453,5 +782,27 @@ mod tests {
             check_stdin_chunk_base64(&encoded),
             Err(ProtocolError::ChunkTooLarge { decoded: 147_456 })
         ));
+    }
+
+    #[test]
+    fn decode_materializes_only_pre_measured_bytes() {
+        for (raw, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            let measured = decoded_base64_len(encoded).unwrap();
+            assert_eq!(measured, raw.len());
+            assert_eq!(
+                base64_decode_bounded(encoded, measured).unwrap(),
+                raw.as_bytes()
+            );
+        }
+        // Length mismatch against the precomputed size refuses rather than
+        // truncating or padding.
+        assert_eq!(base64_decode_bounded("Zg==", 99), None);
+        assert_eq!(base64_decode_bounded("!!!", 0), None);
     }
 }
