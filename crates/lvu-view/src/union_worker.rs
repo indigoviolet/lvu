@@ -180,6 +180,11 @@ struct UnionDependencyAttempt {
     filter: UnionFilterSpec,
     registered_sources: Vec<SourceId>,
     source_fences: Vec<(String, Vec<super::union::UnionSourceFence>)>,
+    /// A definition fence can stay unchanged while its accepted membership
+    /// finishes publishing during restore. Include that publication movement
+    /// so an attempt against the temporary raw carrier is not memoized after
+    /// the derived frame becomes authoritative.
+    input_publication_revisions: Vec<(String, u64)>,
 }
 
 impl UnionViewState {
@@ -226,6 +231,7 @@ fn dependency_attempt(
         .clone();
     let mut current_inputs = Vec::with_capacity(inputs.len());
     let mut source_fences = Vec::with_capacity(inputs.len());
+    let mut input_publication_revisions = Vec::with_capacity(inputs.len());
     for input in inputs {
         let view = shared.views.get(&input.view_id)?;
         current_inputs.push(if refresh_input_fences {
@@ -238,12 +244,14 @@ fn dependency_attempt(
             input.clone()
         });
         source_fences.push((input.view_id.clone(), current_source_fence(shared, view)));
+        input_publication_revisions.push((input.view_id.clone(), view.provider_revision));
     }
     Some(UnionDependencyAttempt {
         inputs: current_inputs,
         filter: filter.clone(),
         registered_sources,
         source_fences,
+        input_publication_revisions,
     })
 }
 
@@ -401,14 +409,27 @@ impl super::NativeViewAdapter {
     pub fn union_needs_refresh(&self, union_view_id: &str) -> Option<bool> {
         let shared = self.shared.lock().expect("view state poisoned");
         let state = shared.union_views.get(union_view_id)?;
-        if state.published_revision == 0 {
+        // Before a first successful publication, retry the definition whose
+        // failure state the worker retained. This is still dependency-driven:
+        // terminal failures remain quiet, while retryable failures obey their
+        // bounded backoff and publish-readiness movement invalidates it.
+        let attempted = (state.published_revision == 0)
+            .then(|| {
+                state
+                    .retry_attempt
+                    .as_ref()
+                    .or(state.rejected_attempt.as_ref())
+            })
+            .flatten();
+        let (inputs, filter) = attempted
+            .map(|attempt| (attempt.inputs.as_slice(), &attempt.filter))
+            .unwrap_or((&state.inputs, &state.published_filter));
+        if state.published_revision == 0 && attempted.is_none() {
             return Some(false);
         }
-        if state.inputs.len() != state.published_source_fences.len() {
-            return Some(true);
-        }
-        let mut needs_refresh = false;
-        for input in &state.inputs {
+        let mut needs_refresh =
+            state.published_revision == 0 || inputs.len() != state.published_source_fences.len();
+        for input in inputs {
             let Some(view) = shared.views.get(&input.view_id) else {
                 return Some(true);
             };
@@ -417,27 +438,23 @@ impl super::NativeViewAdapter {
             {
                 needs_refresh = true;
             }
-            let Some((_, published)) = state
-                .published_source_fences
-                .iter()
-                .find(|(view_id, _)| view_id == &input.view_id)
-            else {
-                return Some(true);
-            };
-            if &current_source_fence(&shared, view) != published {
-                needs_refresh = true;
+            if state.published_revision > 0 {
+                let Some((_, published)) = state
+                    .published_source_fences
+                    .iter()
+                    .find(|(view_id, _)| view_id == &input.view_id)
+                else {
+                    return Some(true);
+                };
+                if &current_source_fence(&shared, view) != published {
+                    needs_refresh = true;
+                }
             }
         }
         if !needs_refresh {
             return Some(false);
         }
-        let current = dependency_attempt(
-            &shared,
-            union_view_id,
-            &state.inputs,
-            &state.published_filter,
-            true,
-        );
+        let current = dependency_attempt(&shared, union_view_id, inputs, filter, true);
         if current.as_ref() == state.rejected_attempt.as_ref() {
             return Some(false);
         }

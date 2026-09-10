@@ -675,6 +675,69 @@ async fn transient_refresh_failure_retries_same_dependency_after_backoff() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_first_union_retries_after_inputs_publish_accepted_enrichments() {
+    let api_rows = b"{\"request_key\":\"raw-api-other\",\"api_id\":9007199254740992,\"msg\":\"api-other\"}\n{\"request_key\":\"raw-api-selected\",\"api_id\":9007199254740993,\"msg\":\"api-selected\"}\n";
+    let worker_rows = b"{\"request_key\":\"raw-worker-other\",\"worker_id\":9007199254740994,\"msg\":\"worker-other\"}\n{\"request_key\":\"raw-worker-selected\",\"worker_id\":9007199254740993,\"msg\":\"worker-selected\"}\n";
+    let (root, manager, api, worker, mut adapter) =
+        setup_raw_bytes_with_budget(8 * 1024 * 1024, api_rows, worker_rows).await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    let exact = ExactFieldConstraint::new(
+        "request_key",
+        ExactScalar::UnsignedInteger(9_007_199_254_740_993),
+    )
+    .unwrap();
+    let mut first = raw_candidate(1);
+    first.filter.exact_key = Some(exact.clone());
+    adapter.submit_union_candidate(first, &|_| None).unwrap();
+    let error = wait_union(&mut adapter, 1)
+        .unwrap()
+        .error
+        .expect("the temporary raw String column cannot satisfy a UInt64 key");
+    assert!(
+        error.contains("incompatible with unsigned integer"),
+        "{error}"
+    );
+
+    apply_slash_enrichment(
+        &mut adapter,
+        "raw-a",
+        "request_key = pl.col('api_id').cast(pl.UInt64)",
+    );
+    wait_applied(&mut adapter, 1).await;
+    apply_slash_enrichment(
+        &mut adapter,
+        "raw-b",
+        "request_key = pl.col('worker_id').cast(pl.UInt64)",
+    );
+    wait_applied(&mut adapter, 1).await;
+    assert_eq!(
+        adapter.union_needs_refresh("union"),
+        Some(true),
+        "accepted input publication invalidates the failed startup attempt"
+    );
+
+    let mut retry = raw_candidate(2);
+    for input in &mut retry.inputs {
+        input.accepted_revision = 1;
+        input.applied_generation = 1;
+    }
+    retry.filter.exact_key = Some(exact);
+    adapter.submit_union_candidate(retry, &|_| None).unwrap();
+    assert_eq!(wait_union(&mut adapter, 2).unwrap().error, None);
+    let rows = union_texts(&mut adapter);
+    assert_eq!(rows.len(), 2, "only the exact UInt64 matches publish");
+    assert!(rows.iter().any(|row| row.contains("api-selected")));
+    assert!(rows.iter().any(|row| row.contains("worker-selected")));
+    assert!(rows.iter().all(|row| !row.contains("other")));
+
+    adapter.shutdown();
+    manager.shutdown().await;
+    drop(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_rejects_input_source_set_drift_and_preserves_last_good() {
     let (root, manager, api, worker, mut adapter) = setup().await;
     adapter
