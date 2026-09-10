@@ -105,12 +105,13 @@ def add_ordered_rules(app: PtyApp) -> tuple[str, str]:
     app.send(b"critical")
     app.wait_for("severity = critical")
 
-    # Value -> Colour -> Add. New rules advance to the next palette colour,
-    # so the second overlapping classifier is observably lower precedence.
-    app.send(b"\t\t")
-    app.send(b"\r")
+    # Alt-A is the dialog's actual Add control mnemonic. New rules advance to
+    # the next palette colour, so the second overlapping classifier is
+    # observably lower precedence.
+    app.send(b"\x1ba")
     second_classifier = app.wait_until(
-        lambda text: "Column" in text
+        lambda text: "2 of 2" in text
+        and "Column" in text
         and "Value" in text
         and "‹ severity ›" in text,
         "second rule also binds the accepted severity output",
@@ -118,9 +119,12 @@ def add_ordered_rules(app: PtyApp) -> tuple[str, str]:
     )
     assert "Predicate" not in second_classifier, second_classifier
     app.send(b"critical")
-    app.settle()
     summary = "severity = critical"
-    assert app.text().count(summary) == 2, app.text()
+    app.wait_until(
+        lambda text: text.count(summary) == 2,
+        "both overlapping classifier summaries are rendered",
+        timeout=4,
+    )
     first = swatch_foreground(app, summary, 0)
     second = swatch_foreground(app, summary, 1)
     assert first != second, (first, second, app.text())
