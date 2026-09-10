@@ -80,6 +80,48 @@ pub fn worker_route(session_present: bool, definition: &SourceDefinition) -> boo
     session_present && !matches!(definition.acquisition, Acquisition::Stdin)
 }
 
+/// Window-side path contract for worker acquisition (cross-layer,
+/// coordinated with a8's worker boundary): relative paths resolve against
+/// the ORIGINATING window's cwd BEFORE any RPC, because the worker process
+/// has no window cwd and one worker serves windows with different cwds.
+/// The same lexical relative path from different cwds therefore arrives as
+/// different absolute paths and can never reuse the wrong file; the local
+/// spelling is preserved untouched (definitions, notices, session files
+/// keep the user's expression — each acquisition re-resolves in its own
+/// acquiring window). Absolute paths pass through verbatim, so this is
+/// compatible with every worker-side choice: reject-relative validation,
+/// capture-root joins, or identity fingerprinting all see absolute input.
+/// Identity is preserved by construction: resolution never touches
+/// `SourceId` (the worker's Present/dedup answers with the canonical id),
+/// restart addresses the worker-remembered absolute definition by id
+/// (never resends a path), and record identities stay worker-side
+/// journal offsets. `Acquisition::Stdin`/`Http` carry no filesystem path.
+/// NOTE (for a8): `Exec` program paths are deliberately NOT rewritten
+/// here — bare names are PATH lookups and `./x` spellings are spawn
+/// semantics owned worker-side; only the capture file and the command
+/// working directory (plainly "which file/dir") resolve here.
+fn resolve_for_worker(definition: &SourceDefinition, cwd: &Path) -> SourceDefinition {
+    let mut effective = definition.clone();
+    match &mut effective.acquisition {
+        Acquisition::File { path, .. } => {
+            if path.is_relative() {
+                *path = cwd.join(&*path);
+            }
+        }
+        Acquisition::Command { command } => {
+            let resolved = match &command.cwd {
+                Some(dir) if dir.is_relative() => Some(cwd.join(dir)),
+                _ => None,
+            };
+            if let Some(dir) = resolved {
+                command.cwd = Some(dir);
+            }
+        }
+        Acquisition::Stdin | Acquisition::Http { .. } => {}
+    }
+    effective
+}
+
 /// A worker-owned capture, ready for adapter input: the identity the worker
 /// enforces plus the journal path it derived (windows never hardcode the
 /// capture layout).
@@ -172,7 +214,16 @@ impl SharedStore {
         &self,
         definition: &SourceDefinition,
     ) -> Result<SharedSource, String> {
-        let started = match self.client.lock().await.request_start(definition).await? {
+        // The worker never sees a relative path from this window: resolve
+        // first (see `resolve_for_worker`). A window that cannot read its
+        // own cwd forwards the definition unchanged and lets the worker's
+        // absolute-path validation refuse it loudly — failing closed beats
+        // a cwd-ambiguous acquisition.
+        let effective = match std::env::current_dir() {
+            Ok(cwd) => resolve_for_worker(definition, &cwd),
+            Err(_) => definition.clone(),
+        };
+        let started = match self.client.lock().await.request_start(&effective).await? {
             StartOutcome::Started {
                 source_id,
                 journal_path,
@@ -895,6 +946,102 @@ mod tests {
         assert!(worker_route(true, &file));
         assert!(worker_route(true, &command));
         assert!(!worker_route(true, &stdin));
+    }
+
+    /// The cross-layer path contract, unit-tested without touching the
+    /// process cwd: the pure function takes an explicit originating
+    /// directory, so two windows are just two cwds. The live call site
+    /// passes `current_dir` and fails closed when it cannot read it.
+    #[test]
+    fn resolve_for_worker_joins_relative_file_against_origin_cwd() {
+        let definition = test_definition(11, Path::new("logs/app.log"));
+        let effective = resolve_for_worker(&definition, Path::new("/win/a"));
+        match &effective.acquisition {
+            lvu_core::Acquisition::File { path, follow } => {
+                assert_eq!(path, &PathBuf::from("/win/a/logs/app.log"));
+                assert!(*follow);
+            }
+            other => panic!("expected file acquisition, saw {other:?}"),
+        }
+        // The caller's spelling is untouched: identity downstream still
+        // keys on the worker answer, never on this joined path.
+        match &definition.acquisition {
+            lvu_core::Acquisition::File { path, .. } => {
+                assert_eq!(path, &PathBuf::from("logs/app.log"))
+            }
+            other => panic!("fixture must stay relative, saw {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_for_worker_same_spelling_from_different_cwds_diverges() {
+        let definition = test_definition(12, Path::new("f.log"));
+        let from_a = resolve_for_worker(&definition, Path::new("/win/a"));
+        let from_b = resolve_for_worker(&definition, Path::new("/win/b"));
+        let path_a = match &from_a.acquisition {
+            lvu_core::Acquisition::File { path, .. } => path.clone(),
+            other => panic!("expected file acquisition, saw {other:?}"),
+        };
+        let path_b = match &from_b.acquisition {
+            lvu_core::Acquisition::File { path, .. } => path.clone(),
+            other => panic!("expected file acquisition, saw {other:?}"),
+        };
+        assert!(path_a.is_absolute() && path_b.is_absolute());
+        assert_ne!(path_a, path_b, "two origins must never reuse one file");
+    }
+
+    #[test]
+    fn resolve_for_worker_leaves_absolute_and_pathless_kinds_verbatim() {
+        let dir = std::env::temp_dir();
+        let absolute = test_definition(13, &dir.join("abs.log"));
+        let untouched = resolve_for_worker(&absolute, Path::new("/win/a"));
+        assert_eq!(absolute.acquisition, untouched.acquisition);
+
+        let mut stdin = absolute.clone();
+        stdin.acquisition = lvu_core::Acquisition::Stdin;
+        let still_stdin = resolve_for_worker(&stdin, Path::new("/win/a"));
+        assert_eq!(still_stdin.acquisition, lvu_core::Acquisition::Stdin);
+    }
+
+    #[test]
+    fn resolve_for_worker_resolves_command_cwd_but_not_program() {
+        let dir = std::env::temp_dir();
+        let mut definition = test_definition(14, &dir.join("cmd.log"));
+        definition.acquisition = lvu_core::Acquisition::Command {
+            command: lvu_core::CommandDefinition {
+                program: lvu_core::CommandProgram::Shell {
+                    text: "tail -F x.log".to_owned(),
+                },
+                cwd: Some(PathBuf::from("subdir")),
+                environment: Default::default(),
+                restart: Default::default(),
+            },
+        };
+        let effective = resolve_for_worker(&definition, Path::new("/win/a"));
+        match &effective.acquisition {
+            lvu_core::Acquisition::Command { command } => {
+                assert_eq!(command.cwd, Some(PathBuf::from("/win/a/subdir")));
+                match &command.program {
+                    lvu_core::CommandProgram::Shell { text } => {
+                        assert_eq!(text, "tail -F x.log")
+                    }
+                    other => panic!("program must pass through, saw {other:?}"),
+                }
+            }
+            other => panic!("expected command acquisition, saw {other:?}"),
+        }
+
+        let mut absolute_cwd = definition.clone();
+        if let lvu_core::Acquisition::Command { command } = &mut absolute_cwd.acquisition {
+            command.cwd = Some(PathBuf::from("/elsewhere"));
+        }
+        let kept = resolve_for_worker(&absolute_cwd, Path::new("/win/a"));
+        match &kept.acquisition {
+            lvu_core::Acquisition::Command { command } => {
+                assert_eq!(command.cwd, Some(PathBuf::from("/elsewhere")))
+            }
+            other => panic!("expected command acquisition, saw {other:?}"),
+        }
     }
 
     /// One serving worker plus its socket: windows attach with distinct
