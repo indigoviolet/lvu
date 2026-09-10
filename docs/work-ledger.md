@@ -2902,3 +2902,34 @@ without repeating cleanup or runtime verification. The report refers to the
 original cache-config commit `13d9a59`, subsequently amended to `33746fe`;
 the pinned 3G setting is unchanged. Cleanup is closed; automated retirement
 policy is a distinct open task. Documentation whitespace checks passed.
+
+
+### Shared-capture review checkpoints — 2026-09-10
+
+Window owner c98 delivered `a6ff2ea93259a1fbf7641cb5f934e01bab0ecb8a`,
+with checked-in union prerequisites through `f074d84` and session accessors
+`321f192`. The three-file repair adds an absolute transport deadline enforced
+by the window, preserves last-good membership on timeout/cancellation, refuses
+late receipts, and covers previously omitted digest fields or rejects retained
+unsupported state. Owner-reported validation: one digest mutation test, one
+deadline/last-good/late-receipt/retry test, six focused remote tests and clean
+view-lib/union-worker Clippy. Logs are in `sol-window-remote-union-logs/` as
+`repair-digest-r1.log`, `repair-timeout-r2.log`, `repair-remote-suite-r1.log`
+and `repair-clippy-r2.log`. Sol4666 is reviewing the exact checkpoint. Real
+transport same-identity status recovery remains a downstream requirement;
+there is no app/RPC acceptance or integration claim.
+
+Controller `b17208e` has fourteen reported shared-capture tests and app-bin
+Clippy evidence, but Sol97 found unresolved cwd lookup failure forwarding,
+missing originating cwd for commands with no explicit cwd, and relative Exec
+paths inheriting worker context. Repairs are assigned to the controller owner.
+The earlier log does not independently bind its commands and commit.
+
+Worker candidate `6f04b39` failed exact-checkpoint validation with missing
+`start_admitted` calls and a borrowed-field assignment in a test; no tests ran.
+The retained `lvu-validate-6f04b39-gate.log` ends at exit 101. Six independent
+source findings remain: cancellation after acquisition side effects, stop/start
+serialization, stdin deduplication, non-UTF-8 key failure, relative-path origin
+and schema validation before reuse. After the original worker agent errored,
+Sol820 took the same isolated assignment from `2ad1495`; no repaired acceptance
+is claimed. Shared-memory `31b6158` retains its narrow source clearance.
