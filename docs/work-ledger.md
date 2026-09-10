@@ -2872,3 +2872,11 @@ size is now 28,881,498,112 bytes (26.9 GiB); volume free space is about 63 GiB.
 This agent's execution assignment is complete. Cache and remaining viewport
 retirement belong exclusively to765; primary has not repeated this pass's
 file/process checks.
+
+Disk agent765 reports CACHE AVAILABLE after maintenance under the canonical
+validation lock. The shared server runs through the primary sccache wrapper
+with effective maximum and current cache size both 3 GiB and no cache errors.
+Primary has relayed the release of the build hold: assigned bounded validation
+may resume under the shared lock; independent restarts or cap overrides remain
+prohibited. This records the maintenance owner's result, not a second primary
+cache operation.
