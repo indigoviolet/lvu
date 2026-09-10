@@ -148,3 +148,12 @@ remain open in TODO.md.
 | **Done** | Status prioritizes actionable notices, event-time diagnostics, row ranges and visible return/help controls; wide/combining text fits and optional indicators give way as whole segments. |
 | **Done** | FOLLOW draws the newest servable window while preserving true-tail selection. HISTORY keeps its requested destination separate from retained displayed rows, retries without another keypress, and reports the actual range. |
 | **Done** | Pending raw-context location is visible in narrow status lines: the protected prefix says `locating #N` until the chase resolves or reports its bounded failure. Full origin context remains optional when space fits. |
+
+
+## v0.1.4 — 2026-09-10
+
+- Shipped severity and UTC timestamp assistance shortcuts through ordinary
+  enrichment review, with per-view output roles and persistent selection.
+  Ready canonical severity and accepted timestamp-basis values replace normal
+  implicit recognition. Exact-source and installed-archive acceptance are
+  recorded in the work ledger.

@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.3**. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.4**. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -18,14 +18,6 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 | **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
 | **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
 | **Working** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no performance or full-soak pass is claimed yet. |
-
-## Accepted for the next release
-
-Integrated after v0.1.3; outside its immutable tag and installed runtime.
-
-| Status | Work |
-| --- | --- |
-| **Ready** | Make “give me a UTC timestamp column” and “give me a severity column” assistance shortcuts that propose ordinary enrichment definitions for review; let each view select the output columns for time/severity roles. Replace the separate automatic recognition/normalization paths. Capture time remains acquisition metadata. |
 
 ## Active parallel assignments
 

@@ -4,9 +4,11 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
-## v0.1.4 — prepared for release
+## v0.1.4 — 2026-09-10
 
-Publication follows exact-source acceptance and all four native archives.
+[Published release](https://github.com/indigoviolet/lvu/releases/tag/v0.1.4),
+from `984b6f0`, with all four native archives. The installed Linux archive
+passed all eight mandatory PTY suites, including both role workflows.
 
 - Severity and timestamp roles use reviewed enrichment columns. Fields can assign
   either role; assistance can propose a severity or UTC timestamp column through

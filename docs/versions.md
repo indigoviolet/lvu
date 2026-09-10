@@ -4,20 +4,20 @@ lvu has one publication scheme: annotated `vX.Y.Z` tags and matching GitHub
 releases. There is no separate preview channel or preview numbering. Every
 version must agree with `crates/lvu-app/Cargo.toml` and `Cargo.lock`.
 
-Current version: **[v0.1.3](https://github.com/indigoviolet/lvu/releases/tag/v0.1.3)**,
-published 2026-09-09 at 22:58:15 UTC from `8ca75d0`. All four native archives
-passed release verification. The local installation is the official x86_64 Linux
-musl archive, SHA-256 `f9c546e26b83e85c262b0d33222696d70f6125df0017470e1e9b438193d0fe05`.
-Its bundled resources and six actual terminal suites passed acceptance outside
-the checkout; `versions/latest` points to `v0.1.3`. Homebrew tap commit `67359d3`
-provides the matching formula. What each version shipped is recorded in
+Current version: **[v0.1.4](https://github.com/indigoviolet/lvu/releases/tag/v0.1.4)**,
+published 2026-09-10 at 00:20:58 UTC from `984b6f0`. All four native archives
+passed release CI. The local installation is the official x86_64 Linux musl
+archive, SHA-256 `9cc1d57892a00fe599f70a941d83c1cde65d7f744b5b95e053151924abd01711`.
+Its bundled resources and eight actual terminal suites passed acceptance outside
+the checkout, including column-role and shortcut-role workflows;
+`versions/latest` points to `v0.1.4`. What each version shipped is recorded in
 [CHANGELOG.md](../CHANGELOG.md).
 
-Exact-source acceptance passed workspace tests, clippy, 105 bridge tests and
-all 75 PTY suites. The volume-backed full soak remains unaccepted: cold-query
-latency, autosave-flush shutdown and the broader 512 MB viewport investigation
-remain unresolved. Column roles and live union composition remain separate
-unreleased work.
+Exact-source acceptance passed 1386 Rust tests (7 ignored), clippy, 105 bridge
+tests and all 77 PTY suites. The volume-backed full soak remains unaccepted:
+cold-query latency, autosave-flush shutdown and the broader 512 MB viewport
+investigation remain unresolved. Named zones and live union composition remain
+separate unreleased work.
 
 See the [release runbook](release-runbook.md) for validation, archive publication,
 Homebrew updates and installation checks. Archives contain the application,

@@ -2114,3 +2114,37 @@ candidates independently. The three storage investigations share one lead soak
 rather than running competing volume benchmarks. Builds and heavy tests remain
 serialized under the validation lock while design, implementation and review
 proceed in parallel. No new backlog completion is claimed.
+
+
+## 2026-09-10 — v0.1.4 published and archive activated
+
+Exact source `984b6f0dda96c782de3fb7c3e9a9bf169db08eae` passed the isolated
+release gate: 1386 Rust tests passed (7 ignored), formatting and workspace
+clippy clean, bridge 105/105, and PTY matrix 77/77. Both binary hashes were
+checked before and after the matrix. Producer SHA256 is
+`4d1cb5e5ee256fb5317ce79bb6da38799e9384dd79949e9a0ed444f22979ae39`.
+Evidence is under build-volume
+`primary-astra-scratch/release-gate-984b6f0dda96-977250d2a08642b38f8e6b09b38c1bd6/`.
+
+Immutable annotated tag object `ad6664675f8659f3a89b64f38a54c1c3f74c728e`
+peels to that source; workflow 34418420557 passed all four native archive jobs
+and publish. Release 385921636 became public at 00:20:58 UTC. Primary checked
+public release state independently after installation.
+
+Reviewed installer SHA256
+`f14e3c912269bb488f78b5d6199fb3d0162db47b32cbf23224a1bf553c7a07e9`
+ran under the shared lock with the pinned producer hash. It verified official
+assets, exact clean source, full archive layout/tree, bundled helper/bridge,
+and eight mandatory actual PTY suites from a disposable external cwd. The
+archive acceptance includes column-role and shortcut-role workflows. It verified
+the released launcher after promotion and wrote exclusive records at
+`versions/records/v0.1.4.json` and `v0.1.4.tree.json`. The record correctly
+captures draft=true before subsequent publication. Installer log:
+`muse-v014-prep/v014-delivery/installer-run.log` on the build volume.
+
+Primary verified `versions/latest` points to `v0.1.4` and its binary SHA256
+`10b2f8e9c3db925698a1344c06e6edb6e818424a65b1ec0b5b1f84d6973adbd2`
+matches the acceptance record. The full volume soak remains unaccepted; no new
+cold-query, shutdown durability, or managed-memory performance claim follows.
+Named zones, union/shared-key composition, colour classification, shared capture
+and platform validation remain separate assignments.

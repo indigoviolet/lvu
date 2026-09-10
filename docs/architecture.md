@@ -1,8 +1,8 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.3` (2026-09-09) is the current public release, including unified grouping
-and status/FOLLOW changes. Releases use only the vX.Y.Z scheme.
+`v0.1.4` (2026-09-10) is the current public release, including enrichment
+column roles, unified grouping and status/FOLLOW changes. Releases use only the vX.Y.Z scheme.
 Historical build numbers below date when behavior arrived; they are not a separate
 release channel.
 
@@ -12,7 +12,7 @@ for binary-specific acceptance. The [implementation plan](implementation-plan.md
 is the broader design/roadmap and contains historical proposed layouts. Actual
 module names and executable code take precedence over those proposals.
 
-Column roles are integrated after v0.1.3 and accepted for the next release.
+Column roles shipped in v0.1.4.
 View presentation stores selected severity/timestamp output names. The view worker
 publishes separate derived declaration, ready and error markers for ordinary and
 grouped projections. The renderer consumes canonical ready severity values and
