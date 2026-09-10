@@ -36,7 +36,7 @@ use std::{
 };
 
 use lvu_core::{SourceDefinition, SourceId};
-use lvu_ingest::{RuntimeConfig, SourceManager};
+use lvu_ingest::{RuntimeConfig, RuntimeError, SourceManager, StopReport};
 use lvu_memory::WorkspaceStore;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -58,6 +58,11 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often lifecycle changes re-broadcast presence while subscribers
 /// exist. Counts are sampled at event time; there is no per-record feed.
 pub const STATUS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Lifecycle work detached from a timed-out socket request is capped at the
+/// viewer cap. A connection dispatches one request at a time, and excess
+/// work is refused instead of growing a hidden task/queue without bound.
+const MAX_LIFECYCLE_SETTLEMENTS: usize = crate::MAX_VIEWERS;
 
 /// Admission decision hook, implemented by the application with its real
 /// acquisition comparator (duplicate identity/acquisition detection). The
@@ -194,14 +199,14 @@ struct StdinBinding {
 /// the racing starter (leader) and joiners (waiters).
 #[derive(Clone, Debug)]
 enum StartSettlement {
-    /// The winner's source id; its definition is committed and its capture
-    /// is live. Joiners present exactly this identity.
-    Settled(SourceId),
+    /// The winner's exact outcome; its definition is committed and its
+    /// capture was successfully started. Joiners present its identity.
+    Settled(StartedOutcome),
     /// The attempt failed; joiners surface this instead of starting over
     /// blindly. A later request may retry and lead anew.
     Failed(String),
-    /// The leader future was dropped before settling (timeout/cancel); the
-    /// reservation is void and joiners re-evaluate from worker state.
+    /// The detached leader task ended before settling (panic/runtime
+    /// teardown); the reservation is void and joiners re-evaluate state.
     Abandoned,
 }
 
@@ -219,17 +224,15 @@ enum KeyEntry {
     /// Sole leader: run admission plus the manager start, then settle.
     Lead(Arc<SharedStart>),
     /// Observer: return the leader's settled outcome, or re-evaluate when
-    /// the leader future was dropped unsettled.
+    /// the detached leader task ended unsettled.
     Join(Arc<SharedStart>),
 }
 
 /// Normalize an incoming definition's file spelling at the worker
 /// boundary: absolute paths canonicalize (symlinks, `.`/`..` resolved
-/// independent of any process cwd); anything uncanonicalizable keeps its
-/// absolute spelling, and relative paths stay lexical — only the
-/// originating window knows the base they resolve against, never whichever
-/// process became worker. Infallible by design: normalization sharpens the
-/// identity key but must never refuse a start.
+/// independent of any process cwd), and anything uncanonicalizable keeps
+/// its absolute spelling. `validate_start_boundary` has already rejected
+/// relative paths before this infallible normalization runs.
 fn canonicalize_definition(mut definition: SourceDefinition) -> SourceDefinition {
     if let lvu_core::Acquisition::File { path, .. } = &mut definition.acquisition
         && path.is_absolute()
@@ -243,28 +246,73 @@ fn canonicalize_definition(mut definition: SourceDefinition) -> SourceDefinition
     definition
 }
 
-/// Removes a start reservation this task never settled (timeout or cancel
-/// dropped the leader future mid-flight) and marks it abandoned so joiners
-/// re-evaluate instead of hanging. Removal is idempotent with the settle
+/// Validate process-relative meaning before any duplicate lookup. A worker
+/// may have been elected by a different window and therefore must never use
+/// its own current directory to reinterpret another window's request.
+fn validate_start_boundary(definition: &SourceDefinition) -> Result<(), String> {
+    if definition.schema_version != 1 {
+        return Err(format!(
+            "unsupported source schema_version {}",
+            definition.schema_version
+        ));
+    }
+    match &definition.acquisition {
+        lvu_core::Acquisition::File { path, .. } => {
+            if !path.is_absolute() {
+                return Err("file path must be absolute before worker admission".into());
+            }
+        }
+        lvu_core::Acquisition::Command { command } => {
+            let cwd = command
+                .cwd
+                .as_ref()
+                .ok_or_else(|| "command cwd must be explicit before worker admission".to_owned())?;
+            if !cwd.is_absolute() {
+                return Err("command cwd must be absolute before worker admission".into());
+            }
+            if let lvu_core::CommandProgram::Exec { executable, .. } = &command.program
+                && !executable.is_absolute()
+            {
+                let mut components = executable.components();
+                let bare_path_name =
+                    matches!(components.next(), Some(std::path::Component::Normal(_)))
+                        && components.next().is_none();
+                if !bare_path_name {
+                    return Err(
+                        "relative command executable paths must be resolved before worker admission"
+                            .into(),
+                    );
+                }
+            }
+        }
+        lvu_core::Acquisition::Stdin | lvu_core::Acquisition::Http { .. } => {}
+    }
+    Ok(())
+}
+
+/// Removes a start reservation whose detached task never settled and marks
+/// it abandoned so joiners re-evaluate instead of hanging. Ordinary request
+/// timeout/cancellation cannot reach this path because it owns no leader
+/// work. Removal is idempotent with the settle
 /// path and with fellow joiners; entries never outlive their observers.
 /// The registry is a plain `std` mutex because no holder ever keeps it
 /// across an await (every critical section below is pointer-sized map
 /// surgery), which is also what lets this cleanup run infallibly inside
 /// `Drop` with no lock gaps for entries to leak through.
-struct StartGuard<'a> {
-    starting: &'a std::sync::Mutex<HashMap<String, Arc<SharedStart>>>,
+struct StartGuard {
+    starting: Arc<std::sync::Mutex<HashMap<String, Arc<SharedStart>>>>,
     key: String,
     mine: Arc<SharedStart>,
     settled: bool,
 }
 
-impl StartGuard<'_> {
+impl StartGuard {
     fn disarm(&mut self) {
         self.settled = true;
     }
 }
 
-impl Drop for StartGuard<'_> {
+impl Drop for StartGuard {
     fn drop(&mut self) {
         if self.settled {
             return;
@@ -282,6 +330,161 @@ impl Drop for StartGuard<'_> {
         {
             starting.remove(&self.key);
         }
+    }
+}
+
+#[derive(Default)]
+struct LifecycleState {
+    closed: bool,
+    in_flight: usize,
+    next_id: u64,
+    permits: HashMap<u64, LifecycleOperation>,
+    settlements: HashMap<u64, tokio::task::AbortHandle>,
+}
+
+struct LifecycleOperation {
+    source_id: SourceId,
+    begun: bool,
+}
+
+/// One atomic authority for lifecycle admission and draining. The same
+/// short-held mutex decides closed/open and reserves a bounded in-flight
+/// slot, eliminating a flag-check/permit-acquire gap. RAII release covers
+/// request cancellation and detached leader completion alike.
+struct LifecycleAdmission {
+    state: std::sync::Mutex<LifecycleState>,
+    in_flight: tokio::sync::watch::Sender<usize>,
+}
+
+impl LifecycleAdmission {
+    fn new() -> Arc<Self> {
+        let (in_flight, _) = tokio::sync::watch::channel(0);
+        Arc::new(Self {
+            state: std::sync::Mutex::new(LifecycleState::default()),
+            in_flight,
+        })
+    }
+
+    fn try_enter(self: &Arc<Self>, source_id: SourceId) -> Result<LifecyclePermit, String> {
+        let mut state = self.state.lock().expect("lifecycle admission poisoned");
+        if state.closed {
+            return Err("worker is shutting down".into());
+        }
+        if state.in_flight >= MAX_LIFECYCLE_SETTLEMENTS {
+            return Err("worker lifecycle settlement capacity is full".into());
+        }
+        let id = state.next_id;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| "worker lifecycle settlement id space exhausted".to_owned())?;
+        state.in_flight += 1;
+        state.permits.insert(
+            id,
+            LifecycleOperation {
+                source_id,
+                begun: false,
+            },
+        );
+        self.in_flight.send_replace(state.in_flight);
+        Ok(LifecyclePermit {
+            admission: Arc::clone(self),
+            id,
+        })
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .expect("lifecycle admission poisoned")
+            .closed = true;
+    }
+
+    async fn drained(&self) {
+        let mut in_flight = self.in_flight.subscribe();
+        while *in_flight.borrow_and_update() != 0 {
+            if in_flight.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn attach_settlement(&self, id: u64, settlement: tokio::task::AbortHandle) {
+        let mut state = self.state.lock().expect("lifecycle admission poisoned");
+        if state.permits.contains_key(&id) {
+            state.settlements.insert(id, settlement);
+        }
+    }
+
+    fn abort_settlements(&self) -> Vec<SourceId> {
+        let state = self.state.lock().expect("lifecycle admission poisoned");
+        let begun = state
+            .settlements
+            .keys()
+            .filter_map(|id| state.permits.get(id))
+            .filter(|operation| operation.begun)
+            .map(|operation| operation.source_id)
+            .collect();
+        let settlements: Vec<_> = state.settlements.values().cloned().collect();
+        drop(state);
+        for settlement in settlements {
+            settlement.abort();
+        }
+        begun
+    }
+
+    fn unsettled_sources(&self) -> Vec<SourceId> {
+        self.state
+            .lock()
+            .expect("lifecycle admission poisoned")
+            .permits
+            .values()
+            .map(|operation| operation.source_id)
+            .collect()
+    }
+}
+
+struct LifecyclePermit {
+    admission: Arc<LifecycleAdmission>,
+    id: u64,
+}
+
+impl LifecyclePermit {
+    /// Commit this reservation to side effects. Closure and this check use
+    /// the same mutex: either begin wins and shutdown drains this permit, or
+    /// closure wins and the queued operation must settle without spawning.
+    fn begin(&self) -> Result<(), String> {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .expect("lifecycle admission poisoned");
+        if state.closed {
+            Err("worker is shutting down".into())
+        } else {
+            state
+                .permits
+                .get_mut(&self.id)
+                .expect("live lifecycle permit missing")
+                .begun = true;
+            Ok(())
+        }
+    }
+}
+
+impl Drop for LifecyclePermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .expect("lifecycle admission poisoned");
+        debug_assert!(state.in_flight > 0);
+        state.in_flight -= 1;
+        state.permits.remove(&self.id);
+        state.settlements.remove(&self.id);
+        self.admission.in_flight.send_replace(state.in_flight);
+        drop(state);
     }
 }
 
@@ -303,7 +506,23 @@ pub struct WorkerService {
     /// lazily by the first joiner to observe an abandonment. Plain `std`
     /// mutex: no holder spans an await (see `StartGuard`), so locking here
     /// can neither stall the executor nor strand an entry.
-    starting: std::sync::Mutex<HashMap<String, Arc<SharedStart>>>,
+    starting: Arc<std::sync::Mutex<HashMap<String, Arc<SharedStart>>>>,
+    /// Start, stop, restart and Present-to-restart transitions share this
+    /// gate. The mutex state is constant-size; detached settlements are
+    /// admitted and capped by `lifecycle_admission`.
+    lifecycle: Mutex<()>,
+    lifecycle_admission: Arc<LifecycleAdmission>,
+    #[cfg(test)]
+    start_side_effect_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    #[cfg(test)]
+    lifecycle_admission_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    #[cfg(test)]
+    stop_side_effect_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    #[cfg(test)]
+    incomplete_stop_reports: std::sync::Mutex<std::collections::HashSet<SourceId>>,
     shutdown_flag: std::sync::atomic::AtomicBool,
     /// Worker lifetime nonce, minted once per `open` and published in
     /// `Welcome` and every progress answer. Windows key remote epoch on
@@ -343,7 +562,17 @@ impl WorkerService {
                 stdin_bindings: Mutex::new(HashMap::new()),
                 session: Mutex::new(session),
                 definitions: Mutex::new(HashMap::new()),
-                starting: std::sync::Mutex::new(HashMap::new()),
+                starting: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                lifecycle: Mutex::new(()),
+                lifecycle_admission: LifecycleAdmission::new(),
+                #[cfg(test)]
+                start_side_effect_pause: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                lifecycle_admission_pause: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                stop_side_effect_pause: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                incomplete_stop_reports: std::sync::Mutex::new(std::collections::HashSet::new()),
                 shutdown_flag: std::sync::atomic::AtomicBool::new(false),
                 worker_session: uuid::Uuid::new_v4().to_string(),
             }),
@@ -354,6 +583,101 @@ impl WorkerService {
     /// This worker's lifetime nonce (see the field docs).
     pub fn worker_session(&self) -> &str {
         &self.worker_session
+    }
+
+    #[cfg(test)]
+    fn set_start_side_effect_pause(
+        &self,
+        pause: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    ) {
+        *self
+            .start_side_effect_pause
+            .lock()
+            .expect("test start pause poisoned") = pause;
+    }
+
+    #[cfg(test)]
+    async fn pause_after_manager_start(&self) {
+        let pause = self
+            .start_side_effect_pause
+            .lock()
+            .expect("test start pause poisoned")
+            .clone();
+        if let Some((reached, release)) = pause {
+            reached.wait().await;
+            release.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_lifecycle_admission_pause(
+        &self,
+        pause: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    ) {
+        *self
+            .lifecycle_admission_pause
+            .lock()
+            .expect("test lifecycle admission pause poisoned") = pause;
+    }
+
+    #[cfg(test)]
+    async fn pause_before_lifecycle_admission(&self) {
+        let pause = self
+            .lifecycle_admission_pause
+            .lock()
+            .expect("test lifecycle admission pause poisoned")
+            .clone();
+        if let Some((reached, release)) = pause {
+            reached.wait().await;
+            release.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_stop_side_effect_pause(
+        &self,
+        pause: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    ) {
+        *self
+            .stop_side_effect_pause
+            .lock()
+            .expect("test stop pause poisoned") = pause;
+    }
+
+    #[cfg(test)]
+    async fn pause_after_manager_stop(&self) {
+        let pause = self
+            .stop_side_effect_pause
+            .lock()
+            .expect("test stop pause poisoned")
+            .clone();
+        if let Some((reached, release)) = pause {
+            reached.wait().await;
+            release.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn force_incomplete_stop_report(&self, id: SourceId) {
+        self.incomplete_stop_reports
+            .lock()
+            .expect("test incomplete stop reports poisoned")
+            .insert(id);
+    }
+
+    #[cfg(test)]
+    fn reported_stop_complete(&self, id: SourceId, complete: bool) -> bool {
+        complete
+            && !self
+                .incomplete_stop_reports
+                .lock()
+                .expect("test incomplete stop reports poisoned")
+                .remove(&id)
+    }
+
+    #[cfg(not(test))]
+    fn reported_stop_complete(&self, _id: SourceId, complete: bool) -> bool {
+        complete
     }
 
     /// Resume the persisted session set with exactly startup-resume rules:
@@ -367,6 +691,11 @@ impl WorkerService {
         let mut outcomes = Vec::with_capacity(session.len());
         for definition in session {
             let id = definition.id;
+            if let Err(reason) = validate_start_boundary(&definition) {
+                outcomes.push((id, Err(format!("resume: {reason}"))));
+                continue;
+            }
+            let definition = canonicalize_definition(definition);
             let outcome = match &definition.acquisition {
                 lvu_core::Acquisition::File { .. } => {
                     let outcome = self
@@ -389,25 +718,36 @@ impl WorkerService {
         outcomes
     }
 
-    /// Record a newly admitted definition in the session set and persist it.
-    /// Best-effort and reported: a session write failure never fails the
-    /// capture it describes.
-    async fn note_session_started(&self, definition: &SourceDefinition) -> Option<String> {
+    /// Publish all worker-owned state for a manager-started source. Every
+    /// async lock is acquired before the first mutation; from that point to
+    /// the durable write there is no cancellation point. Thus shutdown may
+    /// abort a pre-publication settlement safely, or drain a wholly published
+    /// one, but can never leave only half of bindings/definitions/session.
+    async fn publish_started(
+        &self,
+        definition: &SourceDefinition,
+        stdin_binding: Option<StdinBinding>,
+    ) -> Option<String> {
+        let mut stdin_bindings = self.stdin_bindings.lock().await;
+        let mut definitions = self.definitions.lock().await;
         let mut session = self.session.lock().await;
+        if let Some(binding) = stdin_binding {
+            stdin_bindings.insert(definition.id, binding);
+        }
+        definitions.insert(definition.id, definition.clone());
         if !session.iter().any(|value| value.id == definition.id) {
             session.push(definition.clone());
         }
         let snapshot = session.clone();
-        drop(session);
         store_session_set(&self.config.workspace_root, &snapshot).err()
     }
 
-    async fn note_session_stopped(&self, id: SourceId) {
+    async fn note_session_stopped(&self, id: SourceId) -> Result<(), String> {
         let mut session = self.session.lock().await;
         session.retain(|definition| definition.id != id);
         let snapshot = session.clone();
         drop(session);
-        let _ = store_session_set(&self.config.workspace_root, &snapshot);
+        store_session_set(&self.config.workspace_root, &snapshot)
     }
 
     /// Capture journal path for a source, mirroring the ingest layout
@@ -440,6 +780,7 @@ impl WorkerService {
     pub fn request_shutdown(&self) {
         self.shutdown_flag
             .store(true, std::sync::atomic::Ordering::Release);
+        self.lifecycle_admission.close();
     }
 }
 
@@ -529,69 +870,53 @@ impl WorkerService {
         self: &Arc<Self>,
         definition: SourceDefinition,
     ) -> Result<StartedOutcome, String> {
+        #[cfg(test)]
+        self.pause_before_lifecycle_admission().await;
+        // This must precede canonicalization, key construction and admission:
+        // an invalid candidate may resemble a live definition but must never
+        // receive a success-shaped Present reply.
+        validate_start_boundary(&definition)?;
         let definition = canonicalize_definition(definition);
-        let Some(key) = admission_key(&definition) else {
+        let Some(key) = admission_key(&definition)? else {
             // Stdin attachments are independent pipelines by invariant:
-            // no shared identity exists to serialize on.
-            return self.settle_start_path(definition).await;
+            // no shared identity exists to deduplicate. Its settlement still
+            // outlives the request so a dispatch timeout cannot orphan a
+            // manager-owned reader before definitions/session registration.
+            let permit = self.lifecycle_admission.try_enter(definition.id)?;
+            return self.spawn_keyless_start(definition, permit).await;
         };
-        let mut definition = Some(definition);
         loop {
+            // Admission and shutdown closure are one atomic decision. A
+            // leader transfers this permit to its detached settlement; a
+            // joiner retains it while observing the shared outcome.
+            let permit = self.lifecycle_admission.try_enter(definition.id)?;
             match self.enter_start_key(&key) {
                 KeyEntry::Lead(shared) => {
-                    let mut guard = StartGuard {
-                        starting: &self.starting,
-                        key: key.clone(),
-                        mine: Arc::clone(&shared),
-                        settled: false,
-                    };
-                    let definition = definition.take().expect("leader owns its definition");
-                    let outcome = self.settle_start_path(definition).await;
-                    self.publish_settlement(&key, &shared, &outcome, &mut guard)
-                        .await;
-                    return outcome;
+                    let service = Arc::clone(self);
+                    let leader_shared = Arc::clone(&shared);
+                    let leader_key = key.clone();
+                    let leader_definition = definition.clone();
+                    let settlement_id = permit.id;
+                    let settlement = tokio::spawn(async move {
+                        service
+                            .settle_start_leader(
+                                leader_key,
+                                leader_shared,
+                                leader_definition,
+                                permit,
+                            )
+                            .await;
+                    });
+                    self.lifecycle_admission
+                        .attach_settlement(settlement_id, settlement.abort_handle());
+                    if let Some(outcome) = self.wait_start_settlement(&key, shared, true).await? {
+                        return Ok(outcome);
+                    }
                 }
                 KeyEntry::Join(shared) => {
-                    // Observe-then-wait on the versioned channel: a settle
-                    // that lands before subscribing is still observed, and
-                    // every waiter wakes on advancement, so no wakeup can be
-                    // missed and no wakeup is ever needed twice.
-                    let mut settled = shared.outcome.subscribe();
-                    loop {
-                        if let Some(outcome) = (*settled.borrow()).clone() {
-                            match outcome {
-                                // Revalidate: the winner may have stopped
-                                // between settling and this observation
-                                // (including a leaked entry from a
-                                // cancelled settle). A live winner
-                                // presents; anything else falls through to
-                                // re-evaluation below, which retries the
-                                // start honestly instead of presenting a
-                                // dead capture.
-                                StartSettlement::Settled(live_id) if self.is_live(live_id) => {
-                                    return Ok(StartedOutcome::Present { live_id });
-                                }
-                                StartSettlement::Failed(error) => return Err(error),
-                                _ => {
-                                    let mut starting =
-                                        self.starting.lock().expect("start registry poisoned");
-                                    if let Some(current) = starting.get(&key)
-                                        && Arc::ptr_eq(current, &shared)
-                                    {
-                                        starting.remove(&key);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        // No outcome yet: sleep until the version advances.
-                        // A closed channel is unreachable here (this waiter
-                        // holds an `Arc` keeping the sender alive) but
-                        // re-observes from the map like every other
-                        // inconclusive outcome instead of spinning.
-                        if settled.changed().await.is_err() {
-                            break;
-                        }
+                    let _permit = permit;
+                    if let Some(outcome) = self.wait_start_settlement(&key, shared, false).await? {
+                        return Ok(outcome);
                     }
                 }
             }
@@ -613,6 +938,108 @@ impl WorkerService {
             AdmissionVerdict::Refuse(reason) => Err(reason),
             AdmissionVerdict::Present { live_id } => self.present_or_restart(live_id).await,
             AdmissionVerdict::Admit => self.start_admitted(definition).await,
+        }
+    }
+
+    async fn spawn_keyless_start(
+        self: &Arc<Self>,
+        definition: SourceDefinition,
+        permit: LifecyclePermit,
+    ) -> Result<StartedOutcome, String> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let service = Arc::clone(self);
+        let settlement_id = permit.id;
+        let settlement = tokio::spawn(async move {
+            let _permit = permit;
+            let _lifecycle = service.lifecycle.lock().await;
+            if let Err(error) = _permit.begin() {
+                let _ = send.send(Err(error));
+                return;
+            }
+            // Keyless means stdin. Deliberately bypass `admit_known`: every
+            // fresh pipe is independent, while SourceManager still refuses
+            // an already-used id.
+            let outcome = service.start_admitted(definition).await;
+            let _ = send.send(outcome);
+        });
+        self.lifecycle_admission
+            .attach_settlement(settlement_id, settlement.abort_handle());
+        receive
+            .await
+            .map_err(|_| "worker lifecycle settlement task closed".to_owned())?
+    }
+
+    async fn settle_start_leader(
+        self: &Arc<Self>,
+        key: String,
+        shared: Arc<SharedStart>,
+        definition: SourceDefinition,
+        permit: LifecyclePermit,
+    ) {
+        // This is deliberately declared before StartGuard: reverse drop
+        // order makes reservation abandonment/removal happen before the
+        // lifecycle count can publish fully drained during task abortion.
+        let _permit = permit;
+        let mut guard = StartGuard {
+            starting: Arc::clone(&self.starting),
+            key: key.clone(),
+            mine: Arc::clone(&shared),
+            settled: false,
+        };
+        let _lifecycle = self.lifecycle.lock().await;
+        let outcome = match _permit.begin() {
+            Ok(()) => self.settle_start_path(definition).await,
+            Err(error) => Err(error),
+        };
+        self.publish_settlement(&key, &shared, &outcome, &mut guard);
+    }
+
+    /// Wait for a detached leader. `Ok(None)` asks the caller to re-enter
+    /// admission after a panicked/abandoned leader; ordinary request
+    /// cancellation cannot produce abandonment because the leader task owns
+    /// the settlement independently.
+    async fn wait_start_settlement(
+        &self,
+        key: &str,
+        shared: Arc<SharedStart>,
+        leader: bool,
+    ) -> Result<Option<StartedOutcome>, String> {
+        let mut settled = shared.outcome.subscribe();
+        loop {
+            if let Some(outcome) = (*settled.borrow()).clone() {
+                match outcome {
+                    StartSettlement::Settled(outcome) => {
+                        // The elected caller receives the exact completed
+                        // operation even when a finite source reaches EOF
+                        // before this task is scheduled again. Liveness
+                        // revalidation is only for joiners deciding whether
+                        // an older success can still be presented.
+                        if leader {
+                            return Ok(Some(outcome));
+                        }
+                        let id = match &outcome {
+                            StartedOutcome::Started { source_id, .. }
+                            | StartedOutcome::StdinBound { source_id, .. } => *source_id,
+                            StartedOutcome::Present { live_id } => *live_id,
+                        };
+                        if self.is_live(id) {
+                            return Ok(Some(StartedOutcome::Present { live_id: id }));
+                        }
+                    }
+                    StartSettlement::Failed(error) => return Err(error),
+                    StartSettlement::Abandoned => {}
+                }
+                let mut starting = self.starting.lock().expect("start registry poisoned");
+                if let Some(current) = starting.get(key)
+                    && Arc::ptr_eq(current, &shared)
+                {
+                    starting.remove(key);
+                }
+                return Ok(None);
+            }
+            if settled.changed().await.is_err() {
+                return Ok(None);
+            }
         }
     }
 
@@ -659,7 +1086,9 @@ impl WorkerService {
         definition: SourceDefinition,
     ) -> Result<StartedOutcome, String> {
         let id = definition.id;
-        if let Some(handle) = self.manager.source(id) {
+        if let Some(handle) = self.manager.source(id)
+            && !handle.progress().state.is_terminal()
+        {
             let report = handle
                 .stop()
                 .await
@@ -691,25 +1120,15 @@ impl WorkerService {
     /// Removal is unconditional here: no second leader can exist while this
     /// entry is present, and abandon-observers only remove entries whose
     /// outcome is still unsettled.
-    async fn publish_settlement(
+    fn publish_settlement(
         &self,
         key: &str,
         shared: &Arc<SharedStart>,
         outcome: &Result<StartedOutcome, String>,
-        guard: &mut StartGuard<'_>,
+        guard: &mut StartGuard,
     ) {
         let settlement = match outcome {
-            Ok(StartedOutcome::Started { source_id, .. })
-            | Ok(StartedOutcome::Present { live_id: source_id }) => {
-                StartSettlement::Settled(*source_id)
-            }
-            // Unreachable through keyed paths (stdin bypasses reservation);
-            // mapped harmlessly rather than panicking: a joiner would
-            // present an identity whose stream it cannot use, exactly like
-            // any stale binding today.
-            Ok(StartedOutcome::StdinBound { source_id, .. }) => {
-                StartSettlement::Settled(*source_id)
-            }
+            Ok(outcome) => StartSettlement::Settled(outcome.clone()),
             Err(error) => StartSettlement::Failed(error.clone()),
         };
         shared.outcome.send_modify(|slot| {
@@ -722,10 +1141,7 @@ impl WorkerService {
             .remove(key);
     }
 
-    async fn start_admitted(
-        self: &Arc<Self>,
-        definition: SourceDefinition,
-    ) -> Result<StartedOutcome, String> {
+    async fn start_admitted(&self, definition: SourceDefinition) -> Result<StartedOutcome, String> {
         let id = definition.id;
         if matches!(definition.acquisition, lvu_core::Acquisition::Stdin) {
             let (writer, reader) = tokio::io::duplex(crate::STDIN_BUFFER_BYTES);
@@ -735,23 +1151,20 @@ impl WorkerService {
                 .await
                 .map_err(|error| format!("start stdin: {error}"))?;
             drop(handle);
-            self.stdin_bindings.lock().await.insert(
-                id,
-                StdinBinding {
-                    writer,
-                    expected_seq: 0,
-                },
-            );
-            self.definitions.lock().await.insert(id, definition.clone());
-            if let Some(warning) = self.note_session_started(&definition).await {
-                return Ok(StartedOutcome::StdinBound {
-                    source_id: id,
-                    warning: Some(warning),
-                });
-            }
+            #[cfg(test)]
+            self.pause_after_manager_start().await;
+            let warning = self
+                .publish_started(
+                    &definition,
+                    Some(StdinBinding {
+                        writer,
+                        expected_seq: 0,
+                    }),
+                )
+                .await;
             return Ok(StartedOutcome::StdinBound {
                 source_id: id,
-                warning: None,
+                warning,
             });
         }
         let handle = self
@@ -760,8 +1173,9 @@ impl WorkerService {
             .await
             .map_err(|error| format!("start {}: {error}", definition.name))?;
         drop(handle);
-        self.definitions.lock().await.insert(id, definition.clone());
-        let warning = self.note_session_started(&definition).await;
+        #[cfg(test)]
+        self.pause_after_manager_start().await;
+        let warning = self.publish_started(&definition, None).await;
         Ok(StartedOutcome::Started {
             source_id: id,
             warning,
@@ -814,28 +1228,86 @@ impl WorkerService {
 
     /// Explicit stop: halts capture, drops any stdin binding, and removes
     /// the definition from the session set.
-    pub async fn request_stop(&self, id: SourceId) -> Result<(), String> {
+    pub async fn request_stop(self: &Arc<Self>, id: SourceId) -> Result<(), String> {
+        #[cfg(test)]
+        self.pause_before_lifecycle_admission().await;
+        let permit = self.lifecycle_admission.try_enter(id)?;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let service = Arc::clone(self);
+        let settlement_id = permit.id;
+        let settlement = tokio::spawn(async move {
+            let _permit = permit;
+            let _lifecycle = service.lifecycle.lock().await;
+            let outcome = match _permit.begin() {
+                Ok(()) => service.stop_inner(id).await,
+                Err(error) => Err(error),
+            };
+            let _ = send.send(outcome);
+        });
+        self.lifecycle_admission
+            .attach_settlement(settlement_id, settlement.abort_handle());
+        receive
+            .await
+            .map_err(|_| "worker lifecycle settlement task closed".to_owned())?
+    }
+
+    async fn stop_inner(&self, id: SourceId) -> Result<(), String> {
         self.stdin_bindings.lock().await.remove(&id);
-        if let Some(handle) = self.manager.source(id) {
-            handle
+        if let Some(handle) = self.manager.source(id)
+            && !handle.progress().state.is_terminal()
+        {
+            let report = handle
                 .stop()
                 .await
                 .map_err(|error| format!("stop: {error}"))?;
+            #[cfg(test)]
+            self.pause_after_manager_stop().await;
+            return self
+                .finish_stop(id, self.reported_stop_complete(id, report.complete))
+                .await;
         }
-        self.note_session_stopped(id).await;
+        self.finish_stop(id, true).await
+    }
+
+    async fn finish_stop(&self, id: SourceId, complete: bool) -> Result<(), String> {
+        if !complete {
+            return Err("capture stop incomplete; source remains in the session".into());
+        }
+        self.note_session_stopped(id).await.map_err(|error| {
+            format!("capture stopped but session update failed: {error}; retry stop")
+        })?;
         Ok(())
     }
 
     /// Explicit restart: stdin refuses per the existing rule (a fresh
     /// pipeline needs a new attachment); anything else stops completely
-    /// first and only then starts, so a partial stop never silently
-    /// becomes a second capture. Against an in-flight start of the same
-    /// canonical acquisition this refuses honestly instead of queueing one
-    /// explicit user action behind another request's whole capture startup;
-    /// the caller retries, and by then the earlier attempt has settled and
-    /// this same call leads. Keyless definitions keep today's unreserved
-    /// behavior.
+    /// first and only then starts, so a partial stop never silently becomes
+    /// a second capture. The shared lifecycle gate orders this against every
+    /// start, Present-to-restart and stop transition.
     pub async fn request_restart(self: &Arc<Self>, id: SourceId) -> Result<StartedOutcome, String> {
+        #[cfg(test)]
+        self.pause_before_lifecycle_admission().await;
+        let permit = self.lifecycle_admission.try_enter(id)?;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let service = Arc::clone(self);
+        let settlement_id = permit.id;
+        let settlement = tokio::spawn(async move {
+            let _permit = permit;
+            let _lifecycle = service.lifecycle.lock().await;
+            let outcome = match _permit.begin() {
+                Ok(()) => service.restart_inner(id).await,
+                Err(error) => Err(error),
+            };
+            let _ = send.send(outcome);
+        });
+        self.lifecycle_admission
+            .attach_settlement(settlement_id, settlement.abort_handle());
+        receive
+            .await
+            .map_err(|_| "worker lifecycle settlement task closed".to_owned())?
+    }
+
+    async fn restart_inner(&self, id: SourceId) -> Result<StartedOutcome, String> {
         let definition = self
             .definitions
             .lock()
@@ -846,25 +1318,7 @@ impl WorkerService {
         if matches!(definition.acquisition, lvu_core::Acquisition::Stdin) {
             return Err("stdin cannot restart; attach a fresh pipeline".into());
         }
-        let Some(key) = admission_key(&definition) else {
-            return self.restart_original(definition).await;
-        };
-        let KeyEntry::Lead(shared) = self.enter_start_key(&key) else {
-            return Err(
-                "another start of this acquisition is already in flight; retry after it settles"
-                    .into(),
-            );
-        };
-        let mut guard = StartGuard {
-            starting: &self.starting,
-            key: key.clone(),
-            mine: Arc::clone(&shared),
-            settled: false,
-        };
-        let outcome = self.restart_original(definition).await;
-        self.publish_settlement(&key, &shared, &outcome, &mut guard)
-            .await;
-        outcome
+        self.restart_original(definition).await
     }
 
     /// Look up the currently committed version of a view for conflict
@@ -1705,29 +2159,57 @@ impl WorkerService {
     /// manager's stop reports for diagnostics. The socket file is unlinked
     /// by the wiring that bound it.
     pub async fn shutdown(&self) -> Vec<(SourceId, Result<String, String>)> {
+        self.shutdown_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.lifecycle_admission.close();
+        // A request deadline retires only its waiter; lifecycle work keeps a
+        // admission until definitions/session registration settles. Closing
+        // the same primitive that grants admission and waiting for its
+        // in-flight count therefore drains every detached operation without relying
+        // on a definitions snapshot that may not contain it yet. The wait is
+        // bounded; on expiry SourceManager::shutdown applies its own bounded
+        // start cancellation/stop compensation to every manager-owned source.
+        let mut failed_settlements = Vec::new();
+        if tokio::time::timeout(
+            self.config.request_timeout,
+            self.lifecycle_admission.drained(),
+        )
+        .await
+        .is_err()
+        {
+            // A settlement that outlives the public deadline must not resume
+            // later and publish definitions/session state after teardown.
+            // Abort only the bounded detached lifecycle tasks owned by this
+            // service, then give their RAII permits one final bounded drain.
+            failed_settlements = self.lifecycle_admission.abort_settlements();
+            if tokio::time::timeout(
+                self.config.request_timeout,
+                self.lifecycle_admission.drained(),
+            )
+            .await
+            .is_err()
+            {
+                failed_settlements.extend(self.lifecycle_admission.unsettled_sources());
+            }
+        }
         self.stdin_bindings.lock().await.clear();
-        let mut reports = Vec::new();
-        for (id, _) in self.snapshot_definitions().await {
-            if let Some(handle) = self.manager.source(id) {
-                reports.push((
-                    id,
-                    handle
-                        .stop()
-                        .await
-                        .map(|report| {
-                            if report.complete {
-                                "stopped".to_owned()
-                            } else {
-                                "stop incomplete".to_owned()
-                            }
-                        })
-                        .map_err(|error| format!("stop: {error}")),
-                ));
+        let reports = self.manager.shutdown().await;
+        let mut reports: Vec<_> = reports
+            .into_iter()
+            .map(|(id, outcome)| (id, shutdown_stop_outcome(outcome)))
+            .collect();
+        for id in failed_settlements {
+            let failure =
+                Err("lifecycle settlement did not settle cleanly during shutdown".to_owned());
+            match reports.iter_mut().find(|(reported, _)| *reported == id) {
+                Some((_, outcome)) => *outcome = failure,
+                None => reports.push((id, failure)),
             }
         }
         reports
     }
 
+    #[cfg(test)]
     async fn snapshot_definitions(&self) -> Vec<(SourceId, SourceDefinition)> {
         self.definitions
             .lock()
@@ -2123,6 +2605,14 @@ impl WorkerService {
     }
 }
 
+fn shutdown_stop_outcome(outcome: Result<StopReport, RuntimeError>) -> Result<String, String> {
+    match outcome {
+        Ok(report) if report.complete => Ok("stopped".to_owned()),
+        Ok(_) => Err("stop incomplete".to_owned()),
+        Err(error) => Err(format!("stop: {error}")),
+    }
+}
+
 /// Correlation id of any request, for refusal paths that no longer own it.
 fn request_id_of(request: &WorkerRequest) -> String {
     match request {
@@ -2170,6 +2660,15 @@ mod tests {
     impl AdmissionHook for ScriptedAdmission {
         fn admit(&self, _definition: &SourceDefinition) -> AdmissionVerdict {
             self.verdict.clone()
+        }
+    }
+
+    struct CountingAdmission(std::sync::atomic::AtomicUsize);
+
+    impl AdmissionHook for CountingAdmission {
+        fn admit(&self, _definition: &SourceDefinition) -> AdmissionVerdict {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            AdmissionVerdict::Admit
         }
     }
 
@@ -3176,6 +3675,461 @@ mod tests {
             service.request_start(definition).await,
             Err(reason) if reason.contains("unknown source")
         ));
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_schema_and_relative_process_context_refuse_before_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let admission = Arc::new(CountingAdmission(std::sync::atomic::AtomicUsize::new(0)));
+        let (service, _) =
+            WorkerService::open(test_config(root.path()), admission.clone()).unwrap();
+
+        let mut unsupported = file_definition(54, &root.path().join("schema.log"));
+        unsupported.schema_version = 2;
+        assert!(matches!(
+            service.request_start(unsupported).await,
+            Err(reason) if reason.contains("unsupported source schema_version 2")
+        ));
+
+        let relative = file_definition(55, Path::new("window.log"));
+        assert!(matches!(
+            service.request_start(relative).await,
+            Err(reason) if reason.contains("file path must be absolute")
+        ));
+
+        let command = |id, executable: &str, cwd: Option<PathBuf>| SourceDefinition {
+            schema_version: 1,
+            id: SourceId(uuid::Uuid::from_u128(id)),
+            name: format!("command-{id}"),
+            acquisition: lvu_core::Acquisition::Command {
+                command: lvu_core::CommandDefinition {
+                    program: lvu_core::CommandProgram::Exec {
+                        executable: PathBuf::from(executable),
+                        args: Vec::new(),
+                    },
+                    cwd,
+                    environment: Default::default(),
+                    restart: lvu_core::RestartPolicy::Never,
+                },
+            },
+            identity_hints: Default::default(),
+            retention: None,
+        };
+        assert!(matches!(
+            service.request_start(command(56, "./tool", Some(root.path().to_path_buf()))).await,
+            Err(reason) if reason.contains("relative command executable paths")
+        ));
+        assert!(
+            validate_start_boundary(&command(58, "tool", Some(root.path().to_path_buf()))).is_ok(),
+            "bare executable names retain PATH lookup semantics"
+        );
+        assert!(
+            validate_start_boundary(&command(59, "bin/tool", Some(root.path().to_path_buf())))
+                .is_err(),
+            "path-like executable names must arrive resolved"
+        );
+        assert!(matches!(
+            service.request_start(command(57, "tool", None)).await,
+            Err(reason) if reason.contains("command cwd must be explicit")
+        ));
+        assert_eq!(
+            admission.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "boundary failures never reach duplicate admission"
+        );
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_start_finishes_registration_before_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("timeout.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let (service, _) = WorkerService::open(
+            test_config(root.path()),
+            Arc::new(crate::child::ChildAdmission),
+        )
+        .unwrap();
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_start_side_effect_pause(Some((Arc::clone(&reached), Arc::clone(&release))));
+
+        let definition = file_definition(58, &log);
+        let request = {
+            let service = Arc::clone(&service);
+            let definition = definition.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_millis(20), service.request_start(definition))
+                    .await
+            })
+        };
+        reached.wait().await;
+        assert!(
+            request.await.unwrap().is_err(),
+            "request deadline must elapse"
+        );
+        service.set_start_side_effect_pause(None);
+        release.wait().await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if service.snapshot_definitions().await.len() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "settlement did not register"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut duplicate = definition.clone();
+        duplicate.id = SourceId(uuid::Uuid::from_u128(59));
+        assert!(matches!(
+            service.request_start(duplicate).await,
+            Ok(StartedOutcome::Present { live_id }) if live_id == definition.id
+        ));
+        assert_eq!(
+            load_session_set(&root.path().join("workspace")).unwrap(),
+            vec![definition]
+        );
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_a_timed_out_start_before_stopping_it() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("shutdown-timeout.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let (service, _) =
+            WorkerService::open(test_config(root.path()), Arc::new(AdmitAll)).unwrap();
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_start_side_effect_pause(Some((Arc::clone(&reached), Arc::clone(&release))));
+        let definition = file_definition(65, &log);
+        let request = {
+            let service = Arc::clone(&service);
+            let definition = definition.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_millis(20), service.request_start(definition))
+                    .await
+            })
+        };
+        reached.wait().await;
+        assert!(request.await.unwrap().is_err());
+
+        let mut shutdown = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.shutdown().await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown must wait for detached definition/session settlement"
+        );
+        service.set_start_side_effect_pause(None);
+        release.wait().await;
+        let reports = shutdown.await.unwrap();
+        assert!(reports.iter().any(|(id, outcome)| {
+            *id == definition.id && outcome.as_ref().is_ok_and(|report| report == "stopped")
+        }));
+        assert_eq!(service.snapshot_definitions().await.len(), 1);
+        assert_eq!(
+            load_session_set(&root.path().join("workspace")).unwrap(),
+            vec![definition.clone()]
+        );
+        assert!(
+            service
+                .manager
+                .source(definition.id)
+                .is_none_or(|handle| handle.progress().state.is_terminal())
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_admission_before_a_paused_request_can_reserve() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("pre-admission.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let (service, _) =
+            WorkerService::open(test_config(root.path()), Arc::new(AdmitAll)).unwrap();
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_lifecycle_admission_pause(Some((Arc::clone(&reached), Arc::clone(&release))));
+        let definition = file_definition(67, &log);
+        let request = {
+            let service = Arc::clone(&service);
+            let definition = definition.clone();
+            tokio::spawn(async move { service.request_start(definition).await })
+        };
+        reached.wait().await;
+
+        assert!(service.shutdown().await.is_empty());
+        service.set_lifecycle_admission_pause(None);
+        release.wait().await;
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(reason) if reason.contains("shutting down")
+        ));
+        assert!(service.snapshot_definitions().await.is_empty());
+        assert!(service.manager.source(definition.id).is_none());
+        assert!(
+            load_session_set(&root.path().join("workspace"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_an_overdue_settlement_without_late_registration() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("overdue-settlement.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let mut config = test_config(root.path());
+        config.request_timeout = Duration::from_millis(20);
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_start_side_effect_pause(Some((Arc::clone(&reached), release)));
+        let definition = file_definition(68, &log);
+        let request = {
+            let service = Arc::clone(&service);
+            let definition = definition.clone();
+            tokio::spawn(async move { service.request_start(definition).await })
+        };
+        reached.wait().await;
+
+        let reports = tokio::time::timeout(Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown remains bounded after aborting overdue settlement");
+        assert!(reports.iter().any(|(id, _)| *id == definition.id));
+        service.set_start_side_effect_pause(None);
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(reason) if reason.contains("shutting down") || reason.contains("closed")
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(service.snapshot_definitions().await.is_empty());
+        assert!(
+            load_session_set(&root.path().join("workspace"))
+                .unwrap()
+                .is_empty(),
+            "aborted settlement cannot publish a session after shutdown"
+        );
+        assert!(
+            service
+                .manager
+                .source(definition.id)
+                .is_none_or(|handle| handle.progress().state.is_terminal())
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_a_stop_aborted_before_session_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("aborted-stop.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let mut config = test_config(root.path());
+        config.request_timeout = Duration::from_millis(20);
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let definition = file_definition(70, &log);
+        service.request_start(definition.clone()).await.unwrap();
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_stop_side_effect_pause(Some((Arc::clone(&reached), release)));
+        let stop = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.request_stop(definition.id).await })
+        };
+        reached.wait().await;
+
+        let reports = service.shutdown().await;
+        service.set_stop_side_effect_pause(None);
+        assert!(reports.iter().any(|(id, outcome)| {
+            *id == definition.id
+                && matches!(outcome, Err(reason) if reason.contains("did not settle cleanly"))
+        }));
+        assert!(stop.await.unwrap().is_err());
+        assert_eq!(
+            load_session_set(&root.path().join("workspace")).unwrap(),
+            vec![definition.clone()],
+            "an aborted stop must preserve durable restart intent"
+        );
+        assert!(
+            service
+                .manager
+                .source(definition.id)
+                .is_none_or(|handle| handle.progress().state.is_terminal())
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_and_undurable_stops_retain_session_until_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("stop-persist.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let (service, _) =
+            WorkerService::open(test_config(root.path()), Arc::new(AdmitAll)).unwrap();
+        let definition = file_definition(66, &log);
+        service.request_start(definition.clone()).await.unwrap();
+
+        service.force_incomplete_stop_report(definition.id);
+        assert!(matches!(
+            service.request_stop(definition.id).await,
+            Err(reason) if reason.contains("stop incomplete") && reason.contains("remains in the session")
+        ));
+        assert_eq!(
+            load_session_set(&root.path().join("workspace")).unwrap(),
+            vec![definition.clone()],
+            "an incomplete manager report must retain durable restart intent"
+        );
+
+        let temporary = root.path().join("workspace/session.json.tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        assert!(matches!(
+            service.request_stop(definition.id).await,
+            Err(reason) if reason.contains("session update failed") && reason.contains("retry stop")
+        ));
+        assert_eq!(
+            load_session_set(&root.path().join("workspace")).unwrap(),
+            vec![definition.clone()],
+            "failed removal never masquerades as durable"
+        );
+
+        std::fs::remove_dir(&temporary).unwrap();
+        service.request_stop(definition.id).await.unwrap();
+        assert!(
+            load_session_set(&root.path().join("workspace"))
+                .unwrap()
+                .is_empty()
+        );
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[test]
+    fn shutdown_maps_an_incomplete_manager_report_to_error() {
+        assert_eq!(
+            shutdown_stop_outcome(Ok(StopReport {
+                complete: false,
+                discarded_bytes: 17,
+                discarded_bytes_known: false,
+            })),
+            Err("stop incomplete".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_a_settlement_that_survives_abort_and_second_drain() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config(root.path());
+        config.request_timeout = Duration::from_millis(5);
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let id = SourceId(uuid::Uuid::from_u128(69));
+        let permit = service.lifecycle_admission.try_enter(id).unwrap();
+
+        let reports = service.shutdown().await;
+        assert!(reports.iter().any(|(reported, outcome)| {
+            *reported == id
+                && matches!(outcome, Err(reason) if reason.contains("did not settle cleanly"))
+        }));
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_restart_settlement_and_wins_last() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("lifecycle.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let (service, _) =
+            WorkerService::open(test_config(root.path()), Arc::new(AdmitAll)).unwrap();
+        let definition = file_definition(60, &log);
+        service.request_start(definition.clone()).await.unwrap();
+
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_start_side_effect_pause(Some((Arc::clone(&reached), Arc::clone(&release))));
+        let restart = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.request_restart(definition.id).await })
+        };
+        reached.wait().await;
+        let mut stop = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.request_stop(definition.id).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut stop)
+                .await
+                .is_err(),
+            "stop must not overlap the paused restart"
+        );
+        service.set_start_side_effect_pause(None);
+        release.wait().await;
+        restart.await.unwrap().unwrap();
+        stop.await.unwrap().unwrap();
+        assert!(
+            service
+                .manager
+                .source(definition.id)
+                .is_none_or(|handle| handle.progress().state.is_terminal()),
+            "serialized later stop leaves no restarted capture live"
+        );
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_present_to_restart_settlement_and_wins_last() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("present-lifecycle.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let (service, _) = WorkerService::open(
+            test_config(root.path()),
+            Arc::new(crate::child::ChildAdmission),
+        )
+        .unwrap();
+        let definition = file_definition(63, &log);
+        service.request_start(definition.clone()).await.unwrap();
+        service.request_stop(definition.id).await.unwrap();
+
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_start_side_effect_pause(Some((Arc::clone(&reached), Arc::clone(&release))));
+        let present_restart = {
+            let service = Arc::clone(&service);
+            let mut duplicate = definition.clone();
+            duplicate.id = SourceId(uuid::Uuid::from_u128(64));
+            tokio::spawn(async move { service.request_start(duplicate).await })
+        };
+        reached.wait().await;
+        let mut stop = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.request_stop(definition.id).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut stop)
+                .await
+                .is_err(),
+            "stop must not overlap the paused Present-to-restart transition"
+        );
+        service.set_start_side_effect_pause(None);
+        release.wait().await;
+        assert!(matches!(
+            present_restart.await.unwrap().unwrap(),
+            StartedOutcome::Started { source_id, .. } if source_id == definition.id
+        ));
+        stop.await.unwrap().unwrap();
+        assert!(
+            service
+                .manager
+                .source(definition.id)
+                .is_none_or(|handle| handle.progress().state.is_terminal())
+        );
         service.request_shutdown();
         service.shutdown().await;
     }

@@ -97,6 +97,26 @@ async fn wait_not_live(client: &mut WorkerClient, id: lvu_core::SourceId, what: 
     }
 }
 
+async fn wait_records(
+    tail: &FileJournalTail,
+    expected: usize,
+    journal: &Path,
+    what: &str,
+) -> lvu_core::journal::JournalPage {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(page) = tail.read_page(0, 128, 1024 * 1024)
+            && page.records.len() == expected
+        {
+            return page;
+        }
+        if Instant::now() >= deadline {
+            panic!("{what} never settled at {}", journal.display());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Two windows racing fresh-ID starts of one acquisition share the first
 /// capture: both replies carry the winner's id and journal, presence lists
 /// exactly one source, and that journal receives the file's bytes.
@@ -125,27 +145,21 @@ async fn concurrent_fresh_id_starts_share_the_first_capture() {
         let definition_a = file_definition(101, &log);
         let task_a = tokio::spawn(async move {
             barrier_a.wait().await;
-            first.request_start(&definition_a).await
+            let outcome = first.request_start(&definition_a).await;
+            (first, outcome)
         });
         let barrier_b = Arc::clone(&barrier);
         let definition_b = file_definition(102, &log);
         let task_b = tokio::spawn(async move {
             barrier_b.wait().await;
-            second.request_start(&definition_b).await
+            let outcome = second.request_start(&definition_b).await;
+            (second, outcome)
         });
         barrier.wait().await;
-        let (id_a, journal_a) = started_id(
-            task_a
-                .await
-                .expect("starter A joins")
-                .expect("starter A starts"),
-        );
-        let (id_b, journal_b) = started_id(
-            task_b
-                .await
-                .expect("starter B joins")
-                .expect("starter B starts"),
-        );
+        let (first, outcome_a) = task_a.await.expect("starter A joins");
+        let (id_a, journal_a) = started_id(outcome_a.expect("starter A starts"));
+        let (second, outcome_b) = task_b.await.expect("starter B joins");
+        let (id_b, journal_b) = started_id(outcome_b.expect("starter B starts"));
         assert_eq!(
             id_a, id_b,
             "concurrent fresh-ID starts must share one capture identity"
@@ -169,7 +183,7 @@ async fn concurrent_fresh_id_starts_share_the_first_capture() {
                 .exists(),
             "the loser id must not own a journal directory"
         );
-        let (mut third, presence) = WorkerClient::attach(&bin, &capture_root, "window-c", 5003)
+        let (third, presence) = WorkerClient::attach(&bin, &capture_root, "window-c", 5003)
             .await
             .expect("window C attaches");
         assert_eq!(
@@ -209,6 +223,10 @@ async fn stopped_source_restarts_under_original_id_on_explicit_start() {
             .await
             .expect("window A attaches");
         let definition = file_definition(111, &log);
+        let mut definition = definition;
+        if let lvu_core::Acquisition::File { follow, .. } = &mut definition.acquisition {
+            *follow = false;
+        }
         let (original, journal) = started_id(
             first
                 .request_start(&definition)
@@ -218,23 +236,27 @@ async fn stopped_source_restarts_under_original_id_on_explicit_start() {
         assert_eq!(original, definition.id);
 
         let tail = FileJournalTail::new(original, &journal);
-        wait_journal_growth(&tail, 0, &journal, "initial rows").await;
-        let before = tail
-            .read_page(0, 128, 1024 * 1024)
-            .expect("journal readable")
-            .records
-            .len();
+        let initial = wait_records(&tail, 1, &journal, "initial rows").await;
+        assert_eq!(initial.records[0].bytes.as_slice(), b"one");
+        assert_eq!(initial.records[0].record_id.source_id, original);
+        assert_eq!(initial.records[0].record_id.sequence, 0);
+        let initial_record_id = initial.records[0].record_id;
+        wait_not_live(&mut first, original, "finite initial capture").await;
 
         first
             .request_stop(original)
             .await
             .expect("explicit stop works");
-        wait_not_live(&mut first, original, "stopped capture");
+        wait_not_live(&mut first, original, "stopped capture").await;
 
         // Same acquisition, fresh id: must come back as the ORIGINAL id
         // with its journal, observably live.
         let mut revived = file_definition(112, &log);
         revived.name = "window-b-label".into();
+        if let lvu_core::Acquisition::File { follow, .. } = &mut revived.acquisition {
+            *follow = false;
+        }
+        std::fs::write(&log, "one\ntwo\nthree\nfour\n").expect("append before restart");
         let (restarted, restarted_journal) = started_id(
             first
                 .request_start(&revived)
@@ -249,13 +271,117 @@ async fn stopped_source_restarts_under_original_id_on_explicit_start() {
             restarted_journal, journal,
             "restart preserves the durable journal path"
         );
-        std::fs::write(&log, "one\ntwo\nthree\nfour\n").expect("append after restart");
-        wait_journal_growth(&tail, before, &journal, "post-restart rows").await;
+        wait_not_live(&mut first, original, "finite restarted capture").await;
+        let settled = wait_records(&tail, 4, &journal, "post-restart rows").await;
+        let bytes: Vec<&[u8]> = settled
+            .records
+            .iter()
+            .map(|record| record.bytes.as_slice())
+            .collect();
+        assert_eq!(bytes, [b"one".as_slice(), b"two", b"three", b"four"]);
+        assert_eq!(settled.records[0].record_id, initial_record_id);
+        for record in &settled.records {
+            assert_eq!(record.record_id.source_id, original);
+        }
+        assert!(
+            settled
+                .records
+                .windows(2)
+                .all(|pair| { pair[0].record_id.sequence < pair[1].record_id.sequence })
+        );
 
         first.shutdown().await.expect("window A drains");
     })
     .await;
     assert!(scenario.is_ok(), "stop/start scenario exceeded 120s");
+}
+
+#[tokio::test]
+async fn real_worker_refuses_invalid_identity_context_before_reuse() {
+    let scenario = tokio::time::timeout(Duration::from_secs(120), async {
+        let root = tempfile::tempdir().expect("scratch root");
+        let capture_root = root.path().join("captures");
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\n").expect("seed log");
+        let bin = worker_bin();
+        let (mut client, _) = WorkerClient::attach(&bin, &capture_root, "window-a", 5301)
+            .await
+            .expect("window attaches");
+
+        let valid = file_definition(131, &log);
+        let (live_id, _) = started_id(client.request_start(&valid).await.expect("valid start"));
+        let mut unsupported = valid.clone();
+        unsupported.id = lvu_core::SourceId(uuid::Uuid::from_u128(132));
+        unsupported.schema_version = 2;
+        assert!(
+            client
+                .request_start(&unsupported)
+                .await
+                .expect_err("invalid schema must not present the live capture")
+                .contains("unsupported source schema_version 2")
+        );
+        let relative = file_definition(133, Path::new("same-window-name.log"));
+        assert!(
+            client
+                .request_start(&relative)
+                .await
+                .expect_err("relative file must fail closed")
+                .contains("file path must be absolute")
+        );
+        let (observer, presence) = WorkerClient::attach(&bin, &capture_root, "window-b", 5302)
+            .await
+            .expect("observer attaches");
+        assert_eq!(presence.len(), 1);
+        assert_eq!(presence[0].id, live_id.0.to_string());
+        client.shutdown().await.expect("window drains");
+        observer.shutdown().await.expect("observer drains");
+    })
+    .await;
+    assert!(scenario.is_ok(), "boundary scenario exceeded 120s");
+}
+
+#[tokio::test]
+async fn real_worker_binds_fresh_stdin_definitions_independently() {
+    let scenario = tokio::time::timeout(Duration::from_secs(120), async {
+        let root = tempfile::tempdir().expect("scratch root");
+        let capture_root = root.path().join("captures");
+        let bin = worker_bin();
+        let (mut first, _) = WorkerClient::attach(&bin, &capture_root, "window-a", 5401)
+            .await
+            .expect("window A attaches");
+        let (mut second, _) = WorkerClient::attach(&bin, &capture_root, "window-b", 5402)
+            .await
+            .expect("window B attaches");
+        let stdin = |id| lvu_core::SourceDefinition {
+            schema_version: 1,
+            id: lvu_core::SourceId(uuid::Uuid::from_u128(id)),
+            name: format!("stdin-{id}"),
+            acquisition: lvu_core::Acquisition::Stdin,
+            identity_hints: Default::default(),
+            retention: None,
+        };
+        let first_id = match first
+            .request_start(&stdin(141))
+            .await
+            .expect("first stdin binds")
+        {
+            StartOutcome::StdinBound { source_id, .. } => source_id,
+            other => panic!("first stdin was not freshly bound: {other:?}"),
+        };
+        let second_id = match second
+            .request_start(&stdin(142))
+            .await
+            .expect("second stdin binds")
+        {
+            StartOutcome::StdinBound { source_id, .. } => source_id,
+            other => panic!("second stdin was not freshly bound: {other:?}"),
+        };
+        assert_ne!(first_id, second_id);
+        first.shutdown().await.expect("window A drains");
+        second.shutdown().await.expect("window B drains");
+    })
+    .await;
+    assert!(scenario.is_ok(), "stdin scenario exceeded 120s");
 }
 
 /// Direct and symlink spellings of one file share one capture even under
@@ -293,7 +419,7 @@ async fn direct_and_symlink_spellings_share_one_capture() {
         );
         assert_eq!(direct_journal, alias_journal);
 
-        let (mut second, presence) = WorkerClient::attach(&bin, &capture_root, "window-b", 5202)
+        let (second, presence) = WorkerClient::attach(&bin, &capture_root, "window-b", 5202)
             .await
             .expect("window B attaches");
         assert_eq!(
