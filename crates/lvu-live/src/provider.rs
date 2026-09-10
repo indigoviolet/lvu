@@ -225,6 +225,13 @@ pub struct LiveConfig {
     pub index_lock_retry_window: Duration,
     /// Ceiling for the backoff between those retries.
     pub index_lock_retry_ceiling: Duration,
+    /// Opt-in window tag for concurrent-window derived indexes. When set,
+    /// a per-source index file owned by another live window does not fail
+    /// terminally: this window builds its own derived index beside it
+    /// (`<source>.<journal>.<tag>.rows.idx`, swept once its owner is gone;
+    /// see [`sweep_stale_window_indexes`]). `None` keeps the historical
+    /// single-owner behavior exactly (contend, then terminally fail).
+    pub window_tag: Option<String>,
 }
 
 impl LiveConfig {
@@ -245,6 +252,7 @@ impl LiveConfig {
             maximum_view_sources: 32,
             index_lock_retry_window: Duration::from_secs(30),
             index_lock_retry_ceiling: Duration::from_millis(500),
+            window_tag: None,
         }
     }
 }
@@ -1887,21 +1895,7 @@ async fn source_worker(
         }
     };
     let artifact = artifact_dir.join(format!("{}.{}.rows.idx", source_id.0, journal_identity));
-    if !emit(
-        &updates,
-        &mut cancelled,
-        WorkerUpdate::Artifact {
-            source_id,
-            generation,
-            epoch,
-            path: artifact.clone(),
-        },
-    )
-    .await
-    {
-        return;
-    }
-    let (mut disk, rebuilt, budget) = match open_index(
+    let (mut disk, rebuilt, budget, artifact) = match open_index(
         &handle,
         token,
         &artifact,
@@ -1936,6 +1930,22 @@ async fn source_worker(
         }
         None => return,
     };
+    // Publish the artifact actually opened (a window-overflow path when the
+    // primary was contended): readers and active-checks below key on this.
+    if !emit(
+        &updates,
+        &mut cancelled,
+        WorkerUpdate::Artifact {
+            source_id,
+            generation,
+            epoch,
+            path: artifact.clone(),
+        },
+    )
+    .await
+    {
+        return;
+    }
     let initial_state = if rebuilt {
         IndexState::Rebuilding
     } else {
@@ -2144,6 +2154,168 @@ async fn source_worker(
 /// still terminal, and the caller reports it. `None` means the worker was
 /// cancelled while waiting.
 #[allow(clippy::type_complexity)]
+/// Keep a window tag filesystem-safe: letters, digits, dash, underscore.
+/// Anything else (notably `/` and `.`, which would escape the artifact
+/// directory or confuse the overflow-name parse below) is dropped; an
+/// empty result disables the overflow fallback.
+fn sanitize_window_tag(tag: &str) -> Option<String> {
+    let kept: String = tag
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if kept.is_empty() { None } else { Some(kept) }
+}
+
+/// Overflow artifact for a contended primary: same directory, canonical
+/// stem plus the window tag (`<source>.<journal>.<tag>.rows.idx`). The
+/// stem keeps its canonical shape so budget accounting (which matches
+/// `*.rows.idx`) and source attribution (`source_bytes` reads the first
+/// dot-part) keep working unchanged; `owned_index_name` deliberately
+/// excludes three-part names so inspection flows never mistake an
+/// overflow for a primary.
+fn overflow_artifact_path(primary: &Path, tag: &str) -> PathBuf {
+    let stem = primary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".rows.idx"))
+        .unwrap_or("index");
+    primary.with_file_name(format!("{stem}.{tag}.rows.idx"))
+}
+
+/// Whether a derived-dir entry is a window-overflow index. Primary names
+/// carry exactly two dot-parts (`<source>.<journal>`); overflows carry a
+/// third `window-<pid>` part minted by `overflow_artifact_path`. Anything
+/// else (foreign files, future shapes) is conservatively NOT an overflow
+/// and is never swept.
+fn is_window_overflow_name(file_name: &str) -> bool {
+    let Some(stem) = file_name.strip_suffix(".rows.idx") else {
+        return false;
+    };
+    let mut parts = stem.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(_), Some(_), Some(tag), None) => {
+            tag.len() > "window-".len()
+                && tag.starts_with("window-")
+                && tag["window-".len()..]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        }
+        _ => false,
+    }
+}
+
+/// Bounded cleanup for window-overflow indexes: remove overflow files
+/// whose owner is gone. Liveness comes from the file lock itself — the
+/// kernel releases it on owner death, so no pid tracking (and no pid-reuse
+/// hazard) is involved. Only overflow-shaped names are candidates;
+/// primary indexes are never touched (they persist across relaunches for
+/// fast resume by design). A file created but not yet locked by a racing
+/// launcher sweeps harmlessly: its owner try-locks the unlinked inode
+/// successfully and keeps a self-consistent (if invisible) index for its
+/// own lifetime. Returns the number of files removed. Best-effort: every
+/// per-file failure is skipped, never fatal to startup.
+pub fn sweep_stale_window_indexes(artifact_dir: &Path) -> usize {
+    let entries = match std::fs::read_dir(artifact_dir) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_window_overflow_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        // Probe while holding: index files are locked with fs2 flock
+        // locks (see `DiskService::open`), so the probe uses the same
+        // domain — an fcntl probe would not see an flock lock and could
+        // sweep a live file. A racing launcher that loses this probe
+        // skips the file, and one that won it keeps us out, so removal
+        // below never races a live owner.
+        let acquirable = {
+            use fs2::FileExt;
+            file.try_lock_exclusive().is_ok()
+        };
+        if !acquirable {
+            continue;
+        }
+        // Remove while still holding the probe lock: a racing launcher
+        // try-locks during this window, fails, and retries against the
+        // gone file (recreating it) instead of inhabiting an unlinked
+        // ghost. A racing sweeper fails its own probe and skips.
+        let removed_file = std::fs::remove_file(&path).is_ok();
+        drop(file);
+        if removed_file {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(test)]
+mod window_overflow_tests {
+    use super::{is_window_overflow_name, overflow_artifact_path, sanitize_window_tag};
+    use std::path::Path;
+
+    #[test]
+    fn sanitize_keeps_window_ids_and_rejects_escapes() {
+        assert_eq!(
+            sanitize_window_tag("window-1234"),
+            Some("window-1234".to_owned())
+        );
+        assert_eq!(sanitize_window_tag(""), None);
+        assert_eq!(sanitize_window_tag("..."), None);
+        assert_eq!(sanitize_window_tag("../evil"), Some("evil".to_owned()));
+        assert_eq!(
+            sanitize_window_tag("window-1/x.rows.idx"),
+            Some("window-1xrowsidx".to_owned())
+        );
+    }
+
+    #[test]
+    fn overflow_names_keep_stem_and_match_sweep_pattern() {
+        let primary = Path::new(
+            "/cache/derived/8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.rows.idx",
+        );
+        let overflow = overflow_artifact_path(primary, "window-99");
+        assert_eq!(
+            overflow,
+            Path::new(
+                "/cache/derived/8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-99.rows.idx"
+            )
+        );
+        assert!(is_window_overflow_name(
+            overflow.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(!is_window_overflow_name(
+            primary.file_name().unwrap().to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn sweep_pattern_ignores_primaries_and_foreign_names() {
+        assert!(!is_window_overflow_name("notes.txt"));
+        assert!(!is_window_overflow_name("a.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.other.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.window-.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.c.d.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.window-1.rows.idx.bak"));
+        assert!(is_window_overflow_name("a.b.window-7.rows.idx"));
+    }
+}
+
 async fn open_index(
     handle: &AnySourceHandle,
     token: WorkerToken,
@@ -2152,12 +2324,16 @@ async fn open_index(
     config: &LiveConfig,
     updates: &mpsc::Sender<WorkerUpdate>,
     cancelled: &mut watch::Receiver<bool>,
-) -> Option<Result<(DiskService, bool, BudgetVerification), (std::io::ErrorKind, String)>> {
+) -> Option<Result<(DiskService, bool, BudgetVerification, PathBuf), (std::io::ErrorKind, String)>>
+{
     let budget = IndexBudget {
         per_source: config.maximum_index_bytes_per_source,
         total: config.maximum_total_index_bytes,
         reconciliation_limit: config.maximum_sources.saturating_mul(4).clamp(64, 4096),
     };
+    let overflow_tag = config.window_tag.as_deref().and_then(sanitize_window_tag);
+    let mut current = artifact.to_path_buf();
+    let mut overflowed = false;
     let deadline = tokio::time::Instant::now() + config.index_lock_retry_window;
     let mut backoff = INDEX_LOCK_RETRY_FIRST_BACKOFF;
     let mut attempts: u32 = 0;
@@ -2165,7 +2341,7 @@ async fn open_index(
     loop {
         attempts = attempts.saturating_add(1);
         let opened = DiskService::open(
-            artifact.to_path_buf(),
+            current.clone(),
             handle.source_id(),
             token.generation,
             config.index_page_records,
@@ -2175,11 +2351,23 @@ async fn open_index(
         )
         .await;
         let (kind, error) = match opened {
-            Ok(value) => return Some(Ok(value)),
+            Ok((disk, rebuilt, budget)) => return Some(Ok((disk, rebuilt, budget, current))),
             Err(failure) => failure,
         };
         if kind != std::io::ErrorKind::WouldBlock {
             return Some(Err((kind, error)));
+        }
+        if !overflowed && let Some(tag) = overflow_tag.as_deref() {
+            // The primary is owned by another live window: build this
+            // window's own derived index beside it instead of queueing 30s
+            // behind a lock that only frees when that window exits. The
+            // overflow name keeps the canonical stem so budget accounting
+            // and source attribution keep working; lifecycle is bounded by
+            // `sweep_stale_window_indexes`. No sleep: this is a different
+            // file, nothing to wait for.
+            overflowed = true;
+            current = overflow_artifact_path(&current, tag);
+            continue;
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {

@@ -7722,7 +7722,18 @@ async fn run() -> Result<(), String> {
         .map_err(|error| format!("effective settings: {error}"))?;
     let row_cache_bytes = usize::try_from(effective_settings.row_cache_bytes.value)
         .map_err(|_| "row cache setting exceeds this platform".to_owned())?;
-    let mut live_config = LiveConfig::new(paths.cache_dir.join("derived"));
+    // Derived live indexes are per-window namespaces under the shared
+    // cache: the per-source index file takes an exclusive lock for its
+    // whole lifetime, so a second concurrent window would terminally fail
+    // opening the first window's file. With the window tag set, contention
+    // overflows to a window-suffixed sibling instead (see
+    // `sweep_stale_window_indexes`); the shared journal and capture stay
+    // single and stable IDs never change. Reap dead windows' overflow
+    // files here so crash debris is bounded by one generation.
+    let derived_dir = paths.cache_dir.join("derived");
+    let _swept_overflow = lvu_live::sweep_stale_window_indexes(&derived_dir);
+    let mut live_config = LiveConfig::new(derived_dir);
+    live_config.window_tag = Some(window_id.clone());
     live_config.maximum_request_rows = 256;
     live_config.cache_bytes = row_cache_bytes;
     live_config.maximum_index_bytes_per_source = effective_settings.index_per_source_bytes.value;

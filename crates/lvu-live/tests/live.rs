@@ -1681,3 +1681,125 @@ async fn overlapping_windows_keep_prefix_order_and_stable_ids() {
     let _ = handle.stop().await;
     provider.shutdown().await;
 }
+
+#[tokio::test]
+async fn concurrent_windows_share_one_journal_through_overflow_indexes() {
+    // Two providers over ONE derived dir and ONE live source: the first
+    // takes the canonical index, the second overflows to its window-suffixed
+    // sibling instead of failing terminally on the exclusive lock. Both
+    // serve identical rows with identical stable ids: the shared journal
+    // and capture stay single, only the writable derived index is private.
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("app.log");
+    fs::write(&input, b"first\nsecond\n").unwrap();
+    let id = SourceId::new();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager.start(file_source(id, &input, true)).await.unwrap();
+    wait_runtime(&handle, |state, records| {
+        state == RuntimeState::Running && records >= 2
+    })
+    .await;
+
+    let mut config_a = live_config(&root);
+    config_a.window_tag = Some("window-1".into());
+    let mut config_b = live_config(&root);
+    config_b.window_tag = Some("window-2".into());
+    let provider_a = LiveRowProvider::new(config_a).unwrap();
+    let provider_b = LiveRowProvider::new(config_b).unwrap();
+    provider_a
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
+    provider_b
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
+    provider_a.register_raw_view("raw", vec![id]).unwrap();
+    provider_b.register_raw_view("raw", vec![id]).unwrap();
+    wait_index(&provider_a, id, 2).await;
+    wait_index(&provider_b, id, 2).await;
+    let rows_a = wait_page(&provider_a, "raw", 0, 2).await;
+    let rows_b = wait_page(&provider_b, "raw", 0, 2).await;
+    assert_eq!(rows_a[0].text, "first");
+    assert_eq!(rows_b[0].text, "first");
+    assert_eq!(
+        rows_a[0].id, rows_b[0].id,
+        "stable ids must match across windows sharing one journal"
+    );
+
+    // Exactly two derived indexes: the canonical primary plus one
+    // window-suffixed overflow (either window may win the primary; the
+    // loser overflows). The shared journal was never duplicated.
+    let mut indexes: Vec<String> = fs::read_dir(root.path().join("derived"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rows.idx"))
+        .collect();
+    indexes.sort();
+    assert_eq!(indexes.len(), 2, "primary plus one overflow: {indexes:?}");
+    let dot_parts = |name: &String| {
+        name.strip_suffix(".rows.idx")
+            .unwrap_or_default()
+            .split('.')
+            .count()
+    };
+    assert!(
+        indexes.iter().any(|name| dot_parts(name) == 2),
+        "canonical primary present: {indexes:?}"
+    );
+    assert!(
+        indexes.iter().any(|name| dot_parts(name) == 3
+            && (name.contains(".window-1.") || name.contains(".window-2."))),
+        "window-suffixed overflow present: {indexes:?}"
+    );
+    let _ = handle.stop().await;
+    provider_a.shutdown().await;
+    provider_b.shutdown().await;
+}
+
+#[test]
+fn sweep_removes_only_dead_window_overflow() {
+    use fs2::FileExt;
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("derived");
+    fs::create_dir_all(&dir).unwrap();
+    let primary =
+        "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.rows.idx";
+    let dead = "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-99.rows.idx";
+    let live = "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-100.rows.idx";
+    let foreign = "notes.txt";
+    let foreign_shaped = "a.b.c.rows.idx";
+    for name in [primary, dead, live, foreign, foreign_shaped] {
+        fs::write(dir.join(name), b"x").unwrap();
+    }
+    // A live owner holds its overflow exclusive for its whole lifetime.
+    let live_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(live))
+        .unwrap();
+    live_file.try_lock_exclusive().unwrap();
+    // The primary is locked too: primaries are never swept regardless.
+    let primary_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(primary))
+        .unwrap();
+    primary_file.try_lock_exclusive().unwrap();
+
+    let removed = lvu_live::sweep_stale_window_indexes(&dir);
+    assert_eq!(removed, 1, "exactly the dead overflow goes");
+    assert!(dir.join(primary).exists(), "primary kept");
+    assert!(!dir.join(dead).exists(), "dead overflow swept");
+    assert!(dir.join(live).exists(), "live overflow kept");
+    assert!(dir.join(foreign).exists(), "foreign files ignored");
+    assert!(
+        dir.join(foreign_shaped).exists(),
+        "non-window shapes ignored"
+    );
+
+    // A missing directory sweeps to zero, never an error.
+    assert_eq!(
+        lvu_live::sweep_stale_window_indexes(&root.path().join("absent")),
+        0
+    );
+}
