@@ -3,8 +3,9 @@
 
 Two file sources log interleaving event times. The Union dialog merges two
 views into one timestamp-ordered view; a union-level text search narrows it;
-the Grouping dialog applies over it without disturbing membership; and the
-union survives a restart through ordinary persisted working state.
+an append after publication refreshes it with no view edit; the Grouping
+dialog applies over it without disturbing membership; and the union survives
+a restart through ordinary persisted working state.
 """
 import pathlib
 import sys
@@ -143,6 +144,22 @@ def run(binary):
             )
             app.send(b"\x1b")
             wait_closed(app, "┌ Filter", "filter editor closed")
+
+            # --- File-follow progress refreshes the accepted union itself. -
+            # No view edit or keypress occurs between the append and this
+            # assertion. The old first identity remains visible while the new
+            # physical record appears through the same raw capture.
+            with api.open("a") as stream:
+                stream.write(
+                    '{"ts":"2026-03-04T05:06:30Z","svc":"api","n":99,"marker":"live-after-completion"}\n'
+                )
+            refreshed = app.wait_until(
+                lambda text: "live-after-completion" in text
+                and '"svc":"api","n":0' in text,
+                "published union refreshed after append without a view edit",
+                timeout=25,
+            )
+            assert '"svc":"worker","n":0' in refreshed, refreshed
 
             # --- Grouping applies over the union without losing rows. ------
             # Editors stay open on Apply by design, so close explicitly: an

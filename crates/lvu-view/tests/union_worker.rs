@@ -11,9 +11,10 @@ use lvu::{
     QueryConstraints, QueryPurpose, QueryRequest, RowProvider, TextConstraint, ViewportRequest,
     terminal::QueryDispatcher,
 };
-use lvu_core::{Acquisition, SourceDefinition, SourceId};
+use lvu_core::{Acquisition, ExactFieldConstraint, ExactScalar, SourceDefinition, SourceId};
 use lvu_ingest::{RuntimeConfig, RuntimeState, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
+use lvu_query::CompilerHostConfig;
 use lvu_view::{
     NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec, UnionPhaseTestProbe,
     UnionPublishTestBarrier, UnionTestBarrier, ViewConfig,
@@ -60,7 +61,25 @@ fn configs(root: &TempDir) -> (LiveConfig, ViewConfig) {
     let mut view = ViewConfig::new(root.path().join("view-index"));
     view.page_records = 4;
     view.page_bytes = 4096;
-    view.compiler = None;
+    view.compiler = Some(CompilerHostConfig {
+        executable: "uv".into(),
+        args: vec![
+            "run".into(),
+            "--project".into(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../python")
+                .display()
+                .to_string(),
+            "--locked".into(),
+            "python".into(),
+            "-m".into(),
+            "lvu_expr_helper".into(),
+        ],
+        request_limit: 64 * 1024,
+        output_limit: 384 * 1024,
+        stderr_limit: 32 * 1024,
+        timeout: Duration::from_secs(10),
+    });
     (live, view)
 }
 
@@ -100,6 +119,26 @@ fn apply(adapter: &mut NativeViewAdapter, view: &str, revision: u64) {
                 constraints.clone()
             },
             purpose: QueryPurpose::Search,
+            constraints,
+        })
+        .unwrap();
+}
+
+fn apply_slash_enrichment(adapter: &mut NativeViewAdapter, view: &str, source: &str) {
+    let mut constraints = QueryConstraints::default();
+    constraints.enrichments = vec![lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId(format!("{view}-capture")),
+        source: source.into(),
+        command: None,
+    }];
+    adapter
+        .submit(QueryRequest {
+            view_id: view.into(),
+            generation: 1,
+            revision: 1,
+            base_revision: 0,
+            base_constraints: QueryConstraints::default(),
+            purpose: QueryPurpose::Enrichment,
             constraints,
         })
         .unwrap();
@@ -325,6 +364,27 @@ fn raw_candidate(revision: u64) -> UnionCandidateSpec {
             },
         ],
         filter: UnionFilterSpec::default(),
+    }
+}
+
+fn duplicate_projection_candidate(revision: u64, filter: UnionFilterSpec) -> UnionCandidateSpec {
+    UnionCandidateSpec {
+        union_view_id: "union".into(),
+        union_revision: revision,
+        generation: revision,
+        inputs: vec![
+            StoredUnionInput {
+                view_id: "view-loser".into(),
+                accepted_revision: 1,
+                applied_generation: 1,
+            },
+            StoredUnionInput {
+                view_id: "view-winner".into(),
+                accepted_revision: 1,
+                applied_generation: 1,
+            },
+        ],
+        filter,
     }
 }
 
@@ -696,6 +756,134 @@ async fn union_applies_its_own_text_search() {
     let mut sorted = texts.clone();
     sorted.sort();
     assert_eq!(texts, sorted);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_advanced_filters_post_dedup_and_preserve_last_good() {
+    let (root, manager, api, _worker, mut adapter) = setup().await;
+    adapter
+        .register_view("view-loser", vec![api.source_id()])
+        .unwrap();
+    adapter
+        .register_view("view-winner", vec![api.source_id()])
+        .unwrap();
+    apply_slash_enrichment(&mut adapter, "view-loser", r#"/svc\":\"(?P<choice>api)/"#);
+    wait_applied(&mut adapter, 1).await;
+    apply_slash_enrichment(&mut adapter, "view-winner", r#"/\"n\":(?P<choice>\d+)/"#);
+    wait_applied(&mut adapter, 1).await;
+    adapter
+        .register_union_view("union", vec![api.source_id()])
+        .unwrap();
+
+    // Both inputs contain the same stable identities. First-input dedup keeps
+    // choice="api"; filtering inputs separately would incorrectly retain the
+    // second projection's choice="0" row.
+    adapter
+        .submit_union_candidate(
+            duplicate_projection_candidate(
+                1,
+                UnionFilterSpec {
+                    advanced_polars: Some("pl.col('choice') == '0'".into()),
+                    ..UnionFilterSpec::default()
+                },
+            ),
+            &|_| None,
+        )
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+    assert!(union_rows(&mut adapter).is_empty());
+
+    adapter
+        .submit_union_candidate(
+            duplicate_projection_candidate(
+                2,
+                UnionFilterSpec {
+                    advanced_polars: Some("pl.col('choice') == 'api'".into()),
+                    ..UnionFilterSpec::default()
+                },
+            ),
+            &|_| None,
+        )
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 2).unwrap().error, None);
+    let accepted = union_rows(&mut adapter);
+    assert_eq!(accepted.len(), 6);
+
+    for (revision, invalid) in [
+        (3, "pl.col('unknown_union_column') == 1"),
+        (4, "pl.col('choice')"),
+    ] {
+        adapter
+            .submit_union_candidate(
+                duplicate_projection_candidate(
+                    revision,
+                    UnionFilterSpec {
+                        advanced_polars: Some(invalid.into()),
+                        ..UnionFilterSpec::default()
+                    },
+                ),
+                &|_| None,
+            )
+            .unwrap();
+        assert!(wait_union(&mut adapter, revision).unwrap().error.is_some());
+        assert_eq!(union_rows(&mut adapter), accepted);
+    }
+
+    let exact = ExactFieldConstraint::new("choice", ExactScalar::string("api").unwrap()).unwrap();
+    let combined = UnionFilterSpec {
+        advanced_polars: Some("pl.col('n') >= 3".into()),
+        exact_key: Some(exact),
+        ..UnionFilterSpec::default()
+    };
+    adapter
+        .submit_union_candidate(duplicate_projection_candidate(5, combined.clone()), &|_| {
+            None
+        })
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 5).unwrap().error, None);
+    assert_eq!(union_rows(&mut adapter).len(), 3);
+    let compiled_before_refresh = adapter.compiler_calls();
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("api.log"))
+        .unwrap();
+    writeln!(
+        file,
+        "{{\"ts\":\"2026-03-04T05:06:20Z\",\"svc\":\"api\",\"n\":6}}"
+    )
+    .unwrap();
+    file.flush().unwrap();
+    wait_runtime(&api, 7).await;
+    let started = std::time::Instant::now();
+    loop {
+        adapter.drain_updates(64);
+        let ready = ["view-loser", "view-winner"].into_iter().all(|view_id| {
+            adapter.status(view_id).is_some_and(|status| {
+                status
+                    .high_watermarks
+                    .iter()
+                    .any(|(source, high)| *source == api.source_id() && *high == Some(6))
+            })
+        });
+        if ready {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    adapter
+        .submit_union_candidate(duplicate_projection_candidate(6, combined), &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 6).unwrap().error, None);
+    assert_eq!(union_rows(&mut adapter).len(), 4);
+    assert_eq!(
+        adapter.compiler_calls(),
+        compiled_before_refresh,
+        "an unchanged published Advanced definition reuses its compiler cache"
+    );
     adapter.shutdown();
     manager.shutdown().await;
 }
