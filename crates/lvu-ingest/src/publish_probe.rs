@@ -47,6 +47,41 @@ pub enum PrePublishObservation {
     Poisoned,
 }
 
+/// Exact pending publication at a hooked attempt: the lock observation plus
+/// the pending generation, high-watermark sequence and record count read
+/// from `WriterState.current` at the hook call — before the write lock, so
+/// this is what the publish is about to make visible, not what is visible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishAttempt {
+    pub observation: PrePublishObservation,
+    pub generation: u64,
+    pub high_watermark: Option<u64>,
+    pub records: u64,
+}
+
+/// Selection for [`arm_filtered`]: only an attempt whose pending triple
+/// matches exactly is reported and parked. Non-matching attempts pass
+/// through WITHOUT consuming the arm, so a periodic same-fence publish can
+/// never steal the rendezvous meant for the awaited records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpectedPublish {
+    pub generation: u64,
+    pub high_watermark: Option<u64>,
+    pub records: u64,
+}
+
+impl ExpectedPublish {
+    fn matches(&self, current: &crate::SourceProgress) -> bool {
+        self.generation == current.generation
+            && self.high_watermark
+                == current
+                    .high_watermark
+                    .as_ref()
+                    .map(|record| record.sequence)
+            && self.records == current.records
+    }
+}
+
 /// Duplicate-arm refusal: any existing registration for the source — live
 /// or already consumed — refuses a second arm until the previous arm is
 /// dropped (RAII cleanup). Re-arming a consumed one-shot therefore requires
@@ -69,7 +104,8 @@ impl std::error::Error for ArmError {}
 
 struct Probe {
     token: u64,
-    entered_tx: Option<SyncSender<PrePublishObservation>>,
+    expected: Option<ExpectedPublish>,
+    entered_tx: Option<SyncSender<PublishAttempt>>,
     release_rx: Option<Receiver<()>>,
 }
 
@@ -94,17 +130,23 @@ fn alloc_token() -> u64 {
 pub struct ProbeArm {
     source: SourceId,
     token: u64,
-    entered_rx: Receiver<PrePublishObservation>,
+    entered_rx: Receiver<PublishAttempt>,
     release_tx: Option<SyncSender<()>>,
 }
 
 impl ProbeArm {
-    /// Wait (bounded) for the writer's next publication attempt for this
-    /// source, returning what the publication lock looked like there.
-    pub fn await_observation(&self, timeout: Duration) -> Result<PrePublishObservation, String> {
+    /// Wait (bounded) for the writer's next selected publication attempt for
+    /// this source, returning the full pending triple.
+    pub fn await_attempt(&self, timeout: Duration) -> Result<PublishAttempt, String> {
         self.entered_rx
             .recv_timeout(timeout)
             .map_err(|error| format!("publish attempt not observed: {error:?}"))
+    }
+
+    /// Wait (bounded) for the next selected attempt's lock observation only.
+    pub fn await_observation(&self, timeout: Duration) -> Result<PrePublishObservation, String> {
+        self.await_attempt(timeout)
+            .map(|attempt| attempt.observation)
     }
 
     /// Release the parked writer. Send failure (writer timed out or already
@@ -131,6 +173,19 @@ impl Drop for ProbeArm {
 /// the previous arm is dropped, so at most one arm ever names a source and a
 /// stale handle can never shadow a live one.
 pub fn arm(source: SourceId) -> Result<ProbeArm, ArmError> {
+    arm_inner(source, None)
+}
+
+/// Arm the rendezvous for one source, selected to one exact pending
+/// publication: only an attempt whose pending triple matches `expected`
+/// notifies and parks. Anything else passes through WITHOUT consuming the
+/// arm, so a periodic same-fence publish can never steal the rendezvous
+/// meant for awaited records. Duplicate and drop rules match [`arm`].
+pub fn arm_filtered(source: SourceId, expected: ExpectedPublish) -> Result<ProbeArm, ArmError> {
+    arm_inner(source, Some(expected))
+}
+
+fn arm_inner(source: SourceId, expected: Option<ExpectedPublish>) -> Result<ProbeArm, ArmError> {
     let mut registry = registry().lock().expect("probe registry poisoned");
     if registry.contains_key(&source) {
         return Err(ArmError::AlreadyArmed);
@@ -142,6 +197,7 @@ pub fn arm(source: SourceId) -> Result<ProbeArm, ArmError> {
         source,
         Probe {
             token,
+            expected,
             entered_tx: Some(entered_tx),
             release_rx: Some(release_rx),
         },
@@ -164,12 +220,33 @@ fn disarm_if_token(source: &SourceId, token: u64) {
     }
 }
 
-/// Observe-and-park hook for the publication write attempt. Takes the
-/// one-shot ends under the registry lock, observes the passed publication
-/// lock with a non-blocking `try_write` (dropping an acquired guard
-/// immediately), notifies the test, then parks for release with no locks
-/// held. Unregistered or already-consumed attempts return immediately.
-pub(crate) fn pre_publish(source: &SourceId, publication: &RwLock<()>) {
+/// Observe-and-park hook for the publication write attempt. Reads the
+/// pending triple from `current` (already the about-to-publish values),
+/// skips unregistered sources and — for filtered arms — non-matching
+/// attempts WITHOUT consuming the arm, then takes the one-shot ends under
+/// the registry lock, observes the passed publication lock with a
+/// non-blocking `try_write` (dropping an acquired guard immediately),
+/// notifies the test with the full attempt, then parks for release with no
+/// locks held. Selection and consumption are separate steps so a
+/// non-matching publish can never steal a filtered rendezvous.
+pub(crate) fn pre_publish(
+    source: &SourceId,
+    publication: &RwLock<()>,
+    current: &crate::SourceProgress,
+) {
+    let selected = {
+        let registry = registry().lock().expect("probe registry poisoned");
+        match registry.get(source) {
+            None => return,
+            Some(probe) => match probe.expected {
+                None => true,
+                Some(want) => want.matches(current),
+            },
+        }
+    };
+    if !selected {
+        return;
+    }
     let taken = {
         let mut registry = registry().lock().expect("probe registry poisoned");
         match registry.get_mut(source) {
@@ -188,18 +265,57 @@ pub(crate) fn pre_publish(source: &SourceId, publication: &RwLock<()>) {
         Err(TryLockError::WouldBlock) => PrePublishObservation::WouldBlock,
         Err(TryLockError::Poisoned(_)) => PrePublishObservation::Poisoned,
     };
-    let _ = entered_tx.try_send(observation);
+    let _ = entered_tx.try_send(PublishAttempt {
+        observation,
+        generation: current.generation,
+        high_watermark: current
+            .high_watermark
+            .as_ref()
+            .map(|record| record.sequence),
+        records: current.records,
+    });
     let _ = release_rx.recv_timeout(PUBLISH_PROBE_WAIT);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RuntimeState, SourceProgress};
+    use lvu_core::RecordId;
     use std::sync::Arc;
     use std::thread::JoinHandle;
 
     fn test_source(n: u128) -> SourceId {
         SourceId(uuid::Uuid::from_u128(n))
+    }
+
+    fn progress(
+        source: SourceId,
+        generation: u64,
+        high_watermark: Option<u64>,
+        records: u64,
+    ) -> SourceProgress {
+        SourceProgress {
+            source_id: source,
+            generation,
+            state: RuntimeState::Running,
+            records,
+            high_watermark: high_watermark.map(|sequence| RecordId {
+                source_id: source,
+                sequence,
+            }),
+            journal_bytes: 0,
+            synced_records: 0,
+            syncs: 0,
+            handovers: 0,
+            writer_cpu_nanos: 0,
+            reader_cpu_nanos: 0,
+            boundaries: 0,
+            exit_code: None,
+            discarded_bytes: 0,
+            discarded_bytes_known: true,
+            last_error: None,
+        }
     }
 
     /// Run `pre_publish` on a helper thread (it may park until released) and
@@ -210,10 +326,11 @@ mod tests {
     fn parked_call(
         source: SourceId,
         lock: Arc<RwLock<()>>,
+        current: SourceProgress,
     ) -> (JoinHandle<()>, mpsc::Receiver<()>) {
         let (done_tx, done_rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
-            pre_publish(&source, &lock);
+            pre_publish(&source, &lock, &current);
             let _ = done_tx.send(());
         });
         (handle, done_rx)
@@ -228,8 +345,9 @@ mod tests {
     #[test]
     fn unregistered_attempts_pass_through() {
         let lock = RwLock::new(());
-        pre_publish(&test_source(1), &lock);
-        pre_publish(&test_source(1), &lock);
+        let current = progress(test_source(1), 1, None, 0);
+        pre_publish(&test_source(1), &lock, &current);
+        pre_publish(&test_source(1), &lock, &current);
     }
 
     /// Any existing registration refuses a second arm — live or already
@@ -243,7 +361,7 @@ mod tests {
         assert!(matches!(arm(source), Err(ArmError::AlreadyArmed)));
         // Fire and consume through a helper thread; the consumed entry still
         // refuses until the old arm is dropped.
-        let (writer, done) = parked_call(source, lock.clone());
+        let (writer, done) = parked_call(source, lock.clone(), progress(source, 1, None, 0));
         assert_eq!(
             first.await_observation(Duration::from_secs(10)),
             Ok(PrePublishObservation::Acquired)
@@ -255,7 +373,7 @@ mod tests {
         assert!(matches!(arm(source), Err(ArmError::AlreadyArmed)));
         drop(first);
         let mut second = arm(source).expect("re-arm after drop");
-        let (writer, done) = parked_call(source, lock.clone());
+        let (writer, done) = parked_call(source, lock.clone(), progress(source, 1, None, 0));
         assert_eq!(
             second.await_observation(Duration::from_secs(10)),
             Ok(PrePublishObservation::Acquired)
@@ -269,20 +387,20 @@ mod tests {
         let source = test_source(3);
         let lock = Arc::new(RwLock::new(()));
         let mut arm1 = arm(source).expect("arm");
-        let (writer, done) = parked_call(source, lock.clone());
+        let (writer, done) = parked_call(source, lock.clone(), progress(source, 1, None, 0));
         assert_eq!(
             arm1.await_observation(Duration::from_secs(10)),
             Ok(PrePublishObservation::Acquired)
         );
         // Consumed: a further attempt proceeds unimpeded without notifying,
         // while the first arm still blocks re-arming until dropped.
-        pre_publish(&source, &lock);
+        pre_publish(&source, &lock, &progress(source, 1, None, 0));
         arm1.release();
         join_bounded(writer, done);
         assert!(matches!(arm(source), Err(ArmError::AlreadyArmed)));
         drop(arm1);
         let mut arm2 = arm(source).expect("re-arm after drop");
-        let (writer, done) = parked_call(source, lock.clone());
+        let (writer, done) = parked_call(source, lock.clone(), progress(source, 1, None, 0));
         assert_eq!(
             arm2.await_observation(Duration::from_secs(10)),
             Ok(PrePublishObservation::Acquired)
@@ -300,7 +418,7 @@ mod tests {
         let lock = Arc::new(RwLock::new(()));
         let _held = lock.read().expect("hold read guard");
         let mut arm = arm(source).expect("arm");
-        let (writer, done) = parked_call(source, lock.clone());
+        let (writer, done) = parked_call(source, lock.clone(), progress(source, 1, None, 0));
         assert_eq!(
             arm.await_observation(Duration::from_secs(30)),
             Ok(PrePublishObservation::WouldBlock)
@@ -319,7 +437,7 @@ mod tests {
             panic!("poison the lock");
         }));
         let mut arm = arm(source).expect("arm");
-        let (writer, done) = parked_call(source, lock.clone());
+        let (writer, done) = parked_call(source, lock.clone(), progress(source, 1, None, 0));
         assert_eq!(
             arm.await_observation(Duration::from_secs(10)),
             Ok(PrePublishObservation::Poisoned)
@@ -333,12 +451,41 @@ mod tests {
         let source = test_source(6);
         let lock = Arc::new(RwLock::new(()));
         let arm = arm(source).expect("arm");
-        let (writer, done) = parked_call(source, lock.clone());
+        let (writer, done) = parked_call(source, lock.clone(), progress(source, 1, None, 0));
         assert_eq!(
             arm.await_observation(Duration::from_secs(30)),
             Ok(PrePublishObservation::Acquired)
         );
         drop(arm);
+        join_bounded(writer, done);
+    }
+
+    /// Filtered selection: a non-matching attempt passes through WITHOUT
+    /// consuming the arm (no notification, same thread safe), while the
+    /// matching attempt notifies with the full pending triple.
+    #[test]
+    fn filtered_selection_skips_nonmatching() {
+        let source = test_source(7);
+        let lock = Arc::new(RwLock::new(()));
+        let want = ExpectedPublish {
+            generation: 1,
+            high_watermark: Some(9),
+            records: 10,
+        };
+        let mut arm = arm_filtered(source, want).expect("arm");
+        pre_publish(&source, &lock, &progress(source, 1, Some(9), 7));
+        assert!(arm.await_observation(Duration::from_millis(100)).is_err());
+        let (writer, done) = parked_call(source, lock.clone(), progress(source, 1, Some(9), 10));
+        assert_eq!(
+            arm.await_attempt(Duration::from_secs(10)),
+            Ok(PublishAttempt {
+                observation: PrePublishObservation::Acquired,
+                generation: 1,
+                high_watermark: Some(9),
+                records: 10,
+            })
+        );
+        arm.release();
         join_bounded(writer, done);
     }
 }

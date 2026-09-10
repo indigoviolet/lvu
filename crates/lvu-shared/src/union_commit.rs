@@ -1347,7 +1347,9 @@ mod tests {
         use super::super::*;
         use super::digest;
         use lvu_core::{Acquisition, SourceDefinition, SourceId};
-        use lvu_ingest::publish_probe::{self, PrePublishObservation};
+        use lvu_ingest::publish_probe::{
+            self, ExpectedPublish, PrePublishObservation, PublishAttempt,
+        };
         use lvu_ingest::{RuntimeConfig, RuntimeError, SourceHandle, SourceManager};
         use std::collections::BTreeMap;
         use std::sync::Arc;
@@ -1367,6 +1369,17 @@ mod tests {
             }
         }
 
+        fn stdin_definition(id: SourceId) -> SourceDefinition {
+            SourceDefinition {
+                schema_version: 1,
+                id,
+                name: "commit fixture".into(),
+                acquisition: Acquisition::Stdin,
+                identity_hints: BTreeMap::new(),
+                retention: None,
+            }
+        }
+
         fn small_config() -> RuntimeConfig {
             let mut config = RuntimeConfig::default();
             config.acquisition.channel_capacity = 2;
@@ -1378,6 +1391,25 @@ mod tests {
             config.sync_every_records = 8;
             config.sync_interval = Duration::from_millis(20);
             config.graceful_stop_deadline = Duration::from_secs(3);
+            config
+        }
+
+        /// Fixture config for the hook rendezvous test: identical to
+        /// [`small_config`] except group-commit timer publishes are pushed
+        /// far beyond the test horizon. The writer is single-threaded and a
+        /// passed-through publish blocks on the write lock behind retained
+        /// read guards, queueing everything behind it — so a timer-driven
+        /// same-fence publish between arming and the append would wedge the
+        /// writer before the appended line's publish ever fires, and the
+        /// exact-triple rendezvous could never observe it. With the timer
+        /// neutered, the only publish in the window is the appended line's
+        /// Records batch. Fence values are independent of sync policy
+        /// (records/high-watermark advance per record regardless of commit
+        /// timing), so this shapes the fixture to the exact scenario without
+        /// sleeps, barriers, or timeouts-as-synchronization.
+        fn hook_config() -> RuntimeConfig {
+            let mut config = small_config();
+            config.sync_interval = Duration::from_secs(3600);
             config
         }
 
@@ -1677,28 +1709,36 @@ mod tests {
         /// Guard-retention regression (commit-wins) on the worker-side
         /// publication hook: the entire sorted guard vector stays alive
         /// across the copy and the settle, and the hook observes the actual
-        /// pre-write attempt behind these exact guards. `WouldBlock`
-        /// discriminates retention — dropped guards would read `Acquired`.
-        /// The hook is released BEFORE settlement so the writer's real write
-        /// attempt genuinely contends with the retained guards; settling
-        /// while parked would hide dropped guards. HWM waits run guard-free.
+        /// pre-write attempt behind these exact guards. The arm selects the
+        /// appended line's exact pending triple, asserted byte-for-byte;
+        /// `WouldBlock` plus the triple discriminates retention — dropped
+        /// guards would read `Acquired`. The hook is released BEFORE
+        /// settlement so the writer's real write attempt genuinely contends
+        /// with the retained guards; settling while parked would hide
+        /// dropped guards. HWM waits run guard-free. The live source is
+        /// stdin-driven and timer publishes are neutered ([`hook_config`]),
+        /// so the awaited Records batch is the only publish that can fire in
+        /// the window: a followed file would emit a FileCheckpoint publish
+        /// first, which — passed through unobserved — would wedge the
+        /// single-threaded writer behind our guards before the awaited
+        /// publish ever fires.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn retained_guards_block_observed_publish_attempt() {
             let root = tempfile::tempdir().expect("capture root");
             let manager =
-                SourceManager::new(root.path().join("capture"), small_config()).expect("manager");
-            let live_path = root.path().join("live.log");
+                SourceManager::new(root.path().join("capture"), hook_config()).expect("manager");
+            // Stdin-driven live source: the test authors every byte, so the
+            // only publish that can fire in the rendezvous window is the
+            // appended line's Records batch (no cursor checkpoints, and timer
+            // publishes are neutered by hook_config).
             let stable_path = root.path().join("stable.log");
-            std::fs::write(&live_path, "r-0\nr-1\nr-2\n").expect("fixture");
             std::fs::write(&stable_path, "s-1\ns-2\ns-3\n").expect("fixture");
+            let live_id = SourceId(uuid::Uuid::from_u128(0xC004));
+            let (mut stdin_writer, stdin_reader) = tokio::io::duplex(64);
             let live = manager
-                .start(file_definition(
-                    SourceId(uuid::Uuid::from_u128(0xC004)),
-                    &live_path,
-                    true,
-                ))
+                .start_with_reader(stdin_definition(live_id), stdin_reader)
                 .await
-                .expect("start followed source");
+                .expect("start stdin source");
             let stable = manager
                 .start(file_definition(
                     SourceId(uuid::Uuid::from_u128(0xC005)),
@@ -1707,6 +1747,13 @@ mod tests {
                 ))
                 .await
                 .expect("start stable source");
+            {
+                use tokio::io::AsyncWriteExt;
+                stdin_writer
+                    .write_all(b"r-0\nr-1\nr-2\n")
+                    .await
+                    .expect("write fixture lines");
+            }
             wait_for_records(&live, 3).await;
             wait_for_records(&stable, 3).await;
 
@@ -1724,28 +1771,50 @@ mod tests {
             let CommitAdmission::Verify { attempt_epoch } = table.commit(&request) else {
                 panic!("retention commit must be admitted");
             };
-            // Armed with guards already held: every attempt from here observes
-            // WouldBlock, whether spuriously periodic or the appended line's.
+            // Arm selects the appended line's exact pending triple: three
+            // journaled records plus the appended fourth, same capture
+            // generation. A periodic same-fence publish passes through
+            // unobserved instead of counting as proof.
+            let live_sid = live.source_id().0.to_string();
+            let live_generation = frozen
+                .iter()
+                .find(|fence| fence.source_id == live_sid)
+                .expect("live fence")
+                .generation;
+            let expected = ExpectedPublish {
+                generation: live_generation,
+                high_watermark: Some(3),
+                records: 4,
+            };
             let outcome = with_pinned(&handles, |current| {
                 assert_eq!(current, frozen);
-                let mut probe = publish_probe::arm(live.source_id()).expect("arm publish probe");
-                {
-                    let mut file = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&live_path)
-                        .expect("append fixture");
-                    use std::io::Write;
-                    writeln!(file, "r-3").expect("append line");
-                }
+                let mut probe = publish_probe::arm_filtered(live.source_id(), expected)
+                    .expect("arm publish probe");
+                // The only publish that can fire from here is the appended
+                // line's Records batch. Written through block_in_place: a
+                // 4-byte write into the draining 64-byte duplex never blocks
+                // meaningfully, and the closure is synchronous.
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        use tokio::io::AsyncWriteExt;
+                        stdin_writer.write_all(b"r-3\n").await.expect("append line");
+                    })
+                });
                 // Exact pre-publication rendezvous: the capture's write
-                // attempt behind OUR retained read guards.
-                let observation = probe
-                    .await_observation(Duration::from_secs(60))
+                // attempt for the appended records behind OUR retained read
+                // guards — never an arbitrary periodic publish.
+                let attempt = probe
+                    .await_attempt(Duration::from_secs(60))
                     .expect("publish attempt observed");
                 assert_eq!(
-                    observation,
-                    PrePublishObservation::WouldBlock,
-                    "write attempt must contend behind retained guards (Acquired would name dropped guards)"
+                    attempt,
+                    PublishAttempt {
+                        observation: PrePublishObservation::WouldBlock,
+                        generation: live_generation,
+                        high_watermark: Some(3),
+                        records: 4,
+                    },
+                    "write attempt must contend for the appended records behind retained guards"
                 );
                 // Release BEFORE settle: the writer proceeds to the real
                 // write-lock attempt, which genuinely contends now.
@@ -1761,7 +1830,8 @@ mod tests {
             // since the released attempt publishes once the guards release.
             wait_for_records(&live, 4).await;
             assert!(refresh_needed(&frozen, &freeze_copy(&handles)));
-            stop_quietly(&live, "followed source").await;
+            drop(stdin_writer);
+            stop_quietly(&live, "stdin source").await;
             stop_quietly(&stable, "stable source").await;
         }
 
