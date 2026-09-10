@@ -304,8 +304,10 @@ const STOP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound for the teardown acknowledgement (queued work, then the shared
 /// backend's session drain) plus the thread join. Past the bound the stop
 /// reports and the thread is left detached to die with the process —
-/// never a silent clean report, never a hung shutdown.
-const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(25);
+/// never a silent clean report, never a hung shutdown. Sized to cover the
+/// shared drain bound (`SharedStore::DRAIN_TIMEOUT`) with margin; normal
+/// stops acknowledge in milliseconds.
+const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounded acknowledged stop shared by both backends: deliver `Stop`
 /// reliably (retry while full, bounded), await the worker's teardown ack
@@ -1012,6 +1014,7 @@ fn worker(
                     let canonical = store.ensure_canonical_view(
                         definition.id,
                         canonical_view_id(definition.id),
+                        Some(lvu_shared::legacy_canonical_view_id(definition.id)),
                         CANONICAL_VIEW_NAME,
                     )?;
                     let mut views = store.working_views_for_source(definition.id, 33)?;

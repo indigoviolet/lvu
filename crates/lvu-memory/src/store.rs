@@ -2202,9 +2202,31 @@ impl WorkspaceStore {
         &self,
         source_id: SourceId,
         preferred_id: ViewId,
+        legacy_id: Option<ViewId>,
         name: &str,
     ) -> Result<WorkingView, MemoryError> {
         if let Some(existing) = self.canonical_view_for_source(source_id)? {
+            if existing.id == preferred_id {
+                // Still fold a legacy twin: the lookup returns only the
+                // first ordered row, so a legacy row can hide behind the
+                // preferred one from the buggy era regardless of uuid
+                // order. Deleting by exact legacy identity is safe.
+                if let Some(legacy) = legacy_id.filter(|legacy| *legacy != preferred_id) {
+                    self.conn.execute(
+                        "DELETE FROM working_views WHERE view_id=?1 AND source_id=?2",
+                        params![legacy.0.to_string(), source_id.0.to_string()],
+                    )?;
+                }
+                return Ok(existing);
+            }
+            // A superseded canonical row must never run beside the
+            // preferred one (two "All events" for one source). Only a
+            // positively identified legacy (pre-parity worker-scheme) row
+            // is folded; anything unrecognized is preserved untouched per
+            // the documented migration guarantee above.
+            if legacy_id.is_some_and(|legacy| legacy == existing.id) {
+                return self.adopt_legacy_canonical_view(source_id, existing.id, preferred_id);
+            }
             return Ok(existing);
         }
         if name.is_empty() || name.len() > MAX_VIEW_NAME_BYTES {
@@ -2248,6 +2270,54 @@ impl WorkspaceStore {
         Err(MemoryError::InvalidData(
             "could not allocate a canonical view identity".into(),
         ))
+    }
+
+    /// Fold a legacy (pre-parity worker-scheme) canonical row into the
+    /// preferred identity: rename when free (version and state travel with
+    /// the row, so save CAS chains continue uninterrupted), else drop the
+    /// legacy row — worker-ensured pristine defaults, since canonical views
+    /// are immutable by product contract — in favor of the survivor. No
+    /// table references working_views.view_id, so neither operation orphans
+    /// durable state. Exactly one canonical row remains either way.
+    fn adopt_legacy_canonical_view(
+        &self,
+        source_id: SourceId,
+        from: ViewId,
+        to: ViewId,
+    ) -> Result<WorkingView, MemoryError> {
+        if self.view_id_is_free(to)? {
+            self.conn.execute(
+                "UPDATE working_views SET view_id=?1 WHERE view_id=?2 AND source_id=?3",
+                params![
+                    to.0.to_string(),
+                    from.0.to_string(),
+                    source_id.0.to_string()
+                ],
+            )?;
+            return self
+                .get_view(to)?
+                .ok_or_else(|| MemoryError::InvalidData("canonical view disappeared".into()));
+        }
+        // Preferred taken: only fold when the occupant is ours (same
+        // source) — a controller-saved row whose version chain continues
+        // uninterrupted. A foreign occupant is impossible in practice
+        // (canonical ids embed their source); leave everything untouched
+        // rather than destroy what we cannot classify.
+        match self.get_view(to)? {
+            Some(survivor) if survivor.source_id == source_id => {
+                self.conn.execute(
+                    "DELETE FROM working_views WHERE view_id=?1 AND source_id=?2",
+                    params![from.0.to_string(), source_id.0.to_string()],
+                )?;
+                Ok(survivor)
+            }
+            // Foreign occupant or vanished preferred (should be
+            // impossible): leave everything untouched rather than destroy
+            // what we cannot classify.
+            _ => self
+                .get_view(from)?
+                .ok_or_else(|| MemoryError::InvalidData("canonical view disappeared".into())),
+        }
     }
 
     /// The source's canonical view, by persisted role only.

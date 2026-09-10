@@ -1080,14 +1080,28 @@ impl Composition {
                         health.push_str(&counters);
                     }
                 }
-                if let Ok(id) = Uuid::parse_str(&view.source_id)
-                    && let Some(handle) = self.manager.source(SourceId(id))
-                {
-                    let progress = handle.progress();
-                    app.update_source_health(
-                        &view.source_id,
-                        format!("{:?}: {} records", progress.state, progress.records),
-                    );
+                if let Ok(id) = Uuid::parse_str(&view.source_id) {
+                    let source_id = SourceId(id);
+                    if let Some(handle) = self.manager.source(source_id) {
+                        let progress = handle.progress();
+                        app.update_source_health(
+                            &view.source_id,
+                            format!("{:?}: {} records", progress.state, progress.records),
+                        );
+                    } else if let Some(shared) = self.shared.as_ref() {
+                        // Worker-owned captures publish health from the
+                        // remote handle's feeder-kept progress cache: same
+                        // shape as local, so Running/Stopped/errored shared
+                        // captures read exactly like local ones instead of
+                        // "starting/indexing" forever. Terminal snapshots
+                        // published by stops flow through the same slot.
+                        if let Some(progress) = shared.source_progress(source_id) {
+                            app.update_source_health(
+                                &view.source_id,
+                                format!("{:?}: {} records", progress.state, progress.records),
+                            );
+                        }
+                    }
                 }
                 app.update_view_runtime_status(&view.id, health);
             }

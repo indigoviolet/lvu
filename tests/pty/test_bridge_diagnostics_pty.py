@@ -97,7 +97,10 @@ def case(binary: pathlib.Path, root: pathlib.Path, source: pathlib.Path,
                  width=110, height=32,
                  environment=environment(workspace, **overrides))
     try:
-        app.wait_for("probe 00")
+        # Initial readiness: worker election plus attach alone may take up
+        # to the 10s attach contract before first paint, like the other
+        # startup tests allow — never the 3s interactive default.
+        app.wait_for("probe 00", timeout=15.0)
         message = ask_and_read_message(app, needles[0], f"{label} diagnostic")
         for needle in needles:
             assert needle in message, f"{label}: missing {needle!r} in\n{message}"

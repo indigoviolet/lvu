@@ -125,7 +125,13 @@ class PtyApp(_HarnessPtyApp):
         super().__init__(*args, **kwargs)
 
 
-def wait_reaped(pid: int, timeout: float = 4.0) -> None:
+def wait_reaped(pid: int, timeout: float = 18.0) -> None:
+    # Reaping follows the worker lifecycle, not the app exit: after the
+    # last detach the worker honors WORKER_SHUTDOWN_GRACE (10s, lvu-shared
+    # lib.rs) before exiting, and only then do its owned command children
+    # die and get reaped (bounded by the manager graceful stop, 5s
+    # default). The bound is grace + stop + scheduling margin — an
+    # immediate reap would race the documented grace by design.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         stat = pathlib.Path(f"/proc/{pid}/stat")

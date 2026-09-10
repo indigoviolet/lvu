@@ -480,6 +480,20 @@ impl SharedStore {
             .contains_key(&source_id)
     }
 
+    /// Lock-free publication snapshot for one worker-owned capture, so UI
+    /// health reads exactly like a local capture (same `Debug` state plus
+    /// record count) instead of freezing at "starting/indexing". Returns
+    /// `None` for sources this session does not own — local manager paths
+    /// apply instead. Terminal snapshots published by stops/retires flow
+    /// through the same slot, so a stopped shared capture reads Stopped.
+    pub fn source_progress(&self, source_id: SourceId) -> Option<lvu_ingest::SourceProgress> {
+        self.handles
+            .lock()
+            .expect("shared handles poisoned")
+            .get(&source_id)
+            .map(|handle| handle.progress())
+    }
+
     /// Explicit stop of a worker-owned capture. Its feeder is dropped
     /// first (no more ticks for a dead capture), then the worker stops
     /// it; a final best-effort poll publishes the terminal snapshot into
@@ -561,31 +575,53 @@ impl SharedStore {
         })
     }
 
-    /// Bounded shutdown drain: every feeder aborts first (no ticks race
-    /// the goodbye), then flush, goodbye, bounded close wait through the
-    /// shared client (no single owner can drop it while feeders reference
-    /// it), viewer lock released on drop. Takes `&self` so session Arc
-    /// holders share one drain path; a repeated call fails honestly at
-    /// the flush against the closed connection. A flush failure returns
-    /// before goodbye (no detach on a failed drain); dropping the store
-    /// detaches via EOF either way.
+    /// Total bound for the whole drain: concurrent feeder settle plus
+    /// detach (flush + goodbye). Shutdown must report within the app-exit
+    /// contract no matter how many sources are attached or how wedged the
+    /// transport is; anything unfinished reports instead of hanging. Normal
+    /// drains finish in milliseconds (idle feeders exit at once, flush
+    /// acks immediately); only a wedged transport consumes the bound, and
+    /// there reporting failure is honest.
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+
+    /// Bounded shutdown drain: every feeder is signalled, then all settle
+    /// CONCURRENTLY under one overall deadline (never 8s per feeder);
+    /// stragglers abort and detach runs on whatever budget remains. A
+    /// flush failure returns before goodbye (no detach on a failed drain);
+    /// dropping the store detaches via EOF either way.
     pub async fn drain_and_detach(&self) -> Result<(), String> {
-        // Signal every feeder first so no new ticks start; each is then
-        // awaited through at most one bounded in-flight exchange. Feeders
-        // that will not exit are aborted, and a retired transport then
-        // surfaces honestly from the flush below instead of a fake clean
-        // drain. Viewer lock releases on drop either way.
+        // Signal every feeder first so no new ticks start. Viewer lock
+        // releases on drop either way.
+        let deadline = std::time::Instant::now() + Self::DRAIN_TIMEOUT;
         let feeders = std::mem::take(&mut *self.feeders.lock().expect("shared feeders poisoned"));
-        for (_, (mut task, stop)) in feeders {
-            stop.store(true, std::sync::atomic::Ordering::Release);
-            tokio::select! {
-                _ = &mut task => {}
-                _ = tokio::time::sleep(Self::FEEDER_STOP_TIMEOUT) => {
+        for entry in feeders.values() {
+            entry.1.store(true, std::sync::atomic::Ordering::Release);
+        }
+        // Settle concurrently: poll finished tasks until the overall
+        // deadline instead of awaiting each through its own bound.
+        let mut pending: Vec<tokio::task::JoinHandle<()>> =
+            feeders.into_iter().map(|(_, (task, _))| task).collect();
+        while !pending.is_empty() {
+            pending.retain(|task| !task.is_finished());
+            if pending.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                for task in &pending {
                     task.abort();
                 }
+                break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        self.client.lock().await.detach().await
+        // Detach on whatever budget remains: a wedged flush reports
+        // instead of consuming the app-exit contract past this drain.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        tokio::time::timeout(remaining, async { self.client.lock().await.detach().await })
+            .await
+            .map_err(|_| {
+                "shared drain timed out; feeders settled but detach did not complete".to_owned()
+            })?
     }
 
     /// Load persisted views for one source through the worker. The returned

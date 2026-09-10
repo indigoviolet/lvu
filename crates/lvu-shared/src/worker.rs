@@ -1424,6 +1424,7 @@ impl WorkerService {
                     .ensure_canonical_view(
                         definition.id,
                         canonical_view_id(definition.id),
+                        Some(legacy_canonical_view_id(definition.id)),
                         "All events",
                     )
                     .map_err(|error| error.to_string())?;
@@ -2094,12 +2095,28 @@ fn source_metadata(definition: SourceDefinition) -> lvu_memory::SourceMetadata {
 /// (`lvu-app/src/memory.rs`): deterministic per-source canonical view
 /// identity. Copied rather than imported for the same cycle reason as
 /// above; it is a frozen namespace constant, and any change must update
-/// both sites together (flagged for union review).
+/// all three sites together — this constant, `canonical_view_id` below,
+/// and the application copy (flagged for union review).
 const CANONICAL_VIEW_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
     0x6c, 0x76, 0x75, 0x00, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x00, 0x6e, 0x73, 0x00, 0x00, 0x01,
 ]);
 
+/// Preferred identity for a source's canonical view. Byte-identical to the
+/// application's `lvu-app/src/memory.rs::canonical_view_id` by contract:
+/// `UUIDv5(namespace, "all-events-view:<source uuid>")`. Both sides must
+/// name the same view or restores register a duplicate "All events".
 fn canonical_view_id(source_id: SourceId) -> lvu_core::ViewId {
+    lvu_core::ViewId(uuid::Uuid::new_v5(
+        &CANONICAL_VIEW_NAMESPACE,
+        format!("all-events-view:{}", source_id.0).as_bytes(),
+    ))
+}
+
+/// Pre-parity worker scheme (`UUIDv5(namespace, raw source UUID bytes)`),
+/// kept solely so `ensure_canonical_view` can recognize and migrate rows
+/// persisted before unification. Never minted for new rows. Any change
+/// must update the application copy noted above together with this one.
+pub fn legacy_canonical_view_id(source_id: SourceId) -> lvu_core::ViewId {
     lvu_core::ViewId(uuid::Uuid::new_v5(
         &CANONICAL_VIEW_NAMESPACE,
         source_id.0.as_bytes(),
@@ -4245,5 +4262,45 @@ mod tests {
         assert_eq!(service.snapshot_definitions().await.len(), 1);
         service.request_shutdown();
         service.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod canonical_parity_tests {
+    use super::{canonical_view_id, legacy_canonical_view_id};
+
+    /// The worker's canonical view identity must be byte-identical to the
+    /// application's `lvu-app/src/memory.rs::canonical_view_id`:
+    /// `UUIDv5(namespace, "all-events-view:<source uuid>")`. Goldens below
+    /// are computed independently (Python uuid module); any drift reopens
+    /// the duplicate-"All events" split this parity closed.
+    #[test]
+    fn canonical_view_id_matches_app_scheme_exactly() {
+        let cases = [
+            (
+                "00000000-0000-0000-0000-000000000001",
+                "6d2f8ced-63b8-5ee8-a5b0-d91adae2d561",
+            ),
+            (
+                "00000000-0000-0000-0000-00000000002a",
+                "b93b2297-006e-5ce7-bc45-1178614b72ae",
+            ),
+        ];
+        for (source, expected) in cases {
+            let source_id =
+                lvu_core::SourceId(uuid::Uuid::parse_str(source).expect("fixture uuid"));
+            let expected_id =
+                lvu_core::ViewId(uuid::Uuid::parse_str(expected).expect("fixture uuid"));
+            assert_eq!(
+                canonical_view_id(source_id),
+                expected_id,
+                "worker canonical id must equal the app scheme for {source}"
+            );
+            assert_ne!(
+                legacy_canonical_view_id(source_id),
+                expected_id,
+                "legacy scheme must differ (it is only a migration key)"
+            );
+        }
     }
 }
