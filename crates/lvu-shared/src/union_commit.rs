@@ -1347,9 +1347,10 @@ mod tests {
         use super::super::*;
         use super::digest;
         use lvu_core::{Acquisition, SourceDefinition, SourceId};
+        use lvu_ingest::publish_probe::{self, PrePublishObservation};
         use lvu_ingest::{RuntimeConfig, RuntimeError, SourceHandle, SourceManager};
         use std::collections::BTreeMap;
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
         use std::time::Duration;
 
         fn file_definition(id: SourceId, path: &std::path::Path, follow: bool) -> SourceDefinition {
@@ -1673,22 +1674,16 @@ mod tests {
             stop_quietly(&handle, "followed source").await;
         }
 
-        /// Guard-retention regression (commit-wins): the entire sorted guard
-        /// vector stays alive across the copy and the settle while a writer
-        /// append races, so the verdict reflects the guard-held published
-        /// state deterministically. Honesty note: the rendezvous synchronizes
-        /// the file append, not the capture's progress-write attempt — an
-        /// unchanged published count under held guards cannot distinguish a
-        /// publish blocked behind the guards from capture simply not yet
-        /// scheduled, so this test claims no pending-publish proof. An exact
-        /// pre-publication rendezvous needs a worker-side hook observing the
-        /// actual publish attempt (not owned here). What IS deterministic: no
-        /// publish can land while the guards are held, so the settle verdict
-        /// names exactly the retained fences. Waiting the new high-watermark
-        /// runs with no guards held: waiting under guards would wedge the
-        /// writer's write lock.
+        /// Guard-retention regression (commit-wins) on the worker-side
+        /// publication hook: the entire sorted guard vector stays alive
+        /// across the copy and the settle, and the hook observes the actual
+        /// pre-write attempt behind these exact guards. `WouldBlock`
+        /// discriminates retention — dropped guards would read `Acquired`.
+        /// The hook is released BEFORE settlement so the writer's real write
+        /// attempt genuinely contends with the retained guards; settling
+        /// while parked would hide dropped guards. HWM waits run guard-free.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn retained_guards_linearize_on_held_state_with_writer_racing() {
+        async fn retained_guards_block_observed_publish_attempt() {
             let root = tempfile::tempdir().expect("capture root");
             let manager =
                 SourceManager::new(root.path().join("capture"), small_config()).expect("manager");
@@ -1729,48 +1724,41 @@ mod tests {
             let CommitAdmission::Verify { attempt_epoch } = table.commit(&request) else {
                 panic!("retention commit must be admitted");
             };
-            // Writer side: appends and flushes one line (file I/O needs no
-            // publication lock), then meets the test at the barrier. The
-            // append strictly precedes the settle below; the publish cannot
-            // precede it, because the test's read guards are already held.
-            let appended = Arc::new(Barrier::new(2));
-            let writer = {
-                let appended = appended.clone();
-                let live_path = live_path.clone();
-                std::thread::spawn(move || {
+            // Armed with guards already held: every attempt from here observes
+            // WouldBlock, whether spuriously periodic or the appended line's.
+            let outcome = with_pinned(&handles, |current| {
+                assert_eq!(current, frozen);
+                let mut probe = publish_probe::arm(live.source_id()).expect("arm publish probe");
+                {
                     let mut file = std::fs::OpenOptions::new()
                         .append(true)
                         .open(&live_path)
                         .expect("append fixture");
                     use std::io::Write;
                     writeln!(file, "r-3").expect("append line");
-                    drop(file);
-                    appended.wait();
-                })
-            };
-            let outcome = with_pinned(&handles, |current| {
-                assert_eq!(current, frozen);
-                appended.wait();
-                // The writer flushed new bytes, yet the published count is
-                // still the old one: no publish could land under these held
-                // guards. (Not proof a publish was attempted — capture may
-                // simply not be scheduled yet; the verdict below is
-                // deterministic either way because it names guard-held state.)
+                }
+                // Exact pre-publication rendezvous: the capture's write
+                // attempt behind OUR retained read guards.
+                let observation = probe
+                    .await_observation(Duration::from_secs(60))
+                    .expect("publish attempt observed");
                 assert_eq!(
-                    live.progress().records,
-                    3,
-                    "published state cannot advance under retained guards"
+                    observation,
+                    PrePublishObservation::WouldBlock,
+                    "write attempt must contend behind retained guards (Acquired would name dropped guards)"
                 );
+                // Release BEFORE settle: the writer proceeds to the real
+                // write-lock attempt, which genuinely contends now.
+                probe.release();
                 table.settle("w-3", "u-3", attempt_epoch, &request, current)
             });
             assert!(
                 matches!(outcome, CommitOutcome::Committed { .. }),
                 "guard-held settle must name exactly the retained fences: {outcome:?}"
             );
-            writer.join().expect("writer thread");
             // Guards are dropped (`with_pinned` returned), so waiting the new
             // high-watermark cannot wedge the writer — and it must arrive,
-            // since the flushed bytes publish once the guards release.
+            // since the released attempt publishes once the guards release.
             wait_for_records(&live, 4).await;
             assert!(refresh_needed(&frozen, &freeze_copy(&handles)));
             stop_quietly(&live, "followed source").await;

@@ -16,4 +16,5 @@ tokio = { version = "=1.53.1", features = ["sync", "net", "time", "io-util", "rt
 uuid = { version = "=1.26.0", features = ["serde", "v4", "v5"] }
 
 [dev-dependencies]
+lvu-ingest = { path = "../lvu-ingest", features = ["test-support"] }
 tempfile = "=3.27.0"
