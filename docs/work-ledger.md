@@ -2457,3 +2457,15 @@ test, colour memory-bound test and app test compilation passed in
 Overlap-winner and rule-order regressions passed in
 `lvu-sol-union-preconcat-prior-regressions-r3.log` using `flock --close`.
 Independent final review and the actual union-colour PTY remain pending.
+
+Final immutable review of `8c203425` composed with `26e7ea7` found no defects,
+including retained attempted colour rules and publication-revision retry identity.
+Report: `sol-union-review-scratch/union-colour-typed-8c203425-final-review.md`,
+SHA256 `2a9a6a385410d16aeb3548c65e0b54eeffaaa04e53303e6f79529e54e73ce59b`.
+The actual colour PTY then passed on production-equivalent source with test-only
+`e7a8ccd`, integrated as `2d270e0`. It uses the Add mnemonic and waits for two
+visible rules before checking swatches, first-match authority and restart.
+Evidence: `lvu-muse-union-logs/union-colour-pty-e7a8ccd-r3.log`, exit zero;
+private app SHA256 `d3ec4ea3880fc0246ea0f057191d3e898b1ae284bf967497ff68a9b565d12a99`.
+The wrong-target first run and private r2 synchronization failure are preserved,
+not accepted. The full combined release gate remains pending.

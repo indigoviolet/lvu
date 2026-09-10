@@ -4,7 +4,21 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
-## Unreleased
+## v0.1.6 — 2026-09-10
+
+Prepared release; full acceptance and publication are pending.
+
+### Features
+
+- Combine existing views into a live union while retaining original record
+  identities. Apply filters and grouping to the combined view and restore its
+  accepted inputs after restart.
+- Use accepted enrichment columns as shared keys across union inputs, including
+  exact integers beyond floating-point precision. Raw same-name fields do not
+  acquire derived authority.
+- Classify rows by an enrichment column's exact value in ordinary and union
+  views. Ordered rules retain first-match precedence and survive restart;
+  raw-text rules remain an explicit convenience option.
 
 ### Fixes
 

@@ -38,8 +38,11 @@ as displayed derived cells. Accepted output authority excludes raw namesakes
 after removal. Existing predicate rules retain their ordering and behavior;
 raw-text rules remain an explicit convenience option. Persistence uses additive
 classifier fields, so older readers retain legacy rules but omit classifiers
-when saving. Union colour threading and combined release acceptance remain
-pending; this does not describe published v0.1.5 behavior.
+when saving. Union colour rules use the dedup-winning input's accepted output
+authority; unauthorized raw namesakes are excluded before typed concatenation.
+Focused terminal coverage verifies rule order, row colours and restart.
+Combined release acceptance remains pending; this does not describe published
+v0.1.5 behavior.
 
 | Component | Responsibility and starting points |
 | --- | --- |
