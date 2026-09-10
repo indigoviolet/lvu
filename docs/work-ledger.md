@@ -2819,10 +2819,24 @@ Darwin is available only through an explicit historical re-rendering option;
 the Intel/Windows validation jobs are removed, while diagnostic scripts and
 immutable historical archives remain. Primary ran all six formula fixtures
 successfully; output checks also require renderer exit zero. Independent Sol
-review of this amended checkpoint remains pending. No hosted workflow, new
+review of exact `91391c7` is READY with no findings. The reviewer independently
+passed all six fixtures, bash syntax and Git whitespace checks, and verified
+three-target routing, historical opt-in and unchanged publication/provenance
+contracts. No hosted workflow, new
 release, Homebrew install or Rust build was run for this change.
 
 The release runbook, distribution/support map and packaging notes now match
 the three-target procedure; historical install evidence retains its original
 version. Architecture wording now reflects published v0.1.6 rather than stale
 v0.1.5 status. Documentation whitespace checks passed.
+
+
+Independent review of hook checkpoint `0d65303` found a test-support token race:
+pre_publish selects an arm under one registry lock, then reacquires the registry
+to consume channels without binding to the original token/filter. A dropped
+arm replaced between these sections can have its channels consumed by the old
+attempt. Atomic selection/extraction and a discriminating regression are assigned
+to the hook owner. Exact four-record observation, real WouldBlock contention,
+guards held through settlement, bounded waits and default-off feature/export
+wiring otherwise passed static review. The retained gate has 21 passing tests
+but lacks self-contained command/commit binding; it does not cover this race.
