@@ -2166,3 +2166,26 @@ assignment and regression are independently reviewed READY in
 `sol-review-scratch/named-zone-4b9d3b7-delta-review.md`. The full integrated
 release gate and archive validation are still required; no v0.1.5 tag or
 publication is claimed here. The installed release remains v0.1.4.
+
+
+## 2026-09-10 — statistics throughput measurement boundary repaired
+
+The first v0.1.5 gate at `22dc294` failed the unchanged 200,000 records/CPU-second
+floor: 150,005 records, 0.376 s wall, 0.780 s process CPU, 192,314 records/CPU-s.
+An exact-binary rerun passed at 319,157 records/CPU-s with similar wall time.
+These observations support measurement contamination, but do not directly prove
+which concurrent work contributed. Both logs remain preserved. The subsequent
+remaining checks passed clippy, bridge checks, builds and all 77 PTY suites;
+those partial results did not produce release acceptance.
+
+Integrated reviewed `c339d46b3cf8a9675f40fe2817379cf26a5e1d6f`: the test now
+requires terminal durable capture and exact live-index count/high-watermark
+equality, joins the raw index workers, then measures the same production journal
+statistics path. A fallible process CPU utility uses getrusage instead of an
+assumed procfs tick rate. The correctness assertions and throughput floor remain
+unchanged. Focused validation passed the CPU utility test and statistics test
+(150,004 records, 0.341 s wall, 0.435 s CPU, 344,842 records/CPU-s), followed by
+all-target clippy for lvu-core and lvu-view. Independent static review found no
+issues. Evidence: `sol-stats-throughput-c339d46/focused-validation.log` and
+`sol-runtime-review-scratch/stats-throughput-c339d46-review.md` on the build
+volume. A fresh full release gate remains required.
