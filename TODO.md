@@ -22,12 +22,12 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 ## Active parallel assignments
 
 Supervisor handover refreshed 2026-09-10. These are implementation assignments,
-not claims of integrated or published behavior. The first cleanup restored 8.2 GiB free; bounded validation can resume under
+not claims of integrated or published behavior. Cleanup has restored 15.1 GiB free; bounded validation can resume under
 the shared lock after checking the 6 GiB free-space gate.
 
 | Status | Work |
 | --- | --- |
-| **Working** | Restore build headroom and define target retirement. Audit measured 85.7 GiB: 38.2 GiB worktree targets, 27.8 GiB release/integration targets, 3.4 GiB primary target, 10.0 GiB compiler cache, 6.3 GiB scratch/proof/other. Release owner is inventorying superseded gate targets; preserve captures, proof and required investigation binaries. Ordinary janitor misses release/integration target names and only retires existing worktrees whose branches are in `main`, whereas current integration is on a separate branch. The supervisor reclaimed 4.2 GiB from the superseded a97 gate, preserving accepted binaries and evidence; broader retirement remains in progress. |
+| **Working** | Restore build headroom and define target retirement. Audit measured 85.7 GiB: 38.2 GiB worktree targets, 27.8 GiB release/integration targets, 3.4 GiB primary target, 10.0 GiB compiler cache, 6.3 GiB scratch/proof/other. Release owner is inventorying superseded gate targets; preserve captures, proof and required investigation binaries. Ordinary janitor misses release/integration target names and only retires existing worktrees whose branches are in `main`, whereas current integration is on a separate branch. The supervisor reclaimed 11.5 GiB across the superseded a97, v0.1.5 and v0.1.3 gates, preserving accepted binaries and evidence; target-retirement policy remains unfinished. |
 | **Working** | Automatic shared capture across ordinary windows: acquisition/controller cutover, feeder cancellation, stop/detach and last-window shutdown. Owner's cutover remains uncommitted and unvalidated; controller session was closed at handover and needs continuation. Published v0.1.6 does not include this. |
 | **Working** | Shared-worker admission: serialize concurrent fresh-ID starts, resume stopped matching sources, and deduplicate canonical file aliases without changing acquisition policies. Separate worker-side implementation; independent review and real-connection tests required. |
 | **Working** | Shared-memory failure tracking: candidate `0614340` preserves consumed save/recipe failures through Flush and clears them only on appropriate recovery. Independent Sol review assigned; three new real-stack regression tests and clippy are now authorized after cleanup. This is distinct from the paused slow-volume investigation. |

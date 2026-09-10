@@ -2741,3 +2741,25 @@ for the next release, and the stale Windows acceptance reference is removed.
 The 1.62 GB stale-artifact subtotal is distinguished from the 1.63 GB dry-run
 total including fixtures. Git whitespace checks passed. Source review and
 runtime validation of `0614340` remain separate pending work.
+
+
+### Superseded accepted release targets retired — 2026-09-10
+
+Primary removed only dependency/build/fingerprint/incremental/tmp bulk from
+the accepted `2a636c02` (v0.1.5) and `8ca75d00` (v0.1.3) gate targets.
+The reviewed plan is `muse-v016-prep/retire-2a636c02-8ca-plan.json`; execution
+parsed each original accepted.json, verified its hash/source/target/passed
+result and binary hashes, and checked the exact delete/preserve path sets.
+The shared validation lock and each target lock were held throughout. Fresh
+privileged process scans had zero denied/refused references. All four binaries
+and both acceptance records matched after deletion; versions/latest remained
+v0.1.6. No captures, proof, current release target or worker targets were removed.
+
+Observed free-space gains were 3.742 and 3.539 GiB, respectively (7.281 GiB
+combined); the plan's 7.45 GiB used apparent sizes, not allocated-space gains.
+Together with the earlier a97 cleanup, observed reclamation is 11.476 GiB.
+The volume has 15.085 GiB free at completion. Proofs and execution wrapper are
+in `supervisor-disk-audit-20260910/`: `retire-2a636c02-proof.jsonl`,
+`retire-8ca75d00-proof.jsonl` and `retire-accepted.py`. The executor exited zero,
+and documentation whitespace checks passed. No product build/test was run by
+this cleanup.
