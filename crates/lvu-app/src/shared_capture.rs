@@ -302,6 +302,38 @@ impl SharedStore {
                 return Err("shared capture cannot drive a forwarded stdin pipe: start stdin sources window-locally".into());
             }
         };
+        // Re-present fast path for an already-fed capture: when a second
+        // proposal (session resume plus explicit request, or a racing
+        // second window) resolves to the same live source, share the one
+        // live handle instead of minting a parallel handle+feeder. Minting
+        // would strand the first handle the moment the feeder map replaces
+        // its task — every earlier reader frozen at its last tick while the
+        // replacement feeds only the new handle (proven by
+        // same_store_double_start_same_winner_keeps_feeding before the
+        // fix). The shared slot stays live under exactly one feeder,
+        // respawned here if it ever died; stop and restart keep their
+        // replace semantics and are unaffected.
+        let existing = self
+            .handles
+            .lock()
+            .expect("shared handles poisoned")
+            .get(&started.source_id)
+            .cloned();
+        if let Some(existing) = existing {
+            if !self.feeder_alive(started.source_id) {
+                let session = self.session_string().await;
+                self.spawn_feeder(
+                    started.source_id,
+                    existing.clone(),
+                    Arc::clone(&self.client),
+                    session,
+                );
+            }
+            return Ok(SharedSource {
+                remote: started,
+                handle: existing,
+            });
+        }
         let handle = self.feed_handle(&started).await?;
         Ok(SharedSource {
             remote: started,
@@ -342,18 +374,31 @@ impl SharedStore {
         // (not abort) is the normal exit: it lets the in-flight bounded
         // exchange finish so the shared client is never poisoned by us.
         // The serve result is intentionally dropped: task end IS the signal.
+        self.spawn_feeder(remote.source_id, fed, feeding, session);
+        self.handles
+            .lock()
+            .expect("shared handles poisoned")
+            .insert(remote.source_id, handle.clone());
+        Ok(handle)
+    }
+
+    /// Spawn one feeder task for a handle and register it via
+    /// `replace_feeder` (which signals any previous feeder for the
+    /// source to exit at its next exchange boundary).
+    fn spawn_feeder(
+        &self,
+        source_id: SourceId,
+        fed: lvu_shared::RemoteSourceHandle,
+        feeding: std::sync::Arc<tokio::sync::Mutex<lvu_shared::WorkerClient>>,
+        session: String,
+    ) {
         let interval = lvu_shared::DEFAULT_FEED_INTERVAL;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let task = tokio::spawn(async move {
             let _ = lvu_shared::serve_feed(feeding, fed, session, interval, stopping).await;
         });
-        self.replace_feeder(remote.source_id, task, stop);
-        self.handles
-            .lock()
-            .expect("shared handles poisoned")
-            .insert(remote.source_id, handle.clone());
-        Ok(handle)
+        self.replace_feeder(source_id, task, stop);
     }
 
     /// This session's worker lifetime nonce, sampled from the handshake.
@@ -1475,6 +1520,61 @@ mod tests {
         assert_eq!(started.remote.source_id, absolute.id);
     }
 
+    /// The app-second-window shape on one store: two sequential starts of
+    /// the same file under distinct proposed ids must resolve to one live
+    /// capture (second presents the winner), keep exactly one feeder
+    /// feeding, leave the client unretired, and serve live rows through
+    /// both handles — including rows appended after the second start.
+    #[tokio::test]
+    async fn same_store_double_start_same_winner_keeps_feeding() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\ntwo\n").unwrap();
+        let fixture = serving_with(root.path(), Arc::new(PresentSecond)).await;
+        let store = attach_window(&fixture, "window-b", 6305).await;
+        let first = test_definition(53, &log);
+        let second = test_definition(54, &log);
+        assert_ne!(first.id, second.id);
+
+        let started_a = store
+            .start_source(&first, None)
+            .await
+            .expect("first proposal admits");
+        assert_eq!(started_a.remote.source_id, first.id);
+        let started_b = store
+            .start_source(&second, None)
+            .await
+            .expect("second proposal presents");
+        assert_eq!(
+            started_b.remote.source_id, first.id,
+            "distinct proposal of the same file must present the winner"
+        );
+        assert!(store.feeder_alive(first.id));
+        wait_for_records(&started_a.handle, 2).await;
+        wait_for_records(&started_b.handle, 2).await;
+
+        // Direct journal reads through both handles: the presented handle
+        // must serve the winner's rows, not an empty page.
+        for (label, handle) in [("first", &started_a.handle), ("second", &started_b.handle)] {
+            let page = handle
+                .read_page(0, 128, 1024 * 1024)
+                .await
+                .unwrap_or_else(|error| panic!("{label} handle read failed: {error:?}"));
+            assert_eq!(
+                page.records.len(),
+                2,
+                "{label} handle must read the winner's rows"
+            );
+        }
+
+        // Rows appended after the second start flow through both handles,
+        // proving one live capture with one feeding session — and a client
+        // that was never retired by the replacement.
+        std::fs::write(&log, "one\ntwo\nthree\n").unwrap();
+        wait_for_records(&started_a.handle, 3).await;
+        wait_for_records(&started_b.handle, 3).await;
+    }
+
     /// One serving worker plus its socket: windows attach with distinct
     /// viewer pids (the election refuses two takes of one slot).
     struct Fixture {
@@ -1483,6 +1583,48 @@ mod tests {
     }
 
     async fn serving(root: &Path) -> Fixture {
+        serving_with(root, Arc::new(AdmitAll)).await
+    }
+
+    /// Production-dedup mimic for controller tests: the first acquisition
+    /// of a file path admits; any later acquisition of the same path —
+    /// whatever id it proposes — presents the live winner. This exercises
+    /// exactly the `StartedOutcome::Present` wire shape the real
+    /// `ChildAdmission` returns (proven end to end in
+    /// `lvu-shared/tests/two_window_child.rs`), so controller handling of
+    /// winner identity is tested without forking admission semantics.
+    #[derive(Default)]
+    struct PresentSecond;
+
+    impl AdmissionHook for PresentSecond {
+        fn admit(&self, _definition: &SourceDefinition) -> AdmissionVerdict {
+            AdmissionVerdict::Admit
+        }
+
+        fn admit_known(
+            &self,
+            definition: &SourceDefinition,
+            live: &[SourceDefinition],
+        ) -> AdmissionVerdict {
+            let lvu_core::Acquisition::File { path, .. } = &definition.acquisition else {
+                return AdmissionVerdict::Admit;
+            };
+            for known in live {
+                let lvu_core::Acquisition::File {
+                    path: known_path, ..
+                } = &known.acquisition
+                else {
+                    continue;
+                };
+                if known_path == path {
+                    return AdmissionVerdict::Present { live_id: known.id };
+                }
+            }
+            AdmissionVerdict::Admit
+        }
+    }
+
+    async fn serving_with(root: &Path, hook: Arc<dyn AdmissionHook>) -> Fixture {
         let capture_root = root.join("captures");
         let paths = lvu_shared::WorkerPaths::new(&capture_root);
         paths.ensure_directories().unwrap();
@@ -1493,7 +1635,7 @@ mod tests {
             viewer_grace: Duration::from_millis(100),
             request_timeout: Duration::from_secs(10),
         };
-        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let (service, _) = WorkerService::open(config, hook).unwrap();
         let listener = tokio::net::UnixListener::bind(paths.socket_path()).unwrap();
         tokio::spawn(async move {
             service.serve(listener).await;
