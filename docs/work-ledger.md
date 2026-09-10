@@ -2626,3 +2626,12 @@ v0.1.5 references, denied entries or unknowns. Only `versions/v0.1.5` was
 removed; its records remain. The v0.1.6 full tree and binary hashes were
 identical before and after, and `latest` remained on v0.1.6. Captures, builds
 and delivery proof were untouched.
+
+Independent final delivery review is complete: DELIVERY CONSISTENT / READY,
+no findings. The reviewer verified all four live archive digests and sizes,
+the fixed eleven-suite installer path, every entry of the installed 1,006-entry
+tree, promoted binary/latest, public notes and tap formula. Report:
+`sol-runtime-review-scratch/v016-final-delivery-consistency-review.md`, SHA256
+`b772a6b98e8db74ae937dfe7267012a76714ce23aa87c5a27939b4842771094f`.
+This closes v0.1.6 delivery acceptance; it does not accept shared-capture or
+paused performance work.
