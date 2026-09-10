@@ -659,6 +659,13 @@ fn shared_worker(
         }
     };
     runtime.block_on(async {
+        // Unrecovered per-view save failures and recipe failures, mirroring
+        // the local worker thread exactly: a consumed failure stays
+        // represented here until a matching success clears it, so Flush
+        // keeps failing closed instead of reporting a clean shutdown over
+        // undurable state.
+        let mut failed: HashMap<ViewId, String> = HashMap::new();
+        let mut recipe_failure: Option<String> = None;
         while let Ok(command) = commands.recv() {
             match command {
                 Command::Load(definition, view_id) => {
@@ -674,9 +681,32 @@ fn shared_worker(
                 Command::Save(request) => {
                     let (id, view_id, sequence) =
                         (request.definition.id, request.view_id, request.sequence);
+                    // Mirror the local worker: success clears this view's
+                    // failure, any failure records it (including transport
+                    // outcome-unknown faults, whose durability is unproven),
+                    // and the event carries the same message the flush
+                    // check reports, so notices and shutdown agree.
                     let event = match store.save_view(&request).await {
-                        Ok(event) => event,
-                        Err(error) => Event::SaveFailed(id, view_id, sequence, error),
+                        Ok(Event::Saved(source, view, seq)) => {
+                            failed.remove(&view);
+                            Event::Saved(source, view, seq)
+                        }
+                        Ok(Event::SaveFailed(source, view, seq, reason)) => {
+                            let message = format!("memory autosave: {reason}");
+                            failed.insert(view, message.clone());
+                            Event::SaveFailed(source, view, seq, message)
+                        }
+                        Ok(_) => {
+                            let message = "memory autosave: unexpected save reply; outcome unknown"
+                                .to_string();
+                            failed.insert(view_id, message.clone());
+                            Event::SaveFailed(id, view_id, sequence, message)
+                        }
+                        Err(error) => {
+                            let message = format!("memory autosave: {error}");
+                            failed.insert(view_id, message.clone());
+                            Event::SaveFailed(id, view_id, sequence, message)
+                        }
                     };
                     if events.send(event).is_err() {
                         break;
@@ -710,12 +740,32 @@ fn shared_worker(
                     }
                 }
                 Command::SaveRecipe(meta, recipe, expected_revision, context) => {
+                    // Mirror the local worker: only a saved revision clears
+                    // the recipe failure; anything else keeps failing flush.
                     let event = match store
                         .save_recipe(&meta, *recipe, expected_revision, &context)
                         .await
                     {
-                        Ok(event) => event,
-                        Err(error) => Event::RecipeFailed(meta, error),
+                        Ok(Event::RecipeSaved(_, saved)) => {
+                            recipe_failure = None;
+                            Event::RecipeSaved(meta, saved)
+                        }
+                        Ok(Event::RecipeFailed(_, reason)) => {
+                            let message = format!("save recipe: {reason}");
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
+                        Ok(_) => {
+                            let message =
+                                "save recipe: unexpected reply; outcome unknown".to_string();
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
+                        Err(error) => {
+                            let message = format!("save recipe: {error}");
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
                     };
                     if events.send(event).is_err() {
                         break;
@@ -731,9 +781,29 @@ fn shared_worker(
                     }
                 }
                 Command::ImportRecipe(meta, path) => {
+                    // Mirror the local worker: only an imported revision
+                    // clears the recipe failure.
                     let event = match store.import_recipe(&meta, path).await {
-                        Ok(event) => event,
-                        Err(error) => Event::RecipeFailed(meta, error),
+                        Ok(Event::RecipeSaved(_, saved)) => {
+                            recipe_failure = None;
+                            Event::RecipeSaved(meta, saved)
+                        }
+                        Ok(Event::RecipeFailed(_, reason)) => {
+                            let message = format!("import recipe: {reason}");
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
+                        Ok(_) => {
+                            let message =
+                                "import recipe: unexpected reply; outcome unknown".to_string();
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
+                        Err(error) => {
+                            let message = format!("import recipe: {error}");
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
                     };
                     if events.send(event).is_err() {
                         break;
@@ -759,9 +829,19 @@ fn shared_worker(
                     }
                 }
                 Command::Flush(done) => {
-                    // Sequential service means every accepted command
-                    // already answered: acknowledge durability at once.
-                    if done.send(Ok(())).is_err() {
+                    // Mirror the local worker exactly: consumed save and
+                    // recipe failures stay represented here until a matching
+                    // success clears them, so a failed shutdown cannot
+                    // report clean. Sequential service already answered
+                    // everything accepted before this command.
+                    let result = if let Some(error) = &recipe_failure {
+                        Err(error.clone())
+                    } else if failed.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(failed.values().next().expect("nonempty").clone())
+                    };
+                    if done.send(result).is_err() {
                         break;
                     }
                 }
@@ -3069,6 +3149,119 @@ mod tests {
             Ok(()) => panic!("stopped shim must not accept saves"),
         }
         assert!(memory.poll().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_conflict_makes_flush_fail_closed() {
+        // A peer-winning conflict must stay represented at shutdown like
+        // the local worker's failed map: flush reports the failure instead
+        // of a clean exit over undurable state.
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6211).await;
+        let memory = SharedMemory::wrap(store);
+        let definition = definition();
+        let view = ViewId::new();
+        memory
+            .save(Box::new(request(1, definition.clone(), view, "ours")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        poll_until(&memory, deadline, |event| matches!(event, Event::Saved(..))).await;
+        // A second writer moves the row underneath us.
+        let external =
+            WorkspaceStore::open(root.path().join("captures").join("workspace")).unwrap();
+        let mut moved = external.get_view(view).unwrap().unwrap();
+        moved.applied_search = "theirs".into();
+        external.update_view(&moved, 0).unwrap();
+        drop(external);
+        memory
+            .save(Box::new(request(2, definition, view, "ours edited")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match poll_until(&memory, deadline, |event| {
+            matches!(event, Event::SaveFailed(..))
+        })
+        .await
+        {
+            Event::SaveFailed(_, failed_view, sequence, message) => {
+                assert_eq!(failed_view, view);
+                assert_eq!(sequence, 2);
+                assert!(
+                    message.contains("memory autosave"),
+                    "flush and notices share one message: {message}"
+                );
+            }
+            other => panic!("expected save failure, got {other:?}"),
+        }
+        let (_, result) = memory.flush(Duration::from_secs(10));
+        assert!(result.is_err(), "flush must report the failed save");
+        memory.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_invalid_save_makes_flush_fail_then_recovery_clears() {
+        // An invalid save fails the flush; a later valid save for the same
+        // view clears it, mirroring local recovery. The invalid attempt
+        // never touches versions, so the valid save commits at once.
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6212).await;
+        let memory = SharedMemory::wrap(store);
+        let definition = definition();
+        let view = ViewId::new();
+        let mut invalid = request(1, definition.clone(), view, "bad");
+        invalid.state.bookmarks = vec![lvu::Bookmark {
+            id: lvu::RowId::new(SourceId::new().0.to_string(), 7),
+            note: "nowhere".into(),
+        }];
+        memory.save(Box::new(invalid)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        poll_until(&memory, deadline, |event| {
+            matches!(event, Event::SaveFailed(..))
+        })
+        .await;
+        let (_, stale) = memory.flush(Duration::from_secs(10));
+        assert!(stale.is_err(), "flush must report the invalid save");
+        memory
+            .save(Box::new(request(2, definition, view, "good")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        poll_until(&memory, deadline, |event| matches!(event, Event::Saved(..))).await;
+        let (_, recovered) = memory.flush(Duration::from_secs(10));
+        recovered.expect("flush acknowledges after recovery");
+        memory.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_recipe_failure_makes_flush_fail() {
+        // Recipe failures poison the flush exactly like view failures;
+        // only a saved revision clears them.
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6213).await;
+        let memory = SharedMemory::wrap(store);
+        let meta = lvu::RecipeRequestMeta {
+            request_id: 1,
+            dialog_id: 2,
+            dialog_revision: 3,
+        };
+        memory
+            .import_recipe(meta, root.path().join("missing-recipe.toml"))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match poll_until(&memory, deadline, |event| {
+            matches!(event, Event::RecipeFailed(..))
+        })
+        .await
+        {
+            Event::RecipeFailed(_, message) => {
+                assert!(
+                    message.contains("import recipe"),
+                    "recipe flush and notices share one message: {message}"
+                );
+            }
+            other => panic!("expected recipe failure, got {other:?}"),
+        }
+        let (_, result) = memory.flush(Duration::from_secs(10));
+        assert!(result.is_err(), "flush must report the recipe failure");
+        memory.stop();
     }
 }
 
