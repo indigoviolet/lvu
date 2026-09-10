@@ -3813,12 +3813,12 @@ impl Composition {
     }
 
     /// Translate one queued request for a union view into a fenced union
-    /// candidate. Text search and presentation-only grouping/colour rules
-    /// pass through (the worker runs text search itself); advanced filters,
-    /// enrichment and time windows are refused here — before any freeze is
-    /// spent — with the input-preserving error the editor shows. Unknown or
-    /// closed inputs fail the same way, and every failure preserves the
-    /// prior union through the ordinary editor-error path.
+    /// candidate. Text search, native Advanced filters and grouping pass to
+    /// the merged-frame worker. Enrichment, time windows, legacy correlation
+    /// and colour rules are rejected before any freeze is spent rather than
+    /// falsely accepted without execution. Unknown or closed inputs fail the
+    /// same way, and every failure preserves the prior union through the
+    /// ordinary editor-error path.
     fn submit_union_request(
         &mut self,
         app: &mut App,

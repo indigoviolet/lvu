@@ -4468,14 +4468,40 @@ impl App {
         if !valid_enrichments(&restored.applied_enrichments) {
             return false;
         }
-        if let Some(union) = restored_union.as_ref()
-            && (!restored.applied_enrichments.is_empty()
+        if let Some(union) = restored_union.as_ref() {
+            if !restored.applied_enrichments.is_empty()
                 || !restored.applied_enrichment.is_empty()
                 || restored.applied_capture_time.is_some()
-                || union.inputs.len() < 2
-                || union.inputs.len() > 8)
-        {
-            return false;
+                || !restored.color_rules.is_empty()
+                || union
+                    .exact_key
+                    .as_ref()
+                    .is_some_and(|key| key.validate().is_err())
+            {
+                return false;
+            }
+            let mut draft = crate::components::union::UnionDialog::new();
+            for input in &union.inputs {
+                // Input view restoration may arrive from another source's
+                // memory event later in the same startup. Validate the stored
+                // identity/shape now; availability is fenced at submission.
+                if draft.add_input(input.view_id.clone()).is_err() {
+                    return false;
+                }
+            }
+            if draft.validate_for_create(view_id).is_err()
+                || draft
+                    .validate_no_cycle(view_id, |id| {
+                        self.views.states.get(id).and_then(|state| {
+                            state.union_inputs.as_ref().map(|inputs| {
+                                inputs.iter().map(|input| input.view_id.clone()).collect()
+                            })
+                        })
+                    })
+                    .is_err()
+            {
+                return false;
+            }
         }
         let mut source_ids = HashSet::new();
         let primary = self
@@ -6090,7 +6116,7 @@ impl App {
     /// enter the ordinary query pipeline, so their completions arrive here
     /// (drained from the adapter beside query completions) rather than
     /// through `apply_query_completion`. Only editors a union submit can
-    /// carry — search, advanced, grouping and colour rules — settle here;
+    /// carry — search, advanced and grouping — settle here; colour rules,
     /// enrichment and time edits are refused before submission, so they can
     /// never be pending on one. A revision mismatch or an unknown generation
     /// means stale or superseded: ignored like its ordinary counterpart.
@@ -6127,14 +6153,6 @@ impl App {
                 state.search.applied = constraint_text(&constraints);
                 state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
                 state.grouping.applied = constraints.grouping.clone().unwrap_or_default();
-                state.color_rules = constraints.color_rules.clone();
-                if state
-                    .pending_color_rules
-                    .is_some_and(|(_, revision)| revision <= union_revision)
-                {
-                    state.pending_color_rules = None;
-                    state.color_rules_error = None;
-                }
                 state.applied_query_revision = union_revision;
                 state.applied_generation = generation;
                 clear_accepted_pending(&mut state.search, union_revision);

@@ -21,26 +21,9 @@
 //! Deliberately dependency-light (std only): nothing here decides row
 //! membership or order — that is `lvu-view::union`'s job through Polars.
 //!
-//! PROPOSED HOOKS (primary-owned; do not apply without assignment).
-//!
-//! H1 — `crates/lvu/src/components/mod.rs`: `pub mod union;`, plus
-//! `use union::UnionDialog;` and a `pub union: UnionDialog` slot on `Layers`
-//! (constructed in `Layers::default`), following the `CorrelationDialog`
-//! precedent.
-//! H2 — `crates/lvu/src/component.rs`: a `LayerId::Union` variant with dialog
-//! class M (modal task over one view, like Folding/Correlate), palette row
-//! `Union views…` reachable from a derived view, and mnemonic-audited action
-//! labels (`&Add input`, `&Remove`, `&Create union`, `&Cancel`).
-//! H3 — `crates/lvu/src/app.rs`: union draft/accepted state per derived view
-//! (accepted input IDs + fenced revisions, mirroring `exact_field` as
-//! accepted-state-or-nothing), `take_query_requests` emitting the union
-//! candidate with its fence, and `apply_query_completion` preserving the
-//! prior union on failure. Coordinate with W22 (grouping/folding UI) and
-//! the source-assistance owner (main.rs source methods) — nonoverlapping
-//! regions per the assignment.
-//! H4 — persistence (autosave owner): accepted union inputs ride the additive
-//! `presentation_json.union` key shaped in `lvu-view/src/union.rs`
-//! (`StoredUnionShape`); no schema bump.
+//! The dialog, app fence/controller, native worker and additive persistence
+//! hooks are integrated. This module remains the single std-only draft and
+//! cycle-validation boundary; it does not acquire sources or evaluate rows.
 
 /// Dialog-side bound mirroring `lvu-view`'s `MAX_UNION_INPUTS`.
 ///

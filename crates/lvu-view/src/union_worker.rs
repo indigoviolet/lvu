@@ -40,11 +40,11 @@
 //!   each record's DISPLAY RANK. Ranks are strictly increasing per source, so
 //!   the existing k-way merge reproduces the union order exactly; `times`
 //!   still carries the honest basis values for time bounds and gap search.
-//!   Union-level search/advanced filters over the merged stream need worker
-//!   execution over union frames (primary-owned `run_query` region) and are
-//!   an explicit follow-up: inputs arrive already filtered, and folding,
-//!   grouping, export, correlation and time bounds read `Membership`
-//!   generically from day one.
+//!   Union-level search, native Advanced and exact-key predicates execute on
+//!   the merged/deduplicated typed frame before this membership is built.
+//!   Grouping consumes native typed flags (or the established lexical rule),
+//!   while paging, folding, export, raw context and time bounds read the same
+//!   ordinary `Membership` downstream.
 
 use super::export::{FrozenInput, FrozenInputError, FrozenInputLimits};
 use super::union::{
@@ -964,6 +964,20 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
     let identity_index_bytes = retained_rows
         .checked_mul(96)
         .ok_or_else(|| "union identity index size overflow".to_owned())?;
+    // Configured grouping temporarily carries the engine flag vector and the
+    // identity-indexed flag map together. Reserve both before either native
+    // helper or map builder runs; Run keys may retain the full exact-key
+    // bound and are never truncated to fit the budget.
+    let configured_grouping_bytes = match prepared_filter.grouping.as_ref() {
+        Some(ContinuationRule::Filter { .. }) => retained_rows
+            .checked_mul(96)
+            .and_then(|bytes| bytes.checked_mul(2)),
+        Some(ContinuationRule::Run { .. }) => retained_rows
+            .checked_mul(96 + lvu_query::MAX_EXACT_KEY_BYTES as u64)
+            .and_then(|bytes| bytes.checked_mul(2)),
+        _ => Some(0),
+    }
+    .ok_or_else(|| "union configured grouping size overflow".to_owned())?;
     let reserved_bytes = source_count
         .checked_mul(
             SOURCE_OVERHEAD
@@ -972,6 +986,7 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
         )
         .and_then(|overhead| workspace.checked_add(overhead))
         .and_then(|bytes| bytes.checked_add(identity_index_bytes))
+        .and_then(|bytes| bytes.checked_add(configured_grouping_bytes))
         .ok_or_else(|| "union workspace size overflow".to_owned())?;
     let additional = reserved_bytes
         .checked_sub(carrier_bytes)
@@ -1665,10 +1680,21 @@ fn publish_union(
     use super::union::{SEQUENCE_COLUMN, SOURCE_ID_COLUMN, UNION_TS_COLUMN};
     use polars::prelude::AnyValue;
     let height = matched_ids.len();
+    // A union exposes an enrichment output only when every accepted input
+    // structurally produced it at its frozen fence. This conservative
+    // intersection prevents a raw same-named field in another input from
+    // acquiring derived authority for configured grouping or shared-key
+    // selection on the union view.
     let mut accepted_enrichment_outputs = frozen_inputs
-        .iter()
-        .flat_map(|input| input.accepted_enrichment_outputs.iter().cloned())
-        .collect::<Vec<_>>();
+        .first()
+        .map(|input| input.accepted_enrichment_outputs.clone())
+        .unwrap_or_default();
+    accepted_enrichment_outputs.retain(|output| {
+        frozen_inputs
+            .iter()
+            .skip(1)
+            .all(|input| input.accepted_enrichment_outputs.contains(output))
+    });
     accepted_enrichment_outputs.sort();
     accepted_enrichment_outputs.dedup();
     let configured_grouping_flags = prepared_filter

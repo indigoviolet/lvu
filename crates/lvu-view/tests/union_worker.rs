@@ -16,14 +16,17 @@ use lvu_ingest::{RuntimeConfig, RuntimeState, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
 use lvu_query::CompilerHostConfig;
 use lvu_view::{
-    NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec, UnionPhaseTestProbe,
-    UnionPublishTestBarrier, UnionTestBarrier, ViewConfig,
+    FrozenInputLimits, NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec,
+    UnionPhaseTestProbe, UnionPublishTestBarrier, UnionTestBarrier, ViewConfig,
 };
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
-    sync::{Arc, atomic::AtomicUsize},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize},
+    },
     time::Duration,
 };
 use tempfile::TempDir;
@@ -1036,6 +1039,73 @@ async fn native_advanced_filters_post_dedup_and_preserve_last_good() {
             .map(|sequence| format!("{}:{sequence}", api.source_id().0))
             .collect::<Vec<_>>()
     );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn union_derived_inventory_requires_every_frozen_input_to_accept_the_output() {
+    let (root, manager, api, _worker, mut adapter) = setup().await;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("api.log"))
+        .unwrap();
+    writeln!(
+        file,
+        "{{\"ts\":\"2026-03-04T05:06:20Z\",\"svc\":\"api\",\"choice\":\"raw-name\"}}"
+    )
+    .unwrap();
+    file.flush().unwrap();
+    wait_runtime(&api, 7).await;
+
+    adapter
+        .register_view("view-loser", vec![api.source_id()])
+        .unwrap();
+    adapter
+        .register_view("view-winner", vec![api.source_id()])
+        .unwrap();
+    apply_slash_enrichment(&mut adapter, "view-loser", r#"/svc\":\"(?P<choice>api)/"#);
+    wait_applied(&mut adapter, 1).await;
+    apply(&mut adapter, "view-winner", 1);
+    wait_applied(&mut adapter, 1).await;
+    adapter
+        .register_union_view("union", vec![api.source_id()])
+        .unwrap();
+    adapter
+        .submit_union_candidate(
+            duplicate_projection_candidate(1, UnionFilterSpec::default()),
+            &|_| None,
+        )
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+
+    let frozen = adapter
+        .freeze_input("union", FrozenInputLimits::default())
+        .unwrap();
+    assert_eq!(frozen.summary().view_id, "union");
+    assert_eq!(frozen.summary().applied_revision, 1);
+    assert_eq!(frozen.summary().applied_generation, 1);
+    assert!(
+        frozen.summary().accepted_enrichment_outputs.is_empty(),
+        "the other input's raw choice field cannot confer derived authority"
+    );
+    let rows = std::thread::spawn(move || {
+        let mut rows = Vec::new();
+        frozen
+            .visit_precise(&AtomicBool::new(false), |batch| {
+                rows.extend(batch.rows);
+                Ok(())
+            })
+            .unwrap();
+        rows
+    })
+    .join()
+    .unwrap();
+    assert!(
+        rows.iter().any(|row| row.fields.contains_key("choice")),
+        "the typed column remains available even though it is not accepted-derived authority"
+    );
+
     adapter.shutdown();
     manager.shutdown().await;
 }

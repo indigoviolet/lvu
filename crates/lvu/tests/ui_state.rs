@@ -10235,12 +10235,21 @@ fn a_correlation_naming_a_source_the_view_does_not_carry_is_refused() {
 fn an_invalid_union_restore_is_transactional() {
     let (_provider, mut app) = demo();
     let view = app.active_view_id().unwrap().to_owned();
+    let accepted_correlation = lvu_core::FieldCorrelation::new(
+        "request_id",
+        lvu_core::ExactScalar::string("req-7").unwrap(),
+        [("api".to_owned(), "request_id".to_owned())]
+            .into_iter()
+            .collect(),
+    )
+    .unwrap();
     let accepted = PersistentViewState {
         view_name: "accepted name".into(),
         applied_search: "request".into(),
         search_draft: "accepted draft".into(),
         severity_column: Some("severity".into()),
         timestamp_column: Some("event_time".into()),
+        exact_field: Some(accepted_correlation),
         ..PersistentViewState::default()
     };
     assert!(app.restore_persistent_view(&view, accepted));
@@ -10254,14 +10263,23 @@ fn an_invalid_union_restore_is_transactional() {
     invalid.search_draft = "must not land".into();
     invalid.severity_column = None;
     invalid.timestamp_column = None;
+    invalid.exact_field = None;
     invalid.union = Some(lvu::PersistentUnion {
-        // One input is not a union. This failure happens after DTO decode but
-        // must precede cancellation, revision changes, or accepted-state edits.
-        inputs: vec![lvu::PersistentUnionInput {
-            view_id: view.clone(),
-            accepted_revision: 7,
-            applied_generation: 9,
-        }],
+        // The count is valid, but the duplicate/self-referential definition
+        // is not. Rejection must still precede cancellation, revision changes,
+        // or accepted-state edits.
+        inputs: vec![
+            lvu::PersistentUnionInput {
+                view_id: view.clone(),
+                accepted_revision: 7,
+                applied_generation: 9,
+            },
+            lvu::PersistentUnionInput {
+                view_id: view.clone(),
+                accepted_revision: 7,
+                applied_generation: 9,
+            },
+        ],
         filter: "invalid".into(),
         advanced_filter: String::new(),
         exact_key: None,

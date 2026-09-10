@@ -4,12 +4,9 @@
 //! merged in timestamp order, with ordinary downstream filters, grouping and
 //! folding applying on top of the merged stream.
 //!
-//! Ownership: Muse union-views assignment. This file is new and owned here;
-//! the hooks that register it with the adapter live in primary-owned files
-//! and are proposed verbatim at the bottom of this module (`PROPOSED HOOKS`).
-//! Until those land this module is exercised through
-//! `crates/lvu-view/tests/union_views.rs`, which includes it by path, so no
-//! shared manifest or existing module is touched.
+//! Ownership: Muse union-views assignment. The registration, frozen replay,
+//! native filtering and publication path is integrated through
+//! `union_worker`; this module owns its typed contract and pure helpers.
 //!
 //! Semantics (user request, preserved here):
 //!
@@ -52,53 +49,12 @@
 //! * No cycle or self-reference: a union may not (transitively) contain
 //!   itself. Input count, row count, scan work and snapshot work are bounded.
 //!
-//! Engine/app division (AGENTS.md): Polars owns ALL union/sort/filter/equality
-//! compute over typed values — diagonal concatenation, `unique_stable`
-//! first-keep dedup on the canonical identity columns, and the total
-//! timestamp ordering all execute in `lvu-query/src/union.rs`, included here
-//! by path until its coordinated export lands. This module holds the
-//! spec/contract layer (validation, cycles, budgets, provenance-fenced
-//! decoding, persistence shape) plus `merge_union_rows`, the cheap pure
-//! identity-order contract used for pre-freeze planning and pinned by
-//! convergence tests against the engine output — never a second compute
-//! implementation.
-//!
-//! PROPOSED HOOKS — exact minimal ownership (primary assigns).
-//!
-//! Non-touch regions for this feature: W22 owns the grouping sections of
-//! `lib.rs` (folding policy, `ContinuationRule`, group publication); the
-//! roles agent owns new role helpers and the narrow `with_enrichment` seam
-//! (`lib.rs:3447-3468`); `merge_order`/`extends` are read-only references.
-//!
-//! LANDED in this worktree (executable, gated):
-//! H1. `lib.rs` module lines + re-exports; `Shared.union_views` field;
-//!     `register_union_view` / `unregister_union_view` / `union_inputs` /
-//!     `submit_union_candidate` / `take_union_completions` (all implemented
-//!     in the owned `union_worker.rs`); one `drive_unions` call in
-//!     `drain_updates`; a guard in `submit_query` refusing ordinary queries
-//!     for union views. New engine file `lvu-query/src/union.rs` (compute).
-//! OUTSTANDING (contacts, not this worktree):
-//! H2. W22: `QueryPurpose::Union` variant (`lvu/src/app.rs`) so union
-//!     completions map into `QueryCompletion` like every other purpose.
-//! H3. Source owner: `main.rs` union entry dispatch — dialog acceptance to
-//!     `submit_union_candidate`, per-tick `take_union_completions` routing,
-//!     input-advance refresh via the controller.
-//! H4. Autosave owner: `StoredUnionShape` as additive `presentation_json.union`
-//!     (`color_rules` precedent, no schema bump); restore re-resolves input
-//!     IDs and never launches commands.
-//! H5. Primary: `FrozenInput::visit_precise` (or a precise flag on `visit`)
-//!     in `export.rs` — ~5 lines mirroring `visit` with precise replay — so
-//!     the worker's dtype evidence comes from native `field_types` for every
-//!     field. Until then the worker uses the public non-precise visit and the
-//!     decoder enforces strict scalar fallback with explicit rejects.
-//! H6. Primary: union-level search/advanced filters executed over merged
-//!     frames in the owned `run_query` region. Inputs arrive already
-//!     filtered; folding, grouping, export, correlation, time bounds and gap
-//!     search read the published `Membership` generically from day one.
-//! H7. Archive review (primary): union snapshots freeze input view IDs,
-//!     accepted revisions/generations and per-source high-watermarks
-//!     (`FrozenInputSummary` carries all three); independent input advances
-//!     create new immutable boundaries.
+//! Engine/app division (AGENTS.md): Polars owns diagonal concatenation,
+//! stable first-input dedup, ordering and native predicates in `lvu-query`.
+//! This module owns validation, cycles, checked budgets, provenance-fenced
+//! decoding and the additive transport shape. `merge_union_rows` is a small
+//! identity-order contract pinned against engine output, not the executable
+//! value/filter evaluator.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -404,9 +360,8 @@ pub struct UnionCandidateSpec {
 ///
 /// `error` is `None` on publication. The published membership itself is
 /// already installed under the union view ID when the worker reports success;
-/// this is only the acknowledgement the shell routes like a query completion.
-/// (Terminal mapping to `QueryCompletion` needs `QueryPurpose::Union` — W22
-/// contact — so the worker reports here and the tick translates later.)
+/// this is only the acknowledgement the shell routes through the dedicated
+/// union completion path, alongside ordinary query completions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnionCompletion {
     pub union_view_id: String,
