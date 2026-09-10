@@ -1,571 +1,560 @@
-# macOS acceptance test plan
+# macOS acceptance plan
 
-For an agent or a person with no prior knowledge of lvu, on macOS. No
-human acceptance has been recorded on a Mac. Hosted arm64 CI now also covers
-file capture, kernel-PTY terminal restoration and orderly process cleanup; see
-[platform evidence](platform-validation.md). The human terminal-emulator checks
-below remain unverified. This checklist retains its historical v0.1.0-specific
-steps; record the actual installed version and do not treat those older labels
-as current release evidence.
+Status: prepared for published `v0.1.6`; not executed by this documentation refresh.
 
-**Build under test: `v0.1.0` from the tap.** Steps marked *(post-0.1.0)* need a
-build from `main` and must be skipped otherwise; each says what 0.1.0 does
-instead. Do not report a skipped step as a failure.
+This checklist validates the immutable published macOS distribution in a real
+terminal emulator. It is not evidence that the checks passed. Record every
+result against the exact executable and resources described below; do not
+substitute a development build or a moving branch.
 
-Record every step as PASS or FAIL. Report format is in [§13](#13-reporting-a-failure).
+The source under test is annotated tag `v0.1.6`, commit
+`697865e493b1607b63423f5f2646e3339de73c3e`. The release workflow was
+`34440412338`, and the Homebrew formula update was commit
+`8fce418c7ff069530942a9e63927c0cdde1f98ec`. Published archive digests are:
 
-## 0. Prerequisites
-
-| | |
+| Artifact | SHA-256 |
 | --- | --- |
-| Homebrew | 6 or newer for `brew trust`. `brew --version` |
-| Terminals | Terminal.app, iTerm2, and one truecolor terminal (Ghostty, WezTerm, Kitty or Alacritty) |
-| `uv` | optional; required only by §5 and §6 |
-| `node` | optional; required only by the assistance rows, which this plan does not cover |
+| `lvu-0.1.6-aarch64-apple-darwin.tar.gz` | `19b6ebbdcc8de941aee6a18a8b8b970049bb19a3833f99a7d4590706a252f278` |
+| `lvu-0.1.6-x86_64-apple-darwin.tar.gz` | `7a34e2aef62746d46b55fd3ef761d17cce3b541ba692d2c0f63156b1e17f0f23` |
+| `SHA256SUMS` | `ec3e0001f948a2acc9a63b8dd8a67189c072139ce9ed59503fc11f72eeb59636` |
+
+Dedicated platform validation at source commit
+`9dff245ddcf0c217116b168fe7262eb47c65bb2e` proved the arm64 Darwin kernel PTY
+and terminal restoration/cleanup probes; its separate Intel Darwin job proved
+compilation only. Release workflow `34440412338` separately executed checks on
+all four published release archives, including the Intel Darwin archive. None
+of that CI evidence accepts the human Terminal.app, iTerm2, truecolor, mouse,
+clipboard, resize, or Option/Meta checks below.
+
+## Scope and prerequisites
+
+Run the checklist on each supported machine/terminal combination being claimed:
+
+- Apple silicon with the native arm64 Homebrew package.
+- Intel macOS with the native x86_64 Homebrew package.
+- Terminal.app and iTerm2, separately.
+
+Use a normal interactive terminal with `brew`, `python3`, `shasum`, and `ps`
+available. Do not run the long-scale checks during routine acceptance.
+Do not use captured user data. The fixture commands below create an isolated,
+marked temporary root with deterministic content.
+
+This plan does not accept Windows support, Darwin parent-death cleanup after
+`SIGKILL`, or piped-stdin capture. It does not publish, merge, or replace a
+release.
+
+## 1. Install and bind exact provenance
+
+Install the published formula, then record the immutable executable and its
+adjacent resources. `lvu` does not currently expose a `--version` option, so the
+formula version, resolved binary path, binary hash, and resource report together
+identify the installed subject.
 
 ```sh
-brew trust indigoviolet/tap        # Homebrew 5 has no `trust`; skip the line
+if brew help trust >/dev/null 2>&1; then
+  brew trust indigoviolet/tap
+fi
 brew install indigoviolet/tap/lvu
-brew install uv                    # optional
-mkdir -p ~/lvu-test && cd ~/lvu-test
+
+LVU_TEST_ROOT="$(mktemp -d /tmp/lvu-macos-v016.XXXXXX)"
+chmod 700 "$LVU_TEST_ROOT"
+touch "$LVU_TEST_ROOT/.lvu-macos-acceptance-fixture"
+export LVU_TEST_ROOT
+printf 'Retain this exact root for the second shell: %s\n' "$LVU_TEST_ROOT"
+LVU_CAPTURE="$LVU_TEST_ROOT/capture"
+export LVU_CAPTURE
+
+LVU_PREFIX="$(brew --prefix lvu)"
+export LVU_PREFIX
+
+brew info --json=v2 indigoviolet/tap/lvu >"$LVU_TEST_ROOT/brew-info.json"
+python3 - <<'PY' | tee "$LVU_TEST_ROOT/provenance.txt"
+import hashlib
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["LVU_TEST_ROOT"])
+info = json.loads((root / "brew-info.json").read_text())
+formula = info["formulae"][0]
+prefix = Path(os.environ["LVU_PREFIX"]).resolve()
+binary = (prefix / "bin" / "lvu").resolve()
+digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+print(f"formula={formula['full_name']}")
+print(f"stable={formula['versions']['stable']}")
+print(f"prefix={prefix}")
+print(f"binary={binary}")
+print(f"binary_sha256={digest}")
+PY
+
+LVU_BIN="$(cd "$LVU_PREFIX/bin" && pwd -P)/lvu"
+export LVU_BIN
+"$LVU_BIN" --resources | tee "$LVU_TEST_ROOT/resources.txt"
+"$LVU_BIN" --help | tee "$LVU_TEST_ROOT/help.txt"
+uname -a | tee "$LVU_TEST_ROOT/uname.txt"
+sw_vers | tee "$LVU_TEST_ROOT/sw-vers.txt"
+printf 'TERM=%s\nCOLORTERM=%s\n' "${TERM-}" "${COLORTERM-}" \
+  | tee "$LVU_TEST_ROOT/terminal-env.txt"
 ```
 
-Fixtures, used throughout:
+Accept only when:
+
+- `stable=0.1.6` is recorded.
+- The resolved executable is below the installed formula prefix.
+- `--resources` reports every packaged resource as found, with origin
+  `installed beside the executable`.
+- The resource paths resolve beside that same immutable installation, rather
+  than a checkout or an older Cellar version.
+- The executable SHA-256 is retained with the result. Compare it only with a
+  digest calculated from the same installed binary; the archive SHA values
+  above are hashes of compressed archives, not of the executable inside them.
+
+Known published inconsistency: the final sentence of `lvu --help` in `v0.1.6`
+still mentions `p` for advanced Polars filtering. The executable no longer maps
+`p`; the supported path is `/`, then `Alt-A`. Record the help discrepancy, but
+do not use `p` in acceptance.
+
+## 2. Create deterministic fixtures
 
 ```sh
-python3 - <<'EOF'
-import random, datetime
-lv=["INFO","WARN","ERROR","DEBUG"]
-with open("big.log","w") as f:
-    t=datetime.datetime(2026,9,8,10,0,0)
-    for i in range(200000):
-        t+=datetime.timedelta(milliseconds=random.randint(1,40))
-        f.write(f"{t.isoformat()}Z {random.choice(lv)} status={random.choice([200,201,404,500,503])} "
-                f"user=u{random.randint(1,50)} latency={random.randint(1,9000)}ms request handled id={i}\n")
-EOF
-printf 'plain ascii line\n' > small.log
-printf '\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e wide glyphs \xf0\x9f\x8e\x89 emoji\n' >> small.log
-printf 'combining: e\xcc\x81 a\xcc\x80 n\xcc\x83 and ZWJ: \xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb\n' >> small.log
-printf 'tab\there\tand\ttabs\n' >> small.log
-wc -l big.log small.log
+python3 - <<'PY'
+import os
+from pathlib import Path
+
+root = Path(os.environ["LVU_TEST_ROOT"])
+levels = ("INFO", "WARN", "ERROR", "DEBUG")
+statuses = (200, 201, 404, 503)
+users = ("alice", "bob", "céline", "李雷")
+with (root / "events.log").open("w", encoding="utf-8", newline="\n") as out:
+    for i in range(240):
+        second = i % 60
+        level = levels[i % len(levels)]
+        status = statuses[(i // 3) % len(statuses)]
+        user = users[(i // 5) % len(users)]
+        latency = (i * 137) % 8000
+        out.write(
+            f"stamp<2026-09-10T05:{i // 60:02d}:{second:02d}Z> "
+            f"{level} request id={i:04d} status={status} "
+            f"user={user} latency={latency}ms\n"
+        )
+
+(root / "unicode.log").write_text(
+    "plain ascii\n"
+    "combining: cafe\u0301 nai\u0308ve\n"
+    "wide: 東京 李雷\n"
+    "emoji: investigation 🧠 complete ✅\n"
+    "control-looking text: \\x1b[31m is literal\n",
+    encoding="utf-8",
+    newline="\n",
+)
+
+(root / "multiline.log").write_text(
+    "2026-09-10T05:00:00Z ERROR request failed\n"
+    "  at parser.rs:42\n"
+    "  caused by invalid field\n"
+    "2026-09-10T05:00:01Z INFO recovered\n",
+    encoding="utf-8",
+    newline="\n",
+)
+PY
+
+shasum -a 256 "$LVU_TEST_ROOT"/*.log | tee "$LVU_TEST_ROOT/fixture-sha256.txt"
+wc -l "$LVU_TEST_ROOT"/*.log | tee "$LVU_TEST_ROOT/fixture-lines.txt"
 ```
 
-Run every step in each of the three terminals unless the step says otherwise.
-`Escape` closes a dialog; `q` quits from the base screen.
+The expected counts are 240 lines for `events.log`, 5 for `unicode.log`, and 4
+for `multiline.log`. Retain the hashes; regenerating the fixtures must produce
+the same bytes.
 
-## 1. Command line
+## 3. Startup, file acquisition, and restart
 
-### 1.1 `lvu --help`
+Run in both Terminal.app and iTerm2 unless a narrower platform claim is being
+made.
 
 ```sh
-lvu --help
+"$LVU_BIN" --capture-dir "$LVU_CAPTURE" --fresh "$LVU_TEST_ROOT/events.log"
 ```
 
-Must show: first line `lvu — live local log viewer`, second blank, third
-`Usage: lvu [OPTIONS] [FILE ...]`. The string `lvu-app` must not appear.
+Verify interactively:
 
-PASS / FAIL: ______
+1. The TUI appears without shell escape sequences or diagnostic output mixed
+   into the record list.
+2. The 240 records are available and navigation remains responsive.
+3. `q` exits and restores the shell prompt, cursor, echo, and canonical input.
+4. `stty -a | grep -Eo '(-?echo|-?icanon)'` after exit shows normal `echo` and
+   `icanon` for the invoking terminal.
 
-### 1.2 `lvu --resources`
+Then restart without a path:
 
 ```sh
-cd /tmp && lvu --resources
+"$LVU_BIN" --capture-dir "$LVU_CAPTURE" --resume
 ```
 
-Must show, for both `Python expression helper` and `agent bridge`, the word
-`found` and the line:
+Verify that the remembered file source is acquired again without duplicate
+records. In `v0.1.6`, bare `lvu` and `--resume` also re-acquire remembered
+command sources; older checklist language saying commands must not rerun is no
+longer valid. `--fresh` starts without remembered sources.
 
-```
-  origin: installed beside the executable
-```
+## 4. Command acquisition and owned-process cleanup
 
-`origin: development checkout` is a failure. So is `missing` on a Homebrew
-install. The `executable:` line must point inside
-`/opt/homebrew/Cellar/lvu/0.1.0` (Apple silicon) or
-`/usr/local/Cellar/lvu/0.1.0` (Intel), not into a source tree.
-
-PASS / FAIL: ______
-
-### 1.3 An unknown option
+Use only the recorded process identities from this fixture. Never use a blanket
+`pkill` or kill unrelated processes.
 
 ```sh
-lvu --nonesuch
+rm -f "$LVU_TEST_ROOT/parent.pid" "$LVU_TEST_ROOT/child.pid"
+"$LVU_BIN" --capture-dir "$LVU_CAPTURE" --fresh --command '
+  echo $$ >"$LVU_TEST_ROOT/parent.pid"
+  sleep 600 & child=$!
+  echo "$child" >"$LVU_TEST_ROOT/child.pid"
+  i=0
+  while :; do
+    printf "command-line-%04d\n" "$i"
+    i=$((i + 1))
+    sleep 1
+  done
+'
 ```
 
-Must exit non-zero with a message naming the argument and pointing at `--help`.
-**Known cosmetic defect in 0.1.0:** the message is prefixed `lvu-app:`, not
-`lvu:`. Record it, do not report it as new.
-
-PASS / FAIL: ______
-
-## 2. First launch and sources
-
-### 2.1 Startup with no sources
+After several lines appear, use a second shell to record the identities while
+they are still live. Enter the exact root printed by the first shell; do not run
+`mktemp` or create a second fixture root:
 
 ```sh
-cd ~/lvu-test && lvu
+printf 'Exact retained LVU_TEST_ROOT from the first shell: '
+IFS= read -r LVU_TEST_ROOT
+export LVU_TEST_ROOT
+test -f "$LVU_TEST_ROOT/.lvu-macos-acceptance-fixture"
+LVU_CAPTURE="$LVU_TEST_ROOT/capture"
+export LVU_CAPTURE
+
+parent_pid="$(cat "$LVU_TEST_ROOT/parent.pid")"
+ps -p "$parent_pid" -o pgid= | tr -d ' ' >"$LVU_TEST_ROOT/command.pgid"
+owned_pgid="$(cat "$LVU_TEST_ROOT/command.pgid")"
+for pidfile in "$LVU_TEST_ROOT/parent.pid" "$LVU_TEST_ROOT/child.pid"; do
+  pid="$(cat "$pidfile")"
+  ps -p "$pid" -o pid=,ppid=,pgid=,command=
+done >"$LVU_TEST_ROOT/command-owned-before.txt"
+ps -axo pid=,ppid=,pgid=,command= \
+  | awk -v group="$owned_pgid" '$3 == group' \
+  >>"$LVU_TEST_ROOT/command-owned-before.txt"
+cat "$LVU_TEST_ROOT/command-owned-before.txt"
 ```
 
-Must open the Add source dialog. Startup art is drawn above or behind it.
-Nothing may be garbled, and no escape sequence may appear literally.
-
-PASS / FAIL: ______
-
-Note which terminal, and whether the art rendered as blocks, as colour, or not
-at all. All three are acceptable; a corrupted screen is not.
-
-### 2.2 A file source from the dialog
-
-From the Add source dialog: press `Alt-F`, type `big.log`, press `Tab` to
-complete, press `Enter`.
-
-Must show: the log pane fills with records, a footer, and a record count that
-settles at 200000. Timestamps and levels are visible.
-
-PASS / FAIL: ______
-
-Press `q` to quit.
-
-### 2.3 A file source from the command line
+Exit normally with `q`, then check only those recorded PIDs:
 
 ```sh
-lvu big.log small.log
+cleanup_status=0
+owned_pgid="$(cat "$LVU_TEST_ROOT/command.pgid")"
+{
+for pidfile in "$LVU_TEST_ROOT/parent.pid" "$LVU_TEST_ROOT/child.pid"; do
+  pid="$(cat "$pidfile")"
+  if kill -0 "$pid" 2>/dev/null; then
+    ps -p "$pid" -o pid=,ppid=,pgid=,command=
+    printf 'FAIL: owned process still alive: %s\n' "$pid"
+    cleanup_status=1
+  else
+    printf 'cleaned: %s\n' "$pid"
+  fi
+done
+remaining="$(ps -axo pid=,ppid=,pgid=,command= | awk -v group="$owned_pgid" '$3 == group')"
+if test -n "$remaining"; then
+  printf 'FAIL: owned process group %s still has members:\n%s\n' "$owned_pgid" "$remaining"
+  cleanup_status=1
+else
+  printf 'cleaned process group: %s\n' "$owned_pgid"
+fi
+} >"$LVU_TEST_ROOT/command-cleanup.txt" 2>&1
+cat "$LVU_TEST_ROOT/command-cleanup.txt"
+test "$cleanup_status" -eq 0
 ```
 
-Must show: both sources open. `]` and `[` switch views. `G` jumps to the end,
-`g` to the start.
+Copy those PID files before the next run, invoke
+`"$LVU_BIN" --capture-dir "$LVU_CAPTURE" --resume`, and
+verify that a new command process identity is created because resume re-acquires
+the command. Exit normally and repeat the identity-scoped cleanup check for the
+new pair. Finally invoke
+`"$LVU_BIN" --capture-dir "$LVU_CAPTURE" --fresh` and verify that neither the
+file nor command source is restored automatically.
 
-PASS / FAIL: ______
+Do not substitute `SIGKILL` for normal cleanup acceptance. Darwin does not
+currently provide the Linux parent-death signal behavior; killing the app with
+`SIGKILL` can leave its command process group alive and is an unresolved
+boundary, not a passing graceful-cleanup test.
 
-### 2.4 A command source
+## 5. Piped stdin boundary
+
+`v0.1.6` intentionally does not claim piped-stdin capture on macOS. Verify only
+the explicit refusal, outside a TUI:
 
 ```sh
-lvu --command 'for i in $(seq 1 200); do echo "tick $i"; sleep 0.05; done'
+printf 'one\ntwo\n' | "$LVU_BIN" \
+  --capture-dir "$LVU_TEST_ROOT/stdin-capture" --fresh \
+  >"$LVU_TEST_ROOT/stdin.out" 2>"$LVU_TEST_ROOT/stdin.err"; status=$?
+printf 'status=%s\n' "$status" | tee "$LVU_TEST_ROOT/stdin-status.txt"
+sed -n '1,20p' "$LVU_TEST_ROOT/stdin.err"
 ```
 
-Must show: lines appearing live. `f` toggles following the tail; with follow on,
-the view stays pinned to the newest line.
+Accept this boundary only when the status is nonzero and stderr says that stdin
+pipe capture requires isolated nonblocking descriptors. Do not reinterpret the
+refusal as stdin support.
 
-PASS / FAIL: ______
+## 6. Search and last-good behavior
 
-Let it finish, confirm the child is reaped (no `sleep` left):
+Open the deterministic event fixture with `--fresh`.
 
-```sh
-pgrep -fl 'seq 1 200' || echo "no orphan"
+1. Press `/`. Confirm the unified Filter dialog opens on its Search tab.
+2. Search for `ERROR`; apply it and confirm only matching visible rows remain.
+3. Reopen `/`, enter an invalid regular expression such as `[`, and attempt to
+   apply it. Confirm the error is actionable and the last valid `ERROR` view
+   remains usable.
+4. Correct the draft, apply it, then use the dialog's `Clear` control. Confirm
+   all records return.
+5. Press `Esc` while editing and confirm the dialog closes without applying the
+   draft.
+
+## 7. Advanced filter and enrichment
+
+The supported advanced-filter path is `/`, then `Alt-A`; `p` is retired.
+
+1. Open `/`, press `Alt-A`, and confirm the Advanced tab is selected.
+2. Apply a valid Polars expression such as:
+
+   ```python
+   pl.col("raw_text").str.contains("status=503", literal=True)
+   ```
+
+3. Enter an invalid expression and verify the last valid applied view remains
+   available.
+4. Switch back with `Alt-S`, then close with `Esc`.
+
+Open Enrich and add these deterministic extraction steps in order:
+
+```text
+/^stamp<(?P<timestamp_utc>[^>]+)>/
+/^stamp<[^>]+> (?P<level>INFO|WARN|ERROR|DEBUG) /
+/latency=(?P<latency_ms>\d+)ms/
+/(?P<error_start>ERROR)/
 ```
 
-PASS / FAIL: ______
+Add a derived expression named `slow`:
 
-### 2.5 stdin
-
-```sh
-seq 1 5000 | lvu
+```python
+pl.col("latency_ms").cast(pl.Int64) > 5000
 ```
 
-Must show: 5000 records, and the terminal is still interactive (lvu reads keys
-from `/dev/tty`, not stdin). Press `q`.
-
-PASS / FAIL: ______
-
-*docs/portability.md reads piped stdin capture as a macOS risk. If this fails,
-capture the exact message — it is one of the two behaviours most expected to
-differ here.*
-
-### 2.6 Resume by default
-
-```sh
-cd ~/lvu-test && lvu big.log     # quit with q
-cd ~/lvu-test && lvu             # no arguments
-```
-
-Must show: the second launch re-acquires `big.log` without being told to, and
-does not re-capture from the beginning — the record count does not double.
-
-PASS / FAIL: ______
-
-A restored **command** source must not relaunch on its own. Repeat with §2.4's
-command, quit, relaunch bare, and confirm the command is listed but not running.
-
-PASS / FAIL: ______
-
-### 2.7 `--fresh` *(post-0.1.0)*
-
-`--fresh` and `--resume` are not in 0.1.0. On the released build:
-
-```sh
-lvu --fresh
-```
-
-must fail with `unknown argument "--fresh"`. That is the correct 0.1.0
-behaviour. On a build from `main`, `lvu --fresh` must instead start with no
-restored sources.
-
-PASS / FAIL / SKIPPED: ______
-
-## 3. Search
-
-Open `lvu big.log` for §3-§9.
-
-### 3.1 Literal
-
-Press `/`, type `ERROR`, press `Enter`.
-
-Must show: the view narrows as you type; only matching records remain; the
-match count is shown. Press `Escape` to clear.
-
-PASS / FAIL: ______
-
-### 3.2 Field-scoped
-
-Press `/`, type `status: 500`, `Enter`. Must narrow to those records.
-
-PASS / FAIL: ______
-
-### 3.3 Regex
-
-Press `/`, type `/status=5\d\d/`, `Enter`. Must match 500 and 503 and nothing
-else.
-
-PASS / FAIL: ______
-
-### 3.4 An invalid regex leaves the view usable
-
-Press `/`, type `/[unclosed/`, `Enter`.
-
-Must show: a message naming the problem, and **the previous valid view still on
-screen**. lvu must not clear the pane, must not exit, and must not show an
-empty result as if it were a real answer.
-
-PASS / FAIL: ______
-
-## 4. Advanced filter (needs `uv`)
-
-Press `p`. Type:
-
-```
-pl.col('status') >= 500
-```
-
-Press `Enter`.
-
-Must show: the view narrows to 500 and 503 records. First use may pause while
-`uv` provisions CPython 3.12 and Polars — that is expected, once.
-
-PASS / FAIL: ______
-
-Without `uv` installed, `p` must report the helper unavailable with an
-actionable message and leave everything else working. If you have `uv`, verify
-this too:
-
-```sh
-env PATH=/usr/bin:/bin lvu big.log     # uv not on PATH
-```
-
-PASS / FAIL: ______
-
-Now an invalid expression: press `p`, type `pl.col('nope' >= `, `Enter`. Must
-report the error and keep the last accepted view.
-
-PASS / FAIL: ______
-
-## 5. Enrichment on a large file (needs `uv`)
-
-Press `e`. Add a step:
-
-```
-/latency=(?P<ms>\d+)ms/
-```
-
-Must show: a new `ms` column, populated across the file, with the record count
-unchanged. Confirm on a record near the end (`G`) as well as the start.
-
-PASS / FAIL: ______
-
-Edit the step to a Polars expression:
-
-```
-slow = pl.col('ms').cast(pl.Int64) > 5000
-```
-
-Must show: a `slow` column of booleans consistent with `ms`. Values must line up
-with the right records — spot-check three rows against their raw text in
-Details (`d`).
-
-PASS / FAIL: ______
-
-Delete the step. The columns must disappear and the record count must not
-change.
-
-PASS / FAIL: ______
-
-## 6. Folding
-
-Press `z`.
-
-Must show: repeated patterns collapse; a gutter marks folded groups with a
-count. The record count a filter reports must **not** change — folding is
-presentation.
-
-PASS / FAIL: ______
-
-Press `z` again. Every record returns and the gutter clears.
-
-PASS / FAIL: ______
-
-Press `m` for multiline grouping and confirm it toggles the same way.
-
-PASS / FAIL: ______
-
-## 7. Time
-
-### 7.1 Time dialog
-
-Press `t`.
-
-Must show: a window over capture time, event time or an extracted timestamp.
-Set a rolling window (for example the last 5 minutes of event time) and apply.
-The view must narrow and say which basis it used.
-
-PASS / FAIL: ______
-
-### 7.2 Gap jumps
-
-Press `}` then `{`.
-
-Must show: the selection jumps forward to the next gap in time, and backward to
-the previous one. At the last gap, `}` must not wrap silently or move the
-selection off-screen.
-
-PASS / FAIL: ______
-
-## 8. Fields, Details, Bookmarks
-
-### 8.1 Fields with the Value pane
-
-Press `i`.
-
-Must show: the record's fields with types and sample values, and a Value pane
-for the selected field.
-
-PASS / FAIL: ______
-
-Bare-letter mnemonics inside Fields — press each and confirm it acts on the
-selected field:
-
-| Key | Must |
+Verify extracted fields align with the selected raw record, derived values do
+not shift across records, and invalid edits preserve the last valid enrichment
+chain and view.
+
+## 8. Multiline grouping
+
+`m` and `z` both open the unified **Multiline grouping** dialog; they are not
+separate direct toggles.
+
+1. Keep `events.log` open after accepting the enrichment chain, then press `m`.
+2. Select Run and choose the accepted `level` output. Apply it and verify only
+   consecutive equal, non-null values form runs; grouping does not reorder or
+   delete physical records.
+3. Reopen with `z`, select Filter and choose the nullable `error_start` output.
+   Apply it and verify each non-null ERROR value starts a group whose following
+   null-valued records continue until the next start.
+4. Select Off, apply, and confirm the ungrouped physical records return.
+5. Enter an invalid or unavailable column candidate and verify the last applied
+   grouping remains usable with an actionable error.
+6. Legacy is compatibility-only. If it is inspected, open `multiline.log`,
+   select Legacy Custom, and use `^(\\s+)` to group the two indented continuation
+   lines with the first record. Do not confuse this restored-settings path with
+   normal Run or Filter behavior.
+
+## 9. Fields, color, severity, time, folding, and correlation
+
+Open the Fields surface and validate the bare-key controls shown by the running
+`v0.1.6` executable:
+
+| Key | Expected action |
 | --- | --- |
-| `j` / `k` | move the selection |
-| `c` | colour by the field |
-| `r` | correlate the field |
-| `o` | open raw context for the record |
-| `Alt-p` | pin the field |
-| `Alt-f` | filter to the selected value |
-| `Alt-x` | filter excluding the value |
-| `Alt-d` | fold by the field |
+| `Space` | pin or unpin field |
+| `f` | include/filter by field value |
+| `x` | exclude field value |
+| `c` | toggle row coloring by the selected field |
+| `s` | assign severity role |
+| `t` | assign timestamp role |
+| `d` | fold by field |
+| `r` | correlate by field |
+| `o` | open raw context for the selected value/record |
 
-PASS / FAIL: ______
+The former `Alt-P`, `Alt-F`, `Alt-X`, and `Alt-D` checklist shortcuts are
+retired. Confirm the footer and behavior agree with the table rather than using
+those old paths.
 
-*On macOS, `Alt` must be sent as Meta. In Terminal.app enable
-Settings → Profiles → Keyboard → **Use Option as Meta key**; in iTerm2 set
-Profiles → Keys → Left Option → **Esc+**. If the Alt rows fail, confirm this
-setting before reporting.*
+Using the extracted `level`, `timestamp_utc`, and `latency_ms` fields:
 
-PASS / FAIL of the Alt rows after enabling Meta: ______
+1. Assign severity to `level`; verify INFO/WARN/ERROR/DEBUG presentation is
+   consistent and raw bytes remain unchanged.
+2. Assign time to `timestamp_utc`; verify ordering and displayed timestamps
+   correspond to the fixture.
+3. Within Fields, press `c` on `level`; verify rows are colored by the selected
+   field, then press it again to clear that field coloring.
+4. Back on the base screen, press `c` to open **Colour rules**. Create a rule on
+   the accepted `level` enrichment output with exact value `ERROR`; verify it
+   affects ERROR only and can be removed.
+5. Pin a field, fold by an appropriate field, and correlate on a deterministic
+   value. Clear each action and confirm the full raw view remains available.
+6. Apply include and exclude from Fields, and verify each produces the expected
+   membership without losing the prior last-good view on an invalid edit.
 
-### 8.2 Details
+## 10. Details and raw-context round trip
 
-Select a record, press `d`.
+1. Select a filtered record in a non-source view and press `o`.
+2. Confirm the app jumps to the same stable record in the source's **All events**
+   view and retains enough context to identify it.
+3. Press `o` again. Confirm the prior view, record, and dialog context are
+   restored.
+4. Open record details and confirm raw text/bytes remain available alongside
+   derived fields.
 
-Must show: the record as a tree beside the log, including its raw line
-unchanged. Close with `Escape`.
+This round trip replaces the older checklist's ambiguous instruction to “record
+which `o` behavior occurs.”
 
-PASS / FAIL: ______
+## 11. Bookmarks, palette, and help
 
-### 8.3 Bookmarks and Go to
+1. Bookmark several deterministic records, navigate away, and return to each.
+2. Open the command palette, run representative navigation and view actions,
+   and verify disabled/unavailable actions explain their state.
+3. Open help and compare the displayed shortcuts with actual behavior in this
+   plan. Record the known stale `p` mention from command-line help separately.
+4. Confirm escape paths return to the prior usable surface without losing an
+   applied filter or enrichment.
 
-Select a record, press `b`. Then press `B`.
+## 12. Human terminal-emulator matrix — explicitly unaccepted
 
-Must show: the bookmarks list containing that record, with room for a note. Add
-a note. Select it and choose **Go to**.
+These checks require a person observing the actual terminal emulator. They were
+not run or accepted during this documentation refresh. Record Terminal.app and
+iTerm2 independently; a pass in one does not imply a pass in the other.
 
-Must show: the record selected in its source's All events view.
+### Color and truecolor
 
-PASS / FAIL: ______
+- Run the exact-value color-rule steps with each emulator's normal profile.
+- Record `TERM`, `COLORTERM`, emulator version, and whether colors are distinct,
+  readable, and restored after closing dialogs.
+- Change no global profile settings merely to force a pass. A hosted kernel PTY
+  cannot prove truecolor rendering.
 
-Quit and relaunch; the bookmark and its note must still be there.
+### Unicode and cell geometry
 
-PASS / FAIL: ______
+- Open `unicode.log` and inspect combining marks, wide CJK characters, and emoji.
+- Move selection/cursor across each line and verify columns, clipping, details,
+  mouse hitboxes, and footer geometry remain aligned at narrow and wide sizes.
+- Verify the literal text `\\x1b[31m` is data, not interpreted control output.
 
-### 8.4 `o` — raw context
+### Mouse and clipboard
 
-Press `o` on a selected record.
+- Exercise scrolling, row selection, tabs, and dialog controls with the mouse.
+- Exercise the app's copy request and separately verify whether content reaches
+  the system clipboard.
+- Terminal.app does not provide OSC 52 clipboard delivery. A displayed copy
+  request is not proof of delivery; record request and confirmed delivery as
+  separate outcomes.
 
-In 0.1.0 this opens raw context. `docs/raw-context-as-jump.md` changes it to a
-jump into All events; on a build from `main` it may do that instead. Record
-which behaviour you saw rather than judging it.
+### Resize and suspend/resume
 
-Observed: ______
+- Resize repeatedly across narrow and wide layouts while a dialog is open and
+  while a record is selected.
+- Suspend/resume only through documented shell/job-control behavior available in
+  the tested build. Verify the cursor, echo, canonical mode, and alternate screen
+  are correct before, during, and after the cycle.
 
-## 9. Palette and Help
+### Option/Meta keys
 
-Press `Ctrl-P`.
+- Record the emulator profile's Option-key setting.
+- Use `"$LVU_BIN" --keys` in that same profile to capture the bytes generated by
+  `Alt-A`, `Alt-S`, and other Option/Meta combinations, then exit the diagnostic.
+- Verify `/` plus `Alt-A`/`Alt-S` works in the app. Treat an emulator mapping
+  difference as environment evidence, not as an invented key equivalent.
 
-Must show: a searchable list of every operation with its key. Type `fold` and
-confirm folding is listed with `z`.
+## 13. Human exit and restoration — explicitly unaccepted
 
-PASS / FAIL: ______
+These observations were not run during the documentation refresh:
 
-Press `?`.
+1. Normal `q` exit from the file fixture.
+2. Normal exit while a command source and its child are alive.
+3. A safe startup failure, for example a capture-root path whose parent is a
+   regular fixture file, with the exact invocation and error retained.
+4. A panic/failure path only if an existing safe diagnostic can induce it; do not
+   modify or corrupt the installation to manufacture one.
 
-Must show: Help. Every key it lists must match §8 and the README table.
-
-PASS / FAIL: ______
-
-## 10. Colour
-
-### 10.1 Truecolor
-
-In the truecolor terminal, default environment:
-
-```sh
-lvu big.log
-```
-
-Must show: level and field colours are distinct and readable. Note the terminal.
-
-PASS / FAIL: ______
-
-### 10.2 Sixteen colours
-
-```sh
-TERM=xterm lvu big.log
-```
-
-Must show: chrome and text remain **readable** — no dark-on-dark, no invisible
-selection, no unreadable footer. Colours will be approximated; that is expected.
-Illegible output is a failure.
-
-PASS / FAIL: ______
-
-Repeat 10.1 in Terminal.app, which supports only 256 colours and will
-approximate. Approximation is expected; illegibility is not.
-
-PASS / FAIL: ______
-
-## 11. Unicode, mouse, resize
-
-### 11.1 Wide glyphs and combining characters
-
-```sh
-lvu small.log
-```
-
-Must show: CJK and emoji occupy two cells without overlapping the next column;
-combining marks stay attached to their base letter; the ZWJ sequence does not
-split a column boundary; tabs do not break alignment. Move the selection over
-each line and confirm the highlight covers exactly the line.
-
-PASS / FAIL: ______
-
-Note the terminal — width handling differs most between Terminal.app and the
-others.
-
-### 11.2 Mouse selection and copy
-
-With `lvu big.log` open, drag across several rows with the mouse, then press
-`Ctrl-C`.
-
-Must show: the drag selects the rows under the pointer, and `Ctrl-C` copies
-them. Paste elsewhere to confirm the text arrived.
-
-PASS / FAIL: ______
-
-*`docs/portability.md` names SGR mouse coordinates and OSC 52 clipboard as the
-assertions most likely to differ. Terminal.app does not support OSC 52; if the
-paste is empty there, check iTerm2 (Preferences → General → Selection →
-**Applications in terminal may access clipboard**) before reporting. A failure
-in Terminal.app only is expected; a failure everywhere is not.*
-
-Terminal.app: ______ iTerm2: ______ truecolor terminal: ______
-
-### 11.3 Resize during a filter
-
-Apply `/ERROR`, and while it is filtering drag the window narrower and wider,
-including down to about 40 columns.
-
-Must show: the layout reflows, the footer stays separate, the selection stays
-visible, and no panel draws outside its area. The filter must complete.
-
-PASS / FAIL: ______
-
-## 12. Exit and terminal restoration
-
-### 12.1 `q`
-
-Press `q`.
-
-Must show: the shell prompt, a normal cursor, no leftover colour, and the
-scrollback intact. Confirm the terminal is sane:
+The safe invalid-capture-root case in row 3 can be invoked without touching
+anything outside the fixture:
 
 ```sh
-stty -a | grep -o 'icanon\|-icanon'; echo "type here and press enter"; read x; echo "got: $x"
+printf 'not a directory\n' >"$LVU_TEST_ROOT/not-a-directory"
+stty -a >"$LVU_TEST_ROOT/stty-before-startup-failure.txt"
+"$LVU_BIN" --capture-dir "$LVU_TEST_ROOT/not-a-directory/capture" \
+  --fresh "$LVU_TEST_ROOT/events.log" \
+  >"$LVU_TEST_ROOT/startup-failure.out" \
+  2>"$LVU_TEST_ROOT/startup-failure.err"; status=$?
+stty -a >"$LVU_TEST_ROOT/stty-after-startup-failure.txt"
+printf 'status=%s\n' "$status" >"$LVU_TEST_ROOT/startup-failure.status"
+test "$status" -ne 0
 ```
 
-Must echo what you type and show `icanon`.
+For each applicable path, retain before/after `stty -a`, the invoking terminal,
+the resolved binary hash, and identity-scoped process evidence. Accept only when
+echo, canonical input, cursor visibility, alternate screen, and owned child
+cleanup are restored. Do not kill unknown PIDs and do not count `SIGKILL` as a
+graceful restoration path.
 
-PASS / FAIL: ______
+## 14. Long-scale checks — paused and unrun
 
-### 12.2 Ctrl-C
+The following existing acceptance work remains intentionally paused. This
+documentation refresh does not activate it and supplies no passing evidence:
 
-Relaunch and press `Ctrl-C`. Same checks as 12.1.
+- the historical 200,000-line interactive fixture;
+- a 512 MB capture/import exercise;
+- cold-query latency measurement;
+- slow-storage/autosave behavior;
+- soak duration, sustained append, or RSS/resource ceilings;
+- long command-process lifecycle tests.
 
-PASS / FAIL: ______
+Run these only under a separately approved performance/soak plan with explicit
+time, storage, cleanup, and evidence bounds. Do not extrapolate from the small
+deterministic fixtures in this checklist.
 
-### 12.3 SIGKILL
+## 15. Result record
+
+For every executed row, retain:
+
+- `PASS`, `FAIL`, `BLOCKED`, or `UNRUN` (never silently omit a row);
+- machine architecture and macOS version;
+- Terminal.app or iTerm2 version and profile-relevant settings;
+- formula version, resolved executable path and SHA-256;
+- `lvu --resources` output and resource origins;
+- deterministic fixture SHA-256 values;
+- exact keystrokes/commands, observed result, and evidence path;
+- identity-scoped cleanup results for command tests;
+- known-boundary classification rather than a support claim.
+
+Clean up only the root created by this plan after its evidence has been copied
+to the approved durable location. Confirm its marker before removal:
 
 ```sh
-lvu big.log &            # then, from another window:
-kill -9 %1
+test -f "$LVU_TEST_ROOT/.lvu-macos-acceptance-fixture" && \
+  printf 'fixture root ready for reviewed cleanup: %s\n' "$LVU_TEST_ROOT"
 ```
 
-The terminal may be left in raw mode; `reset` must recover it. lvu cannot
-restore on `SIGKILL` and is not expected to.
+Do not turn that guarded inspection into automatic deletion in a shared or
+unreviewed shell transcript.
 
-Recovered with `reset`: PASS / FAIL: ______
+## Known macOS boundaries for `v0.1.6`
 
-## 13. Reporting a failure
-
-For every FAIL, attach all four:
-
-1. A screenshot of the terminal showing the failure.
-2. The output of `lvu --resources`.
-3. The terminal name and version, plus `echo "$TERM"` and `sw_vers`.
-4. The step number and what you expected versus what you saw.
-
-```sh
-{ echo "step: "; sw_vers; echo "TERM=$TERM"; echo "shell=$SHELL"; lvu --resources; } > ~/lvu-failure.txt
-```
-
-Attach `~/lvu-failure.txt` with the screenshot.
-
-## 14. Expected macOS differences
-
-`docs/portability.md` is a source-level reading, not a result. It names these as
-the places macOS is expected to differ. Confirm each rather than assuming it.
-
-| Area | Expectation | Step |
-| --- | --- | --- |
-| Piped stdin capture | Read as failing on macOS with a message. If §2.5 passes, that reading was wrong and the doc needs correcting. | §2.5 |
-| Derived-index cleanup | Read as failing with `Unsupported`. Only reachable under storage pressure; not exercised here. | — |
-| `/proc` discovery | Reports Unsupported by design. `Ctrl-D` discovery in the Add source dialog offers nothing. | §2.1 |
-| SGR mouse coordinates | The PTY suites assert them; unverified on macOS. | §11.2 |
-| OSC 52 clipboard | Terminal.app does not support it; iTerm2 needs it enabled. | §11.2 |
-| Truecolor | Terminal.app is 256-colour and approximates. | §10 |
-| Terminal restoration | Asserted on Unix for `q` and `Ctrl-C`; never checked on macOS. | §12 |
-| Command child reaping | Uses `SIGKILL` to the process group; expected to work. | §2.4 |
-| Signing | The archives are unsigned and unnotarized. Homebrew installs from its own download, so no quarantine attribute is set; a manually downloaded archive would need `xattr -d com.apple.quarantine`. | §0 |
-
-The PTY suites themselves have never been run on macOS. Running them is not
-part of this plan; `docs/portability.md` expects their terminal-capability
-assertions to fail under Terminal.app, so a red run there is not a product
-failure and must not be reported as one.
+| Area | Current boundary |
+| --- | --- |
+| Published package | Immutable `v0.1.6` artifacts exist for arm64 and x86_64 Darwin. |
+| Automated native evidence | Dedicated platform validation proved arm64 kernel PTY/runtime cleanup; its separate Intel job was compile-only. Release workflow `34440412338` separately executed all four published archives, including Intel Darwin. |
+| Human terminal acceptance | Terminal.app, iTerm2, truecolor, mouse, clipboard, resize, Unicode geometry, and Option/Meta remain unaccepted until this matrix is run. |
+| Piped stdin | Explicitly unsupported on macOS; expect the isolated-nonblocking-descriptors refusal. |
+| Command resume | Bare launch and `--resume` re-acquire remembered command sources with recorded cwd/environment. |
+| Forced death | No Darwin parent-death guarantee; `SIGKILL` can leave command children and is not graceful-cleanup evidence. |
+| Clipboard | A copy request is distinct from confirmed delivery; Terminal.app lacks OSC 52 delivery. |
+| Long scale | 200k-line, 512 MB, cold-query, slow-storage, soak, and RSS checks remain paused/unrun. |
+| CLI help | The published final help sentence still names retired `p`; use `/`, then `Alt-A`. |
