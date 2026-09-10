@@ -1675,17 +1675,20 @@ mod tests {
 
         /// Guard-retention regression (commit-wins): the entire sorted guard
         /// vector stays alive across the copy and the settle while a writer
-        /// publish is pending, so the verdict reflects the guard-held state.
-        /// The rendezvous is exact, not merely a released file-writing
-        /// thread: the writer appends and flushes, then both sides meet at
-        /// the barrier with the test's read guards still held — at that
-        /// instant the bytes are on disk but the capture publish (which
-        /// needs the write side) cannot have landed, and the test asserts
-        /// the published count is still the old one before settling.
-        /// Waiting the new high-watermark runs with no guards held: waiting
-        /// under guards would wedge the writer's write lock.
+        /// append races, so the verdict reflects the guard-held published
+        /// state deterministically. Honesty note: the rendezvous synchronizes
+        /// the file append, not the capture's progress-write attempt — an
+        /// unchanged published count under held guards cannot distinguish a
+        /// publish blocked behind the guards from capture simply not yet
+        /// scheduled, so this test claims no pending-publish proof. An exact
+        /// pre-publication rendezvous needs a worker-side hook observing the
+        /// actual publish attempt (not owned here). What IS deterministic: no
+        /// publish can land while the guards are held, so the settle verdict
+        /// names exactly the retained fences. Waiting the new high-watermark
+        /// runs with no guards held: waiting under guards would wedge the
+        /// writer's write lock.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn retained_guards_linearize_before_pending_publish() {
+        async fn retained_guards_linearize_on_held_state_with_writer_racing() {
             let root = tempfile::tempdir().expect("capture root");
             let manager =
                 SourceManager::new(root.path().join("capture"), small_config()).expect("manager");
@@ -1748,24 +1751,26 @@ mod tests {
             let outcome = with_pinned(&handles, |current| {
                 assert_eq!(current, frozen);
                 appended.wait();
-                // Exact pre-publication rendezvous: the writer flushed new
-                // bytes, yet the published count is still the old one — the
-                // publish is pending behind these held guards.
+                // The writer flushed new bytes, yet the published count is
+                // still the old one: no publish could land under these held
+                // guards. (Not proof a publish was attempted — capture may
+                // simply not be scheduled yet; the verdict below is
+                // deterministic either way because it names guard-held state.)
                 assert_eq!(
                     live.progress().records,
                     3,
-                    "publish must be pending behind the retained guards"
+                    "published state cannot advance under retained guards"
                 );
                 table.settle("w-3", "u-3", attempt_epoch, &request, current)
             });
             assert!(
                 matches!(outcome, CommitOutcome::Committed { .. }),
-                "guard-held settle must linearize before the pending publish: {outcome:?}"
+                "guard-held settle must name exactly the retained fences: {outcome:?}"
             );
             writer.join().expect("writer thread");
             // Guards are dropped (`with_pinned` returned), so waiting the new
             // high-watermark cannot wedge the writer — and it must arrive,
-            // proving the publish was genuinely pending during settle.
+            // since the flushed bytes publish once the guards release.
             wait_for_records(&live, 4).await;
             assert!(refresh_needed(&frozen, &freeze_copy(&handles)));
             stop_quietly(&live, "followed source").await;
