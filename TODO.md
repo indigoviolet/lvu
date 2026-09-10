@@ -7,6 +7,7 @@ evidence. Completed checklist history is archived in
 
 **Working** = actively being implemented or validated. **Ready** = accepted and
 integrated, awaiting the next release. **Open** = unresolved, not currently assigned.
+**Paused** = preserved unfinished work, deferred while feature delivery takes priority.
 
 ## Ongoing work
 
@@ -15,9 +16,9 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 | Status | Work |
 | --- | --- |
 | **Working** | Compose live union views from existing views across sources, merged in selected timestamp order, with ordinary downstream filters and grouping. Preserve original record identities and capture ownership; define overlap, missing-time and dependency/revision behavior. Implementation integrated; final UI and release acceptance pending. |
-| **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
-| **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
-| **Working** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no performance or full-soak pass is claimed yet. |
+| **Paused** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. Long-running validation is paused; the full volume-backed test remains unaccepted. |
+| **Paused** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. Existing fixes and evidence are preserved; long-running validation is paused. |
+| **Paused** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no causal explanation or full performance acceptance is claimed. |
 
 ## Active parallel assignments
 
