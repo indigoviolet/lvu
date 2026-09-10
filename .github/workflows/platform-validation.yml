@@ -1,0 +1,124 @@
+name: platform validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/platform-validation.yml"
+      - "scripts/platform_compile_probe.py"
+      - "scripts/test_platform_compile_probe.py"
+      - "tests/platform/**"
+      - "mise.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "packaging/**"
+      - "python/**"
+      - "bridge/**"
+
+permissions:
+  contents: read
+
+jobs:
+  darwin:
+    name: ${{ matrix.target }} (${{ matrix.scope }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            scope: compile-runtime-install-tree
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            scope: compile
+    env:
+      RUSTC_WRAPPER: ""
+      RUSTFLAGS: "-C debuginfo=0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set isolated job paths
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cargo-target" >> "$GITHUB_ENV"
+          echo "EVIDENCE_DIR=$RUNNER_TEMP/platform-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${{ matrix.target }}" >> "$GITHUB_ENV"
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.9.2
+          experimental: true
+      - name: Compile every Rust target on the native host
+        run: |
+          mise exec -- python scripts/platform_compile_probe.py \
+            --target "${{ matrix.target }}" \
+            --expect success \
+            --log "$EVIDENCE_DIR/compile.log" \
+            --evidence "$EVIDENCE_DIR/compile.json"
+      - name: Build the complete install tree
+        if: matrix.scope == 'compile-runtime-install-tree'
+        run: |
+          mise exec -- bash tests/platform/test_stage_profile_args.sh
+          mise run install:bridge
+          mise run build:bridge
+          mise exec -- packaging/stage.sh \
+            --profile dev \
+            --target "${{ matrix.target }}" \
+            --out "$RUNNER_TEMP/stage"
+      - name: Exercise native PTY, file capture, and orderly process cleanup
+        if: matrix.scope == 'compile-runtime-install-tree'
+        run: |
+          mise exec -- python tests/platform/test_unix_runtime_harness.py
+          binary=$(find "$RUNNER_TEMP/stage" -path '*/bin/lvu' -type f -print -quit)
+          test -n "$binary"
+          mise exec -- python tests/platform/test_unix_runtime.py "$binary" \
+            --expect-piped-stdin unsupported \
+            --require-installed-resources \
+            --evidence "$EVIDENCE_DIR/runtime.json"
+          mise exec -- python tests/platform/test_runtime_failure_cleanup.py \
+            tests/platform/test_unix_runtime.py "$binary" \
+            --expect-piped-stdin unsupported \
+            --evidence "$EVIDENCE_DIR/runtime-injected-failure.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: platform-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+
+  windows-compile-boundary:
+    name: windows compile boundary (not Windows support)
+    runs-on: windows-2022
+    env:
+      RUSTC_WRAPPER: ""
+      RUSTFLAGS: "-C debuginfo=0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set isolated job paths
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$($env:RUNNER_TEMP)/cargo-target"
+          Add-Content -Path $env:GITHUB_ENV -Value "EVIDENCE_DIR=$($env:RUNNER_TEMP)/platform-evidence-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)-x86_64-pc-windows-msvc"
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.9.2
+          experimental: true
+      - name: Reject mixed diagnostics and authenticate exact log bytes
+        shell: pwsh
+        run: mise exec -- python scripts/test_platform_compile_probe.py
+      - name: Prove the current compile blockers exactly
+        shell: pwsh
+        run: |
+          mise exec -- python scripts/platform_compile_probe.py `
+            --target x86_64-pc-windows-msvc `
+            --expect windows-known-blockers `
+            --log "$env:EVIDENCE_DIR/compile.log" `
+            --evidence "$env:EVIDENCE_DIR/compile.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: platform-evidence-${{ github.run_id }}-${{ github.run_attempt }}-x86_64-pc-windows-msvc
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
