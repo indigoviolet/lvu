@@ -227,6 +227,10 @@ pub struct SharedStore {
     next_request: std::sync::atomic::AtomicU64,
     feeders: std::sync::Mutex<HashMap<SourceId, FeederEntry>>,
     handles: std::sync::Mutex<HashMap<SourceId, lvu_shared::RemoteSourceHandle>>,
+    /// Runtime for spawning commit-recovery tasks: submit() is synchronous
+    /// (the union worker calls it from its own thread), so recovery runs
+    /// as a spawned task reporting through a channel.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl SharedStore {
@@ -254,7 +258,18 @@ impl SharedStore {
             next_request: std::sync::atomic::AtomicU64::new(1),
             feeders: std::sync::Mutex::new(HashMap::new()),
             handles: std::sync::Mutex::new(HashMap::new()),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         }
+    }
+
+    /// The async runtime for spawning commit-recovery tasks, if this
+    /// session was built inside one (production startup always is; bare
+    /// test clients may not be, in which case union submit refuses
+    /// explicitly instead of panicking on a missing runtime).
+    fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+        self.runtime
+            .clone()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
     }
 
     fn take_request_id(&self) -> String {
@@ -622,6 +637,22 @@ impl SharedStore {
             .map_err(|_| {
                 "shared drain timed out; feeders settled but detach did not complete".to_owned()
             })?
+    }
+
+    /// Build the window-side union commit transport for `window_id`: the
+    /// object the view adapter's `set_remote_union_commit_transport` takes.
+    /// Needs an async runtime for the recovery task (production startup
+    /// always has one); without it the transport cannot exist and this
+    /// refuses explicitly instead of panicking later at submit.
+    pub fn union_transport(&self, window_id: String) -> Result<UnionCommitTransport, String> {
+        let Some(runtime) = self.runtime_handle() else {
+            return Err("shared session has no async runtime for union commit recovery".into());
+        };
+        Ok(UnionCommitTransport {
+            client: Arc::clone(&self.client),
+            runtime,
+            window_id,
+        })
     }
 
     /// Load persisted views for one source through the worker. The returned
@@ -1018,6 +1049,196 @@ fn wire_outcome(outcome: &RecipeOutcome) -> SuggestionOutcomeShape {
 fn unexpected_reply(method: &str, event: &StoreEvent) -> String {
     let _ = event;
     format!("shared store answered {method} with an unexpected reply shape")
+}
+
+/// Per-attempt bound for one commit RPC inside recovery: long enough for a
+/// healthy worker to admit, verify and settle (synchronous snapshots),
+/// short enough that a lost reply surfaces quickly into status recovery.
+const UNION_COMMIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Same for one status poll: the worker answers from its table lock.
+const UNION_STATUS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause between status polls: poll RPCs are cheap table reads; this keeps
+/// recovery from hot-spinning while staying far inside any deadline.
+const UNION_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Window-side `RemoteUnionCommitTransport`: nonblocking submit over the
+/// shared worker connection, with same-identity ambiguous-delivery
+/// recovery inside the window's absolute deadline. One struct per window:
+/// it carries the window id the worker checks and the runtime the
+/// recovery task runs on. Nothing here mints request identity — the
+/// window's materialized nonce and digest travel verbatim on every
+/// attempt, including replays after a lost reply.
+pub struct UnionCommitTransport {
+    client: Arc<tokio::sync::Mutex<WorkerClient>>,
+    runtime: tokio::runtime::Handle,
+    window_id: String,
+}
+
+impl lvu_view::RemoteUnionCommitTransport for UnionCommitTransport {
+    fn submit(
+        &self,
+        expected_worker_session: &str,
+        request: lvu_shared::union_commit::CommitRequest,
+        deadline: std::time::Instant,
+    ) -> Result<
+        std::sync::mpsc::Receiver<Result<lvu_shared::union_commit::CommitReceipt, String>>,
+        String,
+    > {
+        if std::time::Instant::now() >= deadline {
+            return Err("remote union commit deadline already passed; no request sent".into());
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let client = Arc::clone(&self.client);
+        let window_id = self.window_id.clone();
+        let expected_session = expected_worker_session.to_owned();
+        self.runtime.spawn(async move {
+            let result =
+                recover_union_commit(&client, &window_id, &expected_session, request, deadline)
+                    .await;
+            // The union worker may have given up at its own deadline and
+            // dropped the receiver: either way this task ends here and the
+            // candidate is never retained past the deadline.
+            let _ = sender.send(result);
+        });
+        Ok(receiver)
+    }
+}
+
+/// Outcome of one status-recovery round: settled receipts complete the
+/// submission, unknown replays the identical commit, deadline ends it.
+enum UnionStatusOutcome {
+    Settled(lvu_shared::union_commit::CommitOutcome),
+    Unknown,
+    Deadline,
+}
+
+/// Drive one submission to a terminal receipt or the deadline: commit
+/// attempts (replay-safe: the same nonce joins a live attempt or
+/// re-admits a lost one) interleaved with status recovery on any
+/// ambiguity (transport fault, attempt timeout, or a `Pending` answer).
+/// Every reply is identity-checked against the original request before
+/// use; a mismatch is a fault, never adopted.
+async fn recover_union_commit(
+    client: &Arc<tokio::sync::Mutex<WorkerClient>>,
+    window_id: &str,
+    expected_session: &str,
+    request: lvu_shared::union_commit::CommitRequest,
+    deadline: std::time::Instant,
+) -> Result<lvu_shared::union_commit::CommitReceipt, String> {
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(
+                "remote union commit exceeded its deadline without a terminal receipt".into(),
+            );
+        }
+        let remaining = deadline - now;
+        let attempt = remaining.min(UNION_COMMIT_ATTEMPT_TIMEOUT);
+        let commit = tokio::time::timeout(attempt, async {
+            let mut client = client.lock().await;
+            client
+                .request_union_commit(window_id, &request, attempt)
+                .await
+        })
+        .await;
+        if let Ok(Ok(receipt)) = commit {
+            if receipt.worker_session != expected_session
+                || receipt.union_view_id != request.union_view_id
+                || receipt.candidate_generation != request.candidate_generation
+                || receipt.nonce != request.nonce
+                || receipt.digest != request.digest
+            {
+                // A receipt that does not bind this attempt is worker
+                // confusion, not a slow answer: no status poll from the
+                // same peer could be trusted either, so this fails the
+                // submission loudly rather than adopting or re-deriving.
+                return Err(
+                    "union commit receipt does not bind this attempt; failing closed".into(),
+                );
+            }
+            match receipt.outcome {
+                lvu_shared::union_commit::CommitOutcome::Pending => {
+                    // Admitted and verifying: fall through to status
+                    // recovery, which observes settlement with the same
+                    // identity.
+                }
+                _ => return Ok(receipt),
+            }
+        }
+        // Transport fault or attempt timeout: delivery is ambiguous
+        // (the worker may still settle late), so recover by status
+        // instead of claiming anything.
+        match recover_union_status(client, window_id, &request, deadline).await {
+            UnionStatusOutcome::Settled(outcome) => {
+                // The receipt is fully determined by the original request
+                // identity plus the settled outcome the worker recorded.
+                return Ok(lvu_shared::union_commit::CommitReceipt {
+                    worker_session: expected_session.to_owned(),
+                    window_id: request.window_id.clone(),
+                    union_view_id: request.union_view_id.clone(),
+                    candidate_generation: request.candidate_generation,
+                    nonce: request.nonce.clone(),
+                    digest: request.digest,
+                    outcome,
+                });
+            }
+            // Never admitted (or admitted nowhere we can see): replay the
+            // IDENTICAL request — same nonce and digest, never a fresh
+            // identity.
+            UnionStatusOutcome::Unknown => continue,
+            UnionStatusOutcome::Deadline => {
+                return Err(
+                    "remote union commit exceeded its deadline without a terminal receipt".into(),
+                );
+            }
+        }
+    }
+}
+
+/// Poll one attempt's status until it settles, proves never-admitted, or
+/// the deadline passes. Transport faults during polling change nothing:
+/// ambiguity persists and only the deadline ends the wait.
+async fn recover_union_status(
+    client: &Arc<tokio::sync::Mutex<WorkerClient>>,
+    window_id: &str,
+    request: &lvu_shared::union_commit::CommitRequest,
+    deadline: std::time::Instant,
+) -> UnionStatusOutcome {
+    use lvu_shared::protocol::UnionCommitStatus;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return UnionStatusOutcome::Deadline;
+        }
+        let remaining = deadline - now;
+        let attempt = remaining.min(UNION_STATUS_ATTEMPT_TIMEOUT);
+        let status = tokio::time::timeout(attempt, async {
+            let mut client = client.lock().await;
+            client
+                .request_union_status(
+                    window_id,
+                    &request.union_view_id,
+                    request.candidate_generation,
+                    &request.nonce,
+                    &request.digest,
+                    attempt,
+                )
+                .await
+        })
+        .await;
+        match status {
+            Ok(Ok(UnionCommitStatus::Settled(outcome))) => {
+                return UnionStatusOutcome::Settled(outcome);
+            }
+            Ok(Ok(UnionCommitStatus::Unknown)) => return UnionStatusOutcome::Unknown,
+            Ok(Ok(UnionCommitStatus::Pending)) => {}
+            Ok(Err(_)) | Err(_) => {}
+        }
+        let wait = UNION_STATUS_POLL_INTERVAL.min(deadline.saturating_duration_since(now));
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2231,6 +2452,415 @@ mod tests {
         assert!(
             seen.iter().any(|kind| kind == "goodbye"),
             "drain must say goodbye, saw: {seen:?}"
+        );
+    }
+
+    /// Fixed commit identity both sides of the scripted peers below know:
+    /// the peer echoes it the way a correct worker echoes the attempt it
+    /// admitted (never a fresh identity), so the transport's identity
+    /// gates see exact matches on the happy path.
+    fn union_test_commit(window: &str) -> lvu_shared::union_commit::CommitRequest {
+        lvu_shared::union_commit::CommitRequest {
+            window_id: window.into(),
+            union_view_id: "union-view-u".into(),
+            candidate_generation: 11,
+            nonce: "nonce-11".into(),
+            digest: [0xB7; lvu_shared::union_commit::COMMIT_DIGEST_BYTES],
+            frozen: vec![lvu_shared::union_commit::UnionSourceFence {
+                source_id: "source-a".into(),
+                generation: 3,
+                high_watermark: Some(9),
+            }],
+        }
+    }
+
+    /// Await the transport's sync-channel answer without blocking this
+    /// single-threaded test runtime: `recv_timeout` on the runtime thread
+    /// would freeze the recovery task and the peer it talks to (the same
+    /// freeze a blocking sleep causes — async sleeps only on this
+    /// runtime). The bound still fails the test loudly when exceeded.
+    async fn await_submit(
+        receiver: std::sync::mpsc::Receiver<
+            Result<lvu_shared::union_commit::CommitReceipt, String>,
+        >,
+        bound: Duration,
+    ) -> Result<lvu_shared::union_commit::CommitReceipt, String> {
+        tokio::task::spawn_blocking(move || receiver.recv_timeout(bound))
+            .await
+            .expect("blocking recv joins")
+            .expect("answer arrives inside the bound")
+    }
+
+    /// Happy path: one commit attempt, one bound receipt, no recovery
+    /// traffic. The receipt's nonce and digest must echo the request —
+    /// same identity, never minted by the transport.
+    #[tokio::test]
+    async fn union_transport_happy_path_returns_bound_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        lvu_shared::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (peer, seen) = ScriptedPeer::new();
+        tokio::spawn(peer.serve(listener, move |kind, id| match kind {
+            "hello" => Some(lvu_shared::WorkerEvent::Welcome {
+                request_id: id.into(),
+                worker_pid: 1,
+                protocol: lvu_shared::PROTOCOL_VERSION,
+                worker_session: "session-u".into(),
+                sources: Vec::new(),
+            }),
+            "union_commit" => Some(lvu_shared::WorkerEvent::Store(
+                lvu_shared::StoreEvent::UnionCommitted {
+                    request_id: id.into(),
+                    receipt: lvu_shared::union_commit::CommitReceipt::answer(
+                        "session-u",
+                        &union_test_commit("window-u"),
+                        lvu_shared::union_commit::CommitOutcome::Committed { current: vec![] },
+                    ),
+                },
+            )),
+            _ => None,
+        }));
+        let (client, _) = WorkerClient::connect(root.path(), &socket, "window-u", 6210)
+            .await
+            .expect("connect");
+        let store = SharedStore::from_client(client);
+        let transport = store
+            .union_transport("window-u".into())
+            .expect("transport builds on a live session");
+        let receiver = <UnionCommitTransport as lvu_view::RemoteUnionCommitTransport>::submit(
+            &transport,
+            "session-u",
+            union_test_commit("window-u"),
+            std::time::Instant::now() + Duration::from_secs(30),
+        )
+        .expect("submit accepts a live deadline");
+        let receipt = await_submit(receiver, Duration::from_secs(15))
+            .await
+            .expect("commit succeeds");
+        assert_eq!(receipt.nonce, "nonce-11");
+        assert_eq!(
+            receipt.digest,
+            [0xB7; lvu_shared::union_commit::COMMIT_DIGEST_BYTES]
+        );
+        assert!(
+            matches!(
+                receipt.outcome,
+                lvu_shared::union_commit::CommitOutcome::Committed { .. }
+            ),
+            "unexpected outcome: {:?}",
+            receipt.outcome
+        );
+        let seen = seen.lock().expect("seen poisoned");
+        assert_eq!(
+            seen.iter().filter(|kind| *kind == "union_commit").count(),
+            1,
+            "happy path commits exactly once, saw: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|kind| kind == "union_status"),
+            "happy path needs no recovery polls, saw: {seen:?}"
+        );
+    }
+
+    /// Pending settles in-transport: the worker admitted the attempt and
+    /// is verifying. The submit contract exposes no status handle, so the
+    /// union worker cannot observe settlement itself — the transport must
+    /// wait for terminal (or the deadline), never return the `Pending`
+    /// receipt early. Fast path: both answers arrive at once, so no
+    /// wall-clock attempt bound elapses. Exactly one commit goes out (no
+    /// replay of an admitted attempt).
+    #[tokio::test]
+    async fn union_transport_pending_settles_by_status_without_replay() {
+        let root = tempfile::tempdir().unwrap();
+        lvu_shared::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (peer, seen) = ScriptedPeer::new();
+        tokio::spawn(peer.serve(listener, move |kind, id| match kind {
+            "hello" => Some(lvu_shared::WorkerEvent::Welcome {
+                request_id: id.into(),
+                worker_pid: 1,
+                protocol: lvu_shared::PROTOCOL_VERSION,
+                worker_session: "session-u".into(),
+                sources: Vec::new(),
+            }),
+            "union_commit" => Some(lvu_shared::WorkerEvent::Store(
+                lvu_shared::StoreEvent::UnionCommitted {
+                    request_id: id.into(),
+                    receipt: lvu_shared::union_commit::CommitReceipt::answer(
+                        "session-u",
+                        &union_test_commit("window-u"),
+                        lvu_shared::union_commit::CommitOutcome::Pending,
+                    ),
+                },
+            )),
+            "union_status" => Some(lvu_shared::WorkerEvent::Store(
+                lvu_shared::StoreEvent::UnionStatus {
+                    request_id: id.into(),
+                    status: lvu_shared::protocol::UnionCommitStatus::Settled(
+                        lvu_shared::union_commit::CommitOutcome::Committed { current: vec![] },
+                    ),
+                },
+            )),
+            _ => None,
+        }));
+        let (client, _) = WorkerClient::connect(root.path(), &socket, "window-u", 6211)
+            .await
+            .expect("connect");
+        let store = SharedStore::from_client(client);
+        let transport = store
+            .union_transport("window-u".into())
+            .expect("transport builds on a live session");
+        let receiver = <UnionCommitTransport as lvu_view::RemoteUnionCommitTransport>::submit(
+            &transport,
+            "session-u",
+            union_test_commit("window-u"),
+            std::time::Instant::now() + Duration::from_secs(30),
+        )
+        .expect("submit accepts a live deadline");
+        let receipt = await_submit(receiver, Duration::from_secs(15))
+            .await
+            .expect("pending settles to terminal");
+        // Terminal and bound to the original identity — the interim
+        // `Pending` receipt is never surfaced to the union worker.
+        assert!(
+            matches!(
+                receipt.outcome,
+                lvu_shared::union_commit::CommitOutcome::Committed { .. }
+            ),
+            "unexpected outcome: {:?}",
+            receipt.outcome
+        );
+        assert_eq!(receipt.nonce, "nonce-11");
+        assert_eq!(
+            receipt.digest,
+            [0xB7; lvu_shared::union_commit::COMMIT_DIGEST_BYTES]
+        );
+        let seen = seen.lock().expect("seen poisoned");
+        assert_eq!(
+            seen.iter().filter(|kind| *kind == "union_commit").count(),
+            1,
+            "an admitted attempt is never replayed, saw: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|kind| kind == "union_status"),
+            "settlement is observed by status, saw: {seen:?}"
+        );
+    }
+
+    /// Short deadline with a dropped reply: the submission must end at the
+    /// deadline with a loud error — never hang, never wedge the
+    /// connection, exactly one attempt on the wire. (Outcome here is
+    /// `Err(deadline)`; the recovery-then-settle path is covered by the
+    /// pending and lost-reply tests with roomy deadlines.)
+    #[tokio::test]
+    async fn union_transport_short_deadline_ends_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        lvu_shared::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (peer, seen) = ScriptedPeer::new();
+        tokio::spawn(peer.serve(listener, move |kind, id| match kind {
+            "hello" => Some(lvu_shared::WorkerEvent::Welcome {
+                request_id: id.into(),
+                worker_pid: 1,
+                protocol: lvu_shared::PROTOCOL_VERSION,
+                worker_session: "session-u".into(),
+                sources: Vec::new(),
+            }),
+            // Admitted nowhere observable: no reply at all.
+            "union_commit" => None,
+            "union_status" => Some(lvu_shared::WorkerEvent::Store(
+                lvu_shared::StoreEvent::UnionStatus {
+                    request_id: id.into(),
+                    status: lvu_shared::protocol::UnionCommitStatus::Settled(
+                        lvu_shared::union_commit::CommitOutcome::Committed { current: vec![] },
+                    ),
+                },
+            )),
+            _ => None,
+        }));
+        let (client, _) = WorkerClient::connect(root.path(), &socket, "window-u", 6213)
+            .await
+            .expect("connect");
+        let store = SharedStore::from_client(client);
+        let transport = store
+            .union_transport("window-u".into())
+            .expect("transport builds on a live session");
+        let receiver = <UnionCommitTransport as lvu_view::RemoteUnionCommitTransport>::submit(
+            &transport,
+            "session-u",
+            union_test_commit("window-u"),
+            std::time::Instant::now() + Duration::from_secs(2),
+        )
+        .expect("submit accepts a live deadline");
+        let error = await_submit(receiver, Duration::from_secs(15))
+            .await
+            .expect_err("a 2s deadline with no reply must fail");
+        assert!(
+            error.contains("deadline"),
+            "deadline failure must name itself: {error}"
+        );
+        let seen = seen.lock().expect("seen poisoned");
+        assert_eq!(
+            seen.iter().filter(|kind| *kind == "union_commit").count(),
+            1,
+            "one attempt only, saw: {seen:?}"
+        );
+    }
+
+    /// Lost reply: the worker admits but its receipt never arrives (the
+    /// peer drops the commit frame). The 10s attempt times out ambiguous,
+    /// and status recovery must settle it — exactly one commit on the wire
+    /// (no replay: the worker may already have settled), with the receipt
+    /// synthesized from the ORIGINAL request identity. Bounds are roomy on
+    /// purpose: the 10s attempt must elapse in wall-clock time, and a
+    /// loaded host must not turn that into a flake.
+    #[tokio::test]
+    async fn union_transport_lost_reply_recovers_by_status_without_replay() {
+        let root = tempfile::tempdir().unwrap();
+        lvu_shared::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (peer, seen) = ScriptedPeer::new();
+        tokio::spawn(peer.serve(listener, move |kind, id| match kind {
+            "hello" => Some(lvu_shared::WorkerEvent::Welcome {
+                request_id: id.into(),
+                worker_pid: 1,
+                protocol: lvu_shared::PROTOCOL_VERSION,
+                worker_session: "session-u".into(),
+                sources: Vec::new(),
+            }),
+            // The commit is admitted nowhere observable: no reply at all.
+            "union_commit" => None,
+            "union_status" => Some(lvu_shared::WorkerEvent::Store(
+                lvu_shared::StoreEvent::UnionStatus {
+                    request_id: id.into(),
+                    status: lvu_shared::protocol::UnionCommitStatus::Settled(
+                        lvu_shared::union_commit::CommitOutcome::Committed { current: vec![] },
+                    ),
+                },
+            )),
+            _ => None,
+        }));
+        let (client, _) = WorkerClient::connect(root.path(), &socket, "window-u", 6214)
+            .await
+            .expect("connect");
+        let store = SharedStore::from_client(client);
+        let transport = store
+            .union_transport("window-u".into())
+            .expect("transport builds on a live session");
+        let receiver = <UnionCommitTransport as lvu_view::RemoteUnionCommitTransport>::submit(
+            &transport,
+            "session-u",
+            union_test_commit("window-u"),
+            std::time::Instant::now() + Duration::from_secs(90),
+        )
+        .expect("submit accepts a live deadline");
+        let receipt = await_submit(receiver, Duration::from_secs(60))
+            .await
+            .expect("lost reply still settles");
+        // Synthesized from the original request, not from any peer bytes:
+        // the dropped attempt never produced observable bytes at all.
+        assert_eq!(receipt.worker_session, "session-u");
+        assert_eq!(receipt.nonce, "nonce-11");
+        assert_eq!(
+            receipt.digest,
+            [0xB7; lvu_shared::union_commit::COMMIT_DIGEST_BYTES]
+        );
+        assert!(
+            matches!(
+                receipt.outcome,
+                lvu_shared::union_commit::CommitOutcome::Committed { .. }
+            ),
+            "unexpected outcome: {:?}",
+            receipt.outcome
+        );
+        let seen = seen.lock().expect("seen poisoned");
+        assert_eq!(
+            seen.iter().filter(|kind| *kind == "union_commit").count(),
+            1,
+            "recovery must not replay a possibly-settled commit, saw: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|kind| kind == "union_status"),
+            "recovery must poll status, saw: {seen:?}"
+        );
+    }
+
+    /// Foreign receipt: the peer answers with a receipt bound to another
+    /// attempt (wrong nonce and digest). The transport must fail the
+    /// submission closed — never adopt the foreign receipt, and never
+    /// trust further answers from a peer that proved confused.
+    #[tokio::test]
+    async fn union_transport_rejects_foreign_receipt_without_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        lvu_shared::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (peer, seen) = ScriptedPeer::new();
+        tokio::spawn(peer.serve(listener, move |kind, id| match kind {
+            "hello" => Some(lvu_shared::WorkerEvent::Welcome {
+                request_id: id.into(),
+                worker_pid: 1,
+                protocol: lvu_shared::PROTOCOL_VERSION,
+                worker_session: "session-u".into(),
+                sources: Vec::new(),
+            }),
+            "union_commit" => Some(lvu_shared::WorkerEvent::Store(
+                lvu_shared::StoreEvent::UnionCommitted {
+                    request_id: id.into(),
+                    receipt: lvu_shared::union_commit::CommitReceipt {
+                        worker_session: "session-u".into(),
+                        window_id: "window-u".into(),
+                        union_view_id: "union-view-u".into(),
+                        candidate_generation: 11,
+                        nonce: "attacker-nonce".into(),
+                        digest: [0x00; lvu_shared::union_commit::COMMIT_DIGEST_BYTES],
+                        outcome: lvu_shared::union_commit::CommitOutcome::Committed {
+                            current: vec![],
+                        },
+                    },
+                },
+            )),
+            _ => None,
+        }));
+        let (client, _) = WorkerClient::connect(root.path(), &socket, "window-u", 6212)
+            .await
+            .expect("connect");
+        let store = SharedStore::from_client(client);
+        let transport = store
+            .union_transport("window-u".into())
+            .expect("transport builds on a live session");
+        let receiver = <UnionCommitTransport as lvu_view::RemoteUnionCommitTransport>::submit(
+            &transport,
+            "session-u",
+            union_test_commit("window-u"),
+            std::time::Instant::now() + Duration::from_secs(30),
+        )
+        .expect("submit accepts a live deadline");
+        let error = await_submit(receiver, Duration::from_secs(15))
+            .await
+            .expect_err("foreign receipt must fail the submission");
+        assert!(
+            error.contains("does not bind"),
+            "mismatch must name itself: {error}"
+        );
+        let seen = seen.lock().expect("seen poisoned");
+        assert!(
+            !seen.iter().any(|kind| kind == "union_status"),
+            "a confused peer earns no further trust, saw: {seen:?}"
         );
     }
 }

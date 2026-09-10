@@ -49,6 +49,7 @@ use crate::{
     frame::{FrameDecoder, FrameError, encode_frame},
     lifetime::ViewerSet,
     protocol::*,
+    union_commit::CommitTable,
 };
 
 /// Bounded per-request dispatch: an unresponsive store call fails the
@@ -536,6 +537,13 @@ pub struct WorkerService {
     #[cfg(test)]
     incomplete_stop_reports: std::sync::Mutex<std::collections::HashSet<SourceId>>,
     shutdown_flag: std::sync::atomic::AtomicBool,
+    /// Bounded receipt table for remote union commits, namespaced by the
+    /// worker session above: a new session starts a new table and old
+    /// receipts never alias into it. Interior mutability throughout
+    /// (`CommitTable` methods take `&self`), so dispatch needs no extra
+    /// locking around it. Created eagerly: an admitted commit needs it
+    /// whether or not any union is currently registered.
+    commits: CommitTable,
     /// Worker lifetime nonce, minted once per `open` and published in
     /// `Welcome` and every progress answer. Windows key remote epoch on
     /// `(worker_session, generation)` so a replacement worker never reads
@@ -584,6 +592,10 @@ impl WorkerService {
             )),
             (None, session) => session,
         };
+        // Minted before construction so the commit table below is
+        // namespaced by the same session the handshake publishes.
+        let worker_session = uuid::Uuid::new_v4().to_string();
+        let commits = CommitTable::new(worker_session.clone());
         Ok((
             Arc::new(Self {
                 config,
@@ -607,7 +619,8 @@ impl WorkerService {
                 #[cfg(test)]
                 incomplete_stop_reports: std::sync::Mutex::new(std::collections::HashSet::new()),
                 shutdown_flag: std::sync::atomic::AtomicBool::new(false),
-                worker_session: uuid::Uuid::new_v4().to_string(),
+                commits,
+                worker_session,
             }),
             warning,
         ))
@@ -1792,6 +1805,92 @@ impl WorkerService {
         }
     }
 
+    /// Admit one union commit attempt and settle it against live fences:
+    /// `commit` decides (immediate answer or a verify epoch), a `Verify`
+    /// observes current fences and settles under the table lock, and the
+    /// receipt binds the outcome to the requesting attempt and session.
+    /// Verification reads point snapshots; concurrent advance is caught
+    /// later by the window's refresh check (receipt `current` vs fresh
+    /// observation), exactly like the local path's two-phase check.
+    pub async fn mediated_union_commit(
+        &self,
+        request_id: String,
+        request: crate::union_commit::CommitRequest,
+    ) -> StoreEvent {
+        let outcome = match self.commits.commit(&request) {
+            crate::union_commit::CommitAdmission::Answer(outcome) => outcome,
+            crate::union_commit::CommitAdmission::Verify { attempt_epoch } => {
+                // Retain the source handles across the copy and the settle
+                // call so a stop between observation and write-back still
+                // resolves explicitly (missing fence) rather than against
+                // dropped state.
+                let mut retained = Vec::new();
+                let mut current = Vec::new();
+                for fence in &request.frozen {
+                    let id = match uuid::Uuid::parse_str(&fence.source_id).map(SourceId) {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
+                    let Some(handle) = self.manager.source(id) else {
+                        continue;
+                    };
+                    let progress = handle.progress();
+                    current.push(crate::union_commit::UnionSourceFence {
+                        source_id: fence.source_id.clone(),
+                        generation: progress.generation,
+                        high_watermark: progress.high_watermark.map(|record| record.sequence),
+                    });
+                    retained.push(handle);
+                }
+                let outcome = self.commits.settle(
+                    &request.window_id,
+                    &request.union_view_id,
+                    attempt_epoch,
+                    &request,
+                    current,
+                );
+                drop(retained);
+                outcome
+            }
+        };
+        let receipt =
+            crate::union_commit::CommitReceipt::answer(&self.worker_session, &request, outcome);
+        StoreEvent::UnionCommitted {
+            request_id,
+            receipt,
+        }
+    }
+
+    /// Read-only status for one exact attempt. Never mutates; unknown
+    /// attempts (never admitted, retired table, higher generation) report
+    /// `Unknown` so the window replays the identical request rather than
+    /// minting a fresh identity.
+    pub async fn mediated_union_status(
+        &self,
+        request_id: String,
+        window_id: String,
+        union_view_id: String,
+        candidate_generation: u64,
+        nonce: String,
+        digest: crate::union_commit::CommitDigest,
+    ) -> StoreEvent {
+        let answer = self.commits.status(
+            &window_id,
+            &union_view_id,
+            candidate_generation,
+            &nonce,
+            &digest,
+        );
+        let status = match answer {
+            crate::union_commit::StatusAnswer::Unknown => UnionCommitStatus::Unknown,
+            crate::union_commit::StatusAnswer::Pending => UnionCommitStatus::Pending,
+            crate::union_commit::StatusAnswer::Settled(outcome) => {
+                UnionCommitStatus::Settled(outcome)
+            }
+        };
+        StoreEvent::UnionStatus { request_id, status }
+    }
+
     /// Route one parsed store method: window check, size-check at the real
     /// boundary (the frame cap bounds the wire, this bounds the decoded
     /// value before any store work), then the matching mediated call under
@@ -1805,6 +1904,7 @@ impl WorkerService {
             return store_failure(
                 method,
                 format!("window identity mismatch: attached as '{attached}'"),
+                &self.worker_session,
             );
         }
         // Fixed-size methods (two short strings at most) skip the payload
@@ -1815,7 +1915,7 @@ impl WorkerService {
             StoreMethod::Recent { .. } | StoreMethod::Flush { .. } => {}
             _ => {
                 if let Err(error) = check_store_size(&method) {
-                    return store_failure(method, error.to_string());
+                    return store_failure(method, error.to_string(), &self.worker_session);
                 }
             }
         }
@@ -1925,6 +2025,29 @@ impl WorkerService {
                 // per-request transactions here replace.)
                 StoreEvent::Flushed { request_id }
             }
+            StoreMethod::UnionCommit {
+                request_id,
+                window_id: _,
+                request,
+            } => self.mediated_union_commit(request_id, request).await,
+            StoreMethod::UnionStatus {
+                request_id,
+                window_id,
+                union_view_id,
+                candidate_generation,
+                nonce,
+                digest,
+            } => {
+                self.mediated_union_status(
+                    request_id,
+                    window_id,
+                    union_view_id,
+                    candidate_generation,
+                    nonce,
+                    digest,
+                )
+                .await
+            }
         }
     }
 }
@@ -1932,8 +2055,11 @@ impl WorkerService {
 /// A refused store command, mapped explicitly per method so the caller
 /// learns which request died and why. Takes the method by value because the
 /// failure shapes need its correlation ids; covers both oversize refusals
-/// and pre-dispatch rejections like window-identity mismatches.
-fn store_failure(method: StoreMethod, reason: String) -> StoreEvent {
+/// and pre-dispatch rejections like window-identity mismatches. A refused
+/// union commit answers terminally (nothing was admitted, so a Refused
+/// receipt bound to this worker session is honest and preserves the
+/// reason); a refused status reads `Unknown` (also honest: nothing ran).
+fn store_failure(method: StoreMethod, reason: String, worker_session: &str) -> StoreEvent {
     match method {
         StoreMethod::Load {
             request_id,
@@ -1993,6 +2119,27 @@ fn store_failure(method: StoreMethod, reason: String) -> StoreEvent {
         // Only pre-store rejections (window mismatch) reach here: oversize
         // checks skip fixed-size methods, and flush commits nothing.
         StoreMethod::Flush { request_id, .. } => StoreEvent::FlushFailed { request_id, reason },
+        StoreMethod::UnionCommit {
+            request_id,
+            request,
+            ..
+        } => {
+            let receipt = crate::union_commit::CommitReceipt::answer(
+                worker_session,
+                &request,
+                crate::union_commit::CommitOutcome::Refused {
+                    reason: reason.clone(),
+                },
+            );
+            StoreEvent::UnionCommitted {
+                request_id,
+                receipt,
+            }
+        }
+        StoreMethod::UnionStatus { request_id, .. } => StoreEvent::UnionStatus {
+            request_id,
+            status: UnionCommitStatus::Unknown,
+        },
     }
 }
 
@@ -2067,6 +2214,16 @@ fn store_timeout(method: &StoreMethod, timeout: std::time::Duration) -> StoreEve
         StoreMethod::Flush { request_id, .. } => StoreEvent::FlushFailed {
             request_id: request_id.clone(),
             reason,
+        },
+        // A timed-out commit or status has no honest receipt: the attempt
+        // may still settle late. Answering `Unknown` re-derives truth
+        // through the recovery protocol instead of inventing an outcome —
+        // replaying the identical nonce joins a live attempt or re-admits
+        // a lost one, never double-admitting.
+        StoreMethod::UnionCommit { request_id, .. }
+        | StoreMethod::UnionStatus { request_id, .. } => StoreEvent::UnionStatus {
+            request_id: request_id.clone(),
+            status: UnionCommitStatus::Unknown,
         },
     }
 }
@@ -3245,7 +3402,9 @@ mod tests {
                 | StoreMethod::ImportRecipe { request_id, .. }
                 | StoreMethod::ExportRecipe { request_id, .. }
                 | StoreMethod::RecordSuggestion { request_id, .. }
-                | StoreMethod::Flush { request_id, .. } => request_id.clone(),
+                | StoreMethod::Flush { request_id, .. }
+                | StoreMethod::UnionCommit { request_id, .. }
+                | StoreMethod::UnionStatus { request_id, .. } => request_id.clone(),
             };
             let wire = encode_frame(&serde_json::to_value(&method).unwrap()).unwrap();
             client.write_all(&wire).await.unwrap();

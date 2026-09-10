@@ -33,8 +33,9 @@ use crate::spawn::pre_exec_detach;
 use crate::{
     FrameDecoder, SourceSummary, StoreEvent, StoreMethod, WorkerEvent, WorkerRequest,
     election::{ViewerGuard, WorkerPaths, owner_is_live, take_viewer_lock, try_take_owner},
-    protocol::{PROTOCOL_VERSION, check_store_size},
+    protocol::{PROTOCOL_VERSION, UnionCommitStatus, check_store_size},
     spawn::{CAPTURE_ROOT_ARG, SOCKET_ARG, SpawnSpec, WORKER_CHILD_FLAG},
+    union_commit::{CommitDigest, CommitReceipt, CommitRequest},
 };
 
 /// Client bound for one store round trip. Exceeds the worker's own
@@ -50,6 +51,11 @@ pub const CONTROL_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(60);
 /// replacement election and child startup when the first attempt meets a
 /// stale socket or a still-starting worker.
 pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on remembered ambiguous request ids (see `stale_request_ids`).
+/// Attempts are deadline-bounded seconds apart, so reaching this means a
+/// genuinely ancient reply; retiring then is correct, not a leak.
+const MAX_STALE_REQUEST_IDS: usize = 64;
 
 /// How a connect attempt failed: transport trouble (retryable within
 /// [`ATTACH_TIMEOUT`]) or an explicit worker refusal / reply-shape skew
@@ -199,6 +205,14 @@ fn spawn_child(executable: &Path, capture_root: &Path, paths: &WorkerPaths) -> R
 /// error on every later operation; recovery is a fresh attach, which the
 /// election makes cheap. Refusals that carry the matching id are clean
 /// answers, not faults: they neither retire nor disturb reuse.
+///
+/// Exception: the union commit/status calls use a recoverable exchange
+/// (see `store_recoverable`) whose timeouts record the outstanding id in
+/// `stale_request_ids` and leave the connection usable, so a lost reply's
+/// ambiguity is resolved by status recovery on the same connection
+/// instead of a fresh attach. A late reply carrying a remembered stale id
+/// is drained, never mistaken for a later answer; an id that was never
+/// issued still retires, preserving the no-shifted-ack invariant.
 pub struct WorkerClient {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: tokio::net::unix::OwnedWriteHalf,
@@ -211,6 +225,11 @@ pub struct WorkerClient {
     _viewer: ViewerGuard,
     retired: bool,
     in_flight: bool,
+    /// Request ids whose attempts timed out under a recoverable exchange
+    /// and whose late replies must be drained, not matched. Request ids
+    /// are unique per connection (`next_request` never repeats), so a
+    /// remembered id can only ever name its own superseded attempt.
+    stale_request_ids: Vec<String>,
 }
 
 impl WorkerClient {
@@ -328,6 +347,7 @@ impl WorkerClient {
             _viewer: viewer,
             retired: false,
             in_flight: false,
+            stale_request_ids: Vec::new(),
         };
         let request_id = client.take_request_id();
         let expected = request_id.clone();
@@ -610,6 +630,67 @@ impl WorkerClient {
         }
     }
 
+    /// Submit one union commit attempt: one request, one receipt, under the
+    /// caller's per-attempt bound (the transport partitions the window's
+    /// absolute deadline across attempts; see the recovery loop that calls
+    /// this). The request travels verbatim — same nonce and digest on every
+    /// replay, never a fresh identity. The exchange is recoverable: a
+    /// transport timeout records the attempt as stale and reports outcome
+    /// unknown WITHOUT retiring, which is exactly the ambiguity status
+    /// recovery resolves on this same connection.
+    pub async fn request_union_commit(
+        &mut self,
+        window_id: &str,
+        request: &CommitRequest,
+        timeout: Duration,
+    ) -> Result<CommitReceipt, String> {
+        let request_id = self.take_request_id();
+        let method = StoreMethod::UnionCommit {
+            request_id,
+            window_id: window_id.to_owned(),
+            request: request.clone(),
+        };
+        match self.store_recoverable(method, timeout).await? {
+            StoreEvent::UnionCommitted { receipt, .. } => Ok(receipt),
+            StoreEvent::UnionStatus { status, .. } => Err(format!(
+                "union commit answered status instead of receipt: {status:?}"
+            )),
+            other => Err(format!("unexpected union commit reply: {other:?}")),
+        }
+    }
+
+    /// Read-only status for one exact attempt, under the caller's
+    /// per-attempt bound. Never mutates worker state; `Unknown` means the
+    /// attempt was never admitted (replay the identical request). The
+    /// exchange is recoverable like the commit call, so a lost status
+    /// reply degrades to another poll rather than a retired connection.
+    pub async fn request_union_status(
+        &mut self,
+        window_id: &str,
+        union_view_id: &str,
+        candidate_generation: u64,
+        nonce: &str,
+        digest: &CommitDigest,
+        timeout: Duration,
+    ) -> Result<UnionCommitStatus, String> {
+        let request_id = self.take_request_id();
+        let method = StoreMethod::UnionStatus {
+            request_id,
+            window_id: window_id.to_owned(),
+            union_view_id: union_view_id.to_owned(),
+            candidate_generation,
+            nonce: nonce.to_owned(),
+            digest: *digest,
+        };
+        match self.store_recoverable(method, timeout).await? {
+            StoreEvent::UnionStatus { status, .. } => Ok(status),
+            StoreEvent::UnionCommitted { receipt, .. } => Err(format!(
+                "union status answered receipt instead of status: {receipt:?}"
+            )),
+            other => Err(format!("unexpected union status reply: {other:?}")),
+        }
+    }
+
     /// Poll one source's canonical progress: one request, one reply, same
     /// strict sequential discipline as every other call (progress is never
     /// pushed, so no unsolicited frame can arrive mid-request). The answer
@@ -671,6 +752,19 @@ impl WorkerClient {
     /// definition, view, and expected version travel verbatim so CAS
     /// semantics are the worker's, not a second evaluator's.
     pub async fn store(&mut self, method: StoreMethod) -> Result<StoreEvent, String> {
+        self.store_with_timeout(method, STORE_ROUNDTRIP_TIMEOUT)
+            .await
+    }
+
+    /// Same exchange with a caller-chosen bound, for deadline-partitioned
+    /// callers (union commit/status recovery splits the window's absolute
+    /// deadline across attempts). Timeout behavior is identical to
+    /// [`Self::store`], reporting outcome-unknown and retiring on timeout.
+    pub async fn store_with_timeout(
+        &mut self,
+        method: StoreMethod,
+        timeout: Duration,
+    ) -> Result<StoreEvent, String> {
         let window_id = self.window_id.clone();
         let mut method = method;
         set_store_window(&mut method, &window_id);
@@ -686,7 +780,7 @@ impl WorkerClient {
         // Encoding and size checks happen before the exchange opens:
         // nothing was sent, so a failure here leaves the stream clean.
         self.begin_exchange().await?;
-        let deadline = Instant::now() + STORE_ROUNDTRIP_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         if let Err(error) = self.writer.write_all(&bytes).await {
             return Err(self.retire(format!("write store method: {error}")).await);
         }
@@ -697,7 +791,7 @@ impl WorkerClient {
                 // later request, so the connection retires with the report.
                 return Err(self
                     .retire(format!(
-                        "store request timed out after {STORE_ROUNDTRIP_TIMEOUT:?}; \
+                        "store request timed out after {timeout:?}; \
                          outcome unknown — the worker may still commit, reload to reconcile; \
                          connection retired"
                     ))
@@ -709,7 +803,7 @@ impl WorkerClient {
                     Err(_) => {
                         return Err(self
                             .retire(format!(
-                                "store request timed out after {STORE_ROUNDTRIP_TIMEOUT:?}; \
+                                "store request timed out after {timeout:?}; \
                              outcome unknown — the worker may still commit, reload to reconcile; \
                              connection retired"
                             ))
@@ -765,6 +859,179 @@ impl WorkerClient {
                         self.in_flight = false;
                         return Ok(store);
                     }
+                    Some(id) => {
+                        return Err(self
+                            .retire(format!(
+                                "store reply id mismatch: expected {expected}, got {id}; \
+                                 connection retired"
+                            ))
+                            .await);
+                    }
+                    None => {
+                        return Err(self
+                            .retire("store reply without correlation; connection retired")
+                            .await);
+                    }
+                },
+                other => {
+                    return Err(self
+                        .retire(format!("unexpected event mid-request: {other:?}"))
+                        .await);
+                }
+            }
+        }
+    }
+
+    /// Remember one ambiguous request id, keeping the set bounded: the
+    /// oldest entry is dropped past the cap. Dropping only risks retiring
+    /// on a genuinely ancient late reply (dozens of attempts old), which
+    /// is the safe direction — never a shifted ack.
+    fn remember_stale(&mut self, request_id: &str) {
+        if self.stale_request_ids.len() >= MAX_STALE_REQUEST_IDS {
+            self.stale_request_ids.remove(0);
+        }
+        self.stale_request_ids.push(request_id.to_owned());
+    }
+
+    /// Recoverable store exchange for union commit/status recovery: same
+    /// wire shape and per-attempt bound as [`Self::store_with_timeout`],
+    /// but a timeout records the outstanding id as stale and returns an
+    /// outcome-unknown error WITHOUT retiring, so the caller can resolve
+    /// the ambiguity with status polls on this same connection. A later
+    /// reply carrying a remembered stale id is drained (its outcome is
+    /// re-derived, never trusted); a reply with an id that was never
+    /// issued still retires, exactly as in the strict exchange. Fatal,
+    /// EOF, decode, shape, and batch faults retire: only timeouts and
+    /// remembered-stale replies are survivable, because only those carry
+    /// no evidence of stream confusion.
+    async fn store_recoverable(
+        &mut self,
+        method: StoreMethod,
+        timeout: Duration,
+    ) -> Result<StoreEvent, String> {
+        let window_id = self.window_id.clone();
+        let mut method = method;
+        set_store_window(&mut method, &window_id);
+        if let Err(error) = check_store_size(&method) {
+            return Err(error.to_string());
+        }
+        let expected = method.request_id().to_owned();
+        let bytes = crate::encode_frame(
+            &serde_json::to_value(&method)
+                .map_err(|error| format!("encode store method: {error}"))?,
+        )
+        .map_err(|error| format!("store method exceeds the wire cap: {error}"))?;
+        // Encoding and size checks happen before the exchange opens:
+        // nothing was sent, so a failure here leaves the stream clean.
+        self.begin_exchange().await?;
+        let deadline = Instant::now() + timeout;
+        if let Err(error) = self.writer.write_all(&bytes).await {
+            return Err(self.retire(format!("write store method: {error}")).await);
+        }
+        // Outcome-unknown without retiring: the worker may still settle
+        // this attempt late. Its id joins the stale set so the late reply
+        // is drained by this or a later exchange, never matched; the
+        // in-flight claim is released so status recovery can proceed on
+        // this same connection.
+        macro_rules! ambiguous {
+            () => {{
+                self.remember_stale(&expected);
+                self.in_flight = false;
+                return Err(format!(
+                    "store request timed out after {timeout:?}; outcome unknown — \
+                     the worker may still settle, resolve with a status poll on \
+                     this same connection (attempt id remembered as stale)"
+                ));
+            }};
+        }
+        loop {
+            if Instant::now() >= deadline {
+                ambiguous!();
+            }
+            let remaining = deadline - Instant::now();
+            let count =
+                match tokio::time::timeout(remaining, self.reader.read(&mut self.read_buf)).await {
+                    Err(_) => {
+                        ambiguous!();
+                    }
+                    Ok(Err(error)) => {
+                        return Err(self.retire(format!("read store reply: {error}")).await);
+                    }
+                    Ok(Ok(count)) => count,
+                };
+            if count == 0 {
+                return Err(self
+                    .retire("worker closed the connection mid-request")
+                    .await);
+            }
+            let decoded = match self.decoder.push_bytes(&self.read_buf[..count]) {
+                Err(error) => {
+                    return Err(self.retire(format!("decode store reply: {error}")).await);
+                }
+                Ok(values) => values,
+            };
+            if decoded.is_empty() {
+                // Partial frame: keep reading.
+                continue;
+            }
+            // A superseded attempt's late answer may share a read with this
+            // attempt's reply (the worker writes back-to-back; the socket
+            // coalesces). Drain remembered-stale frames wherever they land
+            // in the batch; what remains must be exactly one reply, as in
+            // the strict exchange — anything else is genuine confusion.
+            let mut rest = Vec::with_capacity(decoded.len());
+            for value in decoded {
+                let event: WorkerEvent = match serde_json::from_value(value) {
+                    Err(error) => {
+                        return Err(self
+                            .retire(format!("unexpected store reply shape: {error}"))
+                            .await);
+                    }
+                    Ok(event) => event,
+                };
+                match &event {
+                    WorkerEvent::Store(store) => match store_event_request_id(store) {
+                        Some(id)
+                            if id != expected
+                                && self.stale_request_ids.iter().any(|stale| stale == id) =>
+                        {
+                            // A superseded attempt's late answer: its
+                            // outcome is being re-derived by the recovery
+                            // loop, so this copy is stale information,
+                            // never a match. Drain it.
+                            continue;
+                        }
+                        _ => rest.push(event),
+                    },
+                    _ => rest.push(event),
+                }
+            }
+            if rest.is_empty() {
+                // Only stale frames so far: keep waiting within the bound.
+                continue;
+            }
+            if rest.len() > 1 {
+                return Err(self
+                    .retire("worker sent an unsolicited batch mid-request")
+                    .await);
+            }
+            let event = rest.into_iter().next().expect("single rest event");
+            // Exactly one frame answers one request here, as in the strict
+            // exchange — except a reply naming a remembered stale attempt
+            // is drained (above) and the wait continues within this bound.
+            match event {
+                WorkerEvent::Store(StoreEvent::Fatal { reason }) => {
+                    return Err(self
+                        .retire(format!("worker reported fatal mid-request: {reason}"))
+                        .await);
+                }
+                WorkerEvent::Store(store) => match store_event_request_id(&store) {
+                    Some(id) if id == expected => {
+                        self.in_flight = false;
+                        return Ok(store);
+                    }
+                    // Stale ids never reach here (drained from the batch
+                    // above): any other id is foreign, exactly as strict.
                     Some(id) => {
                         return Err(self
                             .retire(format!(
@@ -891,7 +1158,9 @@ fn store_event_request_id(event: &StoreEvent) -> Option<&str> {
         | StoreEvent::SuggestionRecorded { request_id, .. }
         | StoreEvent::SuggestionFailed { request_id, .. }
         | StoreEvent::Flushed { request_id, .. }
-        | StoreEvent::FlushFailed { request_id, .. } => Some(request_id),
+        | StoreEvent::FlushFailed { request_id, .. }
+        | StoreEvent::UnionCommitted { request_id, .. }
+        | StoreEvent::UnionStatus { request_id, .. } => Some(request_id),
         StoreEvent::Fatal { .. } => None,
     }
 }
@@ -1009,6 +1278,12 @@ fn set_store_window(method: &mut StoreMethod, window_id: &str) {
             window_id: slot, ..
         }
         | StoreMethod::Flush {
+            window_id: slot, ..
+        }
+        | StoreMethod::UnionCommit {
+            window_id: slot, ..
+        }
+        | StoreMethod::UnionStatus {
             window_id: slot, ..
         } => *slot = window_id.to_owned(),
     }
@@ -1477,5 +1752,207 @@ mod tests {
             error.contains("retired") || error.contains("never completed"),
             "{error}"
         );
+    }
+
+    fn union_test_request(window: &str) -> CommitRequest {
+        CommitRequest {
+            window_id: window.into(),
+            union_view_id: "union-view".into(),
+            candidate_generation: 7,
+            nonce: "nonce-7".into(),
+            digest: [0xA5; crate::union_commit::COMMIT_DIGEST_BYTES],
+            frozen: vec![crate::union_commit::UnionSourceFence {
+                source_id: "source-a".into(),
+                generation: 3,
+                high_watermark: Some(9),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn recoverable_union_timeout_survives_and_drains_late_reply() {
+        let root = tempfile::tempdir().unwrap();
+        crate::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Async sleeps only: a blocking sleep here would freeze this
+        // single-threaded test runtime's timers and the client's attempt
+        // bound would never fire. The commit reply arrives 300ms after its
+        // request — past the 100ms attempt bound — then a status poll is
+        // answered at once. The late commit receipt must be drained as
+        // stale, never matched to the status poll, and the connection must
+        // stay usable.
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (stream, _) = listener.accept().await.expect("peer accepts");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut decoder = FrameDecoder::new();
+            let mut buffer = vec![0u8; crate::READ_CHUNK_BYTES];
+            let mut requests = 0u32;
+            loop {
+                let count = reader.read(&mut buffer).await.expect("peer reads");
+                if count == 0 {
+                    return;
+                }
+                let values = decoder.push_bytes(&buffer[..count]).expect("peer decodes");
+                for value in values {
+                    requests += 1;
+                    let id = value
+                        .get("request_id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let reply = if requests == 1 {
+                        WorkerEvent::Welcome {
+                            request_id: id,
+                            worker_pid: 1,
+                            protocol: crate::protocol::PROTOCOL_VERSION,
+                            worker_session: "session-test".into(),
+                            sources: Vec::new(),
+                        }
+                    } else if requests == 2 {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        WorkerEvent::Store(StoreEvent::UnionCommitted {
+                            request_id: id,
+                            receipt: CommitReceipt::answer(
+                                "session-test",
+                                &union_test_request("window-t"),
+                                crate::union_commit::CommitOutcome::Committed { current: vec![] },
+                            ),
+                        })
+                    } else {
+                        WorkerEvent::Store(StoreEvent::UnionStatus {
+                            request_id: id,
+                            status: UnionCommitStatus::Unknown,
+                        })
+                    };
+                    let wire =
+                        crate::encode_frame(&serde_json::to_value(&reply).expect("peer encodes"))
+                            .expect("peer frames");
+                    writer.write_all(&wire).await.expect("peer writes");
+                }
+            }
+        });
+        let (mut client, _) = WorkerClient::connect(root.path(), &socket, "window-t", 5006)
+            .await
+            .expect("connect");
+        let error = client
+            .request_union_commit(
+                "window-t",
+                &union_test_request("window-t"),
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("slow commit must time out");
+        assert!(
+            error.contains("status poll"),
+            "recoverable timeout must direct recovery, not retire: {error}"
+        );
+        assert!(
+            !client.retired,
+            "recoverable timeout must leave the connection usable"
+        );
+        // The peer's late commit receipt lands mid-poll: it names the
+        // superseded attempt, so the status exchange drains it and matches
+        // its own reply instead of retiring on a shifted ack.
+        let status = client
+            .request_union_status(
+                "window-t",
+                "union-view",
+                7,
+                "nonce-7",
+                &[0xA5; crate::union_commit::COMMIT_DIGEST_BYTES],
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("status poll must survive the late commit reply");
+        assert!(
+            matches!(status, UnionCommitStatus::Unknown),
+            "stale drain must yield the poll's own answer: {status:?}"
+        );
+        assert!(
+            !client.retired,
+            "draining a stale reply must not retire the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_store_timeout_still_retires() {
+        let root = tempfile::tempdir().unwrap();
+        crate::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Same slow peer, strict exchange: the timeout must retire, and a
+        // later operation must refuse reuse without reading the stream.
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (stream, _) = listener.accept().await.expect("peer accepts");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut decoder = FrameDecoder::new();
+            let mut buffer = vec![0u8; crate::READ_CHUNK_BYTES];
+            let mut requests = 0u32;
+            loop {
+                let count = reader.read(&mut buffer).await.expect("peer reads");
+                if count == 0 {
+                    return;
+                }
+                let values = decoder.push_bytes(&buffer[..count]).expect("peer decodes");
+                for value in values {
+                    requests += 1;
+                    let id = value
+                        .get("request_id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let reply = if requests == 1 {
+                        WorkerEvent::Welcome {
+                            request_id: id,
+                            worker_pid: 1,
+                            protocol: crate::protocol::PROTOCOL_VERSION,
+                            worker_session: "session-test".into(),
+                            sources: Vec::new(),
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        WorkerEvent::Store(StoreEvent::RecentFailed {
+                            request_id: id,
+                            reason: "late".into(),
+                        })
+                    };
+                    let wire =
+                        crate::encode_frame(&serde_json::to_value(&reply).expect("peer encodes"))
+                            .expect("peer frames");
+                    writer.write_all(&wire).await.expect("peer writes");
+                }
+            }
+        });
+        let (mut client, _) = WorkerClient::connect(root.path(), &socket, "window-t", 5007)
+            .await
+            .expect("connect");
+        let error = client
+            .store_with_timeout(
+                StoreMethod::Recent {
+                    request_id: "unused".into(),
+                    window_id: "window-t".into(),
+                },
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("slow store must time out");
+        assert!(error.contains("retired"), "{error}");
+        let error = client
+            .store(StoreMethod::Recent {
+                request_id: "unused".into(),
+                window_id: "window-t".into(),
+            })
+            .await
+            .expect_err("retired connection must refuse reuse");
+        assert!(error.contains("retired"), "{error}");
     }
 }

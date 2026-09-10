@@ -7788,6 +7788,24 @@ async fn run() -> Result<(), String> {
             ));
         }
     };
+    // Window-side union commit transport: remote unions over this shared
+    // session commit through the worker with same-identity recovery. A
+    // transport that cannot exist (no runtime — impossible on this path,
+    // but honest anyway) leaves remote unions loudly unavailable instead
+    // of half-wired.
+    let mut transport_notice: Option<String> = None;
+    match shared_session.union_transport(window_id.clone()) {
+        Ok(transport) => {
+            if let Err(error) =
+                adapter.set_remote_union_commit_transport(window_id.clone(), Arc::new(transport))
+            {
+                transport_notice = Some(format!("union commit transport: {error}"));
+            }
+        }
+        Err(error) => {
+            transport_notice = Some(format!("union commit transport unavailable: {error}"));
+        }
+    };
     let mut app = App::new(Vec::new(), Vec::new(), false);
     app.title = "lvu live sources".into();
     app.configure_ai(
@@ -7815,7 +7833,9 @@ async fn run() -> Result<(), String> {
         &capture_dir,
         &loaded_settings.validated,
     ));
-    app.source_notice = legacy_notice.or_else(|| helper_resource.diagnostic());
+    app.source_notice = transport_notice
+        .or(legacy_notice)
+        .or_else(|| helper_resource.diagnostic());
     let workspace_root = capture_dir.join("workspace");
     // Resuming is the default, so an unreadable manifest may not stop lvu from
     // opening: it degrades to an empty previous session and says so.
