@@ -2538,3 +2538,18 @@ leaving 10,828,181,504 bytes free. Evidence:
 This was cache maintenance, not product validation. Integrated app Clippy with
 warnings denied passed separately in
 `primary-astra-scratch/autopin-integrated-clippy-3fe45c8f3b3b4f348acc873b8a1f0c48.log`.
+
+Final pin PTY amendment `eee9df13ecfc2b21d886b72981da0b02993809c1`,
+integrated as `37364f9`, passed against app SHA256
+`1f097cedd69b84a72093dcd2d0665a47f0e33d68265430268b7f905cbe697c0d`.
+Evidence: `lvu-muse-union-logs/shared-key-autopin-eee9df1-r6.log`, exit zero.
+The test proves creation pinning, cancellation preserving origin pins, manual
+extra pins, explicit key unpin surviving restart, membership/order and stable
+original identities. Earlier r1-r5 logs remain preserved: pinning clipped long
+text markers, the old selector recognized only unchecked fields, clearing a
+filter returned selection to the worker tail, and a restart wait could observe
+initial raw membership. The final test uses visible short markers, handles both
+pin states, keeps the API filter active during inspection, and waits for the
+complete filtered membership after restart. Source review of the six-line
+creation fix was READY; final test delta review and full combined acceptance
+remain pending before tagging.
