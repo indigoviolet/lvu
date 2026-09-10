@@ -38,6 +38,9 @@ PROTECTED = ("proof", "previews")
 WORKTREES = pathlib.Path("/home/venky/.paseo/worktrees/2hywlzbe")
 BUILD_VOLUME = pathlib.Path("/mnt/HC_Volume_106796581/lvu-build")
 TARGET_SUFFIX = "-target"
+TARGET_OWNER_ENTRIES = 512
+TARGET_OWNER_DEP_INFO_FILES = 128
+TARGET_OWNER_DEP_INFO_BYTES = 1024 * 1024
 HARNESS_TEMP = re.compile(r"/tmp/lvu-[a-z0-9_-]*(?:pty|scratch)[a-z0-9_-]*")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 # `<source uuid>.<journal uuid>.rows.idx`, the only shape the product writes.
@@ -453,13 +456,107 @@ def sweep_orphaned_fixtures(minutes: float, dry: bool) -> int:
     return killed
 
 
+def target_worktree_owners(target: pathlib.Path) -> set[pathlib.Path] | None:
+    """Worktrees named by Cargo's bounded top-level dep-info, or unknown.
+
+    Cargo's final binary dep-info contains absolute paths for workspace inputs,
+    even when a caller gives its target a name unrelated to the worktree. Only
+    top-level ``<profile>/*.d`` files are inspected: dependency-unit dep-info is
+    generally relative to the build cwd and cannot establish ownership.
+
+    ``None`` is deliberately broad. Too much evidence, an unreadable or
+    malformed file, excessive directory traversal, or Make escaping means the
+    target is not safe to delete.
+    """
+    prefix = f"{WORKTREES}/"
+    owners: set[pathlib.Path] = set()
+    total = 0
+    entries = 0
+    dep_info_count = 0
+    try:
+        with os.scandir(target) as profiles:
+            for profile_entry in profiles:
+                entries += 1
+                # Reaching the cap is unknown rather than asking the iterator
+                # for a sentinel entry beyond the traversal budget.
+                if entries >= TARGET_OWNER_ENTRIES:
+                    return None
+                if not profile_entry.is_dir(follow_symlinks=False):
+                    continue
+                profile = pathlib.Path(profile_entry.path)
+                with os.scandir(profile) as profile_entries:
+                    for dep_info_entry in profile_entries:
+                        entries += 1
+                        if entries >= TARGET_OWNER_ENTRIES:
+                            return None
+                        if pathlib.Path(dep_info_entry.name).suffix != ".d":
+                            continue
+                        dep_info_count += 1
+                        if dep_info_count > TARGET_OWNER_DEP_INFO_FILES:
+                            return None
+                        if not dep_info_entry.is_file(follow_symlinks=False):
+                            return None
+                        dep_info = pathlib.Path(dep_info_entry.path)
+                        remaining = TARGET_OWNER_DEP_INFO_BYTES - total
+                        if remaining < 0:
+                            return None
+                        with dep_info.open("rb") as handle:
+                            data = handle.read(remaining + 1)
+                        if len(data) > remaining:
+                            return None
+                        total += len(data)
+                        try:
+                            text = data.decode("utf-8")
+                        except UnicodeDecodeError:
+                            return None
+                        # Make escaping needs a real dep-file parser. Guessing
+                        # through it could manufacture a vanished owner.
+                        first_line = text.splitlines()[0] if text else ""
+                        rule_target, separator, _ = first_line.partition(":")
+                        if (
+                            not text.endswith("\n")
+                            or not separator
+                            or not rule_target.strip()
+                            or "\\" in text
+                        ):
+                            return None
+                        for token in text.split():
+                            if not token.startswith(prefix):
+                                continue
+                            components = token[len(prefix) :].split("/")
+                            if len(components) < 2 or any(
+                                not component
+                                or component in (".", "..")
+                                or any(
+                                    not character.isprintable()
+                                    for character in component
+                                )
+                                or ":" in component
+                                for component in components
+                            ):
+                                return None
+                            owner = WORKTREES / components[0]
+                            dependency = WORKTREES.joinpath(*components)
+                            try:
+                                descendant = dependency.relative_to(owner)
+                            except ValueError:
+                                return None
+                            if not descendant.parts:
+                                return None
+                            owners.add(owner)
+    except OSError:
+        return None
+    return owners
+
+
 def abandoned_targets(idle_hours: float) -> list[tuple[pathlib.Path, str]]:
     """Per-worktree cargo targets nobody can still need.
 
     Each is several gigabytes and cargo never removes one, so they outlive the
     work by days. Two conditions are safe to act on and nothing else is:
 
-    - the worktree directory is gone, so nothing can rebuild there; or
+    - Cargo dep-info records one owner and that worktree directory is gone, so
+      nothing can rebuild there; or
     - the worktree exists, its branch is already contained in `main`, *and* the
       target has not been written for `idle_hours`.
 
@@ -469,9 +566,10 @@ def abandoned_targets(idle_hours: float) -> list[tuple[pathlib.Path, str]]:
     that is building right now — including this one. Recency is what separates
     finished from between-assignments.
 
-    A worktree with unmerged work is never touched however old, and neither is
-    the shared `target` the primary checkout uses, nor a target a build holds
-    the lock on right now.
+    A target with unknown or conflicting ownership is never touched. A worktree
+    with unmerged work is never touched however old, and neither is the shared
+    `target` the primary checkout uses, nor a target a build holds the lock on
+    right now.
     """
     if not BUILD_VOLUME.is_dir():
         return []
@@ -481,9 +579,20 @@ def abandoned_targets(idle_hours: float) -> list[tuple[pathlib.Path, str]]:
         if not entry.is_dir() or entry.is_symlink() or build_in_progress(entry):
             continue
         name = entry.name[: -len(TARGET_SUFFIX)]
-        worktree = WORKTREES / name
+        conventional = WORKTREES / name
+        evidenced = target_worktree_owners(entry)
+        if evidenced is None or len(evidenced) > 1:
+            continue
+        if len(evidenced) == 1:
+            worktree = next(iter(evidenced))
+        elif conventional.is_dir():
+            worktree = conventional
+        else:
+            # A missing directory derived only from the target's name is not
+            # ownership evidence: custom targets routinely use another name.
+            continue
         if not worktree.is_dir():
-            found.append((entry, "worktree is gone"))
+            found.append((entry, f"recorded worktree {worktree.name} is gone"))
             continue
         merged = branch_is_merged(worktree)
         if merged is None:
