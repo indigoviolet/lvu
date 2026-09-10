@@ -2270,3 +2270,22 @@ readers remained stalled after it finished. With roughly 4.1 GiB free and
 sustained I/O pressure, new local Cargo/PTY/performance gates are held pending
 storage recovery and a reviewed disposable-build reclamation plan. This is
 host evidence, not a product performance or durability result.
+
+After volume reads recovered, primary executed the reviewed narrow failed-22dc
+reclamation plan while holding both the shared validation lock and that target's
+Cargo lock. A privileged read-only scan checked process exe/cwd/root/fd/maps
+with no live references or unreadable-process errors. Deleted only reproducible
+deps entries (excluding the exact statistics executable and sidecar), build,
+fingerprint, incremental and temporary artifacts in target
+`release-22dc294042d2f6d24aa25cc9cc397b74d8eb3c1f-930f53e2de9b4c30b75aa0b073e6ec3e`.
+Pre/post hashes matched for the retained statistics binary
+`stats_throughput-997fe4120aa00459` (SHA256
+`f6d1061d9469583bb66c0605f52f5377b9a0becb4d418cfe78ccbb90e3ebff54`),
+its sidecar, and top-level app/TUI binaries. The installed latest link was
+unchanged. Logs, captures, proof, other targets and release records were untouched.
+Free space increased by 3,933,835,264 bytes; `mise run disk:check` passed with
+8G free. Exact before/after proof: build-volume
+`primary-astra-scratch/reclaim-22dc-1789007071385917404.jsonl`, SHA256
+`b939daca706dc272e7346b4346390d2cfa2b487d803b44d5a97363591f55689b`.
+This cleanup preserves the unresolved methodology evidence; it does not prove
+the cause of the earlier throughput variability.
