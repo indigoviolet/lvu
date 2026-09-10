@@ -3708,6 +3708,11 @@ impl Composition {
         inputs: Vec<String>,
         exact_key: Option<lvu_core::ExactFieldConstraint>,
     ) -> Result<String, String> {
+        let pinned_columns = exact_key
+            .as_ref()
+            .map(|key| key.field().to_owned())
+            .into_iter()
+            .collect();
         let candidate_exact_key = exact_key;
         if inputs.len() < 2 {
             return Err("a union needs at least two input views".into());
@@ -3780,6 +3785,7 @@ impl Composition {
         let restored = lvu::PersistentViewState {
             source_ids: source_ids.clone(),
             view_name: name.clone(),
+            pinned_columns,
             union: Some(lvu::PersistentUnion {
                 inputs: fenced,
                 filter: String::new(),
