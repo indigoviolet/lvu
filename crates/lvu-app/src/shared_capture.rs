@@ -25,7 +25,7 @@
 //! lifts with that cutover; until then an uncalled function here is pending
 //! wiring, never dead design.
 #![allow(dead_code)]
-//!
+
 //! Version tracking mirrors the local worker thread's `versions` map via
 //! [`SaveBases`](lvu_shared::SaveBases): the last committed version per
 //! view travels as the next save's base, loads reseed every returned view,
