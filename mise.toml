@@ -21,7 +21,7 @@ SCCACHE_DIR = "{{ env.SCCACHE_DIR | default(value='/mnt/HC_Volume_106796581/lvu-
 # Leave space for a fresh release target alongside active worktrees and
 # preserved evidence. The running server keeps its startup cap; restart it
 # under the validation lock after changing this value.
-SCCACHE_CACHE_SIZE = "15G"
+SCCACHE_CACHE_SIZE = "10G"
 # Two jobs bounds compilation on this disk-constrained development host. A
 # release runner is neither shared nor disk-constrained and would otherwise
 # spend most of an hour building Polars one job at a time.

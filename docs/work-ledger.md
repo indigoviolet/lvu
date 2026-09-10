@@ -2510,3 +2510,24 @@ and `correlation-shared-key-7b2488f-r6-pty.log` in the same directory.
 The combined source is being frozen for a fresh full release gate; the previous
 failed gate and diagnostic logs remain preserved. Independent coverage review
 is proceeding separately and remains a release condition.
+
+The full `a97ad2e0c4a08aa1b00f51988eba4808d2ffb5f0` run passed:
+1510 Rust tests, zero failures, seven ignored; workspace all-target Clippy;
+bridge installation/checks; both binary builds; all 80 PTY suites.
+Its immutable record is
+`primary-astra-scratch/release-gate-a97ad2e0c4a0-e296cce15b4f4863a2b432115197e8cb/accepted.json`;
+commands-log SHA256 is
+`7e07f35dec10acce2f6abc7108ce42fe9c331d169c8d08d5f37d2025a1b39859`.
+This is baseline evidence only, not release authorization: independent review
+identified lost automatic key pinning in newly created shared-key unions.
+Legacy saved pins still restore, but no decision retired the creation behavior.
+
+Source repair `43a8240`, integrated as `d9327d9`, initializes the new union's
+pinned columns from its accepted exact key. Plain unions remain unpinned;
+restore and later manual edits remain authoritative. PTY amendment `acd3ced`,
+integrated as `05ab145`, checks creation, cancellation preserving origin pins,
+manual extra pins and a key unpin surviving restart. Focused runtime validation
+and independent review remain pending; the amended source needs a full gate.
+The compiler cache cap is now 10 GiB to reserve that next target without
+deleting retained binaries or proof. Its lock-coordinated restart is logged in
+`primary-astra-scratch/sccache-10g-08fcfc4e9fd34a768f1d6ad3a739431d.log`.
