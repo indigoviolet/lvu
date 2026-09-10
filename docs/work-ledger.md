@@ -2619,3 +2619,10 @@ Shared capture/controller integration remains separate unfinished work. Remote
 union commit module `0989d6d` has narrow source clearance, but its fixed digest
 amendment and wire/window integration still require review and runtime proof.
 All paused soak and long-query investigations remain paused.
+
+Release retention completed after v0.1.6 activation. A privileged scan of 407
+processes across executable, cwd, root, file descriptors and mappings found no
+v0.1.5 references, denied entries or unknowns. Only `versions/v0.1.5` was
+removed; its records remain. The v0.1.6 full tree and binary hashes were
+identical before and after, and `latest` remained on v0.1.6. Captures, builds
+and delivery proof were untouched.
