@@ -2179,6 +2179,10 @@ impl QueryDispatcher for NativeViewAdapter {
 }
 
 impl RowProvider for NativeViewAdapter {
+    fn enrichment_outputs(&self, view_id: &str) -> Vec<String> {
+        self.rows().enrichment_outputs(view_id)
+    }
+
     fn page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
         self.rows().page(view_id, request)
     }
@@ -2940,6 +2944,21 @@ impl RowProvider for NativeViewRows {
                     .wrapping_add(v.rows_retry_revision)
                     .wrapping_add(v.fold.as_ref().map_or(0, |fold| fold.revision))
             })
+    }
+
+    fn enrichment_outputs(&self, view_id: &str) -> Vec<String> {
+        // The accepted membership's declared output inventory, independent of
+        // which rows (if any) are currently served: a pending page or a
+        // settled zero-row filter must not hide accepted outputs from
+        // callers binding new display state to them.
+        let shared = self.shared.lock().expect("view state poisoned");
+        let Some(view) = shared.views.get(view_id) else {
+            return Vec::new();
+        };
+        match &view.published {
+            Published::Raw => Vec::new(),
+            Published::Filtered { membership } => membership.enrichment_names.clone(),
+        }
     }
 
     fn unfolded_page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
@@ -4030,19 +4049,44 @@ fn run_query(
     // never match. A rule with an empty column or value is skipped rather
     // than failing the view: the dialog refuses to submit one, and a rule
     // that can match nothing must not break painting.
-    let mut column_rules: Vec<(u16, String, String)> = Vec::new();
+    // Column classification rules: `(rule name, output column, exact value)`,
+    // named by position like legacy rules so first-match-wins merging and
+    // indexed failure messages treat both kinds uniformly. They never reach
+    // the predicate compiler below: the engine evaluates them natively over
+    // the typed frame. A column rule is malformed when its column is
+    // missing/blank or its value is missing (an empty-string value is
+    // valid: it matches literal empty-string ready cells); malformed shapes
+    // fail the candidate with an indexed diagnostic like any other rule
+    // defect, so the last good view stays applied instead of silently
+    // keeping a rule that paints nothing.
+    let mut column_rules: Vec<(String, String, String)> = Vec::new();
     for (index, rule) in request.constraints.color_rules.iter().enumerate() {
         let position = index + 1;
         if rule.is_column() {
             let column = rule.column.clone().unwrap_or_default();
-            let value = rule.value.clone().unwrap_or_default();
-            if column.is_empty() || value.is_empty() {
-                continue;
+            if column.trim().is_empty() {
+                fail(
+                    tx,
+                    &request,
+                    &cancelled,
+                    QueryPurpose::Advanced,
+                    &format!("colour rule {position}: no column to classify"),
+                    false,
+                );
+                return;
             }
-            let Ok(index) = u16::try_from(index) else {
-                continue;
+            let Some(value) = rule.value.clone() else {
+                fail(
+                    tx,
+                    &request,
+                    &cancelled,
+                    QueryPurpose::Advanced,
+                    &format!("colour rule {position}: no value to match"),
+                    false,
+                );
+                return;
             };
-            column_rules.push((index, column, value));
+            column_rules.push((index.to_string(), column, value));
             continue;
         }
         if rule.predicate.trim().is_empty() {
@@ -4519,6 +4563,7 @@ fn run_query(
                     },
                     text_search: text.as_ref(),
                     colors: &color_rules,
+                    column_colors: &column_rules,
                 },
                 exact.as_ref(),
             );
@@ -4734,42 +4779,7 @@ fn run_query(
                         // same cell; stale errors never outlive their fix.
                         derived_errors.remove(&key);
                     }
-                    derived.insert(key.clone(), value.clone());
-                    // Column classification consumes the accepted chain's
-                    // outputs by exact ready-cell equality — the same key
-                    // equality grouping uses, computed here rather than in
-                    // the engine because only this worker knows per-cell
-                    // Ready (the frame holds display strings where a ready
-                    // `"error: ..."` collides with failures). Null, failed
-                    // and missing cells never match; first-match-wins merges
-                    // with legacy predicate matches below by rule order.
-                    if !failed
-                        && let Some(matched) = value.as_deref()
-                        && let Some(index) =
-                            column_rules.iter().find_map(|(index, column, want)| {
-                                (column == &key.2 && matched == want).then_some(*index)
-                            })
-                    {
-                        match color_matches.entry((key.0.clone(), key.1)) {
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                *entry.get_mut() = (*entry.get()).min(index);
-                            }
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                if !reservation.add(color_match_bytes(&key.0)) {
-                                    fail(
-                                        tx,
-                                        &request,
-                                        &cancelled,
-                                        QueryPurpose::Advanced,
-                                        "colour-rule match memory cap reached; previous applied view preserved",
-                                        true,
-                                    );
-                                    return;
-                                }
-                                entry.insert(index);
-                            }
-                        }
-                    }
+                    derived.insert(key, value);
                 }
             }
             // Configured grouping consumes engine verdicts computed from the

@@ -605,8 +605,13 @@ fn the_layer_declines_to_open_without_a_view_and_dismisses_to_the_base_focus() {
 
 /// Rows proving evaluated enrichment outputs through structural markers, as
 /// the view worker serves them: `derived.` declares the output,
-/// `derived_ready.` proves the cell evaluated without failure.
-struct Classified(Vec<DisplayRow>);
+/// `derived_ready.` proves the cell evaluated without failure. The output
+/// inventory rides the provider API rather than paging, so tests can serve
+/// zero rows while the accepted chain still declares outputs.
+struct Classified {
+    rows: Vec<DisplayRow>,
+    outputs: Vec<String>,
+}
 
 fn classified_row(sequence: u64, level: &str, severity: Option<&str>) -> DisplayRow {
     // Both outputs read as evaluated, as if the accepted chain derived them:
@@ -635,9 +640,9 @@ fn classified_row(sequence: u64, level: &str, severity: Option<&str>) -> Display
 impl RowProvider for Classified {
     fn page(&self, _: &str, request: ViewportRequest) -> RowPage {
         RowPage {
-            total: self.0.len(),
+            total: self.rows.len(),
             rows: self
-                .0
+                .rows
                 .iter()
                 .skip(request.start)
                 .take(request.len.max(1))
@@ -646,22 +651,28 @@ impl RowProvider for Classified {
         }
     }
     fn row_by_id(&self, _: &str, id: &RowId) -> Option<DisplayRow> {
-        self.0.iter().find(|row| &row.id == id).cloned()
+        self.rows.iter().find(|row| &row.id == id).cloned()
     }
     fn index_of_id(&self, _: &str, id: &RowId) -> Option<usize> {
-        self.0.iter().position(|row| &row.id == id)
+        self.rows.iter().position(|row| &row.id == id)
     }
     fn revision(&self, _: &str) -> u64 {
         1
+    }
+    fn enrichment_outputs(&self, _: &str) -> Vec<String> {
+        self.outputs.clone()
     }
 }
 
 fn classified_demo() -> (Classified, App) {
     let (_, sources, views) = FixtureProvider::demo();
-    let provider = Classified(vec![
-        classified_row(1, "warn", Some("WARN")),
-        classified_row(2, "info", Some("INFO")),
-    ]);
+    let provider = Classified {
+        rows: vec![
+            classified_row(1, "warn", Some("WARN")),
+            classified_row(2, "info", Some("INFO")),
+        ],
+        outputs: vec!["level".to_owned(), "severity".to_owned()],
+    };
     let mut app = App::new(sources, views, true);
     app.sync_provider(&provider, 10);
     (provider, app)
@@ -686,12 +697,12 @@ fn add_classifies_an_enrichment_column_instead_of_a_raw_pattern() {
         );
         assert_eq!(draft[0].column.as_deref(), Some("level"));
     }
-    // An empty value cannot be applied: it would match nothing. (Moving
-    // the selection first settles the new rule so clearing its value reads
-    // as an empty edit rather than an abandoned addition, which removes
-    // itself instead.)
+    // An empty-string value is valid: it matches only literal empty-string
+    // ready cells, distinctly from a missing value (which execution
+    // rejects). Authoring text settles the new rule, so clearing it back to
+    // empty reads as an empty edit — not an abandoned addition, which
+    // removes itself instead — and applies as an explicit empty match.
     type_text(&mut app, &provider, "w");
-    key(&mut app, &provider, KeyCode::Down);
     key(&mut app, &provider, KeyCode::Backspace);
     assert!(
         app.view_state().unwrap().color_rules_draft[0]
@@ -700,20 +711,25 @@ fn add_classifies_an_enrichment_column_instead_of_a_raw_pattern() {
             .unwrap_or_default()
             .is_empty()
     );
-    while app.layers.color_rules.control() != ColorRulesControl::Predicate {
-        key(&mut app, &provider, KeyCode::Tab);
-    }
     key(&mut app, &provider, KeyCode::Enter);
-    assert!(
-        app.view_state()
-            .unwrap()
-            .color_rules_error
-            .as_deref()
-            .is_some_and(|error| error.contains("no value")),
-        "empty value refused where typed"
+    let request = app.take_query_requests().pop().expect("one repaint query");
+    assert_eq!(
+        request.constraints.color_rules,
+        vec![ColorRule::column_rule(
+            "level".into(),
+            String::new(),
+            RuleColor::Red,
+        )],
+        "an empty value travels as an explicit empty match"
     );
-    assert!(app.take_query_requests().is_empty());
-    // The value field takes the exact key; the request carries a column rule.
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    // The value field takes the exact key; re-applying carries a column rule.
     type_text(&mut app, &provider, "warn");
     key(&mut app, &provider, KeyCode::Enter);
     let request = app.take_query_requests().pop().expect("one repaint query");
@@ -758,6 +774,33 @@ fn the_column_chooser_repoints_without_rewriting_the_value() {
             .as_deref(),
         Some("level")
     );
+}
+
+#[test]
+fn pending_or_empty_pages_still_classify_accepted_outputs() {
+    // The inventory is the accepted membership's, not the served page: with
+    // zero rows served but outputs declared, Add must still create the same
+    // column rule — never silently fall back to a raw predicate.
+    for name in ["pending page", "settled zero-row filter"] {
+        let (_, sources, views) = FixtureProvider::demo();
+        let provider = Classified {
+            rows: Vec::new(),
+            outputs: vec!["severity".to_owned()],
+        };
+        let mut app = App::new(sources, views, true);
+        app.sync_provider(&provider, 10);
+        app.handle(Action::Open(Open::ColorRules), &provider);
+        draw(&provider, &mut app, 90, 24);
+        key(&mut app, &provider, KeyCode::Enter);
+        let draft = &app.view_state().unwrap().color_rules_draft;
+        assert_eq!(draft.len(), 1, "{name}");
+        assert!(
+            draft[0].is_column(),
+            "{name} must classify, not match raw: {:?}",
+            draft[0]
+        );
+        assert_eq!(draft[0].column.as_deref(), Some("severity"), "{name}");
+    }
 }
 
 #[test]

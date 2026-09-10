@@ -899,6 +899,8 @@ fn visit_frozen_input(
                     filter: None,
                     text_search: None,
                     colors: &[],
+                    // Export replays data, never painting.
+                    column_colors: &[],
                 },
             );
             if enriched.validity != BatchValidity::Valid {
@@ -1453,6 +1455,8 @@ fn export_snapshot(
                     filter: None,
                     text_search: None,
                     colors: &[],
+                    // Export replays data, never painting.
+                    column_colors: &[],
                 },
             );
             if enriched.validity != BatchValidity::Valid {

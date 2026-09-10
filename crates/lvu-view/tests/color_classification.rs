@@ -345,6 +345,73 @@ async fn column_rules_skip_failed_cells() {
     manager.shutdown().await;
 }
 
+/// Malformed column shapes reject the candidate with an indexed diagnostic
+/// while the last good view stays applied; a valid empty-string value
+/// applies and matches only literal empty-string ready cells.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_column_shapes_reject_the_candidate() {
+    let root = TempDir::new().unwrap();
+    let (manager, _handle, mut adapter) = setup(&root, "level=warn first\n", false).await;
+
+    // A column binding with no value is malformed: restore bypasses the
+    // dialog validator, so execution must refuse loudly instead of keeping
+    // a rule that paints nothing.
+    let mut missing = request(1, 1, 0);
+    missing.purpose = QueryPurpose::Advanced;
+    missing.constraints.color_rules = vec![lvu::ColorRule {
+        predicate: String::new(),
+        color: lvu::RuleColor::Red,
+        column: Some("severity".into()),
+        value: None,
+    }];
+    adapter.submit(missing).unwrap();
+    let failure = wait_completion(&mut adapter, 1).await.result.unwrap_err();
+    assert!(
+        failure.message.contains("colour rule 1") && failure.message.contains("no value"),
+        "indexed refusal, not a silent no-op: {failure:?}"
+    );
+
+    // A blank column is malformed for the same reason.
+    let mut blank = request(2, 2, 0);
+    blank.purpose = QueryPurpose::Advanced;
+    blank.constraints.color_rules = vec![lvu::ColorRule {
+        predicate: String::new(),
+        color: lvu::RuleColor::Red,
+        column: Some("   ".into()),
+        value: Some("x".into()),
+    }];
+    adapter.submit(blank).unwrap();
+    let failure = wait_completion(&mut adapter, 2).await.result.unwrap_err();
+    assert!(
+        failure.message.contains("colour rule 1") && failure.message.contains("no column"),
+        "indexed refusal, not a silent no-op: {failure:?}"
+    );
+
+    // An empty-string value is valid end to end: it matches only literal
+    // empty-string ready cells, distinctly from the missing value above.
+    let mut empty = request(3, 3, 0);
+    empty.purpose = QueryPurpose::Enrichment;
+    empty.constraints.enrichments = vec![enrichment_step("blank", "e = pl.lit(\"\")")];
+    empty.constraints.color_rules = vec![lvu::ColorRule::column_rule(
+        "e".into(),
+        String::new(),
+        lvu::RuleColor::Green,
+    )];
+    adapter.submit(empty).unwrap();
+    assert!(wait_completion(&mut adapter, 3).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rule_of(&rows[0]).as_deref(),
+        Some("1"),
+        "empty wants match empty ready cells: {:?}",
+        rows[0].details
+    );
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
 /// Removing the classified output stops painting even with a raw same-name
 /// field present: the worker emits no ready cells, so the lingering rule
 /// matches nothing and membership is untouched.

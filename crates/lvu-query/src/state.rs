@@ -169,6 +169,7 @@ pub struct QueryPlan<'a> {
     pub filter: Option<&'a CompiledDefinition>,
     pub text_search: Option<&'a TextSearch>,
     pub colors: &'a [(String, TextSearch)],
+    pub column_colors: &'a [(String, String, String)],
 }
 pub struct QueryExecution<'a> {
     pub generation: u64,
@@ -209,6 +210,7 @@ pub fn execute_bounded_batches(
                 filter: plan.filter,
                 text_search: plan.text_search,
                 colors: plan.colors,
+                column_colors: plan.column_colors,
             },
         );
         if result.validity != BatchValidity::Valid {

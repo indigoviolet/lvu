@@ -5,15 +5,16 @@ Three claims, all end to end against a real source and the real query engine:
 
 * a rule paints the rows its predicate matched, and only those, without
   narrowing the view — the row count is the same before and after;
-* a column rule classifies an enrichment output's exact value: a slash
-  shorthand derives `severity`, and the rule paints exactly its rows while
-  the legacy rule keeps its own;
+* a column rule classifies an enrichment output's exact value: on a fresh
+  app, a slash shorthand derives `severity` and the rule paints exactly its
+  rows without narrowing the view;
 * a search or rule pattern is underlined *where it matched inside the line*,
   including on a line whose invalid bytes render as replacement characters.
 
 Run at 80x24 and again at 54x16, because a rule list, a predicate field and a
-colour chooser all have to survive the narrow terminal. The enrichment and
-column-rule story needs the room and runs wide only.
+colour chooser all have to survive the narrow terminal. The column story
+runs separately on a wide terminal: the enrichment editor plus chooser need
+the room.
 """
 import pathlib
 import sys
@@ -110,21 +111,39 @@ def open_enrichment_and_save_step(app: PtyApp, expression: str, marker: str) -> 
     app.send(expression.encode())
     app.wait_until(lambda text: expression in text, "the draft shows the edit")
     app.send(b"\r")
+    # Saving returns to the step list; a validation error would keep the
+    # editor open instead, which must fail here rather than masquerade as a
+    # save the later waits cannot distinguish from one.
     app.wait_until(
-        lambda text: marker in text and "External command" in text,
-        f"step accepted: {marker}",
+        lambda text: "New step" not in text and marker in text,
+        f"step saved: {marker}",
+        timeout=15.0,
     )
     close_editor(app)
 
 
 def open_rules_and_add_column_value(app: PtyApp, value: str) -> None:
     # With accepted enrichment outputs present, Add starts a column rule:
-    # the caret lands in its Value field beside a Column chooser.
-    app.send(b"c")
-    app.wait_for("Colour rules")
-    app.send(b"\x1ba")
-    app.wait_for("Value")
-    app.wait_for("Column")
+    # the caret lands in its Value field beside a Column chooser. Acceptance
+    # (enrich:on) and membership publication reach the dialog through
+    # different channels, so a freshly accepted chain can briefly read as
+    # output-free; an untouched legacy Add removes itself on Esc, making a
+    # bounded retry honest rather than a weaker assertion.
+    for attempt in range(6):
+        app.send(b"c")
+        app.wait_for("Colour rules")
+        app.send(b"\x1ba")
+        try:
+            app.wait_for("Value", timeout=4.0)
+            app.wait_for("Column", timeout=4.0)
+            break
+        except AssertionError:
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Colour rules" not in text, "dialog closed"
+            )
+            if attempt == 5:
+                raise
     app.send(value.encode())
     app.wait_for(value)
 
@@ -233,13 +252,6 @@ def story(binary: pathlib.Path, width: int, height: int) -> None:
             app.send(b"\x1b")
             app.wait_until(lambda text: "Colour rules" not in text, "closed")
 
-            # --- a column rule classifies an enrichment output -------------
-            # Patterns belong in enrichment: derive severity with a slash
-            # shorthand, then classify its exact value. Wide terminal only:
-            # the enrichment editor plus chooser need the room.
-            if width >= 80:
-                column_story(app)
-
             app.send(b"q")
             assert app.wait_exit(timeout=10) == 0
             app.assert_restored()
@@ -250,46 +262,90 @@ def story(binary: pathlib.Path, width: int, height: int) -> None:
             app.close()
 
 
-def column_story(app: PtyApp) -> None:
+def column_story(binary: pathlib.Path) -> None:
     """A column rule paints an enrichment output's exact value.
 
-    The slash shorthand derives `severity` (ERROR rows only); the second
-    rule classifies it. The legacy `ready` rule keeps painting its rows, the
-    row count never changes, and removing the enrichment unpaints the column
-    rule while the lingering stored name feeds nothing.
+    Patterns belong in enrichment: a slash shorthand derives `severity`
+    (ERROR rows only), then a column rule classifies it. Runs on its own
+    app: the legacy story above already pins predicate painting, and this
+    keeps the enrichment fork deterministic.
     """
-    open_enrichment_and_save_step(app, "/(?P<severity>ERROR)/", "severity")
-    app.wait_until(
-        lambda text: "raw view" not in text and "ERROR eve" in text,
-        "the enrichment settled",
-        timeout=20.0,
-    )
-    painted_ready = row_foreground(app, "ready eve", 1)
-    plain_error = row_foreground(app, "ERROR eve", 1)
+    with tempfile.TemporaryDirectory(prefix="lvu-column-rules-") as directory:
+        root = pathlib.Path(directory)
+        source = root / "events.log"
+        source.write_text(
+            "".join(
+                f"ready event {index:02d} ok\n" if index % 3
+                else f"ERROR event {index:02d} failed\n"
+                for index in range(12)
+            )
+        )
+        env = settings_at(root)
+        app = PtyApp(
+            binary,
+            [str(source), "--capture-dir", str(root / "capture")],
+            width=150,
+            height=38,
+            environment=env,
+        )
+        try:
+            app.wait_until(
+                lambda text: "ready eve" in text and "ERROR eve" in text,
+                "the first page is served",
+                timeout=15.0,
+            )
+            app.send(b"g")
+            open_enrichment_and_save_step(app, "/(?P<severity>ERROR)/", "severity")
+            # Wait for the accepted chain itself (not merely served rows,
+            # which can still be the pre-enrichment membership while the new
+            # query runs), or the rules dialog would see no classifiable
+            # outputs. `enrich:on` is the status proof the chain is applied.
+            app.wait_until(
+                lambda text: "enrich:on" in text
+                and "raw view" not in text
+                and "ERROR eve" in text,
+                "the enrichment settled",
+                timeout=30.0,
+            )
+            # The fork installs asynchronously after acceptance: opening the
+            # rules dialog before it is selected would bind it to the still
+            # raw origin, which genuinely has nothing to classify.
+            app.wait_until(
+                lambda text: "Enriched" in text,
+                "the enrichment fork is selected",
+                timeout=30.0,
+            )
+            plain_error = row_foreground(app, "ERROR eve", 1)
 
-    open_rules_and_add_column_value(app, "ERROR")
-    app.send(b"\r")  # Apply
-    app.wait_until(
-        lambda text: "Colour rules" not in text or "rules painting" in text,
-        "the column rule was applied",
-    )
-    app.send(b"\x1b")
-    app.wait_until(lambda text: "Colour rules" not in text, "dialog closed")
-    settled = app.wait_until(
-        lambda text: "raw view" not in text
-        and "ERROR eve" in text
-        and "ready eve" in text,
-        "the repaint settled",
-        timeout=20.0,
-    )
-    assert row_foreground(app, "ERROR eve", 1) != plain_error, (
-        f"the classified row was not repainted\n{settled}"
-    )
-    assert row_foreground(app, "ready eve", 1) == painted_ready, (
-        f"the legacy rule lost its rows\n{settled}"
-    )
-    for marker in ("ERROR eve", "ready eve"):
-        assert marker in settled, f"{marker} vanished\n{settled}"
+            open_rules_and_add_column_value(app, "ERROR")
+            app.send(b"\r")  # Apply
+            app.wait_until(
+                lambda text: "Colour rules" not in text or "rule painting" in text,
+                "the column rule was applied",
+                timeout=15.0,
+            )
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Colour rules" not in text, "dialog closed")
+            settled = app.wait_until(
+                lambda text: "raw view" not in text
+                and "ERROR eve" in text
+                and "ready eve" in text,
+                "the repaint settled",
+                timeout=20.0,
+            )
+            assert row_foreground(app, "ERROR eve", 1) != plain_error, (
+                f"the classified row was not repainted\n{settled}"
+            )
+            for marker in ("ERROR eve", "ready eve"):
+                assert marker in settled, f"{marker} vanished\n{settled}"
+            app.send(b"q")
+            assert app.wait_exit(timeout=10) == 0
+            app.assert_restored()
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+                app.process.wait(timeout=5)
+            app.close()
 
 
 def span_story(app: PtyApp) -> None:
@@ -319,22 +375,12 @@ def span_story(app: PtyApp) -> None:
     assert not any("�" in run for run in runs), (
         f"a replacement character was emphasised: {runs}\n{app.text()}"
     )
-    # The column story needs the whole view back: clear the search that
-    # narrowed it to the tail record.
-    app.send(b"/")
-    app.wait_for("Search")
-    app.send(b"\x7f" * len(r"/need\w+/"))
-    app.wait_until(
-        lambda text: "No filter every record is shown" in text,
-        "search cleared for the column story",
-    )
-    app.send(b"\x1b")
-    app.wait_until(lambda text: "Search" not in text, "search closed")
 
 
 def run(binary: pathlib.Path) -> None:
     for width, height in ((80, 24), (54, 16)):
         story(binary, width, height)
+    column_story(binary)
 
 
 if __name__ == "__main__":

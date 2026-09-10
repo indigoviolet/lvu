@@ -61,6 +61,7 @@ fn ascii_literal_search_uses_the_regex_kernel() {
                 filter: None,
                 text_search: Some(&search),
                 colors: &[],
+                column_colors: &[],
             },
         )
     };

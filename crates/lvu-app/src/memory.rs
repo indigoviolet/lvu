@@ -921,16 +921,40 @@ fn working_view(request: &SaveRequest) -> WorkingView {
             color_field: request.state.color_field.clone(),
             severity_column: request.state.severity_column.clone(),
             timestamp_column: request.state.timestamp_column.clone(),
+            // Legacy predicate rules persist verbatim in `color_rules`;
+            // column classifiers persist in the additive sibling
+            // `color_classifiers` with their merged-order positions, so an
+            // older binary that ignores the sibling still reads and rewrites
+            // a valid legacy-only list here — never an empty predicate
+            // standing in for a classifier it cannot see.
             color_rules: request
                 .state
                 .color_rules
                 .iter()
+                .enumerate()
                 .take(lvu::MAX_COLOR_RULES)
-                .map(|rule| lvu_memory::StoredColorRule {
+                .filter(|(_, rule)| !rule.is_column())
+                .map(|(_, rule)| lvu_memory::StoredColorRule {
                     predicate: rule.predicate.clone(),
                     color: rule.color.label().into(),
-                    column: rule.column.clone(),
-                    value: rule.value.clone(),
+                })
+                .collect(),
+            color_classifiers: request
+                .state
+                .color_rules
+                .iter()
+                .enumerate()
+                .take(lvu::MAX_COLOR_RULES)
+                .filter_map(|(position, rule)| {
+                    if !rule.is_column() {
+                        return None;
+                    }
+                    Some(lvu_memory::StoredColorClassifier {
+                        position,
+                        column: rule.column.clone().unwrap_or_default(),
+                        value: rule.value.clone(),
+                        color: rule.color.label().into(),
+                    })
                 })
                 .collect(),
             fold_enabled: request.state.fold_enabled,
@@ -1070,6 +1094,61 @@ fn working_view(request: &SaveRequest) -> WorkingView {
 }
 fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// Rebuilds the merged rule order from the legacy-only list plus the
+/// additive sibling classifiers. Classifiers carry their merged-order
+/// position from save time; legacy rules fill the remaining slots in stored
+/// order. A classifier whose position fits no slot (an older binary rewrote
+/// the legacy list underneath it, or a corrupt store) is ignored —
+///
+/// presentation degrades to the surviving rules rather than inventing
+/// placement. Malformed entries are NOT filtered here: an empty column or a
+/// missing value restores verbatim so execution rejects it loudly through
+/// the colour-rule failure path instead of silently dropping a rule the
+/// user wrote.
+fn merge_color_rules(
+    legacy: Vec<lvu_memory::StoredColorRule>,
+    classifiers: Vec<lvu_memory::StoredColorClassifier>,
+) -> Vec<lvu::ColorRule> {
+    let mut classifiers: Vec<lvu_memory::StoredColorClassifier> = classifiers;
+    classifiers.sort_by_key(|classifier| classifier.position);
+    let total = legacy.len().saturating_add(classifiers.len());
+    let mut merged: Vec<Option<lvu::ColorRule>> = Vec::new();
+    merged.resize_with(total, || None);
+    for classifier in classifiers {
+        if classifier.position >= total {
+            continue;
+        }
+        if merged[classifier.position].is_some() {
+            continue;
+        }
+        merged[classifier.position] = Some(lvu::ColorRule {
+            predicate: String::new(),
+            color: lvu::RuleColor::parse(&classifier.color).unwrap_or_default(),
+            column: Some(classifier.column),
+            value: classifier.value,
+        });
+    }
+    let mut legacy = legacy.into_iter().map(|rule| lvu::ColorRule {
+        predicate: rule.predicate,
+        color: lvu::RuleColor::parse(&rule.color).unwrap_or_default(),
+        column: None,
+        value: None,
+    });
+    for slot in merged.iter_mut() {
+        if slot.is_none() {
+            let Some(rule) = legacy.next() else {
+                break;
+            };
+            *slot = Some(rule);
+        }
+    }
+    merged
+        .into_iter()
+        .flatten()
+        .take(lvu::MAX_COLOR_RULES)
+        .collect()
 }
 
 pub fn restored(value: WorkingView) -> PersistentViewState {
@@ -1308,19 +1387,18 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         timestamp_column: value.presentation.timestamp_column,
         // An unknown colour token is a rule written by a newer build: keep the
         // predicate and fall back to the default colour rather than dropping
-        // the rule the user wrote.
-        color_rules: value
-            .presentation
-            .color_rules
-            .into_iter()
-            .take(lvu::MAX_COLOR_RULES)
-            .map(|rule| lvu::ColorRule {
-                predicate: rule.predicate,
-                color: lvu::RuleColor::parse(&rule.color).unwrap_or_default(),
-                column: rule.column,
-                value: rule.value,
-            })
-            .collect(),
+        // the rule the user wrote. Legacy rules merge with the additive
+        // sibling classifiers by saved merged-order position, so
+        // first-match precedence restores exactly; an older binary that
+        // rewrote the legacy list simply yields fewer legacy slots, and any
+        // classifier whose position no longer exists is ignored rather than
+        // invented elsewhere. Malformed classifier entries (empty column or
+        // missing value) restore verbatim and are rejected loudly at
+        // execution, never silently dropped.
+        color_rules: merge_color_rules(
+            value.presentation.color_rules,
+            value.presentation.color_classifiers,
+        ),
         fold_enabled: value.presentation.fold_enabled,
         fold_minimum_run: value
             .presentation
@@ -1458,6 +1536,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         let view = ViewId::new();
         let mut request = request(1, definition(), view, "");
+        // Interleaved on purpose: the merged first-match order must
+        // survive the split sibling representation exactly.
         request.state.color_rules = vec![
             lvu::ColorRule {
                 predicate: "level: ERROR".into(),
@@ -1466,16 +1546,16 @@ mod tests {
                 value: None,
             },
             lvu::ColorRule {
-                predicate: r"/timeout/i".into(),
-                color: lvu::RuleColor::Purple,
-                column: None,
-                value: None,
-            },
-            lvu::ColorRule {
                 predicate: String::new(),
                 color: lvu::RuleColor::Green,
                 column: Some("severity".into()),
                 value: Some("ERROR".into()),
+            },
+            lvu::ColorRule {
+                predicate: r"/timeout/i".into(),
+                color: lvu::RuleColor::Purple,
+                column: None,
+                value: None,
             },
         ];
         let mut store = WorkspaceStore::open(root.path()).unwrap();

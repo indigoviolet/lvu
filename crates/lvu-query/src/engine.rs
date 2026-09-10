@@ -411,6 +411,18 @@ pub struct BatchQuery<'a> {
     /// type, parsed by the same function, as the filter itself. There is one
     /// predicate evaluator here and rules go through it.
     pub colors: &'a [(String, TextSearch)],
+    /// Column classification colour rules: `(rule name, output column, exact
+    /// value)`. Evaluated natively over the typed enriched frame by exact
+    /// equality — the same single evaluator as predicates, via
+    /// `predicate_mask_expr` below. Readiness is structural: a failed stage
+    /// contributes no column and a removed output is absent from the frame,
+    /// so both silently match nothing (roles-consistent fallback, never a
+    /// view-breaking error); null mask entries never match. No truncation
+    /// and no display conversion: full typed values decide, so values that
+    /// share a display prefix still discriminate. Union views thread their
+    /// own constraints through this same field rather than inheriting
+    /// ordinary view constraints.
+    pub column_colors: &'a [(String, String, String)],
 }
 
 pub struct BatchResult {
@@ -830,6 +842,37 @@ pub fn execute_batch_with_exact_constraint(
                 predicate_mask_expr(&frame, expression)
             }
         };
+        match mask.and_then(|mask| {
+            selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
+        }) {
+            Ok(ids) => {
+                color_matches.insert(name.clone(), ids);
+            }
+            Err(failure) => {
+                color_diagnostics.push(error(Some(name), failure.0, &failure.1));
+            }
+        }
+    }
+    for (name, column, want) in query.column_colors {
+        // A failed stage is recorded in `failed_fields` and contributes no
+        // column; a removed output is absent from the frame. Both silently
+        // match nothing — the caller keeps its last good view, exactly as
+        // roles fall back when their output disappears.
+        if failed_fields.iter().any(|field| field == column) {
+            continue;
+        }
+        if frame.column(column).is_err() {
+            continue;
+        }
+        // Native exact equality over the typed cell: `cast(String)` keeps
+        // one evaluator for every dtype (numbers and booleans compare by
+        // their canonical text form) while null stays null and therefore
+        // never matches. An empty `want` matches only literal empty-string
+        // ready cells — never nulls, never everything.
+        let mask = predicate_mask_expr(
+            &frame,
+            col(column).cast(DataType::String).eq(lit(want.as_str())),
+        );
         match mask.and_then(|mask| {
             selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
         }) {

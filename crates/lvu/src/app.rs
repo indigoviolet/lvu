@@ -1433,6 +1433,17 @@ impl ColorRule {
             value: Some(value),
         }
     }
+
+    /// How a rule reads where rules are listed: `column = value` for a
+    /// column classification, the predicate text for a legacy rule.
+    pub fn summary(&self) -> String {
+        match (&self.column, &self.value) {
+            (Some(column), Some(value)) if !column.is_empty() => {
+                format!("{column} = {value}")
+            }
+            _ => self.predicate.clone(),
+        }
+    }
 }
 
 /// At most this many rules per view. Each one is another predicate the engine

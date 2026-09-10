@@ -108,6 +108,7 @@ fn regex_shorthand_exposes_and_executes_all_named_captures() {
             filter: None,
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(result.validity, BatchValidity::Valid);
@@ -389,6 +390,7 @@ fn enrichments_broadcast_and_fail_independently_without_touching_raw() {
             filter: None,
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(result.enriched_rows.height(), 2);
@@ -443,6 +445,7 @@ fn boolean_null_predicate_is_unmatched_and_non_boolean_is_diagnostic() {
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(
@@ -463,6 +466,7 @@ fn boolean_null_predicate_is_unmatched_and_non_boolean_is_diagnostic() {
             filter: Some(&invalid),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert!(invalid_result.matched_ids.is_empty());
@@ -493,7 +497,8 @@ fn old_generation_cannot_commit_and_cancellation_is_between_batches() {
                 stages: &[],
                 filter: None,
                 text_search: None,
-                colors: &[]
+                colors: &[],
+                column_colors: &[]
             },
             cancellation: &cancel,
         },
@@ -547,6 +552,7 @@ fn actual_python_helper_compiles_then_rust_executes() {
             filter: Some(&compiled),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(output.matched_ids[0].sequence, 4);
@@ -577,6 +583,7 @@ fn actual_python_helper_compiles_then_rust_executes() {
             filter: None,
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     let timestamps = output
@@ -612,6 +619,7 @@ fn legal_expression_matches_whole_and_partitioned_batches() {
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     let mut partitioned = Vec::new();
@@ -629,6 +637,7 @@ fn legal_expression_matches_whole_and_partitioned_batches() {
                     filter: Some(&filter),
                     text_search: None,
                     colors: &[],
+                    column_colors: &[],
                 },
             )
             .matched_ids,
@@ -679,7 +688,8 @@ fn typed_json_schema_survives_partitioning_nulls_and_conflicts() {
                 stages: &[],
                 filter: Some(&filter),
                 text_search: None,
-                colors: &[]
+                colors: &[],
+                column_colors: &[]
             }
         )
         .matched_ids
@@ -748,6 +758,7 @@ fn null_or_duplicate_identity_invalidates_batch_without_losing_rows() {
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(output.validity, BatchValidity::InvalidIdentity);
@@ -798,6 +809,7 @@ fn failed_overwrite_fences_ast_dependents_but_not_literals() {
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(output.validity, BatchValidity::InvalidFilter);
@@ -842,7 +854,8 @@ fn final_progress_cancellation_keeps_prior_pages_and_sink_is_bounded() {
                 stages: &[],
                 filter: None,
                 text_search: None,
-                colors: &[]
+                colors: &[],
+                column_colors: &[]
             },
             cancellation: &QueryCancellation::new(),
         },
@@ -864,7 +877,8 @@ fn final_progress_cancellation_keeps_prior_pages_and_sink_is_bounded() {
                 stages: &[],
                 filter: None,
                 text_search: None,
-                colors: &[]
+                colors: &[],
+                column_colors: &[]
             },
             cancellation: &cancel,
         },
@@ -890,7 +904,8 @@ fn final_progress_cancellation_keeps_prior_pages_and_sink_is_bounded() {
                 stages: &[],
                 filter: Some(&invalid),
                 text_search: None,
-                colors: &[]
+                colors: &[],
+                column_colors: &[]
             },
             cancellation: &QueryCancellation::new()
         },
@@ -936,6 +951,7 @@ fn literal_unicode_text_search_combines_with_advanced_filter() {
             filter: None,
             text_search: Some(&punctuation),
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(search_only.matched_ids.len(), 2);
@@ -953,6 +969,7 @@ fn literal_unicode_text_search_combines_with_advanced_filter() {
             filter: Some(&advanced),
             text_search: Some(&punctuation),
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(
@@ -972,6 +989,7 @@ fn literal_unicode_text_search_combines_with_advanced_filter() {
             filter: None,
             text_search: Some(&TextSearch::new("not present").unwrap()),
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(none.validity, BatchValidity::Valid);
@@ -985,6 +1003,7 @@ fn literal_unicode_text_search_combines_with_advanced_filter() {
             filter: None,
             text_search: Some(&TextSearch::new("").unwrap()),
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(empty.matched_ids.len(), 3);
@@ -998,6 +1017,7 @@ fn literal_unicode_text_search_combines_with_advanced_filter() {
             filter: Some(&invalid),
             text_search: Some(&punctuation),
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(bad.validity, BatchValidity::InvalidFilter);
@@ -1047,6 +1067,7 @@ fn literal_fast_path_is_identical_to_lowercase_over_ascii_and_unicode_batches() 
                 filter: None,
                 text_search: Some(&search),
                 colors: &colors,
+                column_colors: &[],
             },
         );
         let legacy = definition(
@@ -1067,6 +1088,7 @@ fn literal_fast_path_is_identical_to_lowercase_over_ascii_and_unicode_batches() 
                 filter: Some(&legacy),
                 text_search: None,
                 colors: &[],
+                column_colors: &[],
             },
         );
         assert_eq!(
@@ -1211,6 +1233,7 @@ fn initially_null_numeric_predicate_is_valid_across_partitions() {
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(
@@ -1231,6 +1254,7 @@ fn initially_null_numeric_predicate_is_valid_across_partitions() {
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     )
     .matched_ids;
@@ -1248,6 +1272,7 @@ fn initially_null_numeric_predicate_is_valid_across_partitions() {
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     )
     .matched_ids;
@@ -1261,6 +1286,7 @@ fn initially_null_numeric_predicate_is_valid_across_partitions() {
                 filter: Some(&filter),
                 text_search: None,
                 colors: &[],
+                column_colors: &[],
             },
         )
         .matched_ids,
@@ -1303,6 +1329,7 @@ fn failed_overwrite_fences_color_dependency() {
             filter: None,
             text_search: None,
             colors: &colors,
+            column_colors: &[],
         },
     );
     assert!(!output.color_matches.contains_key("stale"));
@@ -1333,6 +1360,7 @@ fn numeric_enrichment_names_never_collide_with_colour_diagnostics() {
                 filter: None,
                 text_search: None,
                 colors,
+                column_colors: &[],
             },
         );
         assert!(output.color_diagnostics.is_empty());
@@ -1357,6 +1385,7 @@ fn numeric_enrichment_names_never_collide_with_colour_diagnostics() {
                 filter: None,
                 text_search: None,
                 colors,
+                column_colors: &[],
             },
         );
         assert!(output.color_diagnostics.is_empty());
@@ -1414,6 +1443,7 @@ fn search_box_field_regex_and_polars_forms_preserve_literal_default() {
                 filter: None,
                 text_search: Some(&search),
                 colors: &[],
+                column_colors: &[],
             },
         );
         assert_eq!(
@@ -1467,6 +1497,7 @@ fn quoted_field_search_uses_json_names_and_explicit_literal_slash() {
                 filter: None,
                 text_search: Some(&search),
                 colors: &[],
+                column_colors: &[],
             },
         );
         assert_eq!(
@@ -1813,6 +1844,7 @@ fn exact_matches(
             filter,
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
         Some(constraint),
     )
@@ -2068,6 +2100,7 @@ fn exact_execution_rejects_projection_for_a_different_field() {
             filter: None,
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
         Some(&constraint),
     );
@@ -2191,6 +2224,7 @@ fn a_filter_naming_a_column_no_stage_produces_reports_actionable_diagnostic() {
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(output.validity, BatchValidity::InvalidFilter);
@@ -2259,6 +2293,7 @@ fn absent_output_is_distinct_from_failed_stage() {
             filter: Some(&failed_filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(failed.validity, BatchValidity::InvalidFilter);
@@ -2285,6 +2320,7 @@ fn absent_output_is_distinct_from_failed_stage() {
             filter: Some(&absent_filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(absent.validity, BatchValidity::InvalidFilter);
@@ -2331,6 +2367,7 @@ fn valid_null_column_is_not_an_absent_output() {
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(
@@ -2365,6 +2402,7 @@ fn valid_null_column_is_not_an_absent_output() {
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(absent.validity, BatchValidity::InvalidFilter);
@@ -2401,6 +2439,7 @@ fn enrichment_stage_naming_absent_column_reports_actionable_diagnostic() {
             filter: None,
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert!(output.enriched_rows.column("broken").is_err());
@@ -2451,6 +2490,7 @@ fn stage_depending_on_later_stage_names_the_ordering_per_batch() {
             filter: None,
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert!(output.enriched_rows.column("early").is_err());
@@ -2522,6 +2562,7 @@ fn heterogeneous_batches_keep_shared_schema_nulls_but_fresh_batches_stay_per_bat
                 filter: Some(&filter),
                 text_search: None,
                 colors: &[],
+                column_colors: &[],
             },
         );
         assert_eq!(
@@ -2549,6 +2590,7 @@ fn heterogeneous_batches_keep_shared_schema_nulls_but_fresh_batches_stay_per_bat
                 filter: Some(&filter),
                 text_search: None,
                 colors: &[],
+                column_colors: &[],
             },
         )
         .matched_ids
@@ -2565,6 +2607,7 @@ fn heterogeneous_batches_keep_shared_schema_nulls_but_fresh_batches_stay_per_bat
                 filter: Some(&filter),
                 text_search: None,
                 colors: &[],
+                column_colors: &[],
             },
         )
         .matched_ids
@@ -2598,6 +2641,7 @@ fn heterogeneous_batches_keep_shared_schema_nulls_but_fresh_batches_stay_per_bat
                 filter: Some(&filter),
                 text_search: None,
                 colors: &[],
+                column_colors: &[],
             },
         )
         .validity,
@@ -2612,6 +2656,7 @@ fn heterogeneous_batches_keep_shared_schema_nulls_but_fresh_batches_stay_per_bat
             filter: Some(&filter),
             text_search: None,
             colors: &[],
+            column_colors: &[],
         },
     );
     assert_eq!(absent.validity, BatchValidity::InvalidFilter);
@@ -2653,7 +2698,8 @@ fn absent_filter_aborts_candidate_and_preserves_published() {
                 stages: &[],
                 filter: None,
                 text_search: None,
-                colors: &[]
+                colors: &[],
+                column_colors: &[]
             },
             cancellation: &QueryCancellation::new(),
         },
@@ -2679,7 +2725,8 @@ fn absent_filter_aborts_candidate_and_preserves_published() {
                 stages: &[],
                 filter: Some(&missing),
                 text_search: None,
-                colors: &[]
+                colors: &[],
+                column_colors: &[]
             },
             cancellation: &QueryCancellation::new()
         },
@@ -2688,4 +2735,119 @@ fn absent_filter_aborts_candidate_and_preserves_published() {
     ));
     assert_eq!(state.committed_generation(), Some(first));
     assert_eq!(sink.published().len(), 1);
+}
+
+/// Column classification rules evaluate natively over the typed enriched
+/// frame: full values decide, so strings sharing a display prefix still
+/// discriminate, numbers and booleans compare by canonical text form, nulls
+/// never match, empty wants match only empty cells, and failed or missing
+/// columns silently match nothing without failing the batch.
+#[test]
+fn column_colors_match_typed_cells_exactly() {
+    let prefix = "p".repeat(600);
+    let long_a = format!("{prefix}A");
+    let long_b = format!("{prefix}B");
+    let frame = df!(
+        "_lvu_source_id" => ["s", "s"],
+        "_lvu_sequence" => [0u64, 1u64],
+        "big" => [long_a.clone(), long_b.clone()],
+        "num" => [42i64, 7i64],
+        "float" => [42.5f64, 1.0f64],
+        "flag" => [true, false],
+        "nothing" => [Option::<String>::None, None],
+        "empty" => ["", "x"],
+    )
+    .unwrap();
+    // A protected-name stage fails structurally: it contributes no column,
+    // so rules naming it must silently match nothing.
+    let failed = [EnrichmentStage {
+        name: "_lvu_bad".into(),
+        definition: definition("pl.lit(1)", lit(1), ExpressionKind::Enrichment),
+    }];
+    let rules = vec![
+        ("long-a".to_string(), "big".to_string(), long_a.clone()),
+        ("long-b".to_string(), "big".to_string(), long_b.clone()),
+        // The shared 512-byte prefix alone matches neither row exactly.
+        ("prefix".to_string(), "big".to_string(), prefix.clone()),
+        ("int".to_string(), "num".to_string(), "42".to_string()),
+        (
+            "int-padded".to_string(),
+            "num".to_string(),
+            "042".to_string(),
+        ),
+        ("float".to_string(), "float".to_string(), "42.5".to_string()),
+        (
+            "float-truncated".to_string(),
+            "float".to_string(),
+            "42".to_string(),
+        ),
+        ("bool".to_string(), "flag".to_string(), "true".to_string()),
+        (
+            "null-text".to_string(),
+            "nothing".to_string(),
+            "null".to_string(),
+        ),
+        (
+            "null-empty".to_string(),
+            "nothing".to_string(),
+            String::new(),
+        ),
+        ("empty".to_string(), "empty".to_string(), String::new()),
+        (
+            "empty-miss".to_string(),
+            "severity".to_string(),
+            String::new(),
+        ),
+        (
+            "missing".to_string(),
+            "missing".to_string(),
+            "x".to_string(),
+        ),
+        (
+            "failed".to_string(),
+            "_lvu_bad".to_string(),
+            "1".to_string(),
+        ),
+    ];
+    let result = execute_batch(
+        &frame,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &failed,
+            filter: None,
+            text_search: None,
+            colors: &[],
+            column_colors: &rules,
+        },
+    );
+    assert_eq!(result.validity, BatchValidity::Valid);
+    assert!(result.color_diagnostics.is_empty());
+    let sequences = |name: &str| {
+        result
+            .color_matches
+            .get(name)
+            .map(|ids| ids.iter().map(|id| id.sequence).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    // Full 601-byte values discriminate where a 512-byte display projection
+    // could not: each names exactly its own row.
+    assert_eq!(sequences("long-a"), vec![0]);
+    assert_eq!(sequences("long-b"), vec![1]);
+    assert!(sequences("prefix").is_empty());
+    // Typed cells compare by canonical text form.
+    assert_eq!(sequences("int"), vec![0]);
+    assert!(sequences("int-padded").is_empty());
+    assert_eq!(sequences("float"), vec![0]);
+    assert!(sequences("float-truncated").is_empty());
+    assert_eq!(sequences("bool"), vec![0]);
+    // Null is never equal to anything, not even its display text.
+    assert!(sequences("null-text").is_empty());
+    assert!(sequences("null-empty").is_empty());
+    // An empty want matches only literal empty-string ready cells.
+    assert_eq!(sequences("empty"), vec![0]);
+    assert!(sequences("empty-miss").is_empty());
+    // Failed and missing columns silently match nothing, never an error.
+    assert!(sequences("missing").is_empty());
+    assert!(sequences("failed").is_empty());
 }

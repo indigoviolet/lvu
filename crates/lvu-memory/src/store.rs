@@ -932,20 +932,36 @@ pub struct StoredBookmark {
 /// One persisted colour rule: the predicate exactly as the user typed it, and
 /// the colour token. Storing the token rather than an RGB triple keeps the
 /// contrast check with the theme, where it can be re-run when the theme or the
-/// terminal's colour depth changes. A column classification rule additionally
-/// carries its output column and exact value; both default to `None` so rows
-/// written before column rules existed read back as predicate rules, exactly
-/// like every other additive presentation field (no schema bump, and an older
-/// binary saving the workspace drops the binding while keeping predicate and
-/// colour).
+/// terminal's colour depth changes.
+///
+/// This list carries legacy predicate rules only. Column classification rules
+/// live in the additive sibling `PresentationState::color_classifiers`, so an
+/// older binary that ignores the sibling still reads and rewrites a valid
+/// legacy-only list here — never an empty predicate standing in for a
+/// classifier it cannot see.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StoredColorRule {
     pub predicate: String,
     pub color: String,
-    #[serde(default)]
-    pub column: Option<String>,
-    #[serde(default)]
+}
+
+/// One persisted column classification rule: the accepted enrichment output
+/// it classifies, the exact value that paints, and the colour token.
+///
+/// `position` is the rule's index in the merged rule order (legacy rules and
+/// classifiers interleaved) at save time, so restore rebuilds first-match
+/// precedence exactly. `value` is `Some` documentedly: `Some("")` matches
+/// only literal empty-string ready cells, while a missing value is malformed
+/// and rejected at execution. The whole list is additive (`serde(default)`):
+/// older rows omit it and restore legacy-only; older binaries ignore it and
+/// keep saving the legacy-only list above, which degrades classifiers to
+/// absence — allowed — but never to an empty active predicate.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StoredColorClassifier {
+    pub position: usize,
+    pub column: String,
     pub value: Option<String>,
+    pub color: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -983,6 +999,15 @@ pub struct PresentationState {
     /// downgrade.
     #[serde(default)]
     pub color_rules: Vec<StoredColorRule>,
+    /// Column classification rules in merged-order positions. Additive like
+    /// every other presentation field: older rows omit it, older binaries
+    /// ignore it while still round-tripping the legacy-only `color_rules`
+    /// above, and no schema version moves. Classifier loss across a
+    /// downgrade is allowed; an empty active predicate never is — this list
+    /// is the only place column bindings are stored, so no legacy entry is
+    /// ever written as a stand-in for one.
+    #[serde(default)]
+    pub color_classifiers: Vec<StoredColorClassifier>,
     /// Repeated-pattern folding. Off unless the user turned it on for this
     /// view; it is reversible presentation, so nothing else depends on it.
     #[serde(default)]

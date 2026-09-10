@@ -234,6 +234,11 @@ impl<P: RowProvider> RowProvider for CommandRows<P> {
                 .revision,
         )
     }
+    fn enrichment_outputs(&self, view: &str) -> Vec<String> {
+        // Command presentation decorates row text, never membership: the
+        // accepted output inventory passes straight through like paging.
+        self.native.enrichment_outputs(view)
+    }
     fn context_page(&self, view: &str, anchor: &RowId, offset: isize, len: usize) -> ContextPage {
         self.native.context_page(view, anchor, offset, len)
     }
@@ -300,6 +305,9 @@ mod tests {
         }
         fn revision(&self, _: &str) -> u64 {
             9
+        }
+        fn enrichment_outputs(&self, _: &str) -> Vec<String> {
+            vec!["severity".to_owned()]
         }
         fn context_page(&self, _: &str, _: &RowId, _: isize, len: usize) -> ContextPage {
             ContextPage {
@@ -409,6 +417,19 @@ mod tests {
             rows.row_by_id("view", &original[0].id).unwrap(),
             original[0]
         );
+    }
+
+    #[test]
+    fn command_decoration_forwards_the_accepted_output_inventory() {
+        // The colour dialog binds new rules through this seam: a wrapper
+        // that answers empty here would silently reopen the raw-text
+        // exception on views with accepted outputs.
+        let (_, native) = fixture();
+        let rows = CommandRows {
+            native,
+            presentation: CommandPresentation::default(),
+        };
+        assert_eq!(rows.enrichment_outputs("view"), vec!["severity"]);
     }
 
     #[test]

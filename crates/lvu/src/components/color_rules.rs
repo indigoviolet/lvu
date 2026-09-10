@@ -155,29 +155,18 @@ impl ColorRulesDialog {
         }
     }
 
-    /// Accepted enrichment outputs a new or repointed rule may classify,
-    /// read from the structural `derived.` markers on the newest served row
-    /// rather than by parsing definition source — which is blind to
-    /// slash-shorthand named captures. Sorted and deduplicated for the
-    /// chooser; empty while the view serves nothing yet.
+    /// Accepted enrichment outputs a new or repointed rule may classify: the
+    /// accepted membership's declared output inventory, read through the
+    /// provider rather than by parsing definition source — which is blind to
+    /// slash-shorthand named captures — and independent of which rows (if
+    /// any) are currently served, so a pending page or a settled zero-row
+    /// filter never forces the raw-text exception. Sorted and deduplicated
+    /// for the chooser; empty only when the accepted chain declares nothing.
     fn classifiable_columns(ctx: &Ctx<'_>) -> Vec<String> {
         let Some(view_id) = ctx.views.active_id() else {
             return Vec::new();
         };
-        let page = ctx.provider.page(
-            view_id,
-            crate::provider::ViewportRequest { start: 0, len: 1 },
-        );
-        let Some(row) = page.rows.first() else {
-            return Vec::new();
-        };
-        let mut columns: Vec<String> = row
-            .details
-            .iter()
-            .filter_map(|(key, _)| key.strip_prefix("derived."))
-            .filter(|name| !name.is_empty())
-            .map(str::to_owned)
-            .collect();
+        let mut columns = ctx.provider.enrichment_outputs(view_id);
         columns.sort();
         columns.dedup();
         columns
@@ -397,6 +386,10 @@ impl ColorRulesDialog {
         );
         self.cursor = cursor;
         if outcome.changed {
+            // Authored text settles the new rule: clearing it afterwards
+            // reads as an (empty, valid) edit rather than an abandoned
+            // addition, which removes itself instead.
+            self.adding = false;
             Self::with_draft(ctx, |rules| {
                 if let Some(rule) = rules.get_mut(selected) {
                     if column {
@@ -431,9 +424,9 @@ impl ColorRulesDialog {
                         "rule {position} names no column — pick an enrichment output"
                     ));
                 }
-                if rule.value.as_deref().is_none_or(|value| value.is_empty()) {
-                    return Err(format!("rule {position} has no value to match"));
-                }
+                // An empty-string value is valid: it matches only literal
+                // empty-string ready cells. A missing value is malformed and
+                // rejected loudly at execution instead.
                 continue;
             }
             if rule.predicate.trim().is_empty() {
@@ -894,12 +887,7 @@ impl Component for ColorRulesDialog {
             if text_x < row.right() {
                 // A column rule reads as what it classifies; a legacy rule
                 // as the predicate it still evaluates.
-                let summary = match (&rule.column, &rule.value) {
-                    (Some(column), Some(value)) if !column.is_empty() => {
-                        format!("{column} = {value}")
-                    }
-                    _ => rule.predicate.clone(),
-                };
+                let summary = rule.summary();
                 frame.render_widget(
                     Paragraph::new(clipped_width(&summary, usize::from(row.right() - text_x)))
                         .style(if chosen {
