@@ -2544,6 +2544,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_without_base_conflicts_against_existing_row() {
+        use crate::protocol::StoreMethod;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let source = SourceId(uuid::Uuid::from_u128(91));
+        let view = lvu_core::ViewId(uuid::Uuid::from_u128(92));
+        let definition = file_definition(91, &root.path().join("v.log"));
+        let save = |sequence| StoreMethod::Save {
+            request_id: format!("s-{sequence}"),
+            window_id: "w".into(),
+            sequence,
+            definition: definition.clone(),
+            view_id: view,
+            state: test_view(source, 92, 0),
+            expected_version: None,
+        };
+        // First write inserts at version 0.
+        match service.dispatch_store("w", save(1)).await {
+            StoreEvent::Saved { version: 0, .. } => {}
+            other => panic!("expected initial insert, got {other:?}"),
+        }
+        // The row exists now: the same baseless save conflicts, permanently.
+        // Every None retry fails identically with the committed version
+        // echoed — never silently overwriting — which is why a first save
+        // after load/create must carry a seeded base.
+        for sequence in 2..=3 {
+            match service.dispatch_store("w", save(sequence)).await {
+                StoreEvent::SaveFailed {
+                    current_version: Some(0),
+                    ..
+                } => {}
+                other => panic!("expected permanent conflict, got {other:?}"),
+            }
+        }
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn load_echoes_versions_and_create_seeds_zero() {
+        use crate::protocol::StoreMethod;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let source = SourceId(uuid::Uuid::from_u128(93));
+        let derived = lvu_core::ViewId(uuid::Uuid::from_u128(94));
+        let definition = file_definition(93, &root.path().join("v.log"));
+        // Create answers Saved with the version read back post-commit.
+        match service
+            .dispatch_store(
+                "w",
+                StoreMethod::CreateDerivedView {
+                    request_id: "c".into(),
+                    window_id: "w".into(),
+                    sequence: 1,
+                    definition: definition.clone(),
+                    view_id: derived,
+                    state: test_view(source, 94, 0),
+                },
+            )
+            .await
+        {
+            StoreEvent::Saved { version: 0, .. } => {}
+            other => panic!("expected created version 0, got {other:?}"),
+        }
+        // A save carrying the seeded base 0 commits version 1.
+        match service
+            .dispatch_store(
+                "w",
+                StoreMethod::Save {
+                    request_id: "s".into(),
+                    window_id: "w".into(),
+                    sequence: 2,
+                    definition: definition.clone(),
+                    view_id: derived,
+                    state: test_view(source, 94, 0),
+                    expected_version: Some(0),
+                },
+            )
+            .await
+        {
+            StoreEvent::Saved { version: 1, .. } => {}
+            other => panic!("expected version 1, got {other:?}"),
+        }
+        // Load echoes the persisted versions, which is what reseeds bases.
+        match service
+            .dispatch_store(
+                "w",
+                StoreMethod::Load {
+                    request_id: "l".into(),
+                    window_id: "w".into(),
+                    definition: definition.clone(),
+                    view_id: derived,
+                },
+            )
+            .await
+        {
+            StoreEvent::Loaded { views, .. } => {
+                let found = views
+                    .iter()
+                    .find(|view| view.id == derived)
+                    .expect("created view is listed");
+                assert_eq!(found.version, 1);
+            }
+            other => panic!("expected loaded views, got {other:?}"),
+        }
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn oversize_store_method_refused_at_dispatch_boundary() {
         use crate::protocol::StoreMethod;
 
