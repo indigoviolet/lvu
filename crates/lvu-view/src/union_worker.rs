@@ -959,6 +959,7 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
         });
     }
     let accepted_enrichment_outputs = accepted_enrichment_outputs(&metas);
+    project_accepted_output_authority(&mut decoded_inputs, &metas, &accepted_enrichment_outputs);
     // Deterministic test barrier, if armed: every input is frozen and
     // visited, nothing is merged or published yet.
     if let Some(barrier) = &ctx.test_barrier {
@@ -1495,6 +1496,30 @@ fn input_accepts_output(inputs: &[FrozenUnionMeta], input: usize, output: &str) 
     })
 }
 
+/// Remove same-named raw fields from inputs that do not structurally accept
+/// an output before Polars constructs the diagonal union. This is authority
+/// projection, not data loss: `raw`, `raw_bytes` and capture identity remain
+/// untouched for display/export context. Accepted inputs retain their exact
+/// dtype evidence, so genuine accepted-vs-accepted type conflicts still fail
+/// in the native concat instead of being coerced or hidden.
+fn project_accepted_output_authority(
+    inputs: &mut [UnionFrozenInput],
+    metas: &[FrozenUnionMeta],
+    outputs: &[String],
+) {
+    for (position, input) in inputs.iter_mut().enumerate() {
+        for output in outputs {
+            if input_accepts_output(metas, position, output) {
+                continue;
+            }
+            for row in &mut input.rows {
+                row.fields.remove(output);
+                row.field_types.remove(output);
+            }
+        }
+    }
+}
+
 fn accepted_output_authority(
     inputs: &[FrozenUnionMeta],
     output: &str,
@@ -1575,17 +1600,33 @@ fn union_color_workspace_bytes(rows: u64, rules: &[lvu::ColorRule]) -> Result<u6
         .ok_or_else(|| "union colour workspace size overflow".to_owned())
 }
 
-fn scalar_json_bytes(value: &serde_json::Value) -> Result<u64, String> {
+fn json_workspace_bytes(value: &serde_json::Value) -> Result<u64, String> {
     match value {
         serde_json::Value::Null => Ok(4),
         serde_json::Value::Bool(_) => Ok(5),
         serde_json::Value::Number(number) => Ok(number.to_string().len() as u64),
+        // Six bytes per input byte safely covers JSON control escapes without
+        // allocating a serialized copy merely to measure it.
         serde_json::Value::String(text) => (text.len() as u64)
-            .checked_add(2)
+            .checked_mul(6)
+            .and_then(|bytes| bytes.checked_add(2))
             .ok_or_else(|| "union derived value size overflow".to_owned()),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            Err("union accepted enrichment output is not an exact scalar value".to_owned())
-        }
+        serde_json::Value::Array(values) => values.iter().try_fold(2u64, |bytes, value| {
+            bytes
+                .checked_add(1)
+                .and_then(|bytes| bytes.checked_add(json_workspace_bytes(value).ok()?))
+                .ok_or_else(|| "union derived value size overflow".to_owned())
+        }),
+        serde_json::Value::Object(values) => values.iter().try_fold(2u64, |bytes, (key, value)| {
+            let key_bytes = (key.len() as u64)
+                .checked_mul(6)
+                .and_then(|bytes| bytes.checked_add(4))
+                .ok_or_else(|| "union derived value size overflow".to_owned())?;
+            bytes
+                .checked_add(key_bytes)
+                .and_then(|bytes| bytes.checked_add(json_workspace_bytes(value).ok()?))
+                .ok_or_else(|| "union derived value size overflow".to_owned())
+        }),
     }
 }
 
@@ -1611,7 +1652,10 @@ fn union_derived_workspace_bytes(
                     continue;
                 };
                 let dtype = row.field_types.get(output).map_or(0, String::len);
-                let scalar = scalar_json_bytes(value)?;
+                // This only sizes the frozen carrier. `decode_union_field`
+                // remains the single semantic authority for exact scalars,
+                // including lossless integer wrappers and nested rejection.
+                let scalar = json_workspace_bytes(value)?;
                 let entry = 36u64
                     .checked_add((output.len().saturating_mul(2)) as u64)
                     .and_then(|size| size.checked_add(dtype as u64))
@@ -1704,7 +1748,7 @@ fn union_derived_projection(
                         + key.2.len() as u64 * 2
                         + value.as_ref().map_or(1, String::len) as u64
                         + dtype.len() as u64
-                        + scalar_json_bytes(typed)?
+                        + json_workspace_bytes(typed)?
                         + 160,
                 )
                 .ok_or_else(|| "union derived publication size overflow".to_owned())?;

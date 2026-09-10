@@ -149,7 +149,7 @@ fn apply_slash_enrichment(adapter: &mut NativeViewAdapter, view: &str, source: &
         .unwrap();
 }
 
-fn apply_slash_enrichment_after_filter(
+fn apply_enrichment_after_filter(
     adapter: &mut NativeViewAdapter,
     view: &str,
     source: &str,
@@ -1290,6 +1290,7 @@ async fn union_derived_inventory_preserves_winning_input_authority() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heterogeneous_union_keeps_winning_row_derived_authority_only() {
+    const KEY: u64 = 9_007_199_254_740_993;
     let (root, manager, api, worker, mut adapter) = setup().await;
     let mut worker_file = OpenOptions::new()
         .append(true)
@@ -1297,15 +1298,15 @@ async fn heterogeneous_union_keeps_winning_row_derived_authority_only() {
         .unwrap();
     writeln!(
         worker_file,
-        "{{\"ts\":\"2026-03-04T05:06:13Z\",\"severity\":\"api\",\"svc\":\"worker\"}}"
+        "{{\"ts\":\"2026-03-04T05:06:13Z\",\"request_key\":\"{KEY}\",\"svc\":\"worker\"}}"
     )
     .unwrap();
     worker_file.flush().unwrap();
     wait_runtime(&worker, 7).await;
-    apply_slash_enrichment_after_filter(
+    apply_enrichment_after_filter(
         &mut adapter,
         "view-a",
-        r#"/svc\":\"(?P<severity>api)/"#,
+        &format!("request_key = pl.lit({KEY}, dtype=pl.UInt64)"),
         2,
     );
     wait_applied(&mut adapter, 2).await;
@@ -1329,8 +1330,8 @@ async fn heterogeneous_union_keeps_winning_row_derived_authority_only() {
     let mut union_candidate = candidate(1, &api, &worker, 2, 1);
     union_candidate.inputs[0].applied_generation = 2;
     union_candidate.color_rules = vec![lvu::ColorRule::column_rule(
-        "severity".into(),
-        "api".into(),
+        "request_key".into(),
+        KEY.to_string(),
         lvu::RuleColor::Red,
     )];
     adapter
@@ -1348,19 +1349,22 @@ async fn heterogeneous_union_keeps_winning_row_derived_authority_only() {
         let ready = row
             .details
             .iter()
-            .any(|(name, value)| name == "derived_ready.severity" && value == "api");
+            .any(|(name, value)| name == "derived_ready.request_key" && value == &KEY.to_string());
         if row.id.source_id == api.source_id().0.to_string() {
             assert!(painted && ready);
-            assert!(row.fields.contains(&("severity".into(), "api".into())));
+            assert!(
+                row.fields
+                    .contains(&("request_key".into(), KEY.to_string()))
+            );
         } else {
             assert!(!painted && !ready, "raw/missing B rows have no authority");
-            assert!(row.fields.contains(&("severity".into(), "null".into())));
+            assert!(row.fields.contains(&("request_key".into(), "null".into())));
         }
     }
     assert!(
         rows.iter()
             .any(|row| row.id.source_id == worker.source_id().0.to_string()
-                && row.text.contains("\"severity\":\"api\"")),
+                && row.text.contains(&format!("\"request_key\":\"{KEY}\""))),
         "the raw namesake remains intact as original context"
     );
 
@@ -1369,7 +1373,7 @@ async fn heterogeneous_union_keeps_winning_row_derived_authority_only() {
         .unwrap();
     assert_eq!(
         frozen.summary().accepted_enrichment_outputs,
-        vec!["severity"]
+        vec!["request_key"]
     );
     let precise = std::thread::spawn(move || {
         let mut rows = Vec::new();
@@ -1385,21 +1389,23 @@ async fn heterogeneous_union_keeps_winning_row_derived_authority_only() {
     .unwrap();
     assert!(precise.iter().any(|row| {
         row.record.record_id.source_id == api.source_id()
-            && row.fields.get("severity") == Some(&serde_json::json!("api"))
-            && row.field_types.get("severity").is_some()
+            && row.fields.get("request_key")
+                == Some(&serde_json::json!({"kind": "u64", "decimal": KEY.to_string()}))
+            && row.field_types.get("request_key").map(String::as_str) == Some("UInt64")
     }));
     let raw_namesake = precise
         .iter()
         .find(|row| {
             row.record.record_id.source_id == worker.source_id()
-                && String::from_utf8_lossy(&row.record.bytes).contains("\"severity\":\"api\"")
+                && String::from_utf8_lossy(&row.record.bytes)
+                    .contains(&format!("\"request_key\":\"{KEY}\""))
         })
         .expect("raw B namesake survives in original bytes");
-    assert!(!raw_namesake.fields.contains_key("severity"));
+    assert!(!raw_namesake.fields.contains_key("request_key"));
     assert_eq!(
         raw_namesake
             .omitted_fields
-            .get("severity")
+            .get("request_key")
             .map(String::as_str),
         Some("accepted output unavailable for this union row")
     );
@@ -1407,7 +1413,7 @@ async fn heterogeneous_union_keeps_winning_row_derived_authority_only() {
     let mut shared_key = candidate(2, &api, &worker, 2, 1);
     shared_key.inputs[0].applied_generation = 2;
     shared_key.filter.exact_key =
-        Some(ExactFieldConstraint::new("severity", ExactScalar::string("api").unwrap()).unwrap());
+        Some(ExactFieldConstraint::new("request_key", ExactScalar::UnsignedInteger(KEY)).unwrap());
     adapter
         .submit_union_candidate(shared_key, &|_| None)
         .unwrap();
