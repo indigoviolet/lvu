@@ -2261,3 +2261,12 @@ on the build volume, SHA256
 Owner validation SHA256:
 `ee8ad8cc6fc590ea99a1ac2782a5b6ebb7f0456b26e5811f91bd0072918a7459`.
 No Cargo build or cleanup is claimed by this integration.
+
+Primary `mise run janitor:dry` subsequently completed with exit 0 and
+`janitor would reclaim 0.00 GB`; it proposed one tiny marked temporary
+reproducer, and did not propose the active custom colour target. No cleanup
+was run. The scan spent several minutes waiting on volume I/O; other volume
+readers remained stalled after it finished. With roughly 4.1 GiB free and
+sustained I/O pressure, new local Cargo/PTY/performance gates are held pending
+storage recovery and a reviewed disposable-build reclamation plan. This is
+host evidence, not a product performance or durability result.
