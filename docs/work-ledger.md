@@ -2553,3 +2553,33 @@ pin states, keeps the API filter active during inspection, and waits for the
 complete filtered membership after restart. Source review of the six-line
 creation fix was READY; final test delta review and full combined acceptance
 remain pending before tagging.
+
+### v0.1.6 final acceptance and tag (2026-09-10)
+
+Final source `697865e493b1607b63423f5f2646e3339de73c3e` passed the complete
+release gate: 1510 Rust tests passed, zero failed, seven ignored; workspace
+all-target Clippy with warnings denied; bridge typecheck/build and 105 tests;
+both Rust binary builds; all 80 actual PTY suites in 138 seconds. The final
+pinning product and test blobs match the independently reviewed amendment.
+
+Acceptance record on the build volume:
+`primary-astra-scratch/release-gate-697865e493b1-7c36d8fecc0240cb9841d0239a6f5d3f/accepted.json`.
+The commands-log SHA256 is
+`2653b3b0c5ffd8b8646dbdda418ab84ce4667730a61185e6d089ede6ed7e3314`;
+app SHA256 is
+`e03f2aaaf17a4fea08b1633460feddff212e9ad4b6df0cb57b4c952f189f99f6`;
+TUI SHA256 is
+`049911103cf7df9e18e5b7825c4776b0ee90fce2ddb9cb4069b47a1e3442c21e`.
+Primary and independent review verified the source, producer, log and retained
+binary hashes. Review:
+`sol-runtime-review-scratch/v016-acceptance-697865e-review.md`, SHA256
+`76e30a9506ad624facd6d82902d917ddca73a1deaf5aae5d5343f9a89c0ff594`.
+
+Annotated tag `v0.1.6`, object
+`4e5237cd97a9309ed2360082b610404785449cfb`, was pushed and its remote peel
+verified equal to the accepted source. Release workflow `34440412338` started
+at that exact commit. All four native archives, tap delivery and the eleven
+installed-package PTYs remain required before undrafting. This entry records
+local acceptance and tagging, not public release or installation completion.
+Shared-capture work remains on its separate branch; paused long-running work
+has not resumed. All earlier diagnostic and baseline evidence remains retained.
