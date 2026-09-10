@@ -369,6 +369,28 @@ fn ownership_lock(path: &Path) -> io::Result<File> {
     Ok(lock)
 }
 
+/// Nonblocking variant for the stale-window sweep: index creation takes
+/// the blocking form above before creating or locking any `*.rows.idx`
+/// file, so a sweeper holding this guard excludes every creator (and a
+/// second sweeper) for the whole scan. `Ok(None)` means held elsewhere —
+/// the sweep skips rather than waits unboundedly.
+pub(crate) fn try_ownership_lock(path: &Path) -> io::Result<Option<File>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("index has no parent directory"))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(parent.join(".lvu-index-ownership.lock"))?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(Some(lock)),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Whether the shared on-disk index total could be accounted for.
 ///
 /// Bounded reconciliation stops after a fixed number of directory entries, so a

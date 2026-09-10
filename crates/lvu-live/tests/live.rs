@@ -1803,3 +1803,67 @@ fn sweep_removes_only_dead_window_overflow() {
         0
     );
 }
+
+#[test]
+fn sweep_serializes_with_creators_through_the_ownership_guard() {
+    // The sweep must hold the same `.lvu-index-ownership.lock` every index
+    // creation takes first: while a creator (simulated here by holding the
+    // guard directly) is inside, the sweep skips entirely instead of
+    // racing open+probe against an unlink. Deterministic: no timing, just
+    // lock ownership.
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("derived");
+    fs::create_dir_all(&dir).unwrap();
+    let dead = "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-99.rows.idx";
+    fs::write(dir.join(dead), b"x").unwrap();
+    let guard = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(".lvu-index-ownership.lock"))
+        .unwrap();
+    guard.try_lock_exclusive().unwrap();
+    assert_eq!(
+        lvu_live::sweep_stale_window_indexes(&dir),
+        0,
+        "sweep must skip while a creator holds the ownership guard"
+    );
+    assert!(dir.join(dead).exists(), "nothing removed under contention");
+    drop(guard);
+    assert_eq!(
+        lvu_live::sweep_stale_window_indexes(&dir),
+        1,
+        "released guard lets the sweep proceed"
+    );
+    assert!(!dir.join(dead).exists());
+}
+
+#[test]
+fn swept_pathname_recreates_cleanly_with_no_ghost() {
+    // Stale-descriptor regression: after the sweep unlinks a dead
+    // overflow file, the same pathname must recreate, lock, and serve
+    // bytes normally — never an unlinked ghost or residue.
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("derived");
+    fs::create_dir_all(&dir).unwrap();
+    let name = "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-77.rows.idx";
+    fs::write(dir.join(name), b"stale-bytes").unwrap();
+    assert_eq!(lvu_live::sweep_stale_window_indexes(&dir), 1);
+    assert!(!dir.join(name).exists(), "swept pathname is gone");
+    let fresh = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(name))
+        .unwrap();
+    fresh.try_lock_exclusive().expect("recreated file locks");
+    use std::io::{Read, Seek, SeekFrom};
+    fresh.try_clone().unwrap().write_all(b"live-bytes").unwrap();
+    let mut back = String::new();
+    let mut reader = fresh;
+    reader.seek(SeekFrom::Start(0)).unwrap();
+    reader.read_to_string(&mut back).unwrap();
+    assert_eq!(back, "live-bytes");
+}

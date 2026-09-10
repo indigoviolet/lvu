@@ -2154,16 +2154,19 @@ async fn source_worker(
 /// still terminal, and the caller reports it. `None` means the worker was
 /// cancelled while waiting.
 #[allow(clippy::type_complexity)]
-/// Keep a window tag filesystem-safe: letters, digits, dash, underscore.
-/// Anything else (notably `/` and `.`, which would escape the artifact
-/// directory or confuse the overflow-name parse below) is dropped; an
-/// empty result disables the overflow fallback.
+/// Accept exactly the window tags the application mints
+/// (`window-<pid>`): strict fail-closed validation, never a silent
+/// character filter. A filter would collide distinct inputs onto one
+/// overflow file (`a/b` and `ab`) and could mint names the sweep pattern
+/// below does not recognize (unsweepable debris). Anything else disables
+/// the overflow fallback, reverting to the historical contend-then-fail
+/// loudly — never silent reuse, never an unrecognized file.
 fn sanitize_window_tag(tag: &str) -> Option<String> {
-    let kept: String = tag
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    if kept.is_empty() { None } else { Some(kept) }
+    let pid = tag.strip_prefix("window-")?;
+    if pid.is_empty() || pid.len() > 16 || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(tag.to_owned())
 }
 
 /// Overflow artifact for a contended primary: same directory, canonical
@@ -2184,43 +2187,85 @@ fn overflow_artifact_path(primary: &Path, tag: &str) -> PathBuf {
 
 /// Whether a derived-dir entry is a window-overflow index. Primary names
 /// carry exactly two dot-parts (`<source>.<journal>`); overflows carry a
-/// third `window-<pid>` part minted by `overflow_artifact_path`. Anything
-/// else (foreign files, future shapes) is conservatively NOT an overflow
-/// and is never swept.
+/// third part minted by `overflow_artifact_path` from a validated tag
+/// (`window-<pid>` digits only — mirroring `sanitize_window_tag` so every
+/// creatable overflow is recognizable). Anything else (foreign files,
+/// future shapes) is conservatively NOT an overflow and is never swept.
 fn is_window_overflow_name(file_name: &str) -> bool {
     let Some(stem) = file_name.strip_suffix(".rows.idx") else {
         return false;
     };
     let mut parts = stem.split('.');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(_), Some(_), Some(tag), None) => {
-            tag.len() > "window-".len()
-                && tag.starts_with("window-")
-                && tag["window-".len()..]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        }
+        (Some(_), Some(_), Some(tag), None) => tag.strip_prefix("window-").is_some_and(|pid| {
+            !pid.is_empty() && pid.len() <= 16 && pid.bytes().all(|b| b.is_ascii_digit())
+        }),
         _ => false,
     }
 }
+
+/// Cap on directory entries inspected per sweep: startup must not stall
+/// scanning an unbounded cache, so the sweep stops here and leaves the
+/// rest for a later launch (debris is crash-only; live files are never
+/// touched regardless of position).
+const SWEEP_ENTRY_CEILING: usize = 4096;
+/// Wall-clock cap per sweep for the same reason. Checked per entry; cheap
+/// enough to check every time (one `Instant::now` per directory entry).
+const SWEEP_TIME_CEILING: std::time::Duration = std::time::Duration::from_secs(2);
+/// Bound for acquiring the ownership guard below: index mutations hold it
+/// briefly, so expiry means a wedged holder and the sweep skips rather
+/// than stalling startup behind it.
+const SWEEP_OWNERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bounded cleanup for window-overflow indexes: remove overflow files
 /// whose owner is gone. Liveness comes from the file lock itself — the
 /// kernel releases it on owner death, so no pid tracking (and no pid-reuse
 /// hazard) is involved. Only overflow-shaped names are candidates;
 /// primary indexes are never touched (they persist across relaunches for
-/// fast resume by design). A file created but not yet locked by a racing
-/// launcher sweeps harmlessly: its owner try-locks the unlinked inode
-/// successfully and keeps a self-consistent (if invisible) index for its
-/// own lifetime. Returns the number of files removed. Best-effort: every
-/// per-file failure is skipped, never fatal to startup.
+/// fast resume by design).
+///
+/// The whole scan runs under the directory's `.lvu-index-ownership.lock`
+/// — the same guard every index creation takes first (see
+/// `DiskService::open_budgeted`, verified as the sole production creator
+/// of `*.rows.idx` files). A racing launcher therefore cannot create or
+/// lock an overflow file mid-sweep: it blocks on (or retries past) the
+/// guard while we hold it, so the stale-descriptor race (open + probe one
+/// inode, unlink a replaced pathname) cannot occur. A racing sweeper
+/// serializes on the same guard.
+///
+/// Returns the number of files removed. Best-effort and bounded: entry
+/// and time ceilings truncate the scan conservatively (unseen debris waits
+/// for a later launch), and every per-file failure is skipped, never fatal
+/// to startup.
 pub fn sweep_stale_window_indexes(artifact_dir: &Path) -> usize {
+    // Serialize with creators; skip the sweep (don't stall startup) if a
+    // wedged holder keeps the guard past the bound.
+    let guard_deadline = std::time::Instant::now() + SWEEP_OWNERSHIP_TIMEOUT;
+    let _guard = loop {
+        match crate::index::try_ownership_lock(&artifact_dir.join(".sweep-probe")) {
+            Ok(Some(guard)) => break Some(guard),
+            Ok(None) => {
+                if std::time::Instant::now() >= guard_deadline {
+                    return 0;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return 0,
+        }
+    };
     let entries = match std::fs::read_dir(artifact_dir) {
         Ok(entries) => entries,
         Err(_) => return 0,
     };
+    let start = std::time::Instant::now();
     let mut removed = 0usize;
-    for entry in entries.flatten() {
+    for (scanned, entry) in entries.enumerate() {
+        if scanned >= SWEEP_ENTRY_CEILING || start.elapsed() >= SWEEP_TIME_CEILING {
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -2269,18 +2314,23 @@ mod window_overflow_tests {
     use std::path::Path;
 
     #[test]
-    fn sanitize_keeps_window_ids_and_rejects_escapes() {
+    fn sanitize_accepts_only_window_pid_tags() {
+        // Exactly what the application mints; everything else disables
+        // the fallback loudly (contend-then-fail) instead of filtering
+        // silently into collisions or unsweepable names.
         assert_eq!(
             sanitize_window_tag("window-1234"),
             Some("window-1234".to_owned())
         );
+        assert_eq!(sanitize_window_tag("window-0"), Some("window-0".to_owned()));
         assert_eq!(sanitize_window_tag(""), None);
-        assert_eq!(sanitize_window_tag("..."), None);
-        assert_eq!(sanitize_window_tag("../evil"), Some("evil".to_owned()));
-        assert_eq!(
-            sanitize_window_tag("window-1/x.rows.idx"),
-            Some("window-1xrowsidx".to_owned())
-        );
+        assert_eq!(sanitize_window_tag("window-"), None);
+        assert_eq!(sanitize_window_tag("window-abc"), None);
+        assert_eq!(sanitize_window_tag("../evil"), None);
+        assert_eq!(sanitize_window_tag("window-1/x.rows.idx"), None);
+        assert_eq!(sanitize_window_tag("window-1x"), None);
+        assert_eq!(sanitize_window_tag("other-99"), None);
+        assert_eq!(sanitize_window_tag("window-12345678901234567"), None);
     }
 
     #[test]
@@ -2310,9 +2360,12 @@ mod window_overflow_tests {
         assert!(!is_window_overflow_name("a.b.rows.idx"));
         assert!(!is_window_overflow_name("a.b.other.rows.idx"));
         assert!(!is_window_overflow_name("a.b.window-.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.window-x.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.window-1x.rows.idx"));
         assert!(!is_window_overflow_name("a.b.c.d.rows.idx"));
         assert!(!is_window_overflow_name("a.b.window-1.rows.idx.bak"));
         assert!(is_window_overflow_name("a.b.window-7.rows.idx"));
+        assert!(is_window_overflow_name("a.b.window-0.rows.idx"));
     }
 }
 
