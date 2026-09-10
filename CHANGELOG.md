@@ -4,6 +4,20 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## [v0.1.7](https://github.com/indigoviolet/lvu/releases/tag/v0.1.7) — 2026-09-10
+
+### Features
+
+- With sources open, `/` opens the Filter dialog (Search and Advanced tabs)
+  and Alt-A selects Advanced, replacing the old `/` literal-search and `p`
+  advanced shortcuts in the help text. Search behavior itself is unchanged.
+- Releases ship Linux x86_64, Linux arm64 and Apple-silicon macOS archives.
+
+### Breaking changes
+
+- No Intel macOS archive is built or shipped. Apple-silicon macOS remains
+  supported; Windows remains unsupported and unpackaged.
+
 ## v0.1.6 — 2026-09-10
 
 Published with all four native archives; exact-source and installed-archive acceptance passed.
