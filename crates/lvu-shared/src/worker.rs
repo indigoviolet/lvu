@@ -494,7 +494,19 @@ impl Drop for LifecyclePermit {
 pub struct WorkerService {
     config: WorkerConfig,
     manager: Arc<SourceManager>,
-    store: Arc<std::sync::Mutex<WorkspaceStore>>,
+    /// Durable view/recipe persistence, or `None` when the workspace
+    /// database could not be opened (unknown future schema, corruption,
+    /// unreadable directory). Degraded mode keeps capture, progress,
+    /// presence and session alive — raw browsing works — while every
+    /// mediated store op fails loudly through `with_store` below. The
+    /// database file itself is never touched in this mode: no migration,
+    /// no reset, no journal-mode flip (see `open`). Exactly one of this
+    /// and `store_unavailable` is `Some`.
+    store: Option<Arc<std::sync::Mutex<WorkspaceStore>>>,
+    /// Why persistence is unavailable (set iff `store` is `None`). Surfaced
+    /// in the open warning (worker log) and in every mediated failure so a
+    /// degraded window always names its cause instead of failing silently.
+    store_unavailable: Option<String>,
     viewers: Mutex<ViewerSet>,
     admission: Arc<dyn AdmissionHook>,
     stdin_bindings: Mutex<HashMap<SourceId, StdinBinding>>,
@@ -542,8 +554,16 @@ impl WorkerService {
         let viewer_grace = config.viewer_grace;
         let manager = SourceManager::new(config.capture_root.clone(), RuntimeConfig::default())
             .map_err(|error| format!("open source manager: {error}"))?;
-        let store = WorkspaceStore::open(config.workspace_root.clone())
-            .map_err(|error| format!("open workspace store: {error}"))?;
+        // Persistence is optional for capture: an unreadable workspace
+        // database (future schema, corruption, permissions) degrades to
+        // loud per-operation failures while capture, progress, presence
+        // and session keep working. The file itself is never opened here,
+        // so no migration or reset can touch it; local (non-worker) open
+        // paths keep their strict behavior unchanged.
+        let (store, store_unavailable) = match WorkspaceStore::open(config.workspace_root.clone()) {
+            Ok(store) => (Some(Arc::new(std::sync::Mutex::new(store))), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         // A corrupt or oversize manifest degrades to an empty session with
         // a reported diagnostic, mirroring session load discipline: it must
         // never block capture startup, and nothing is silently discarded
@@ -552,11 +572,24 @@ impl WorkerService {
             Ok(session) => (session, None),
             Err(error) => (Vec::new(), Some(error)),
         };
+        // Both diagnostics travel: degraded persistence first (it governs
+        // every mediated write below), then the session note. Either way
+        // the child logs the combined warning and serves.
+        let warning = match (store_unavailable.clone(), session_warning) {
+            (Some(degraded), Some(session)) => Some(format!(
+                "workspace store unavailable ({degraded}); capture and raw browsing continue, saves and loads will fail loudly; {session}"
+            )),
+            (Some(degraded), None) => Some(format!(
+                "workspace store unavailable ({degraded}); capture and raw browsing continue, saves and loads will fail loudly"
+            )),
+            (None, session) => session,
+        };
         Ok((
             Arc::new(Self {
                 config,
                 manager: Arc::new(manager),
-                store: Arc::new(std::sync::Mutex::new(store)),
+                store,
+                store_unavailable,
                 viewers: Mutex::new(ViewerSet::new(std::time::Instant::now(), viewer_grace)),
                 admission,
                 stdin_bindings: Mutex::new(HashMap::new()),
@@ -576,7 +609,7 @@ impl WorkerService {
                 shutdown_flag: std::sync::atomic::AtomicBool::new(false),
                 worker_session: uuid::Uuid::new_v4().to_string(),
             }),
-            session_warning,
+            warning,
         ))
     }
 
@@ -2134,7 +2167,20 @@ impl WorkerService {
         E: std::fmt::Display + Send + 'static,
         F: FnOnce(&mut WorkspaceStore) -> Result<T, E> + Send + 'static,
     {
-        let store = Arc::clone(&self.store);
+        // Degraded mode short-circuits every mediated path with the open
+        // failure as the reason: capture never needed the store, and a
+        // persistence failure must stay loud rather than become a silent
+        // empty/success. No store lock is taken on this path.
+        if let Some(reason) = self.store_unavailable.as_deref() {
+            return Err(format!(
+                "workspace store unavailable ({reason}); capture continues, persistence refused"
+            ));
+        }
+        let Some(store) = self.store.as_ref() else {
+            // Unreachable: exactly one of `store`/`store_unavailable` is set.
+            return Err("workspace store unavailable: unknown".into());
+        };
+        let store = Arc::clone(store);
         tokio::task::spawn_blocking(move || {
             let mut store = store.lock().expect("workspace store poisoned");
             operation(&mut store)
@@ -4260,6 +4306,78 @@ mod tests {
         );
         // Exactly one definition committed: no second capture exists.
         assert_eq!(service.snapshot_definitions().await.len(), 1);
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    /// Degraded workspace: a database the store cannot open still yields a
+    /// serving worker. Capture, progress and presence work (raw browsing);
+    /// every mediated store op fails loudly naming the cause; the database
+    /// bytes are never modified (no migration, no reset).
+    #[tokio::test]
+    async fn degraded_workspace_serves_capture_and_refuses_persistence_loudly() {
+        // Minimal SQLite header (100 bytes) with a future user_version at
+        // offset 60: new enough to parse, too new to migrate. Crafted byte
+        // by byte so the test needs no database dependency.
+        let root = tempfile::tempdir().expect("scratch root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let db = workspace.join("workspace.sqlite3");
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\x00");
+        header[60..64].copy_from_slice(&9999u32.to_be_bytes());
+        std::fs::write(&db, &header).expect("fixture database");
+        let before = std::fs::read(&db).expect("fixture bytes");
+
+        let mut config = test_config(root.path());
+        config.workspace_root = workspace.clone();
+        let (service, warning) =
+            WorkerService::open(config, Arc::new(AdmitAll)).expect("degraded open still serves");
+        let warning = warning.expect("degraded open warns loudly");
+        assert!(
+            warning.contains("workspace store unavailable"),
+            "warning names the outage: {warning}"
+        );
+        assert!(
+            warning.contains("raw browsing continue"),
+            "warning states what still works: {warning}"
+        );
+
+        // Capture works: fresh admission through the manager.
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\n").expect("seed log");
+        let definition = file_definition(61, &log);
+        let source_id = match service
+            .request_start(definition.clone())
+            .await
+            .expect("capture starts degraded")
+        {
+            StartedOutcome::Started { source_id, .. } => source_id,
+            other => panic!("expected a live capture, got {other:?}"),
+        };
+        assert_eq!(source_id, definition.id);
+        // Progress works (verbatim snapshot, no store involved).
+        let progress = service
+            .poll_source_progress(&source_id.0.to_string())
+            .expect("progress polls degraded");
+        assert_eq!(progress.source_id, source_id);
+
+        // Every mediated store op fails loudly naming the cause — never a
+        // silent empty, never a fake success.
+        match service.mediated_recent("r1".into()).await {
+            StoreEvent::RecentFailed { reason, .. } => assert!(
+                reason.contains("workspace store unavailable"),
+                "recent names the outage: {reason}"
+            ),
+            other => panic!("recent must fail loudly, got {other:?}"),
+        }
+        // The database file is byte-identical: no migration attempted, no
+        // reset, no journal-mode flip — degraded mode never opens it.
+        assert_eq!(
+            std::fs::read(&db).expect("fixture bytes after"),
+            before,
+            "degraded mode never modifies the database"
+        );
         service.request_shutdown();
         service.shutdown().await;
     }
