@@ -2,8 +2,8 @@
 
 Current support scope (2026-09-10): Linux x86_64/arm64 and Apple-silicon macOS.
 Intel Macs and Windows are unsupported. Their entries below preserve historical
-audit/CI evidence, not acceptance targets. Existing CI still includes those jobs;
-removing them is tracked in TODO.md.
+audit/CI evidence, not acceptance targets. The working-tree workflows now omit Intel/Windows jobs; historical hosted
+results below remain unchanged. No new hosted run is claimed.
 
 Audit baseline: source `9fc7e5363d975c231b7f5d8fe1e16c3e249a7752`, 2026-09-09.
 This is an evidence map, not a claim that every packaged platform is supported.
@@ -70,21 +70,15 @@ open; this result does not claim broad platform support.
 ## Dedicated hosted workflow
 
 `.github/workflows/platform-validation.yml` runs on an explicit dispatch or a
-pull request that changes platform-relevant paths. It performs three distinct
-checks without weakening one into another:
+pull request that changes platform-relevant paths. The Apple-silicon runner
+performs an all-target workspace compile probe, then builds a complete
+development-profile install tree and drives the staged binary through a real
+kernel PTY. It covers help/resource resolution, file capture, Ctrl-C restoration,
+orderly shell-and-child cleanup and the exact current piped-stdin refusal.
 
-1. Both native Darwin runners run an all-target workspace compile probe.
-2. The arm64 runner builds a complete development-profile install tree and
-   drives the staged binary through a real kernel PTY. It covers help/resource
-   resolution, file capture, Ctrl-C restoration, orderly shell-and-child cleanup,
-   and the exact current piped-stdin refusal.
-3. A Windows Server 2022 runner compiles each affected target crate separately
-   and accepts only the exact currently first dependency diagnostics from
-   Cargo's JSON stream, including their package, source path and multiplicity.
-   Mixed or additional compiler failures are rejected. A newly successful
-   compile also fails the characterization so it must be replaced by a real
-   success expectation. This green job is evidence of a blocker, never evidence
-   of Windows support.
+The former Intel compile row and Windows known-blocker job are retired.
+Their diagnostic scripts and recorded evidence remain available for historical
+inspection; they are not current support requirements.
 
 Each job uploads JSON plus the complete compile log under a run-, attempt-, and
 target-specific artifact. The JSON binds the source SHA, host, Rust version,

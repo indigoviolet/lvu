@@ -1,8 +1,9 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.5` (2026-09-10) is the current public release, including named display
-zones, enrichment column roles, unified grouping and status/FOLLOW changes.
+`v0.1.6` (2026-09-10) is the current public release, including live unions,
+shared keys and enrichment-backed colours, plus named display zones, enrichment
+column roles, unified grouping and status/FOLLOW changes.
 Releases use only the vX.Y.Z scheme.
 Historical build numbers below date when behavior arrived; they are not a separate
 release channel.
@@ -31,7 +32,7 @@ time authority. Startup installs the validated effective zone into Appearance.
 
 ## Component map
 
-The working tree also integrates enrichment-based colour classification for
+Published v0.1.6 includes enrichment-based colour classification for
 ordinary views. The dialog selects an accepted output and an exact value;
 native Polars evaluates matching, using the same scalar text representation
 as displayed derived cells. Accepted output authority excludes raw namesakes
@@ -41,8 +42,8 @@ classifier fields, so older readers retain legacy rules but omit classifiers
 when saving. Union colour rules use the dedup-winning input's accepted output
 authority; unauthorized raw namesakes are excluded before typed concatenation.
 Focused terminal coverage verifies rule order, row colours and restart.
-Combined release acceptance remains pending; this does not describe published
-v0.1.5 behavior.
+Combined v0.1.6 release acceptance passed. Automatic shared capture across
+application windows remains separate implementation work.
 
 | Component | Responsibility and starting points |
 | --- | --- |
@@ -249,7 +250,7 @@ same identities; partial success consumes it. Cancellation discards retry
 authority while already-admitted starts finish. Admission compares lossless
 acquisition identities and full policies against live and pending definitions;
 path comparison uses per-pass canonicalization evidence or exact unresolved
-spellings, never display text. This batch flow is not yet in a published release.
+spellings, never display text. This batch flow shipped in v0.1.3.
 
 Timestamp assistance should inspect actual usable typed fields first, regardless
 of their names, and produce `timestamp_utc`. Raw extraction is a fallback requiring

@@ -6,23 +6,18 @@ app crate version and lockfile version must agree. Push the specific version tag
 rather than all local tags, and never move an existing version tag.
 See [versions](versions.md) for local installation and retention.
 
-Support scope as of 2026-09-10 is Linux x86_64/arm64 and Apple-silicon macOS.
-Intel Macs and Windows are unsupported. Historical four-archive releases remain
-immutable. The existing matrix and four-archive commands below still describe
-the previous distribution policy; align automation and these commands before
-the next publication, as tracked in TODO.md.
+Supported release targets are Linux x86_64/arm64 and Apple-silicon macOS.
+Intel Macs and Windows are unsupported. The release workflow and default
+Homebrew renderer require this three-target set. Historical four-archive
+releases remain immutable; `--with-intel-darwin` is available only when
+re-rendering a historical formula.
 
-**State: `v0.1.6` is tagged and published, with all four historical archives and the updated tap.**
-Steps 1–4 retain the historical `v0.1.0` procedure for reference only. Their
-four-archive requirements and publication commands are not instructions for
-the next release. First align the workflow, renderer, verification and this
-runbook with the three supported targets tracked in TODO.md.
-
-Historical publication commands follow. Every step here has been executed
-for real, on `v0.1.0`, and the two install paths in step 4 were verified from a
-clean machine afterwards. See [distribution](distribution.md) for what the
-archives contain and why the Linux target is musl, and
-[packaging](../packaging/README.md) for how one archive is built and verified.
+**State: `v0.1.6` is tagged and published with four historical archives.**
+The next release uses three targets. Steps 1–4 retain `v0.1.0` command examples;
+substitute the new version when following [step 5](#5-cutting-the-next-version).
+Do not recreate or move a published tag. Historical installation evidence is
+described in [distribution](distribution.md); local fixture checks of the
+three-target change are recorded in the [work ledger](work-ledger.md).
 
 Two independent facts have to agree or the release is broken:
 
@@ -134,9 +129,8 @@ gh release view v0.1.0
 ```
 
 If any native job fails, keep the release draft and resolve the failure.
-The historical procedure required all four verified archives and checksums.
-Do not use this procedure for the next release until supported-target alignment
-is complete.
+Publication requires all three supported archives and their checksums.
+A partial draft must remain a draft; do not update the tap or publish it.
 
 ## 3. Render and publish the formula
 
@@ -151,19 +145,22 @@ gh release download v0.1.0 --repo indigoviolet/lvu -p SHA256SUMS -O - \
 ```
 
 The renderer supports explicitly missing targets for historical partial releases.
-The example below is historical only. The renderer and its verification must
-be aligned with the supported targets before use for a new release:
+The example below is historical only; never use missing-target exceptions
+for a new release. Re-rendering an older Intel-inclusive formula requires
+`--with-intel-darwin`:
 
 ```sh
 gh release download v0.1.0 --repo indigoviolet/lvu -p SHA256SUMS -O - \
   | /path/to/lvu/packaging/homebrew/render-formula.sh 0.1.0 - \
+      --with-intel-darwin \
       --allow-missing aarch64-apple-darwin \
       --allow-missing x86_64-apple-darwin > Formula/lvu.rb
 ```
 
-The renderer knows four targets: `x86_64-unknown-linux-musl`,
-`aarch64-unknown-linux-musl`, `aarch64-apple-darwin` and
-`x86_64-apple-darwin`. Dropping every target under a platform removes that
+The default renderer requires `x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl` and `aarch64-apple-darwin`. It excludes Intel macOS
+even when an old checksum file lists that archive. The explicit historical flag
+also enables `x86_64-apple-darwin`. Dropping every target under a platform removes that
 platform's whole block, so a release with no Linux archive renders a
 macOS-only formula rather than an empty `on_linux`.
 
@@ -291,12 +288,10 @@ brew install uv node     # or: mise use -g uv node
 `v0.1.6` is published. Use `0.1.7` for the next release after its integrated
 features pass the checks above; the examples below do not authorize an early tag.
 
-Before executing the versioning/publication sequence below, finish supported-
-target alignment in the workflow, renderer, verification and runbook. The next
-release requires verified Linux x86_64, Linux arm64 and Apple-silicon macOS
-archives and checksums. Intel Darwin is excluded. The existing four-archive
-automation is not ready for this policy; these commands remain non-actionable
-until that tracked work lands.
+The next release requires verified Linux x86_64, Linux arm64 and Apple-silicon
+macOS archives and checksums. Intel Darwin is excluded. Run
+`mise exec -- bash packaging/homebrew/tests/test-render-formula.sh` when changing
+formula generation; local fixtures do not replace actual archive acceptance.
 
 ```sh
 git status --short --branch # use the reviewed integration/release checkout

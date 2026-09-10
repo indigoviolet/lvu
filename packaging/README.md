@@ -87,6 +87,7 @@ draft release with `SHA256SUMS`.
 
 ## Known gaps
 
-- macOS archives are unsigned and unnotarized, and no Darwin binary has been
-  run on a Mac. They are built on GitHub runners only.
-- Linux is x86_64 only; there is no `aarch64-unknown-linux-musl` archive.
+- Apple-silicon macOS archives are unsigned and unnotarized. Native CI executes
+  them; human terminal acceptance remains outstanding. Intel Macs are unsupported.
+- Linux x86_64 and arm64 archives are built and executed on native CI runners.
+  Human interactive acceptance on arm64 remains outstanding.

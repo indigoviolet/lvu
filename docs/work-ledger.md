@@ -2790,3 +2790,39 @@ final-install fencing passed static inspection; tests used an in-process
 transport. The owner is repairing wait bounds and digest coupling, while shared
 API owners coordinate checked-in prerequisites. Real worker RPC and application
 acceptance remain required. No product changes were integrated by this update.
+
+
+### Delegated worktree cleanup report — 2026-09-10
+
+The old supervisor, explicitly assigned an exclusive set by the disk cleanup
+coordination, reports successful retirement of compiler bulk from eight
+targets: Sol named-timezones, platform-validation, shared-key-auto-pin,
+union-visit, enrichment-correlation and stats-throughput, plus Muse enrichment
+and colour. Reported free-space gain is 17,636,868,096 bytes (16.426 GiB),
+ending at 33,833,693,184 bytes free (31.5 GiB). Combined with the earlier
+primary release-target cleanup, reported reclamation is about 27.9 GiB.
+
+Executor exit zero, held validation/per-target locks, privileged scans with
+zero refused/denied references and matching post-cleanup preserved hashes are
+reported. The exact stats_throughput-e107be8178a4dc5d executable remains in deps.
+Proof: `primary-astra-scratch/retire-released-targets-20260910-proof.jsonl`;
+executor: `primary-astra-scratch/retire-released-targets.py`. The primary did not
+execute this pass or independently repeat its file/process checks. These eight
+targets are marked done; the dedicated disk agent owns the remainder. No
+captures or active targets were reported touched.
+
+### Three-target release preparation — 2026-09-10
+
+Candidate `91391c7` was cherry-picked as `18c07c5`. The workflow and default
+formula renderer now select Linux x86_64/arm64 and Apple-silicon macOS. Intel
+Darwin is available only through an explicit historical re-rendering option;
+the Intel/Windows validation jobs are removed, while diagnostic scripts and
+immutable historical archives remain. Primary ran all six formula fixtures
+successfully; output checks also require renderer exit zero. Independent Sol
+review of this amended checkpoint remains pending. No hosted workflow, new
+release, Homebrew install or Rust build was run for this change.
+
+The release runbook, distribution/support map and packaging notes now match
+the three-target procedure; historical install evidence retains its original
+version. Architecture wording now reflects published v0.1.6 rather than stale
+v0.1.5 status. Documentation whitespace checks passed.
