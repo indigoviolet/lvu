@@ -3,6 +3,7 @@
 pub mod command_columns;
 mod export;
 pub mod folding;
+mod remote_union_commit;
 pub mod time_basis;
 /// Live union views over accepted input views (Muse union-views worktree).
 /// The worker and all union methods live in `union_worker.rs`; the pure
@@ -11,6 +12,7 @@ pub mod union;
 mod union_worker;
 pub use command_columns::CommandColumns;
 pub use export::*;
+pub use remote_union_commit::RemoteUnionCommitTransport;
 pub use union::{
     INPUT_COLUMN, MAX_UNION_BYTES, MAX_UNION_INPUTS, MAX_UNION_ROWS, MergedUnionRow,
     SEQUENCE_COLUMN, SOURCE_ID_COLUMN, StoredUnionInput, StoredUnionShape, UNION_TS_COLUMN,
@@ -33,7 +35,6 @@ use lvu::{
     terminal::QueryDispatcher,
 };
 use lvu_core::SourceId;
-use lvu_ingest::SourceHandle;
 use lvu_live::{IndexState, LiveRowProvider, SourceViewStatus};
 use lvu_query::{
     BatchQuery, BatchValidity, CompiledEnrichment, CompilerHost, CompilerHostConfig, DerivedState,
@@ -42,6 +43,7 @@ use lvu_query::{
     compile_enrichment_chain, exact_key_flags, execute_batch_with_exact_constraint, non_null_flags,
     parse_regex_enrichment, records_to_batch_with_context_and_exact_field, scalar_projection,
 };
+use lvu_shared::AnySourceHandle;
 use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -173,7 +175,7 @@ pub trait RawRowSource: Send + Sync {
         len: usize,
     ) -> lvu::ContextPage;
     fn revision(&self, view_id: &str) -> u64;
-    fn register_source(&self, handle: SourceHandle) -> Result<(), String>;
+    fn register_source(&self, handle: AnySourceHandle) -> Result<(), String>;
     fn register_raw_view(&self, view_id: &str, sources: Vec<SourceId>) -> Result<(), String>;
     fn drain_ready_updates(&self, maximum: usize) -> usize;
     fn source_status(&self, source_id: SourceId) -> Option<SourceViewStatus>;
@@ -202,7 +204,7 @@ impl RawRowSource for LiveRowProvider {
     fn revision(&self, view_id: &str) -> u64 {
         RowProvider::revision(self, view_id)
     }
-    fn register_source(&self, handle: SourceHandle) -> Result<(), String> {
+    fn register_source(&self, handle: AnySourceHandle) -> Result<(), String> {
         LiveRowProvider::register_source(self, handle).map_err(|error| error.to_string())
     }
     fn register_raw_view(&self, view_id: &str, sources: Vec<SourceId>) -> Result<(), String> {
@@ -344,7 +346,7 @@ pub struct ViewQueryStatus {
 
 #[derive(Clone)]
 struct SourceRegistration {
-    handle: SourceHandle,
+    handle: AnySourceHandle,
 }
 
 #[derive(Clone)]
@@ -1453,6 +1455,7 @@ pub struct NativeViewAdapter {
     snapshot_jobs: Arc<std::sync::atomic::AtomicUsize>,
     compiler_calls: Arc<AtomicU64>,
     refresh_stats: Arc<RefreshStats>,
+    remote_union_commit: Option<remote_union_commit::RemoteUnionCommitRegistration>,
 }
 
 /// Cloneable read-only half for terminal composition. Keep the adapter itself as
@@ -1541,7 +1544,27 @@ impl NativeViewAdapter {
             snapshot_jobs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             compiler_calls,
             refresh_stats,
+            remote_union_commit: None,
         })
+    }
+
+    /// Installs the non-blocking window-to-worker commit transport used only
+    /// for unions whose raw inputs all belong to one remote worker session.
+    /// Local adapters leave this unset and retain their existing guarded
+    /// publication transaction.
+    pub fn set_remote_union_commit_transport(
+        &mut self,
+        window_id: String,
+        transport: Arc<dyn RemoteUnionCommitTransport>,
+    ) -> Result<(), String> {
+        if window_id.is_empty() || window_id.len() > lvu_shared::union_commit::MAX_WINDOW_ID_BYTES {
+            return Err("remote union commit window id is invalid".into());
+        }
+        self.remote_union_commit = Some(remote_union_commit::RemoteUnionCommitRegistration {
+            window_id,
+            transport,
+        });
+        Ok(())
     }
 
     /// Number of Python definition compilations requested by this adapter.
@@ -1555,7 +1578,7 @@ impl NativeViewAdapter {
         self.refresh_stats.snapshot()
     }
 
-    pub fn register_source(&self, handle: SourceHandle) -> Result<(), ViewError> {
+    pub fn register_source(&self, handle: AnySourceHandle) -> Result<(), ViewError> {
         {
             let shared = self.shared.lock().expect("view state poisoned");
             if !shared.accepting {
@@ -3810,7 +3833,7 @@ fn run_query(
     config: &ViewConfig,
     compiler: &mut Option<CompilerHost>,
     request: QueryRequest,
-    sources: Vec<SourceHandle>,
+    sources: Vec<AnySourceHandle>,
     cancelled: Arc<AtomicBool>,
     command_results: Vec<Arc<CommandColumns>>,
     tx: &mpsc::SyncSender<Update>,
@@ -6747,7 +6770,7 @@ const STATS_AGGREGATE_RECORDS: usize = 65_536;
 fn field_stats_loop(
     request: FieldStatsRequest,
     membership: Option<Arc<Membership>>,
-    handles: Vec<SourceHandle>,
+    handles: Vec<AnySourceHandle>,
     page_records: usize,
     page_bytes: usize,
     tx: mpsc::SyncSender<Update>,
@@ -6797,7 +6820,7 @@ fn field_stats_pass(
     runtime: &tokio::runtime::Runtime,
     request: &FieldStatsRequest,
     membership: Option<&Membership>,
-    handles: &[SourceHandle],
+    handles: &[AnySourceHandle],
     page_records: usize,
     page_bytes: usize,
     cancel: &Arc<AtomicBool>,
@@ -6904,7 +6927,7 @@ fn field_stats_pass(
 
 fn correlation_lookup_loop(
     request: CorrelationLookupRequest,
-    handles: Vec<SourceHandle>,
+    handles: Vec<AnySourceHandle>,
     tx: mpsc::SyncSender<Update>,
     cancel: Arc<AtomicBool>,
 ) {
@@ -6936,7 +6959,7 @@ fn correlation_lookup_loop(
 fn correlation_lookup(
     runtime: &tokio::runtime::Runtime,
     request: &CorrelationLookupRequest,
-    handles: &[SourceHandle],
+    handles: &[AnySourceHandle],
     cancel: &Arc<AtomicBool>,
 ) -> Result<CorrelationCandidate, String> {
     let origin = handles
@@ -6970,7 +6993,7 @@ fn correlation_lookup(
 /// bytes. The displayed string is a projection and is never used here.
 fn correlation_origin_value(
     runtime: &tokio::runtime::Runtime,
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     request: &CorrelationLookupRequest,
     cancel: &Arc<AtomicBool>,
 ) -> Result<lvu_core::ExactScalar, String> {
@@ -7016,7 +7039,7 @@ fn correlation_origin_value(
 /// when the sample stopped early instead of implying it saw everything.
 fn correlation_field_names(
     runtime: &tokio::runtime::Runtime,
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(Vec<String>, bool), String> {
     let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();

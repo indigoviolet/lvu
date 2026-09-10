@@ -2970,3 +2970,22 @@ ordinary shared cache. Sol97 is reviewing exact index ownership/sweep safety,
 closure of controller findings and acceptance source binding. This is owner
 acceptance evidence pending independent review, not primary integration or
 published shared-capture behavior.
+
+
+### Reviewed shared capture merged into primary — 2026-09-10
+
+Sol97 cleared exact `873b3049b4750b3efbdeed9b3a9f747a9686e786` for
+primary integration. Review verified bounded all-entry scan accounting, real
+index creator/sweeper ownership exclusion, integrated no-replay worker tests
+and ordinary two-window acceptance. The retained final binary SHA-256 is
+`d179c29f66a98dd893eefd96b0d496a28a67ef4fbfc18d909487297f71000d1b`.
+Earlier blank-screen probes were causally explained by undrained PTY reads;
+negative controls and properly drained acceptance do not support a product
+startup-race hold. Earlier failed/lint iterations remain retained.
+
+Primary merged that exact candidate without conflicts, preserving the current
+CLI help and release-scope changes. Merge whitespace checks passed. Full
+primary-checkout validation remains pending; this is not a published release.
+A pre-existing unstaged mise tool-version update was preserved outside the
+merge commit. The independent union-colour restore scheduling defect on the
+release line still blocks publication and is assigned to the release owner.

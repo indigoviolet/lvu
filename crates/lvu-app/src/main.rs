@@ -59,6 +59,7 @@ mod memory;
 mod resources;
 mod session;
 pub mod settings;
+mod shared_capture;
 mod shared_key_controller;
 mod shared_key_workflow;
 mod storage;
@@ -68,7 +69,7 @@ use agent::{
     MAX_SOURCES_PER_PROPOSAL, OriginatingRevision, ProposalContext, ProposalEnvelope, ProposalKind,
     Request as AgentRequest, SessionPurpose,
 };
-use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest, SuggestionContext};
+use memory::{Event as MemoryEvent, SaveRequest, SuggestionContext};
 use storage::StorageJob;
 
 const SOURCE_NAMESPACE: Uuid = Uuid::from_bytes([
@@ -261,6 +262,12 @@ struct Options {
     /// Start with nothing acquired. Captured data is untouched; only the
     /// re-acquisition of the previous session's sources is skipped.
     fresh: bool,
+    /// Shared-capture window (hidden intermediate diagnostic, NOT the
+    /// acceptance path): attach to the background worker for the capture
+    /// root instead of owning capture locally. Final shape is automatic
+    /// sharing on ordinary launches; session consumption waits for the
+    /// remote handle seam.
+    shared: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -273,8 +280,32 @@ enum SourceArgument {
 struct StartedSource {
     definition: SourceDefinition,
     view_id: String,
-    handle: SourceHandle,
+    handle: lvu_shared::AnySourceHandle,
     origin: Option<StartOrigin>,
+    /// Id proposed at spawn, for pending-map removal. Always equals
+    /// `definition.id` on local starts; on a worker dedup Present the
+    /// worker answers with the winner's id in `definition.id` while the
+    /// pending maps were keyed by this proposal.
+    proposed_id: SourceId,
+}
+
+/// Adopt the worker-canonical capture identity: on a fresh admit the
+/// worker echoes the proposed id (no-op); on a dedup Present it returns
+/// the winner's, and every downstream registration, view, map, and notice
+/// must use the winner — the proposed id names nothing once the worker
+/// has spoken. The local spelling (name, path, options) is preserved
+/// byte-identical; only the id is worker-authoritative. Failure paths
+/// must never stop the worker capture from the winner id: it may be
+/// another window's live capture (see the settlement and startup
+/// cleanups, which stay manager-scoped).
+fn adopt_winner_identity(
+    definition: SourceDefinition,
+    winner: SourceId,
+) -> (SourceDefinition, String) {
+    let mut definition = definition;
+    definition.id = winner;
+    let view_id = view_id(winner);
+    (definition, view_id)
 }
 
 #[derive(Clone)]
@@ -639,6 +670,24 @@ struct SourceControlJob {
     worker: tokio::task::JoinHandle<()>,
 }
 
+/// Outcome of one shared-capture control operation, settled like a local
+/// control job: restarts carry the fresh remote handle for adapter
+/// registration, stops carry nothing. Failures carry the worker's reason
+/// (or an honest unknown-outcome report when the transport retired
+/// underneath).
+enum SharedControlOutcome {
+    Restarted { handle: lvu_shared::AnySourceHandle },
+    Stopped,
+}
+
+/// In-flight shared control operation, mirroring `SourceControlJob`.
+/// Exactly one of the two maps owns an id at a time (see intake).
+struct SharedControlJob {
+    restart: bool,
+    result: tokio::sync::oneshot::Receiver<Result<SharedControlOutcome, String>>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
 async fn control_source(
     manager: Arc<SourceManager>,
     definition: SourceDefinition,
@@ -707,6 +756,11 @@ struct Composition {
     manager: Arc<SourceManager>,
     raw: Arc<LiveRowProvider>,
     runtime: tokio::runtime::Handle,
+    /// Shared-capture session when this window shares its worker (`None`
+    /// in tests and any flow that must stay process-local). `Some` in
+    /// every ordinary launch: file/command acquisition, control, and the
+    /// store all go through it; stdin stays manager-local.
+    shared: Option<Arc<shared_capture::SharedStore>>,
     starts_tx: mpsc::Sender<StartResult>,
     starts_rx: mpsc::Receiver<StartResult>,
     sources: HashMap<SourceId, String>,
@@ -718,6 +772,11 @@ struct Composition {
     /// same acquisition cannot slip in beside it.
     pending_definitions: HashMap<SourceId, SourceDefinition>,
     source_controls: HashMap<SourceId, SourceControlJob>,
+    /// In-flight shared-capture control operations (worker restarts and
+    /// stops), mirroring `source_controls` shape and limits. Local and
+    /// shared jobs never share an id: routing decides once at intake by
+    /// session ownership, so the two maps cannot double-drive one source.
+    shared_controls: HashMap<SourceId, SharedControlJob>,
     cwd: PathBuf,
     scans_tx: mpsc::Sender<ScanResult>,
     scans_rx: mpsc::Receiver<ScanResult>,
@@ -725,7 +784,7 @@ struct Composition {
     pending_scan: Option<u64>,
     discovery_candidates: HashMap<String, CandidateSelection>,
     recent_sources: Vec<lvu_memory::SourceMetadata>,
-    memory: MemoryWorker,
+    memory: memory::Memory,
     memory_ready: HashSet<SourceId>,
     memory_restoring: HashSet<lvu_core::ViewId>,
     memory_deferred: HashMap<lvu_core::ViewId, lvu_memory::WorkingView>,
@@ -931,8 +990,12 @@ impl Composition {
                 Ok(started) => {
                     let source_id = started.definition.id;
                     let definition = started.definition.clone();
-                    self.pending_starts.remove(&source_id);
-                    self.pending_definitions.remove(&source_id);
+                    // Pending maps were keyed by the spawn-time proposal;
+                    // the worker may have answered with a dedup winner id,
+                    // so removal uses the proposal while everything below
+                    // uses the canonical winner.
+                    self.pending_starts.remove(&started.proposed_id);
+                    self.pending_definitions.remove(&started.proposed_id);
                     let origin = started.origin.clone().expect("dynamic start origin");
                     match register_started(adapter, app, &mut self.sources, started) {
                         Ok(view_id) => {
@@ -953,6 +1016,10 @@ impl Composition {
                             self.note_start_succeeded(app, &origin, &view_id);
                         }
                         Err(message) => {
+                            // Manager-scoped rollback only: a worker-owned
+                            // capture is never stopped here — it may be
+                            // another window's live capture. The winner id
+                            // simply misses in the local manager.
                             if let Some(handle) = self.manager.source(source_id) {
                                 self.runtime.spawn(async move {
                                     let _ = handle.stop().await;
@@ -3203,7 +3270,9 @@ impl Composition {
                 .get(&id)
                 .map_or_else(|| id.0.to_string(), |definition| definition.name.clone());
             app.action_notice = Some(match result {
-                Ok(Some(handle)) => match adapter.register_source(handle.clone()) {
+                Ok(Some(handle)) => match adapter
+                    .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+                {
                     Ok(()) => format!("{name}: capture restarted; existing views retained"),
                     Err(error) => {
                         // A launched capture remains manager-owned until graceful cleanup settles.
@@ -3232,6 +3301,75 @@ impl Composition {
                 Err(error) => format!("{name}: {error}"),
             });
         }
+        // Shared control settlement mirrors local settlement above: poll
+        // completed jobs, register fresh remote handles, surface notices.
+        // A remotely restarted capture that fails registration is stopped
+        // through the worker (never left running unnamed), mirroring the
+        // local cleanup path.
+        let mut shared_completed = Vec::new();
+        for (id, job) in &mut self.shared_controls {
+            if job.restart
+                && app.views().iter().any(|view| {
+                    view.source_id == id.0.to_string() && app.view_has_pending_query(&view.id)
+                })
+            {
+                continue;
+            }
+            let result = match job.result.try_recv() {
+                Ok(result) => result,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => continue,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    Err("shared control worker disconnected".into())
+                }
+            };
+            shared_completed.push((*id, result));
+        }
+        for (id, result) in shared_completed {
+            changed = true;
+            self.shared_controls.remove(&id);
+            let name = self
+                .definitions
+                .get(&id)
+                .map_or_else(|| id.0.to_string(), |definition| definition.name.clone());
+            app.action_notice = Some(match result {
+                Ok(SharedControlOutcome::Restarted { handle }) => {
+                    match adapter.register_source(handle) {
+                        Ok(()) => {
+                            format!("{name}: capture restarted; existing views retained")
+                        }
+                        Err(error) => {
+                            let message = format!("register restarted source: {error}");
+                            if let Some(shared) = self.shared.clone() {
+                                let (sender, result) = tokio::sync::oneshot::channel();
+                                let worker = self.runtime.spawn(async move {
+                                    let stopped = shared.stop_source(id).await;
+                                    let diagnostic = match stopped {
+                                        Ok(()) => message,
+                                        other => {
+                                            format!("{message}; cleanup incomplete: {other:?}")
+                                        }
+                                    };
+                                    let _ = sender.send(Err(diagnostic));
+                                });
+                                self.shared_controls.insert(
+                                    id,
+                                    SharedControlJob {
+                                        restart: false,
+                                        result,
+                                        worker,
+                                    },
+                                );
+                            }
+                            format!("{name}: restart registration failed; stopping capture")
+                        }
+                    }
+                }
+                Ok(SharedControlOutcome::Stopped) => {
+                    format!("{name}: capture stopped; journal and views retained")
+                }
+                Err(error) => format!("{name}: {error}"),
+            });
+        }
         for request in app.take_source_controls() {
             changed = true;
             let id = match Uuid::parse_str(&request.source_id) {
@@ -3241,11 +3379,14 @@ impl Composition {
                     continue;
                 }
             };
-            if self.source_controls.contains_key(&id) || self.pending_starts.contains(&id) {
+            if self.source_controls.contains_key(&id)
+                || self.shared_controls.contains_key(&id)
+                || self.pending_starts.contains(&id)
+            {
                 app.action_notice = Some("source operation already pending".into());
                 continue;
             }
-            if self.source_controls.len() >= 8 {
+            if self.source_controls.len() + self.shared_controls.len() >= 8 {
                 app.action_notice =
                     Some("source control limit reached; wait for pending operations".into());
                 continue;
@@ -3255,6 +3396,47 @@ impl Composition {
                 continue;
             };
             let name = definition.name.clone();
+            // Worker-owned captures route to shared control; everything
+            // else (including stdin, which the worker refuses) stays on
+            // the local manager path below. Routing decides once here by
+            // session ownership, so the two job maps never double-drive.
+            if let Some(shared) = self.shared.clone().filter(|shared| shared.owns_source(id)) {
+                let (sender, result) = tokio::sync::oneshot::channel();
+                let restart = request.restart;
+                let worker = self.runtime.spawn(async move {
+                    let outcome = if restart {
+                        match shared.restart_source(&definition).await {
+                            Ok(started) => Ok(SharedControlOutcome::Restarted {
+                                handle: lvu_shared::AnySourceHandle::Remote(started.handle),
+                            }),
+                            Err(error) => Err(format!("restart capture: {error}")),
+                        }
+                    } else {
+                        match shared.stop_source(id).await {
+                            Ok(()) => Ok(SharedControlOutcome::Stopped),
+                            Err(error) => Err(format!("stop capture: {error}")),
+                        }
+                    };
+                    let _ = sender.send(outcome);
+                });
+                self.shared_controls.insert(
+                    id,
+                    SharedControlJob {
+                        restart,
+                        result,
+                        worker,
+                    },
+                );
+                app.action_notice = Some(format!(
+                    "{name}: {} capture…",
+                    if request.restart {
+                        "restarting"
+                    } else {
+                        "stopping"
+                    }
+                ));
+                continue;
+            }
             let manager = self.manager.clone();
             let (sender, result) = tokio::sync::oneshot::channel();
             let restart = request.restart;
@@ -4989,22 +5171,54 @@ impl Composition {
         self.pending_definitions
             .insert(definition.id, definition.clone());
         let manager = Arc::clone(&self.manager);
+        let shared = self.shared.clone();
         let sender = self.starts_tx.clone();
         self.runtime.spawn(async move {
             let source_id = definition.id;
             let view_id = view_id(source_id);
-            let result = match manager.start(definition.clone()).await {
-                Ok(handle) => Ok(StartedSource {
-                    definition,
-                    view_id,
-                    handle,
-                    origin: Some(origin.clone()),
-                }),
-                Err(error) => Err(StartFailure {
-                    source_id,
-                    origin,
-                    message: format!("start {}: {error}", definition.name),
-                }),
+            // Worker route first (see `worker_route`): at most one
+            // acquisition per definition across all windows, with the
+            // feeder started alongside. Local manager start otherwise.
+            let worker = shared.filter(|_| shared_capture::worker_route(true, &definition));
+            // Originating window cwd for worker-side path resolution; an
+            // unreadable cwd fails closed for relative input inside.
+            let origin_cwd = env::current_dir().ok();
+            let result = match worker {
+                Some(session) => match session
+                    .start_source(&definition, origin_cwd.as_deref())
+                    .await
+                {
+                    Ok(started) => {
+                        let (definition, view_id) =
+                            adopt_winner_identity(definition, started.remote.source_id);
+                        Ok(StartedSource {
+                            definition,
+                            view_id,
+                            handle: lvu_shared::AnySourceHandle::Remote(started.handle),
+                            origin: Some(origin.clone()),
+                            proposed_id: source_id,
+                        })
+                    }
+                    Err(error) => Err(StartFailure {
+                        source_id,
+                        origin,
+                        message: format!("start {}: {error}", definition.name),
+                    }),
+                },
+                None => match manager.start(definition.clone()).await {
+                    Ok(handle) => Ok(StartedSource {
+                        definition,
+                        view_id,
+                        handle: lvu_shared::AnySourceHandle::Local(handle),
+                        origin: Some(origin.clone()),
+                        proposed_id: source_id,
+                    }),
+                    Err(error) => Err(StartFailure {
+                        source_id,
+                        origin,
+                        message: format!("start {}: {error}", definition.name),
+                    }),
+                },
             };
             let _ = sender.send(result).await;
         });
@@ -7418,6 +7632,29 @@ async fn main() {
     }
 }
 
+/// Shared-capture window entry (hidden `--shared`): spawn-or-attach the
+/// background worker for this capture root, verify the handshake, then
+/// drain and detach again. Intermediate diagnostic only — the acceptance
+/// path is ordinary launches sharing automatically, not this flag.
+/// Session consumption (views over worker-owned captures) plugs in at the
+/// marked point once the remote handle seam lands; until then this proves
+/// the real window-side lifecycle end to end — spawn, handshake, flush,
+/// goodbye — with zero split-brain risk, since no local manager or store
+/// ever starts on this path.
+async fn run_shared_capture(capture_root: PathBuf) -> Result<(), String> {
+    let executable = env::current_exe().map_err(|error| format!("current executable: {error}"))?;
+    let window_id = lvu_shared::default_window_id();
+    let shared =
+        shared_capture::SharedStore::startup(&executable, &capture_root, &window_id).await?;
+    // SEAM: session start (StartedSource abstraction over worker-owned
+    // captures; RemoteSource is the adapter input) plugs in here.
+    shared.drain_and_detach().await?;
+    Err(
+        "shared capture sessions need the remote handle seam (pending fc429 paths/signatures)"
+            .into(),
+    )
+}
+
 async fn run() -> Result<(), String> {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
     if arguments
@@ -7432,6 +7669,11 @@ async fn run() -> Result<(), String> {
         // The diagnostic lives beside the input handling it explains (§8.10).
         return lvu::keys::report();
     }
+    if let Some(child) = lvu_shared::parse_child_args(&arguments)? {
+        // Background capture worker: awaited on this runtime (never a
+        // nested one), exits with the worker's code without terminal setup.
+        std::process::exit(lvu_shared::run_child(child).await);
+    }
     let Some(options) = parse_args(arguments, std::io::stdin().is_terminal())? else {
         print_help();
         return Ok(());
@@ -7445,6 +7687,22 @@ async fn run() -> Result<(), String> {
     // its whole workspace. Every dependent path derives from this decision.
     let choice = select_capture_root(options.capture_dir, &paths.data_dir, &cwd)?;
     let capture_dir = choice.root.clone();
+    if options.shared {
+        // Shared mode diverges before ANY local ownership materialises: no
+        // local manager, store, or TUI session starts here, so the worker
+        // stays the single owner of capture and durable state.
+        return run_shared_capture(capture_dir).await;
+    }
+    // Automatic shared session, before any acquisition or store work: every
+    // ordinary launch attaches first (spawning the worker when elected), so
+    // concurrent windows converge on one capture worker and one store.
+    // Attach failure is loud — never a silent local fork. A spawned worker
+    // left unused by a later startup failure drains on its own grace.
+    let executable = env::current_exe().map_err(|error| format!("current executable: {error}"))?;
+    let window_id = lvu_shared::default_window_id();
+    let shared_session = Arc::new(
+        shared_capture::SharedStore::startup(&executable, &capture_dir, &window_id).await?,
+    );
     let record_error = choice
         .record
         .as_ref()
@@ -7464,7 +7722,18 @@ async fn run() -> Result<(), String> {
         .map_err(|error| format!("effective settings: {error}"))?;
     let row_cache_bytes = usize::try_from(effective_settings.row_cache_bytes.value)
         .map_err(|_| "row cache setting exceeds this platform".to_owned())?;
-    let mut live_config = LiveConfig::new(paths.cache_dir.join("derived"));
+    // Derived live indexes are per-window namespaces under the shared
+    // cache: the per-source index file takes an exclusive lock for its
+    // whole lifetime, so a second concurrent window would terminally fail
+    // opening the first window's file. With the window tag set, contention
+    // overflows to a window-suffixed sibling instead (see
+    // `sweep_stale_window_indexes`); the shared journal and capture stay
+    // single and stable IDs never change. Reap dead windows' overflow
+    // files here so crash debris is bounded by one generation.
+    let derived_dir = paths.cache_dir.join("derived");
+    let _swept_overflow = lvu_live::sweep_stale_window_indexes(&derived_dir);
+    let mut live_config = LiveConfig::new(derived_dir);
+    live_config.window_tag = Some(window_id.clone());
     live_config.maximum_request_rows = 256;
     live_config.cache_bytes = row_cache_bytes;
     live_config.maximum_index_bytes_per_source = effective_settings.index_per_source_bytes.value;
@@ -7605,9 +7874,19 @@ async fn run() -> Result<(), String> {
         let outcome = if plan.requested && plan.stdin {
             start_stdin_definition(&manager, plan.definition.clone()).await
         } else if plan.requested {
-            start_definition(&manager, plan.definition.clone()).await
+            start_definition(
+                &manager,
+                Some(Arc::clone(&shared_session)),
+                plan.definition.clone(),
+            )
+            .await
         } else {
-            resume_definition(&manager, plan.definition.clone()).await
+            resume_definition(
+                &manager,
+                Some(Arc::clone(&shared_session)),
+                plan.definition.clone(),
+            )
+            .await
         };
         let started = match outcome {
             Ok(started) => started,
@@ -7633,6 +7912,8 @@ async fn run() -> Result<(), String> {
         let source_id = started.definition.id;
         let definition = started.definition.clone();
         if let Err(error) = register_started(&adapter, &mut app, &mut source_ids, started) {
+            // Manager-scoped rollback only (see the settlement path): a
+            // worker-owned capture may belong to another window.
             if let Some(handle) = manager.source(source_id) {
                 let _ = handle.stop().await;
             }
@@ -7659,7 +7940,13 @@ async fn run() -> Result<(), String> {
     let (starts_tx, starts_rx) = mpsc::channel(MAX_PENDING_STARTS);
     let (scans_tx, scans_rx) = mpsc::channel(2);
     let (completions_tx, completions_rx) = mpsc::channel(2);
-    let memory = MemoryWorker::start(capture_dir.join("workspace"));
+    let memory: memory::Memory = {
+        // Automatic shared store built on the session attached above: the
+        // worker becomes the single workspace writer; the local worker
+        // never starts on this path, so durable state cannot split-brain.
+        // Attach already failed loudly above if sharing was impossible.
+        memory::Memory::Shared(memory::SharedMemory::wrap(Arc::clone(&shared_session)))
+    };
     let command_presentation = command_rows::CommandPresentation::default();
     let command_controller = command_controller::CommandController::new(
         capture_dir.join("workspace"),
@@ -7688,6 +7975,8 @@ async fn run() -> Result<(), String> {
         pending_starts: HashSet::new(),
         pending_definitions: HashMap::new(),
         source_controls: HashMap::new(),
+        shared_controls: HashMap::new(),
+        shared: Some(Arc::clone(&shared_session)),
         cwd,
         scans_tx,
         scans_rx,
@@ -7858,7 +8147,10 @@ async fn run() -> Result<(), String> {
     let memory_flush_result =
         composition.flush_memory(&mut app, &adapter, std::time::Duration::from_millis(500));
     timing.mark("memory-flush");
-    composition.memory.stop();
+    // Bounded acknowledged stop (queued saves, then the shared session
+    // drain for shared mode): a stop/drain failure joins the lifecycle
+    // report below instead of a clean shutdown.
+    let memory_stop_result = composition.memory.stop();
     adapter.shutdown();
     timing.mark("view-adapter");
     let cleanup_result = cleanup(raw.as_ref(), &manager).await;
@@ -7869,12 +8161,19 @@ async fn run() -> Result<(), String> {
         job.worker.abort();
         let _ = job.worker.await;
     }
+    // Shared control tasks hold the worker client; abort them before the
+    // session drains so no defeated restart/stop races the goodbye.
+    for (_, job) in composition.shared_controls.drain() {
+        job.worker.abort();
+        let _ = job.worker.await;
+    }
     timing.mark("source-controls");
     timing.report();
     report_capture_cost(&composition);
     let lifecycle_error = memory_flush_result
         .err()
         .into_iter()
+        .chain(memory_stop_result.err())
         .chain(investigation_shutdown_result.err())
         .chain(source_ai_shutdown_result.err())
         .chain(ai_shutdown_result.err())
@@ -7979,35 +8278,79 @@ fn prepend_notice(app: &mut App, notice: Option<String>) {
 /// the recorded program, working directory and environment of its definition.
 async fn resume_definition(
     manager: &Arc<SourceManager>,
+    shared: Option<Arc<shared_capture::SharedStore>>,
     definition: SourceDefinition,
 ) -> Result<StartedSource, String> {
     let view_id = view_id(definition.id);
     let name = definition.name.clone();
+    if shared_capture::worker_route(shared.is_some(), &definition) {
+        // Worker-owned resume: the worker dedups against live captures
+        // (Present), so resume-after-crash and second-window attach take
+        // the same path and cannot double-acquire. Stdin never routes
+        // here (see `worker_route`).
+        let shared = shared.expect("worker route needs a session");
+        let origin_cwd = env::current_dir().ok();
+        let started = shared
+            .start_source(&definition, origin_cwd.as_deref())
+            .await
+            .map_err(|error| format!("resume {name} on shared worker: {error}"))?;
+        let proposed_id = definition.id;
+        let (definition, view_id) = adopt_winner_identity(definition, started.remote.source_id);
+        return Ok(StartedSource {
+            definition,
+            view_id,
+            handle: lvu_shared::AnySourceHandle::Remote(started.handle),
+            origin: None,
+            proposed_id,
+        });
+    }
     let handle = control_source(Arc::clone(manager), definition.clone(), true)
         .await?
         .ok_or_else(|| format!("resume {name}: capture did not start"))?;
+    let proposed_id = definition.id;
     Ok(StartedSource {
         definition,
         view_id,
-        handle,
+        handle: lvu_shared::AnySourceHandle::Local(handle),
         origin: None,
+        proposed_id,
     })
 }
 
 async fn start_definition(
     manager: &SourceManager,
+    shared: Option<Arc<shared_capture::SharedStore>>,
     definition: SourceDefinition,
 ) -> Result<StartedSource, String> {
     let view_id = view_id(definition.id);
+    if shared_capture::worker_route(shared.is_some(), &definition) {
+        let shared = shared.expect("worker route needs a session");
+        let origin_cwd = env::current_dir().ok();
+        let started = shared
+            .start_source(&definition, origin_cwd.as_deref())
+            .await
+            .map_err(|error| format!("start {} on shared worker: {}", definition.name, error))?;
+        let proposed_id = definition.id;
+        let (definition, view_id) = adopt_winner_identity(definition, started.remote.source_id);
+        return Ok(StartedSource {
+            definition,
+            view_id,
+            handle: lvu_shared::AnySourceHandle::Remote(started.handle),
+            origin: None,
+            proposed_id,
+        });
+    }
     let handle = manager
         .start(definition.clone())
         .await
         .map_err(|error| format!("start {}: {error}", definition.name))?;
+    let proposed_id = definition.id;
     Ok(StartedSource {
         definition,
         view_id,
-        handle,
+        handle: lvu_shared::AnySourceHandle::Local(handle),
         origin: None,
+        proposed_id,
     })
 }
 
@@ -8021,11 +8364,13 @@ async fn start_stdin_definition(
         .start_with_reader(definition.clone(), reader)
         .await
         .map_err(|error| format!("start {}: {error}", definition.name))?;
+    let proposed_id = definition.id;
     Ok(StartedSource {
         definition,
         view_id,
-        handle,
+        handle: lvu_shared::AnySourceHandle::Local(handle),
         origin: None,
+        proposed_id,
     })
 }
 
@@ -8686,6 +9031,7 @@ fn parse_args(
     let mut sources = Vec::new();
     let mut fresh = false;
     let mut resume = false;
+    let mut shared = false;
     let mut explicit_stdin = false;
     let mut options_ended = false;
     let mut index = 0;
@@ -8710,6 +9056,9 @@ fn parse_args(
             // only spelling that changes what happens.
             Some("--resume") => resume = true,
             Some("--fresh") => fresh = true,
+            // Hidden preview flag: shared-capture window. No help text
+            // until sessions can start (handle seam pending).
+            Some("--shared") => shared = true,
             Some("--capture-dir") => {
                 index += 1;
                 capture_dir = Some(PathBuf::from(value_os(&arguments, index, "--capture-dir")?));
@@ -8769,6 +9118,7 @@ fn parse_args(
         capture_dir,
         sources,
         fresh,
+        shared,
     }))
 }
 
@@ -9720,7 +10070,7 @@ mod tests {
         let (starts_tx, starts_rx) = tokio::sync::mpsc::channel(8);
         let (scans_tx, scans_rx) = tokio::sync::mpsc::channel(8);
         let (completions_tx, completions_rx) = tokio::sync::mpsc::channel(8);
-        let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let memory = super::memory::MemoryWorker::start(directory.path().join("workspace"));
         let raw = Arc::new(
             lvu_live::LiveRowProvider::new(lvu_live::LiveConfig::new(
                 directory.path().join("derived"),
@@ -9739,6 +10089,8 @@ mod tests {
             pending_starts: HashSet::new(),
             pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),
+            shared_controls: HashMap::new(),
+            shared: None,
             cwd: directory.path().to_path_buf(),
             scans_tx,
             scans_rx,
@@ -9746,7 +10098,7 @@ mod tests {
             pending_scan: None,
             discovery_candidates: HashMap::new(),
             recent_sources: Vec::new(),
-            memory,
+            memory: crate::memory::Memory::Local(memory),
             memory_ready: HashSet::new(),
             memory_restoring: HashSet::new(),
             memory_deferred: HashMap::new(),
@@ -9862,7 +10214,7 @@ mod tests {
             Some("reviewed agent source started"),
             "single success keeps its exact historical notice"
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -9907,7 +10259,7 @@ mod tests {
             app.layers.source.state().ai.progress,
             "started 0 of 1 reviewed source; failed: solo: source admission limit reached"
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10077,7 +10429,7 @@ mod tests {
         ]);
         let (definitions, _) = super::parse_source_proposals(&envelope, directory.path()).unwrap();
         assert_eq!(definitions.len(), 2);
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10108,6 +10460,26 @@ mod tests {
             follow: true,
         };
         definition
+    }
+
+    /// A worker dedup Present returns the winner's id for a distinct
+    /// proposal: registration must take the winner while the local
+    /// spelling (name, path, options) survives byte-identical, and the
+    /// view id must derive from the winner — never the proposal.
+    #[test]
+    fn adopt_winner_identity_takes_worker_id_keeps_spelling() {
+        let dir = std::env::temp_dir();
+        let proposed = batch_file_at(71, &dir.join("winner.log"));
+        let proposed_id = proposed.id;
+        let winner = lvu_core::SourceId(uuid::Uuid::from_u128(72));
+        let (definition, view_id) = super::adopt_winner_identity(proposed.clone(), winner);
+        assert_eq!(definition.id, winner);
+        assert_ne!(definition.id, proposed_id);
+        assert_eq!(view_id, super::view_id(winner));
+        assert_ne!(view_id, super::view_id(proposed_id));
+        let mut expected = proposed;
+        expected.id = winner;
+        assert_eq!(definition, expected);
     }
 
     fn batch_command(id: u128, restart: lvu_core::RestartPolicy) -> lvu_core::SourceDefinition {
@@ -10295,7 +10667,7 @@ mod tests {
             other => panic!("unsupported schema must refuse, got {other:?}"),
         };
         assert!(message.contains("schema"), "{message}");
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10369,7 +10741,7 @@ mod tests {
             message.contains("already starting"),
             "refusal must say a start is in flight: {message}"
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10417,7 +10789,7 @@ mod tests {
             app.source_notice.as_deref(),
             Some("started 2 of 2 reviewed sources (1 already present)"),
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10488,7 +10860,7 @@ mod tests {
             Some(vec![newer.id]),
             "the newer proposal must survive the old settlement untouched"
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10527,7 +10899,7 @@ mod tests {
             app.source_notice.as_deref(),
             Some("reviewed agent source started")
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10680,7 +11052,7 @@ mod tests {
             !composition.ai_apply_batches.contains_key(&BATCH_GENERATION),
             "settled batches must not leak trackers"
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         for (_, stopped) in manager.shutdown().await {
             assert!(stopped.expect("admitted capture stops").complete);
         }
@@ -10753,7 +11125,7 @@ mod tests {
                 .source_ai_proposals
                 .contains_key(&BATCH_GENERATION)
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         for (_, stopped) in manager.shutdown().await {
             assert!(stopped.expect("retried capture stops").complete);
         }
@@ -11384,7 +11756,7 @@ for line in sys.stdin:
         let (starts_tx, starts_rx) = tokio::sync::mpsc::channel(2);
         let (scans_tx, scans_rx) = tokio::sync::mpsc::channel(2);
         let (completions_tx, completions_rx) = tokio::sync::mpsc::channel(2);
-        let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let memory = super::memory::MemoryWorker::start(directory.path().join("workspace"));
         let raw = Arc::new(
             lvu_live::LiveRowProvider::new(lvu_live::LiveConfig::new(
                 directory.path().join("derived"),
@@ -11403,6 +11775,8 @@ for line in sys.stdin:
             pending_starts: HashSet::new(),
             pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),
+            shared_controls: HashMap::new(),
+            shared: None,
             cwd: directory.path().to_path_buf(),
             scans_tx,
             scans_rx,
@@ -11410,7 +11784,7 @@ for line in sys.stdin:
             pending_scan: None,
             discovery_candidates: HashMap::new(),
             recent_sources: Vec::new(),
-            memory,
+            memory: crate::memory::Memory::Local(memory),
             memory_ready: HashSet::new(),
             memory_restoring: HashSet::new(),
             memory_deferred: HashMap::new(),
@@ -11489,7 +11863,7 @@ for line in sys.stdin:
                 .as_deref()
                 .is_some_and(|notice| notice.contains("view admission limit"))
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         assert!(manager.shutdown().await.is_empty());
     }
 
@@ -11514,7 +11888,7 @@ for line in sys.stdin:
             manifest_path: directory.path().join("manifest.json").display().to_string(),
             question: "new question".into(),
         };
-        let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let memory = super::memory::MemoryWorker::start(directory.path().join("workspace"));
         let raw = Arc::new(
             lvu_live::LiveRowProvider::new(lvu_live::LiveConfig::new(
                 directory.path().join("derived"),
@@ -11533,6 +11907,8 @@ for line in sys.stdin:
             pending_starts: HashSet::new(),
             pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),
+            shared_controls: HashMap::new(),
+            shared: None,
             cwd: directory.path().to_path_buf(),
             scans_tx,
             scans_rx,
@@ -11540,7 +11916,7 @@ for line in sys.stdin:
             pending_scan: None,
             discovery_candidates: HashMap::new(),
             recent_sources: Vec::new(),
-            memory,
+            memory: crate::memory::Memory::Local(memory),
             memory_ready: HashSet::new(),
             memory_restoring: HashSet::new(),
             memory_deferred: HashMap::new(),
@@ -11620,7 +11996,7 @@ for line in sys.stdin:
             Some(super::InvestigationWork::Unresolved { generation: 22, .. })
         ));
 
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         assert!(manager.shutdown().await.is_empty());
     }
 

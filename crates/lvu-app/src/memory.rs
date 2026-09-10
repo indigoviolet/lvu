@@ -46,6 +46,11 @@ pub fn canonical_view_id(source_id: SourceId) -> ViewId {
 pub const CANONICAL_VIEW_NAME: &str = "All events";
 
 const QUEUE_CAPACITY: usize = 32;
+/// Transitional: the automatic shared store never constructs the local
+/// worker in production builds; these items stay alive for the test suite
+/// until primary decides the local store's fate (keep for offline use vs.
+/// remove). The `cfg_attr` keeps test builds strictly linted.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const RECENT_LIMIT: u32 = 32;
 
 #[derive(Clone, Debug)]
@@ -73,8 +78,13 @@ enum Command {
     ExportRecipe(RecipeRequestMeta, lvu_core::RecipeId, uuid::Uuid, PathBuf),
     RecordSuggestion(RecipeOutcome),
     Flush(SyncSender<Result<(), String>>),
-    Stop,
+    /// Bounded acknowledged teardown: the worker sends its teardown result
+    /// (the shared backend's session drain included) before exiting, so a
+    /// full queue, a disconnect, or a drain failure can never report a
+    /// clean stop. Same rendezvous shape as `Flush`.
+    Stop(SyncSender<Result<(), String>>),
 }
+#[derive(Debug)]
 pub enum Event {
     Loaded(SourceId, ViewId, Vec<WorkingView>),
     LoadFailed(SourceId, ViewId, String),
@@ -101,14 +111,18 @@ pub enum Event {
 pub struct MemoryWorker {
     tx: SyncSender<Command>,
     rx: Receiver<Event>,
-    _join: thread::JoinHandle<()>,
+    join: Option<thread::JoinHandle<()>>,
     phase: Arc<AtomicU8>,
 }
 impl MemoryWorker {
+    /// See `RECENT_LIMIT`: transitional test-only entry point.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start(root: PathBuf) -> Self {
         Self::start_with_capacities(root, QUEUE_CAPACITY, QUEUE_CAPACITY)
     }
 
+    /// See `RECENT_LIMIT`: transitional test-only entry point.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn start_with_capacities(
         root: PathBuf,
         command_capacity: usize,
@@ -122,7 +136,7 @@ impl MemoryWorker {
         Self {
             tx,
             rx,
-            _join: join,
+            join: Some(join),
             phase,
         }
     }
@@ -278,9 +292,663 @@ impl MemoryWorker {
             }
         }
     }
-    pub fn stop(&self) {
-        let _ = self.tx.try_send(Command::Stop);
+    pub fn stop(&mut self) -> Result<(), String> {
+        stop_thread(&self.tx, &mut self.join, "memory worker")
     }
+}
+
+/// Bound for a `Stop` to enter a full command queue: the worker drains
+/// FIFO, so a full queue means teardown waits behind real work, not a
+/// wedge. Past the bound the stop reports instead of discarding.
+const STOP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound for the teardown acknowledgement (queued work, then the shared
+/// backend's session drain) plus the thread join. Past the bound the stop
+/// reports and the thread is left detached to die with the process —
+/// never a silent clean report, never a hung shutdown.
+const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Bounded acknowledged stop shared by both backends: deliver `Stop`
+/// reliably (retry while full, bounded), await the worker's teardown ack
+/// (bounded), then join the thread. Every failure mode — full queue past
+/// the bound, disconnect, teardown error, ack timeout — returns `Err`;
+/// only a joined thread after an `Ok` ack returns `Ok`. Stopping twice is
+/// harmless: with no thread left there is nothing to stop.
+fn stop_thread(
+    tx: &SyncSender<Command>,
+    join: &mut Option<thread::JoinHandle<()>>,
+    backend: &str,
+) -> Result<(), String> {
+    let Some(handle) = join.take() else {
+        return Ok(());
+    };
+    // Dropping the taken handle on any early return below detaches the
+    // thread to die with the process; every such path reports Err.
+    let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+    let deadline = std::time::Instant::now() + STOP_DELIVERY_TIMEOUT;
+    let mut command = Command::Stop(ack_tx);
+    let delivered = loop {
+        match tx.try_send(command) {
+            Ok(()) => break true,
+            Err(TrySendError::Full(value)) if std::time::Instant::now() < deadline => {
+                command = value;
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(TrySendError::Full(_)) => {
+                return Err(format!(
+                    "{backend} stop could not enqueue past {STOP_DELIVERY_TIMEOUT:?} (queue full); worker thread not joined"
+                ));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // Receiver gone: the thread already exited without our
+                // Stop. No ack will ever arrive; join reaps it below, and
+                // a panic payload still surfaces as Err.
+                break false;
+            }
+        }
+    };
+    if delivered {
+        match ack_rx.recv_timeout(STOP_ACK_TIMEOUT) {
+            Ok(result) => {
+                // The thread acks immediately before breaking, so this
+                // join reaps an exiting thread; a panic between the two
+                // still surfaces below.
+                handle
+                    .join()
+                    .map_err(|_| format!("{backend} worker thread panicked during stop"))?;
+                result.map_err(|error| format!("{backend} stop teardown failed: {error}"))?;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The thread died before acking: join surfaces its panic,
+                // or reports the unexplained death when it somehow exited.
+                handle
+                    .join()
+                    .map_err(|_| format!("{backend} worker thread panicked during stop"))?;
+                return Err(format!(
+                    "{backend} worker thread died before acknowledging stop"
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "{backend} stop acknowledgement timed out after {STOP_ACK_TIMEOUT:?}; worker thread not joined"
+                ));
+            }
+        }
+    } else {
+        handle
+            .join()
+            .map_err(|_| format!("{backend} worker thread panicked during stop"))?;
+    }
+    Ok(())
+}
+
+/// Durable-state sink behind one stable call surface: the process-local
+/// worker or the shared-capture shim. An enum (not a trait object) so
+/// every existing call site keeps working with no import changes: the
+/// methods below spell exactly what `MemoryWorker` spells, including
+/// returning the request on a full save queue.
+pub enum Memory {
+    /// See `RECENT_LIMIT`: transitional test-only variant.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Local(MemoryWorker),
+    Shared(SharedMemory),
+}
+
+impl Memory {
+    pub fn load(&self, definition: SourceDefinition, view_id: ViewId) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.load(definition, view_id),
+            Memory::Shared(shared) => shared.load(definition, view_id),
+        }
+    }
+    pub fn save(&self, request: Box<SaveRequest>) -> Result<(), Box<SaveRequest>> {
+        match self {
+            Memory::Local(worker) => worker.save(request),
+            Memory::Shared(shared) => shared.save(request),
+        }
+    }
+    pub fn create_derived_view(&self, request: Box<SaveRequest>) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.create_derived_view(request),
+            Memory::Shared(shared) => shared.create_derived_view(request),
+        }
+    }
+    pub fn recent(&self) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.recent(),
+            Memory::Shared(shared) => shared.recent(),
+        }
+    }
+    pub fn list_recipes(
+        &self,
+        meta: RecipeRequestMeta,
+        context: Option<SuggestionContext>,
+    ) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.list_recipes(meta, context),
+            Memory::Shared(shared) => shared.list_recipes(meta, context),
+        }
+    }
+    pub fn save_recipe(
+        &self,
+        meta: RecipeRequestMeta,
+        recipe: RecipeFile,
+        expected_revision: Option<uuid::Uuid>,
+        context: Option<SuggestionContext>,
+    ) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.save_recipe(meta, recipe, expected_revision, context),
+            Memory::Shared(shared) => shared.save_recipe(meta, recipe, expected_revision, context),
+        }
+    }
+    pub fn recipe_history(
+        &self,
+        meta: RecipeRequestMeta,
+        id: lvu_core::RecipeId,
+    ) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.recipe_history(meta, id),
+            Memory::Shared(shared) => shared.recipe_history(meta, id),
+        }
+    }
+    pub fn import_recipe(&self, meta: RecipeRequestMeta, path: PathBuf) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.import_recipe(meta, path),
+            Memory::Shared(shared) => shared.import_recipe(meta, path),
+        }
+    }
+    pub fn export_recipe(
+        &self,
+        meta: RecipeRequestMeta,
+        recipe: lvu_core::RecipeId,
+        revision: uuid::Uuid,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.export_recipe(meta, recipe, revision, path),
+            Memory::Shared(shared) => shared.export_recipe(meta, recipe, revision, path),
+        }
+    }
+    pub fn record_suggestion(&self, outcome: RecipeOutcome) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.record_suggestion(outcome),
+            Memory::Shared(shared) => shared.record_suggestion(outcome),
+        }
+    }
+    pub fn poll(&self) -> Option<Event> {
+        match self {
+            Memory::Local(worker) => worker.poll(),
+            Memory::Shared(shared) => shared.poll(),
+        }
+    }
+    pub fn phase(&self) -> &'static str {
+        match self {
+            Memory::Local(worker) => worker.phase(),
+            Memory::Shared(shared) => shared.phase(),
+        }
+    }
+    pub fn flush(&self, timeout: Duration) -> (Vec<Event>, Result<(), String>) {
+        match self {
+            Memory::Local(worker) => worker.flush(timeout),
+            Memory::Shared(shared) => shared.flush(timeout),
+        }
+    }
+    pub fn stop(&mut self) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.stop(),
+            Memory::Shared(shared) => shared.stop(),
+        }
+    }
+}
+/// The shared-capture memory backend: the same channels, capacities, and
+/// event shapes as `MemoryWorker`, but every command executes as one
+/// synchronous mediated call against the background worker instead of the
+/// process-local store. Requests commit or fail explicitly one at a time
+/// (no batching, no coalescing), so every acknowledgement is truthful;
+/// transport faults surface as the matching `Failed` event with the
+/// outcome-unknown wording preserved, never as a silent drop.
+pub struct SharedMemory {
+    tx: SyncSender<Command>,
+    rx: Receiver<Event>,
+    join: Option<thread::JoinHandle<()>>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SharedMemory {
+    /// Serve `store` on a dedicated thread with its own runtime (never a
+    /// nested one): the sync method surface below stays callable from any
+    /// context, exactly like `MemoryWorker`.
+    pub fn wrap(store: std::sync::Arc<crate::shared_capture::SharedStore>) -> Self {
+        let (tx, commands) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let (events, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let join = thread::spawn(move || shared_worker(store, commands, events));
+        Self {
+            tx,
+            rx,
+            join: Some(join),
+            stopped,
+        }
+    }
+
+    fn accepted(&self) -> bool {
+        !self.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl SharedMemory {
+    fn load(&self, definition: SourceDefinition, view_id: ViewId) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::Load(Box::new(definition), view_id))
+            .map_err(queue_error)
+    }
+    fn save(&self, request: Box<SaveRequest>) -> Result<(), Box<SaveRequest>> {
+        if !self.accepted() {
+            return Err(request);
+        }
+        match self.tx.try_send(Command::Save(request)) {
+            Ok(()) => Ok(()),
+            Err(
+                TrySendError::Full(Command::Save(value))
+                | TrySendError::Disconnected(Command::Save(value)),
+            ) => Err(value),
+            Err(_) => unreachable!(),
+        }
+    }
+    fn create_derived_view(&self, request: Box<SaveRequest>) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::CreateDerivedView(request))
+            .map_err(queue_error)
+    }
+    fn recent(&self) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx.try_send(Command::Recent).map_err(queue_error)
+    }
+    fn list_recipes(
+        &self,
+        meta: RecipeRequestMeta,
+        context: Option<SuggestionContext>,
+    ) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::ListRecipes(meta, context))
+            .map_err(queue_error)
+    }
+    fn save_recipe(
+        &self,
+        meta: RecipeRequestMeta,
+        recipe: RecipeFile,
+        expected_revision: Option<uuid::Uuid>,
+        context: Option<SuggestionContext>,
+    ) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::SaveRecipe(
+                meta,
+                Box::new(recipe),
+                expected_revision,
+                context,
+            ))
+            .map_err(queue_error)
+    }
+    fn recipe_history(
+        &self,
+        meta: RecipeRequestMeta,
+        id: lvu_core::RecipeId,
+    ) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::RecipeHistory(meta, id))
+            .map_err(queue_error)
+    }
+    fn import_recipe(&self, meta: RecipeRequestMeta, path: PathBuf) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::ImportRecipe(meta, path))
+            .map_err(queue_error)
+    }
+    fn export_recipe(
+        &self,
+        meta: RecipeRequestMeta,
+        recipe: lvu_core::RecipeId,
+        revision: uuid::Uuid,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::ExportRecipe(meta, recipe, revision, path))
+            .map_err(queue_error)
+    }
+    fn record_suggestion(&self, outcome: RecipeOutcome) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::RecordSuggestion(outcome))
+            .map_err(queue_error)
+    }
+    fn poll(&self) -> Option<Event> {
+        self.rx.try_recv().ok()
+    }
+    fn phase(&self) -> &'static str {
+        if self.accepted() {
+            "shared store active"
+        } else {
+            "shared store stopped"
+        }
+    }
+    /// Drain queued events, then flush through the worker: the `Flush`
+    /// command travels the same channel in order, and sequential service
+    /// means everything accepted before it already answered. Mirrors
+    /// `MemoryWorker::flush` shape and reporting exactly.
+    fn flush(&self, timeout: Duration) -> (Vec<Event>, Result<(), String>) {
+        if !self.accepted() {
+            return (Vec::new(), Err("shared store stopped".into()));
+        }
+        let (tx, rx) = mpsc::sync_channel(0);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut command = Command::Flush(tx);
+        let mut events = Vec::with_capacity(QUEUE_CAPACITY * 2);
+        loop {
+            match self.tx.try_send(command) {
+                Ok(()) => break,
+                Err(TrySendError::Full(value)) if std::time::Instant::now() < deadline => {
+                    command = value;
+                    while let Ok(event) = self.rx.try_recv() {
+                        events.push(event);
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(TrySendError::Full(_)) => {
+                    return (
+                        events,
+                        Err(
+                            "shared store flush deadline exceeded (waiting to enqueue flush)"
+                                .into(),
+                        ),
+                    );
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return (events, Err("shared store disconnected".into()));
+                }
+            }
+        }
+        loop {
+            while let Ok(event) = self.rx.try_recv() {
+                events.push(event);
+            }
+            match rx.try_recv() {
+                Ok(result) => return (events, result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return (
+                        events,
+                        Err("shared store flush acknowledgement disconnected".into()),
+                    );
+                }
+                Err(mpsc::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    return (
+                        events,
+                        Err(format!(
+                            "shared store flush deadline exceeded (waiting for flush acknowledgement; worker: {})",
+                            self.phase()
+                        )),
+                    );
+                }
+            }
+        }
+    }
+    /// Bounded acknowledged stop: no further commands are accepted, the
+    /// queued `Stop` drains the session (flush + goodbye) on the worker
+    /// thread, and the teardown result plus the thread join gate the
+    /// return. A second call is a harmless no-op.
+    fn stop(&mut self) -> Result<(), String> {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        stop_thread(&self.tx, &mut self.join, "shared store")
+    }
+}
+
+/// Serve shared commands sequentially on this thread's own runtime: one
+/// mediated call per command, each answer forwarded as the event the
+/// local worker would have sent for the same outcome. Transport faults
+/// become the matching `Failed` event with outcome-unknown wording
+/// preserved — the controller's bookkeeping (pending/inflight/ack
+/// sequences) resolves every accepted command exactly once, just later
+/// and elsewhere than local.
+fn shared_worker(
+    store: std::sync::Arc<crate::shared_capture::SharedStore>,
+    commands: Receiver<Command>,
+    events: SyncSender<Event>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = events.send(Event::Fatal(format!("shared store runtime: {error}")));
+            return;
+        }
+    };
+    runtime.block_on(async {
+        // Unrecovered per-view save failures and recipe failures, mirroring
+        // the local worker thread exactly: a consumed failure stays
+        // represented here until a matching success clears it, so Flush
+        // keeps failing closed instead of reporting a clean shutdown over
+        // undurable state.
+        let mut failed: HashMap<ViewId, String> = HashMap::new();
+        let mut recipe_failure: Option<String> = None;
+        while let Ok(command) = commands.recv() {
+            match command {
+                Command::Load(definition, view_id) => {
+                    let (id, vid) = (definition.id, view_id);
+                    let event = match store.load_views(*definition, vid).await {
+                        Ok(event) => event,
+                        Err(error) => Event::LoadFailed(id, vid, error),
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::Save(request) => {
+                    let (id, view_id, sequence) =
+                        (request.definition.id, request.view_id, request.sequence);
+                    // Mirror the local worker: success clears this view's
+                    // failure, any failure records it (including transport
+                    // outcome-unknown faults, whose durability is unproven),
+                    // and the event carries the same message the flush
+                    // check reports, so notices and shutdown agree.
+                    let event = match store.save_view(&request).await {
+                        Ok(Event::Saved(source, view, seq)) => {
+                            failed.remove(&view);
+                            Event::Saved(source, view, seq)
+                        }
+                        Ok(Event::SaveFailed(source, view, seq, reason)) => {
+                            let message = format!("memory autosave: {reason}");
+                            failed.insert(view, message.clone());
+                            Event::SaveFailed(source, view, seq, message)
+                        }
+                        Ok(_) => {
+                            let message = "memory autosave: unexpected save reply; outcome unknown"
+                                .to_string();
+                            failed.insert(view_id, message.clone());
+                            Event::SaveFailed(id, view_id, sequence, message)
+                        }
+                        Err(error) => {
+                            let message = format!("memory autosave: {error}");
+                            failed.insert(view_id, message.clone());
+                            Event::SaveFailed(id, view_id, sequence, message)
+                        }
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::CreateDerivedView(request) => {
+                    let event = match store.create_derived_view(&request).await {
+                        Ok(event) => event,
+                        Err(error) => Event::DerivedViewCreated(request.view_id, Err(error)),
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::Recent => {
+                    let event = match store.recent_sources().await {
+                        Ok(event) => event,
+                        Err(error) => Event::RecentFailed(error),
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::ListRecipes(meta, context) => {
+                    let event = match store.list_recipes(&meta, &context).await {
+                        Ok(event) => event,
+                        Err(error) => Event::RecipeFailed(meta, error),
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::SaveRecipe(meta, recipe, expected_revision, context) => {
+                    // Mirror the local worker: only a saved revision clears
+                    // the recipe failure; anything else keeps failing flush.
+                    let event = match store
+                        .save_recipe(&meta, *recipe, expected_revision, &context)
+                        .await
+                    {
+                        Ok(Event::RecipeSaved(_, saved)) => {
+                            recipe_failure = None;
+                            Event::RecipeSaved(meta, saved)
+                        }
+                        Ok(Event::RecipeFailed(_, reason)) => {
+                            let message = format!("save recipe: {reason}");
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
+                        Ok(_) => {
+                            let message =
+                                "save recipe: unexpected reply; outcome unknown".to_string();
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
+                        Err(error) => {
+                            let message = format!("save recipe: {error}");
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::RecipeHistory(meta, id) => {
+                    let event = match store.recipe_history(&meta, id).await {
+                        Ok(event) => event,
+                        Err(error) => Event::RecipeFailed(meta, error),
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::ImportRecipe(meta, path) => {
+                    // Mirror the local worker: only an imported revision
+                    // clears the recipe failure.
+                    let event = match store.import_recipe(&meta, path).await {
+                        Ok(Event::RecipeSaved(_, saved)) => {
+                            recipe_failure = None;
+                            Event::RecipeSaved(meta, saved)
+                        }
+                        Ok(Event::RecipeFailed(_, reason)) => {
+                            let message = format!("import recipe: {reason}");
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
+                        Ok(_) => {
+                            let message =
+                                "import recipe: unexpected reply; outcome unknown".to_string();
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
+                        Err(error) => {
+                            let message = format!("import recipe: {error}");
+                            recipe_failure = Some(message.clone());
+                            Event::RecipeFailed(meta, message)
+                        }
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::ExportRecipe(meta, recipe, revision, path) => {
+                    let event = match store.export_recipe(&meta, recipe, revision, path).await {
+                        Ok(event) => event,
+                        Err(error) => Event::RecipeFailed(meta, error),
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::RecordSuggestion(outcome) => {
+                    let event = match store.record_suggestion(&outcome).await {
+                        Ok(None) => continue,
+                        Ok(Some(event)) => event,
+                        Err(error) => Event::SuggestionFailed(error),
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::Flush(done) => {
+                    // Mirror the local worker exactly: consumed save and
+                    // recipe failures stay represented here until a matching
+                    // success clears them, so a failed shutdown cannot
+                    // report clean. Sequential service already answered
+                    // everything accepted before this command.
+                    let result = if let Some(error) = &recipe_failure {
+                        Err(error.clone())
+                    } else if failed.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(failed.values().next().expect("nonempty").clone())
+                    };
+                    if done.send(result).is_err() {
+                        break;
+                    }
+                }
+                Command::Stop(done) => {
+                    // Drain the worker session (flush + goodbye) before
+                    // this thread ends, mirroring local teardown order —
+                    // and ACKNOWLEDGE it: a drain failure must surface
+                    // from `stop`, never report clean.
+                    let result = store.drain_and_detach().await;
+                    let _ = done.send(result);
+                    break;
+                }
+            }
+        }
+    });
 }
 fn queue_error<T>(error: TrySendError<T>) -> String {
     match error {
@@ -289,6 +957,8 @@ fn queue_error<T>(error: TrySendError<T>) -> String {
     }
 }
 
+/// See `RECENT_LIMIT`: transitional test-only worker thread.
+#[cfg_attr(not(test), allow(dead_code))]
 fn worker(
     root: PathBuf,
     commands: Receiver<Command>,
@@ -324,7 +994,7 @@ fn worker(
                 Command::Load(..) => 2,
                 Command::Save(..) => 3,
                 Command::Flush(..) => 6,
-                Command::Stop => 7,
+                Command::Stop(..) => 7,
                 _ => 5,
             },
             Ordering::Relaxed,
@@ -815,12 +1485,19 @@ fn worker(
                 };
                 let _ = done.send(result);
             }
-            Command::Stop => break,
+            Command::Stop(done) => {
+                // Local teardown has no fallible step past the queue: the
+                // explicit flush before stop already settled durability.
+                let _ = done.send(Ok(()));
+                break;
+            }
         }
         phase.store(1, Ordering::Relaxed);
     }
     phase.store(7, Ordering::Relaxed);
 }
+/// See `RECENT_LIMIT`: transitional test-only helper.
+#[cfg_attr(not(test), allow(dead_code))]
 fn source_metadata(definition: SourceDefinition) -> SourceMetadata {
     let command = match &definition.acquisition {
         lvu_core::Acquisition::File { path, .. } => Some(path.to_string_lossy().into_owned()),
@@ -841,7 +1518,10 @@ fn source_metadata(definition: SourceDefinition) -> SourceMetadata {
         missing: false,
     }
 }
-fn working_view(request: &SaveRequest) -> WorkingView {
+/// Project a save request's UI-facing draft onto the durable working view.
+/// Shared by the local worker thread and the shared-capture wiring so both
+/// persist byte-identical state through the same rule (never a remodel).
+pub(crate) fn working_view(request: &SaveRequest) -> WorkingView {
     let selected = request.state.selected.as_ref().and_then(|row| {
         let source_id = SourceId(uuid::Uuid::parse_str(&row.source_id).ok()?);
         (source_id == request.definition.id || request.state.source_ids.contains(&row.source_id))
@@ -1690,7 +2370,7 @@ mod tests {
         let worker = MemoryWorker {
             tx,
             rx,
-            _join: join,
+            join: Some(join),
             phase: Arc::new(AtomicU8::new(1)),
         };
         let definition = definition();
@@ -1706,7 +2386,7 @@ mod tests {
     #[test]
     fn stale_save_sequence_cannot_regress_latest_state() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let mut worker = MemoryWorker::start(temp.path().to_path_buf());
         let definition = definition();
         let id = ViewId::new();
         worker
@@ -1721,7 +2401,7 @@ mod tests {
             store.get_view(id).unwrap().unwrap().applied_search,
             "latest"
         );
-        worker.stop();
+        worker.stop().expect("clean stop joins");
     }
 
     #[test]
@@ -1751,7 +2431,8 @@ mod tests {
                 "latest",
             ))))
             .unwrap();
-        commands_tx.send(Command::Stop).unwrap();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(0);
+        commands_tx.send(Command::Stop(stop_tx)).unwrap();
         let root = temp.path().to_path_buf();
         let phase = Arc::new(AtomicU8::new(0));
         let worker_phase = Arc::clone(&phase);
@@ -1768,6 +2449,10 @@ mod tests {
         }
         saved.sort_unstable();
         assert_eq!(saved, vec![1, 2]);
+        stop_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stop ack")
+            .expect("clean teardown");
         join.join().unwrap();
         // One commit, not two: the coalesced save inserts version 0 with the
         // latest state. Two serial commits would have left version 1.
@@ -1810,7 +2495,8 @@ mod tests {
         commands_tx.send(Command::Save(Box::new(failing))).unwrap();
         let (ack_tx, ack_rx) = mpsc::sync_channel(0);
         commands_tx.send(Command::Flush(ack_tx)).unwrap();
-        commands_tx.send(Command::Stop).unwrap();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(0);
+        commands_tx.send(Command::Stop(stop_tx)).unwrap();
         let root = temp.path().to_path_buf();
         let phase = Arc::new(AtomicU8::new(0));
         let worker_phase = Arc::clone(&phase);
@@ -1837,6 +2523,10 @@ mod tests {
             flush.unwrap_err().contains("bookmark source"),
             "flush surfaces the entry failure"
         );
+        stop_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stop ack")
+            .expect("clean teardown");
         join.join().unwrap();
         // Nothing became durable.
         let store = WorkspaceStore::open(temp.path()).unwrap();
@@ -1887,10 +2577,10 @@ mod tests {
         let phase = Arc::new(AtomicU8::new(0));
         let worker_phase = Arc::clone(&phase);
         let join = thread::spawn(move || worker(root, commands_rx, events_tx, worker_phase));
-        let worker = MemoryWorker {
+        let mut worker = MemoryWorker {
             tx: commands_tx,
             rx: events_rx,
-            _join: join,
+            join: Some(join),
             phase,
         };
         let (events, result) = worker.flush(Duration::from_secs(2));
@@ -1915,8 +2605,7 @@ mod tests {
             store.get_view(third_view).unwrap().unwrap().applied_search,
             "third"
         );
-        worker.stop();
-        worker._join.join().unwrap();
+        worker.stop().expect("stop joins after the batch");
     }
 
     #[test]
@@ -1946,7 +2635,8 @@ mod tests {
             ))
             .unwrap();
         commands_tx.send(Command::Recent).unwrap();
-        commands_tx.send(Command::Stop).unwrap();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(0);
+        commands_tx.send(Command::Stop(stop_tx)).unwrap();
         let root = temp.path().to_path_buf();
         let phase = Arc::new(AtomicU8::new(0));
         let worker_phase = Arc::clone(&phase);
@@ -1972,6 +2662,10 @@ mod tests {
         // The Load emits Loaded then its own Recent, so four events arrive;
         // the first three already prove the order Saved < Loaded < Recent.
         assert_eq!(order, vec!["saved", "loaded", "recent"]);
+        stop_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stop ack")
+            .expect("clean teardown");
         join.join().unwrap();
         let store = WorkspaceStore::open(temp.path()).unwrap();
         assert_eq!(
@@ -2018,7 +2712,12 @@ mod tests {
             events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::Recent(_)
         ));
-        commands_tx.send(Command::Stop).unwrap();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(0);
+        commands_tx.send(Command::Stop(stop_tx)).unwrap();
+        stop_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stop ack")
+            .expect("clean teardown");
         join.join().unwrap();
     }
 
@@ -2041,10 +2740,10 @@ mod tests {
         commands_tx
             .send(Command::Save(Box::new(request(1, definition, id, "final"))))
             .unwrap();
-        let worker = MemoryWorker {
+        let mut worker = MemoryWorker {
             tx: commands_tx,
             rx: events_rx,
-            _join: join,
+            join: Some(join),
             phase,
         };
         let (events, result) = worker.flush(Duration::from_secs(2));
@@ -2057,8 +2756,7 @@ mod tests {
         );
         let store = WorkspaceStore::open(temp.path()).unwrap();
         assert_eq!(store.get_view(id).unwrap().unwrap().applied_search, "final");
-        worker.stop();
-        worker._join.join().unwrap();
+        worker.stop().expect("stop joins after the batch");
     }
 
     #[test]
@@ -2069,7 +2767,7 @@ mod tests {
         let worker = MemoryWorker {
             tx,
             rx,
-            _join: thread::spawn(|| {}),
+            join: Some(thread::spawn(|| {})),
             phase: Arc::new(AtomicU8::new(1)),
         };
         let error = worker.flush(Duration::ZERO).1.unwrap_err();
@@ -2083,13 +2781,15 @@ mod tests {
         );
         assert!(error.contains("worker: waiting for command"), "{error}");
         assert!(matches!(commands.try_recv(), Ok(Command::Flush(_))));
-        worker._join.join().unwrap();
+        // The no-op thread already exited; dropping detaches it. This test
+        // never stops the worker, so no ack or join applies.
+        drop(worker);
     }
 
     #[test]
     fn failed_save_is_acknowledged_and_makes_flush_fail() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let mut worker = MemoryWorker::start(temp.path().to_path_buf());
         let definition = definition();
         let view_id = ViewId::new();
         worker
@@ -2115,7 +2815,7 @@ mod tests {
             external.get_view(view_id).unwrap().unwrap().applied_search,
             "external"
         );
-        worker.stop();
+        worker.stop().expect("clean stop joins");
     }
 
     #[test]
@@ -2154,7 +2854,7 @@ mod tests {
     #[test]
     fn autosave_keeps_accepted_filter_separate_from_unfinished_draft() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let mut worker = MemoryWorker::start(temp.path().to_path_buf());
         let definition = definition();
         let view_id = ViewId::new();
         let mut value = request(1, definition, view_id, "accepted");
@@ -2255,13 +2955,13 @@ mod tests {
             restored.grouping_error.as_deref(),
             Some("unfinished grouping edit")
         );
-        worker.stop();
+        worker.stop().expect("clean stop joins");
     }
 
     #[test]
     fn automatic_grouping_token_round_trips_without_changing_custom_storage() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let mut worker = MemoryWorker::start(temp.path().to_path_buf());
         let view_id = ViewId::new();
         let mut value = request(1, definition(), view_id, "accepted");
         value.state.applied_grouping = lvu::grouping::AUTO_GROUPING_TOKEN.into();
@@ -2284,13 +2984,13 @@ mod tests {
             lvu::grouping::AUTO_GROUPING_TOKEN
         );
         assert_eq!(restored.grouping_draft, lvu::grouping::AUTO_GROUPING_TOKEN);
-        worker.stop();
+        worker.stop().expect("clean stop joins");
     }
 
     #[test]
     fn rolling_capture_policy_round_trips_without_persisting_resolved_bounds() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let mut worker = MemoryWorker::start(temp.path().to_path_buf());
         let definition = definition();
         let view_id = ViewId::new();
         let mut value = request(1, definition, view_id, "accepted");
@@ -2303,7 +3003,7 @@ mod tests {
         value.state.time_recent_draft = "30s".into();
         worker.save(Box::new(value)).unwrap();
         assert!(worker.flush(Duration::from_secs(1)).1.is_ok());
-        worker.stop();
+        worker.stop().expect("clean stop joins");
 
         let stored = WorkspaceStore::open(temp.path())
             .unwrap()
@@ -2438,6 +3138,302 @@ mod tests {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
         }
+    }
+    struct AdmitAllShared;
+
+    impl lvu_shared::AdmissionHook for AdmitAllShared {
+        fn admit(&self, _definition: &SourceDefinition) -> lvu_shared::AdmissionVerdict {
+            lvu_shared::AdmissionVerdict::Admit
+        }
+    }
+
+    /// A live worker behind a socket, serving one window client: the
+    /// harness the shared-memory tests drive without a real binary.
+    async fn shared_fixture(
+        root: &std::path::Path,
+        pid: u32,
+    ) -> std::sync::Arc<crate::shared_capture::SharedStore> {
+        let capture_root = root.join("captures");
+        let paths = lvu_shared::WorkerPaths::new(&capture_root);
+        paths.ensure_directories().unwrap();
+        let config = lvu_shared::WorkerConfig {
+            capture_root: capture_root.clone(),
+            workspace_root: capture_root.join("workspace"),
+            socket_path: paths.socket_path(),
+            viewer_grace: Duration::from_millis(100),
+            request_timeout: Duration::from_secs(10),
+        };
+        let (service, _) =
+            lvu_shared::WorkerService::open(config, std::sync::Arc::new(AdmitAllShared)).unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket_path()).unwrap();
+        tokio::spawn(async move {
+            service.serve(listener).await;
+        });
+        let (client, _) = lvu_shared::WorkerClient::connect(
+            &capture_root,
+            &paths.socket_path(),
+            "window-mem",
+            pid,
+        )
+        .await
+        .expect("window attaches");
+        std::sync::Arc::new(crate::shared_capture::SharedStore::from_client(client))
+    }
+
+    async fn poll_until(
+        memory: &SharedMemory,
+        deadline: Instant,
+        mut want: impl FnMut(&Event) -> bool,
+    ) -> Event {
+        loop {
+            if let Some(event) = memory.poll()
+                && want(&event)
+            {
+                return event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shared memory never answered in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_save_load_roundtrip() {
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6201).await;
+        let mut memory = SharedMemory::wrap(store);
+        let definition = definition();
+        let view = ViewId::new();
+        memory
+            .save(Box::new(request(1, definition.clone(), view, "seek")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match poll_until(&memory, deadline, |event| matches!(event, Event::Saved(..))).await {
+            Event::Saved(_, _, sequence) => assert_eq!(sequence, 1),
+            other => panic!("expected saved, got {other:?}"),
+        }
+        memory.load(definition.clone(), view).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match poll_until(&memory, deadline, |event| {
+            matches!(event, Event::Loaded(..))
+        })
+        .await
+        {
+            Event::Loaded(..) => {}
+            other => panic!("expected loaded, got {other:?}"),
+        }
+        memory.stop().expect("clean stop joins");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_flush_acks_after_saves() {
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6202).await;
+        let mut memory = SharedMemory::wrap(store);
+        let definition = definition();
+        let view = ViewId::new();
+        memory
+            .save(Box::new(request(1, definition.clone(), view, "seek")))
+            .unwrap();
+        memory
+            .save(Box::new(request(2, definition.clone(), view, "seek")))
+            .unwrap();
+        let (events, result) = memory.flush(Duration::from_secs(10));
+        result.expect("flush acknowledges after saves settle");
+        assert!(
+            events.iter().any(|event| matches!(event, Event::Saved(..))),
+            "flush drains the save acks first"
+        );
+        memory.stop().expect("clean stop joins");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_stop_rejects_later_saves() {
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6203).await;
+        let mut memory = SharedMemory::wrap(store);
+        let definition = definition();
+        let view = ViewId::new();
+        memory
+            .save(Box::new(request(1, definition.clone(), view, "seek")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        poll_until(&memory, deadline, |event| matches!(event, Event::Saved(..))).await;
+        memory.stop().expect("clean stop joins");
+        // After stop the shim refuses submission with the request back,
+        // mirroring a disconnected local worker — never silently dropped.
+        match memory.save(Box::new(request(2, definition, view, "seek"))) {
+            Err(returned) => assert_eq!(returned.sequence, 2),
+            Ok(()) => panic!("stopped shim must not accept saves"),
+        }
+        assert!(memory.poll().is_none());
+    }
+
+    /// A drain failure must surface from `stop`, never report clean: the
+    /// store is pre-detached (deterministically broken connection), so the
+    /// worker thread's session drain fails and the ack carries the error
+    /// through the join.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_stop_reports_drain_failure() {
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6212).await;
+        store
+            .drain_and_detach()
+            .await
+            .expect("first drain detaches cleanly");
+        let mut memory = SharedMemory::wrap(store);
+        let error = memory.stop().expect_err("broken drain must fail stop");
+        assert!(
+            !error.is_empty(),
+            "drain failure must explain itself: {error:?}"
+        );
+    }
+
+    /// Stop delivers behind queued work instead of discarding on a full
+    /// queue: tiny capacities force enqueue pressure, yet every save is
+    /// acknowledged, the ack is Ok, and the thread is joined (a second
+    /// stop is a harmless Ok).
+    #[test]
+    fn stop_delivers_behind_queued_work_acks_and_joins() {
+        let temp = TempDir::new().unwrap();
+        let mut worker = MemoryWorker::start_with_capacities(temp.path().to_path_buf(), 1, 8);
+        let definition = definition();
+        let view = ViewId::new();
+        for sequence in 1..=3u64 {
+            let request = request(sequence, definition.clone(), view, "queued");
+            // Retry like any producer: capacity 1 means the queue may be
+            // momentarily full while the worker drains it.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match worker.save(Box::new(request.clone())) {
+                    Ok(()) => break,
+                    Err(_) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "queue never drained for sequence {sequence}"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            }
+        }
+        worker.stop().expect("reliable stop joins after the batch");
+        worker.stop().expect("second stop is harmless");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_conflict_makes_flush_fail_closed() {
+        // A peer-winning conflict must stay represented at shutdown like
+        // the local worker's failed map: flush reports the failure instead
+        // of a clean exit over undurable state.
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6211).await;
+        let mut memory = SharedMemory::wrap(store);
+        let definition = definition();
+        let view = ViewId::new();
+        memory
+            .save(Box::new(request(1, definition.clone(), view, "ours")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        poll_until(&memory, deadline, |event| matches!(event, Event::Saved(..))).await;
+        // A second writer moves the row underneath us.
+        let external =
+            WorkspaceStore::open(root.path().join("captures").join("workspace")).unwrap();
+        let mut moved = external.get_view(view).unwrap().unwrap();
+        moved.applied_search = "theirs".into();
+        external.update_view(&moved, 0).unwrap();
+        drop(external);
+        memory
+            .save(Box::new(request(2, definition, view, "ours edited")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match poll_until(&memory, deadline, |event| {
+            matches!(event, Event::SaveFailed(..))
+        })
+        .await
+        {
+            Event::SaveFailed(_, failed_view, sequence, message) => {
+                assert_eq!(failed_view, view);
+                assert_eq!(sequence, 2);
+                assert!(
+                    message.contains("memory autosave"),
+                    "flush and notices share one message: {message}"
+                );
+            }
+            other => panic!("expected save failure, got {other:?}"),
+        }
+        let (_, result) = memory.flush(Duration::from_secs(10));
+        assert!(result.is_err(), "flush must report the failed save");
+        memory.stop().expect("clean stop joins");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_invalid_save_makes_flush_fail_then_recovery_clears() {
+        // An invalid save fails the flush; a later valid save for the same
+        // view clears it, mirroring local recovery. The invalid attempt
+        // never touches versions, so the valid save commits at once.
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6212).await;
+        let mut memory = SharedMemory::wrap(store);
+        let definition = definition();
+        let view = ViewId::new();
+        let mut invalid = request(1, definition.clone(), view, "bad");
+        invalid.state.bookmarks = vec![lvu::Bookmark {
+            id: lvu::RowId::new(SourceId::new().0.to_string(), 7),
+            note: "nowhere".into(),
+        }];
+        memory.save(Box::new(invalid)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        poll_until(&memory, deadline, |event| {
+            matches!(event, Event::SaveFailed(..))
+        })
+        .await;
+        let (_, stale) = memory.flush(Duration::from_secs(10));
+        assert!(stale.is_err(), "flush must report the invalid save");
+        memory
+            .save(Box::new(request(2, definition, view, "good")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        poll_until(&memory, deadline, |event| matches!(event, Event::Saved(..))).await;
+        let (_, recovered) = memory.flush(Duration::from_secs(10));
+        recovered.expect("flush acknowledges after recovery");
+        memory.stop().expect("clean stop joins");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_recipe_failure_makes_flush_fail() {
+        // Recipe failures poison the flush exactly like view failures;
+        // only a saved revision clears them.
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6213).await;
+        let mut memory = SharedMemory::wrap(store);
+        let meta = lvu::RecipeRequestMeta {
+            request_id: 1,
+            dialog_id: 2,
+            dialog_revision: 3,
+        };
+        memory
+            .import_recipe(meta, root.path().join("missing-recipe.toml"))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match poll_until(&memory, deadline, |event| {
+            matches!(event, Event::RecipeFailed(..))
+        })
+        .await
+        {
+            Event::RecipeFailed(_, message) => {
+                assert!(
+                    message.contains("import recipe"),
+                    "recipe flush and notices share one message: {message}"
+                );
+            }
+            other => panic!("expected recipe failure, got {other:?}"),
+        }
+        let (_, result) = memory.flush(Duration::from_secs(10));
+        assert!(result.is_err(), "flush must report the recipe failure");
+        memory.stop().expect("clean stop joins");
     }
 }
 

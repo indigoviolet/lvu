@@ -131,7 +131,7 @@ pub enum TimeBasis {
     Selected,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedRecipe {
     pub path: PathBuf,
     pub content_hash: String,

@@ -120,7 +120,7 @@ impl RawRowSource for GatedRows {
         RowProvider::revision(&*self.inner, view_id)
     }
 
-    fn register_source(&self, handle: SourceHandle) -> Result<(), String> {
+    fn register_source(&self, handle: lvu_shared::AnySourceHandle) -> Result<(), String> {
         self.inner
             .register_source(handle)
             .map_err(|error| error.to_string())
@@ -213,7 +213,9 @@ async fn setup(
     let view = ViewConfig::new(root.path().join("view-index"));
     let adapter =
         NativeViewAdapter::with_raw_rows(Arc::clone(&raw) as Arc<dyn RawRowSource>, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();

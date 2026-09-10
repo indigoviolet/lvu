@@ -1658,6 +1658,7 @@ dependencies = [
  "lvu-live",
  "lvu-memory",
  "lvu-query",
+ "lvu-shared",
  "lvu-view",
  "mimalloc",
  "serde",
@@ -1739,6 +1740,7 @@ dependencies = [
  "lvu",
  "lvu-core",
  "lvu-ingest",
+ "lvu-shared",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
@@ -1781,6 +1783,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvu-shared"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "lvu-core",
+ "lvu-ingest",
+ "lvu-memory",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "lvu-view"
 version = "0.1.0"
 dependencies = [
@@ -1789,11 +1806,13 @@ dependencies = [
  "lvu-ingest",
  "lvu-live",
  "lvu-query",
+ "lvu-shared",
  "polars",
  "ratatui",
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

@@ -303,6 +303,12 @@ impl WriterState {
     }
 
     fn publish(&self) {
+        #[cfg(feature = "test-support")]
+        crate::publish_probe::pre_publish(
+            &self.current.source_id,
+            &self.progress_publication,
+            &self.current,
+        );
         let _publication = self
             .progress_publication
             .write()

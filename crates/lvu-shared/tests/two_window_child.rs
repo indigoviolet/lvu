@@ -1,0 +1,502 @@
+//! Executable shared-capture proof: real worker child processes, real
+//! election, real sockets. Window A spawns the worker by attaching, starts
+//! a file capture, and saves a view; a rival worker process exits
+//! `INCUMBENT`; window B attaches to the same worker, sees the source in
+//! presence, tails the same journal through its own reader, and wins a
+//! cross-window save race with CAS semantics; both windows drain (flush +
+//! goodbye) and the worker exits clean after the last detach.
+//!
+//! Every wait is bounded; any failure names the phase so the preserved
+//! worker log (path printed at start) can be correlated.
+
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::{Duration, Instant},
+};
+
+use lvu_shared::{
+    FileJournalTail, SourceSummary, StartOutcome, StoreEvent, StoreMethod, WorkerClient,
+    election::WorkerPaths,
+    spawn::{SpawnSpec, exit},
+};
+
+fn worker_bin() -> PathBuf {
+    // Cargo sets `CARGO_BIN_EXE_<name>` for integration tests when the
+    // harness binary is in the build graph; otherwise resolve it beside
+    // this test executable (`<target>/debug/deps` -> `<target>/debug`).
+    // The build fails loudly if neither resolves, never silently probing.
+    if let Some(path) = option_env!("CARGO_BIN_EXE_lvu-shared-worker") {
+        return PathBuf::from(path);
+    }
+    let exe = std::env::current_exe().expect("test executable path");
+    let bin = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .map(|debug| debug.join("lvu-shared-worker"))
+        .expect("target layout");
+    assert!(
+        bin.is_file(),
+        "worker harness binary missing at {}",
+        bin.display()
+    );
+    bin
+}
+
+/// A spawned fixture that is always reaped: drop kills and waits, so a
+/// failing assertion never leaves a worker behind holding the election.
+struct KillOnDrop(Option<std::process::Child>);
+
+impl KillOnDrop {
+    fn wait_for_exit(&mut self, what: &str, timeout: Duration) -> i32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.0.as_mut().expect("child taken").try_wait() {
+                Ok(Some(status)) => {
+                    return status.code().unwrap_or(-1);
+                }
+                Ok(None) => {}
+                Err(error) => panic!("{what}: wait failed: {error}"),
+            }
+            if Instant::now() >= deadline {
+                panic!("{what}: no exit within {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn spawn_worker(bin: &Path, capture_root: &Path, socket: &Path) -> KillOnDrop {
+    let spec = SpawnSpec::new(bin, capture_root, socket);
+    let mut argv = spec.argv();
+    argv.remove(0);
+    let child = std::process::Command::new(bin)
+        .args(&argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("worker child must spawn");
+    KillOnDrop(Some(child))
+}
+
+fn file_definition(id: u128, path: &Path) -> lvu_core::SourceDefinition {
+    lvu_core::SourceDefinition {
+        schema_version: 1,
+        id: lvu_core::SourceId(uuid::Uuid::from_u128(id)),
+        name: format!("log-{id}"),
+        acquisition: lvu_core::Acquisition::File {
+            path: path.to_path_buf(),
+            follow: true,
+        },
+        identity_hints: Default::default(),
+        retention: None,
+    }
+}
+
+fn test_view(source: lvu_core::SourceId, view: u128, version: u64) -> lvu_memory::WorkingView {
+    lvu_memory::WorkingView {
+        id: lvu_core::ViewId(uuid::Uuid::from_u128(view)),
+        source_id: source,
+        name: "All events".into(),
+        role: lvu_memory::ViewRole::Derived,
+        applied_revision_id: None,
+        applied_search: String::new(),
+        search_draft: None,
+        applied_advanced_filter: None,
+        advanced_filter_draft: None,
+        navigation: lvu_memory::NavigationState {
+            selected: None,
+            anchor: None,
+            follow: true,
+        },
+        presentation: lvu_memory::PresentationState::default(),
+        version,
+    }
+}
+
+fn save_method(
+    window: &str,
+    sequence: u64,
+    definition: &lvu_core::SourceDefinition,
+    view: lvu_core::ViewId,
+    expected_version: Option<u64>,
+) -> StoreMethod {
+    StoreMethod::Save {
+        request_id: format!("{window}-save-{sequence}"),
+        window_id: window.to_owned(),
+        sequence,
+        definition: definition.clone(),
+        view_id: view,
+        state: test_view(
+            definition.id,
+            view.0.as_u128(),
+            expected_version.unwrap_or(0),
+        ),
+        expected_version,
+    }
+}
+
+#[tokio::test]
+async fn two_windows_share_one_capture_through_real_worker() {
+    let scenario = tokio::time::timeout(Duration::from_secs(120), async {
+        let root = tempfile::tempdir().expect("scratch root");
+        let capture_root = root.path().join("captures");
+        let paths = WorkerPaths::new(&capture_root);
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\n").expect("seed log");
+        let bin = worker_bin();
+
+        // Window A cold-attaches: the client elects and spawns the worker.
+        // Distinct viewer PIDs per logical window: the election refuses two
+        // takes of one PID slot in a process, exactly as for real windows.
+        let (mut first, presence) = WorkerClient::attach(&bin, &capture_root, "window-a", 4001)
+            .await
+            .expect("window A attaches");
+        assert!(presence.is_empty(), "fresh worker has no sources");
+
+        // A rival worker loses the election promptly with INCUMBENT.
+        let mut rival = spawn_worker(&bin, &capture_root, &paths.socket_path());
+        assert_eq!(
+            rival.wait_for_exit("rival worker", Duration::from_secs(15)),
+            exit::INCUMBENT,
+            "second worker must yield, not serve"
+        );
+
+        // Window A starts a file capture through the worker.
+        let definition = file_definition(11, &log);
+        let (source_id, journal_path) = match first
+            .request_start(&definition)
+            .await
+            .expect("window A starts capture")
+        {
+            StartOutcome::Started {
+                source_id,
+                journal_path,
+                ..
+            } => (source_id, journal_path),
+            StartOutcome::StdinBound { .. } => panic!("file start must not bind stdin"),
+        };
+        assert_eq!(source_id, definition.id);
+
+        // The capture follows appends; window B tails the same journal
+        // through its own reader: one capture, two readers.
+        std::fs::write(&log, "one\ntwo\n").expect("append log");
+        let tail = FileJournalTail::new(source_id, &journal_path);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let page = loop {
+            if let Ok(page) = tail.read_page(0, 128, 1024 * 1024)
+                && page.records.len() >= 2
+            {
+                break page;
+            }
+            if Instant::now() >= deadline {
+                panic!("shared rows never arrived at {}", journal_path.display());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(page.records.len(), 2);
+
+        // Window B attaches to the same worker and sees the source.
+        let (mut second, presence) = WorkerClient::attach(&bin, &capture_root, "window-b", 4002)
+            .await
+            .expect("window B attaches");
+        assert!(
+            presence.iter().any(
+                |SourceSummary {
+                     id,
+                     journal_path: journal,
+                     ..
+                 }| id == &source_id.0.to_string()
+                    && Path::new(journal) == journal_path.as_path()
+            ),
+            "window B sees the shared source: {presence:?}"
+        );
+
+        // Cross-window save race with CAS: A creates version 0, B wins
+        // version 1 against it, A's stale retry loses with the committed
+        // version echoed.
+        let view = lvu_core::ViewId(uuid::Uuid::from_u128(12));
+        match first
+            .store(save_method("window-a", 1, &definition, view, None))
+            .await
+            .expect("window A saves")
+        {
+            StoreEvent::Saved { version: 0, .. } => {}
+            other => panic!("expected version 0, got {other:?}"),
+        }
+        match second
+            .store(save_method("window-b", 1, &definition, view, Some(0)))
+            .await
+            .expect("window B saves")
+        {
+            StoreEvent::Saved { version: 1, .. } => {}
+            other => panic!("expected version 1, got {other:?}"),
+        }
+        match first
+            .store(save_method("window-a", 2, &definition, view, Some(0)))
+            .await
+            .expect("stale save answers")
+        {
+            StoreEvent::SaveFailed {
+                current_version: Some(1),
+                ..
+            } => {}
+            other => panic!("expected versioned conflict, got {other:?}"),
+        }
+
+        // Both windows drain (flush + goodbye); detach is explicit.
+        first.shutdown().await.expect("window A drains");
+        second.shutdown().await.expect("window B drains");
+
+        // The worker notices the empty audience past grace and exits
+        // clean: drained viewers, stopped captures, unlinked socket. `root`
+        // rides along so the scratch tree outlives the verification below:
+        // dropping it first would delete the socket and log under us.
+        let log_path = paths.worker_log();
+        (root, log_path, paths.socket_path())
+    })
+    .await;
+    let (scratch, log_path, socket_path) = match scenario {
+        Ok(paths) => paths,
+        Err(_) => panic!("two-window scenario exceeded 120s"),
+    };
+    let _scratch = scratch;
+    // The worker unlinks its socket on clean shutdown: poll for that, then
+    // confirm the log. The owner child is untracked (ensure_worker spawned
+    // it detached); it exits by itself past grace, so no reap is needed.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if !socket_path.exists() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("worker never unlinked its socket after both drains");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        log_text.contains("clean shutdown"),
+        "worker log must record clean shutdown: {log_text:?}"
+    );
+}
+
+/// Production `ChildAdmission` dedup across two real windows: the same file
+/// proposed under two DISTINCT ids admits once — the second start presents
+/// the winner's canonical id (never a second acquisition) — both windows
+/// read the same journal through independent readers, and a failed
+/// operation from the second window (a stale-versioned save conflict)
+/// leaves the winner's capture undamaged: appends still flow and the
+/// winner's next save still commits.
+#[tokio::test]
+async fn second_window_presents_winner_identity_with_distinct_proposal() {
+    let scenario = tokio::time::timeout(Duration::from_secs(120), async {
+        let root = tempfile::tempdir().expect("scratch root");
+        let capture_root = root.path().join("captures");
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\n").expect("seed log");
+        let bin = worker_bin();
+
+        // Window A admits the file under its proposed id: the worker
+        // echoes it back on a fresh admit.
+        let (mut first, _) = WorkerClient::attach(&bin, &capture_root, "window-a", 4101)
+            .await
+            .expect("window A attaches");
+        let proposed_a = file_definition(41, &log);
+        let winner = match first
+            .request_start(&proposed_a)
+            .await
+            .expect("window A starts capture")
+        {
+            StartOutcome::Started { source_id, .. } => source_id,
+            StartOutcome::StdinBound { .. } => panic!("file start must not bind stdin"),
+        };
+        assert_eq!(winner, proposed_a.id);
+
+        // Window B proposes the SAME file under a DISTINCT id: production
+        // admission must Present the winner, not admit a second capture.
+        let (mut second, _) = WorkerClient::attach(&bin, &capture_root, "window-b", 4102)
+            .await
+            .expect("window B attaches");
+        let proposed_b = file_definition(42, &log);
+        assert_ne!(proposed_b.id, proposed_a.id);
+        let presented = match second
+            .request_start(&proposed_b)
+            .await
+            .expect("window B starts same file")
+        {
+            StartOutcome::Started { source_id, .. } => source_id,
+            StartOutcome::StdinBound { .. } => panic!("file start must not bind stdin"),
+        };
+        assert_eq!(
+            presented, winner,
+            "distinct proposal of the same file must present the winner"
+        );
+
+        // Independent readers, one capture: B tails the winner's journal
+        // through its own reader and sees A's rows.
+        std::fs::write(&log, "one\ntwo\n").expect("append log");
+        let journal = second
+            .request_start(&proposed_b)
+            .await
+            .expect("re-proposal still presents");
+        let journal_path = match journal {
+            StartOutcome::Started { journal_path, .. } => journal_path,
+            StartOutcome::StdinBound { .. } => panic!("file start must not bind stdin"),
+        };
+        let tail = FileJournalTail::new(winner, &journal_path);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let page = loop {
+            if let Ok(page) = tail.read_page(0, 128, 1024 * 1024)
+                && page.records.len() >= 2
+            {
+                break page;
+            }
+            if Instant::now() >= deadline {
+                panic!("B never read the winner's rows");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(page.records.len(), 2);
+
+        // A failed operation from B (stale-versioned save) must not damage
+        // the winner: the conflict is reported, then A's rows still flow
+        // and A's next save still commits. B saves under the WINNER id —
+        // exactly what the fixed controller sends after adopting the
+        // canonical identity — so the conflict is versioned, not a stray
+        // source key.
+        let mut adopted_b = proposed_b.clone();
+        adopted_b.id = winner;
+        let view = lvu_core::ViewId(uuid::Uuid::from_u128(43));
+        match second
+            .store(save_method("window-b", 1, &adopted_b, view, Some(99)))
+            .await
+            .expect("stale save answers")
+        {
+            StoreEvent::SaveFailed { .. } => {}
+            other => panic!("expected stale conflict, got {other:?}"),
+        }
+        std::fs::write(&log, "one\ntwo\nthree\n").expect("append after conflict");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(page) = tail.read_page(0, 128, 1024 * 1024)
+                && page.records.len() >= 3
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("winner capture stopped flowing after B's failed save");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        match first
+            .store(save_method("window-a", 1, &proposed_a, view, None))
+            .await
+            .expect("winner saves")
+        {
+            StoreEvent::Saved { .. } => {}
+            other => panic!("winner save must still commit, got {other:?}"),
+        }
+
+        first.shutdown().await.expect("window A drains");
+        second.shutdown().await.expect("window B drains");
+    })
+    .await;
+    if scenario.is_err() {
+        panic!("dedup scenario exceeded 120s");
+    }
+}
+
+/// A killed worker leaves its socket file stale with no live owner. The
+/// next attach must elect a replacement (which unlinks the stale file and
+/// binds) and come back with a welcome from the NEW worker — not reuse the
+/// dead file, and not fail on the first refused connect. The replacement is
+/// then proven functional with a real start and a mediated save, which also
+/// proves the workspace store recovered from the kill.
+#[tokio::test]
+async fn attach_recovers_stale_socket_after_dead_owner() {
+    let scenario = tokio::time::timeout(Duration::from_secs(120), async {
+        let root = tempfile::tempdir().expect("scratch root");
+        let capture_root = root.path().join("captures");
+        let paths = WorkerPaths::new(&capture_root);
+        let bin = worker_bin();
+
+        // Window A elects and attaches a live worker.
+        let (first, _) = WorkerClient::attach(&bin, &capture_root, "window-a", 4201)
+            .await
+            .expect("window A attaches");
+        let dead_pid = first.worker_pid();
+        assert_ne!(dead_pid, 0);
+
+        // Kill without cleanup: the socket file stays stale while the
+        // election lock releases in-kernel on process death.
+        let killed = unsafe { libc::kill(dead_pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(killed, 0, "kill worker {dead_pid}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if !lvu_shared::owner_is_live(&paths).expect("probe election") {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dead worker still holds the election");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            paths.socket_path().exists(),
+            "dead worker leaves a stale socket file"
+        );
+        // Dropping detaches (EOF): no goodbye is possible to a dead worker.
+        drop(first);
+
+        // Window B attaches through the stale file.
+        let (mut second, _) = WorkerClient::attach(&bin, &capture_root, "window-b", 4202)
+            .await
+            .expect("window B recovers through the stale socket");
+        assert_ne!(
+            second.worker_pid(),
+            dead_pid,
+            "a replacement worker serves, not the dead file"
+        );
+
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\n").expect("seed log");
+        let definition = file_definition(31, &log);
+        match second
+            .request_start(&definition)
+            .await
+            .expect("start on the replacement")
+        {
+            StartOutcome::Started { source_id, .. } => assert_eq!(source_id, definition.id),
+            StartOutcome::StdinBound { .. } => panic!("file start must not bind stdin"),
+        }
+        let view = lvu_core::ViewId(uuid::Uuid::from_u128(32));
+        match second
+            .store(save_method("window-b", 1, &definition, view, None))
+            .await
+            .expect("save on the replacement")
+        {
+            StoreEvent::Saved { version: 0, .. } => {}
+            other => panic!("expected version 0, got {other:?}"),
+        }
+        second.shutdown().await.expect("window B drains");
+        // Hold the scratch tree until the drain lands; the replacement
+        // worker exits on its own grace afterwards.
+        root
+    })
+    .await;
+    let _scratch = match scenario {
+        Ok(root) => root,
+        Err(_) => panic!("stale-socket scenario exceeded 120s"),
+    };
+}

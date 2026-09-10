@@ -394,7 +394,9 @@ async fn color_match_cap_rejects_candidate_and_preserves_last_good_rows() {
     view.maximum_index_bytes = 400;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -449,7 +451,9 @@ async fn retained_color_match_clone_obeys_cap_and_keeps_last_good_rows() {
     view.maximum_index_bytes = 300;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -691,7 +695,9 @@ async fn setup_bytes_with_runtime(
     let (live_config, view_config) = configs(root);
     let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
     let adapter = NativeViewAdapter::new(raw, view_config).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -1923,7 +1929,9 @@ async fn filter_grouping_charges_only_retained_pages_under_a_low_budget() {
     view_config.maximum_index_bytes = 96 * 1024;
     let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view_config).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -2416,7 +2424,9 @@ async fn automatic_partial_groups_never_cross_stream_boundaries() {
     let (live_config, view_config) = configs(&root);
     let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view_config).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -2568,7 +2578,9 @@ async fn automatic_grouping_cap_failure_preserves_accepted_membership_and_refres
     view_config.maximum_index_bytes = 5 * 1024;
     let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view_config).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -2737,7 +2749,9 @@ async fn display_grouping_preserves_and_labels_one_oversized_physical_record() {
     view_config.page_bytes = 256 * 1024;
     let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view_config).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -2794,7 +2808,9 @@ async fn display_grouping_never_crosses_source_or_stream_boundaries() {
     let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view_config).unwrap();
     for handle in [&first, &second, &streams] {
-        adapter.register_source(handle.clone()).unwrap();
+        adapter
+            .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+            .unwrap();
     }
     adapter
         .register_view(
@@ -3050,7 +3066,9 @@ async fn latest_request_fences_scan_and_index_limit_is_explicit() {
     view.maximum_index_bytes = 280;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -3094,7 +3112,9 @@ async fn command_arrivals_refresh_an_applied_native_query_and_shutdown_is_bounde
     let (live, view) = configs(&root);
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -3167,7 +3187,9 @@ async fn failed_candidate_progress_does_not_advance_applied_high_watermark() {
     view.page_records = 1;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -3287,7 +3309,9 @@ async fn snapshot_exports_fixed_applied_enriched_rows_and_complete_source_parts(
     view.page_records = 3;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -3575,7 +3599,9 @@ async fn snapshot_packs_many_evaluation_batches_without_losing_rows_nulls_or_ord
     view.page_records = 32;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -3678,7 +3704,9 @@ async fn snapshot_cancel_and_limits_never_publish_complete_manifest() {
     let (live, view) = configs(&root);
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -3779,7 +3807,9 @@ async fn snapshot_never_completes_when_frozen_journal_boundary_is_missing() {
     let (live, view) = configs(&root);
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -3833,7 +3863,9 @@ async fn snapshot_rejects_restarted_source_generation_for_applied_membership() {
     let (live, view) = configs(&root);
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(original).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(original))
+        .unwrap();
     adapter.register_view("view", vec![source_id]).unwrap();
     let mut grouped = request("view", 1, 1, 0, None, None);
     grouped.purpose = QueryPurpose::Grouping;
@@ -3849,7 +3881,9 @@ async fn snapshot_rejects_restarted_source_generation_for_applied_membership() {
         .await
         .unwrap();
     assert!(restarted.progress().generation > 1);
-    adapter.register_source(restarted.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(restarted.clone()))
+        .unwrap();
     let job = adapter
         .start_snapshot(
             "view",
@@ -3907,7 +3941,9 @@ async fn snapshot_preserves_incremental_enrichment_batch_boundaries() {
     view.page_records = 4;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -4007,7 +4043,9 @@ async fn snapshot_replays_batches_across_durable_sequence_reservation_gaps() {
     let (live, view) = configs(&root);
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -4150,7 +4188,9 @@ async fn raw_context_exposes_hidden_neighbors_without_changing_membership_or_cro
         .await
         .unwrap();
     wait_runtime(&other, 1).await;
-    adapter.register_source(other.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(other.clone()))
+        .unwrap();
     adapter
         .register_view("merged", vec![handle.source_id(), other.source_id()])
         .unwrap();
@@ -4230,7 +4270,9 @@ async fn a_correlated_value_gathers_records_from_sources_that_name_the_field_dif
         .await
         .unwrap();
     wait_runtime(&worker, 3).await;
-    adapter.register_source(worker.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(worker.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![api_handle.source_id(), worker.source_id()])
         .unwrap();
@@ -4454,7 +4496,9 @@ async fn measure_capture_and_historical_queries_under_small_cache_budgets() {
     query.maximum_index_bytes = 128 * 1024;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, query).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -4676,7 +4720,9 @@ async fn measure_sustained_capture_queries_and_bounded_paging() {
     query.maximum_index_bytes = 128 * 1024;
     let mut adapter =
         NativeViewAdapter::new(Arc::new(LiveRowProvider::new(live).unwrap()), query).unwrap();
-    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -4789,7 +4835,9 @@ async fn source_membership_changes_publish_atomically_and_preserve_failed_or_sup
         .await
         .unwrap();
     wait_runtime(&second, 2).await;
-    adapter.register_source(second.clone()).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(second.clone()))
+        .unwrap();
     let first_id = first.source_id();
     let second_id = second.source_id();
     let initial = request("view", 1, 1, 0, Some("keep"), None);
@@ -4814,7 +4862,9 @@ async fn source_membership_changes_publish_atomically_and_preserve_failed_or_sup
     assert!(second.stop().await.unwrap().complete);
     let restarted = manager.start(source(second_id, &path, true)).await.unwrap();
     wait_runtime(&restarted, 2).await;
-    adapter.register_source(restarted).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(restarted))
+        .unwrap();
     assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
     let merged = wait_page(&mut adapter, 2).await;
     // Both sources are in the view, and the reordered list published whole.
@@ -4942,7 +4992,9 @@ async fn source_membership_publication_failure_keeps_raw_registration_and_query_
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, config).unwrap();
     for handle in &handles {
-        adapter.register_source(handle.clone()).unwrap();
+        adapter
+            .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+            .unwrap();
     }
     let first = handles[0].source_id();
     adapter.register_view("view", vec![first]).unwrap();

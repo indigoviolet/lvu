@@ -3,7 +3,8 @@ use crate::time::{RecognitionOptions, TimeOutcome, recognize_record};
 use fs2::FileExt;
 use lvu::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
 use lvu_core::{ChunkPosition, RawRecord, SourceId};
-use lvu_ingest::{RuntimeState, SourceHandle};
+use lvu_ingest::RuntimeState;
+use lvu_shared::AnySourceHandle;
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -224,6 +225,13 @@ pub struct LiveConfig {
     pub index_lock_retry_window: Duration,
     /// Ceiling for the backoff between those retries.
     pub index_lock_retry_ceiling: Duration,
+    /// Opt-in window tag for concurrent-window derived indexes. When set,
+    /// a per-source index file owned by another live window does not fail
+    /// terminally: this window builds its own derived index beside it
+    /// (`<source>.<journal>.<tag>.rows.idx`, swept once its owner is gone;
+    /// see [`sweep_stale_window_indexes`]). `None` keeps the historical
+    /// single-owner behavior exactly (contend, then terminally fail).
+    pub window_tag: Option<String>,
 }
 
 impl LiveConfig {
@@ -244,6 +252,7 @@ impl LiveConfig {
             maximum_view_sources: 32,
             index_lock_retry_window: Duration::from_secs(30),
             index_lock_retry_ceiling: Duration::from_millis(500),
+            window_tag: None,
         }
     }
 }
@@ -415,7 +424,7 @@ impl LiveRowProvider {
 
     /// Registers one runtime generation. Re-registering the same SourceId fences
     /// old worker updates and invalidates its derived cache without stopping capture.
-    pub fn register_source(&self, handle: SourceHandle) -> Result<(), AdapterError> {
+    pub fn register_source(&self, handle: AnySourceHandle) -> Result<(), AdapterError> {
         let _ownership = self
             .artifact_ownership
             .lock()
@@ -1798,7 +1807,7 @@ struct WorkerInbox {
 }
 
 async fn source_worker(
-    handle: SourceHandle,
+    handle: AnySourceHandle,
     token: WorkerToken,
     artifact_dir: PathBuf,
     config: LiveConfig,
@@ -1886,21 +1895,7 @@ async fn source_worker(
         }
     };
     let artifact = artifact_dir.join(format!("{}.{}.rows.idx", source_id.0, journal_identity));
-    if !emit(
-        &updates,
-        &mut cancelled,
-        WorkerUpdate::Artifact {
-            source_id,
-            generation,
-            epoch,
-            path: artifact.clone(),
-        },
-    )
-    .await
-    {
-        return;
-    }
-    let (mut disk, rebuilt, budget) = match open_index(
+    let (mut disk, rebuilt, budget, artifact) = match open_index(
         &handle,
         token,
         &artifact,
@@ -1935,6 +1930,22 @@ async fn source_worker(
         }
         None => return,
     };
+    // Publish the artifact actually opened (a window-overflow path when the
+    // primary was contended): readers and active-checks below key on this.
+    if !emit(
+        &updates,
+        &mut cancelled,
+        WorkerUpdate::Artifact {
+            source_id,
+            generation,
+            epoch,
+            path: artifact.clone(),
+        },
+    )
+    .await
+    {
+        return;
+    }
     let initial_state = if rebuilt {
         IndexState::Rebuilding
     } else {
@@ -2143,20 +2154,263 @@ async fn source_worker(
 /// still terminal, and the caller reports it. `None` means the worker was
 /// cancelled while waiting.
 #[allow(clippy::type_complexity)]
+/// Accept exactly the window tags the application mints
+/// (`window-<pid>`): strict fail-closed validation, never a silent
+/// character filter. A filter would collide distinct inputs onto one
+/// overflow file (`a/b` and `ab`) and could mint names the sweep pattern
+/// below does not recognize (unsweepable debris). Anything else disables
+/// the overflow fallback, reverting to the historical contend-then-fail
+/// loudly — never silent reuse, never an unrecognized file.
+fn sanitize_window_tag(tag: &str) -> Option<String> {
+    let pid = tag.strip_prefix("window-")?;
+    if pid.is_empty() || pid.len() > 16 || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(tag.to_owned())
+}
+
+/// Overflow artifact for a contended primary: same directory, canonical
+/// stem plus the window tag (`<source>.<journal>.<tag>.rows.idx`). The
+/// stem keeps its canonical shape so budget accounting (which matches
+/// `*.rows.idx`) and source attribution (`source_bytes` reads the first
+/// dot-part) keep working unchanged; `owned_index_name` deliberately
+/// excludes three-part names so inspection flows never mistake an
+/// overflow for a primary.
+fn overflow_artifact_path(primary: &Path, tag: &str) -> PathBuf {
+    let stem = primary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".rows.idx"))
+        .unwrap_or("index");
+    primary.with_file_name(format!("{stem}.{tag}.rows.idx"))
+}
+
+/// Whether a derived-dir entry is a window-overflow index. Primary names
+/// carry exactly two dot-parts (`<source>.<journal>`); overflows carry a
+/// third part minted by `overflow_artifact_path` from a validated tag
+/// (`window-<pid>` digits only — mirroring `sanitize_window_tag` so every
+/// creatable overflow is recognizable). Anything else (foreign files,
+/// future shapes) is conservatively NOT an overflow and is never swept.
+fn is_window_overflow_name(file_name: &str) -> bool {
+    let Some(stem) = file_name.strip_suffix(".rows.idx") else {
+        return false;
+    };
+    let mut parts = stem.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(_), Some(_), Some(tag), None) => tag.strip_prefix("window-").is_some_and(|pid| {
+            !pid.is_empty() && pid.len() <= 16 && pid.bytes().all(|b| b.is_ascii_digit())
+        }),
+        _ => false,
+    }
+}
+
+/// Our own control files, compared as `OsStr` (no decode): neither sweep
+/// candidates nor scan budget. The ownership lock file is created by the
+/// guard acquisition above, so it is always present during a sweep; the
+/// budget name mirrors `index::BUDGET_FILE`.
+fn is_sweep_control_file(name: &std::ffi::OsStr) -> bool {
+    name == ".lvu-index-ownership.lock" || name == ".lvu-index-budget"
+}
+
+/// Cap on directory entries inspected per sweep: startup must not stall
+/// scanning an unbounded cache, so the sweep stops here and leaves the
+/// rest for a later launch (debris is crash-only; live files are never
+/// touched regardless of position).
+const SWEEP_ENTRY_CEILING: usize = 4096;
+/// Wall-clock cap per sweep for the same reason. Checked per entry; cheap
+/// enough to check every time (one `Instant::now` per directory entry).
+const SWEEP_TIME_CEILING: std::time::Duration = std::time::Duration::from_secs(2);
+/// Bound for acquiring the ownership guard below: index mutations hold it
+/// briefly, so expiry means a wedged holder and the sweep skips rather
+/// than stalling startup behind it.
+const SWEEP_OWNERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bounded cleanup for window-overflow indexes: remove overflow files
+/// whose owner is gone. Liveness comes from the file lock itself — the
+/// kernel releases it on owner death, so no pid tracking (and no pid-reuse
+/// hazard) is involved. Only overflow-shaped names are candidates;
+/// primary indexes are never touched (they persist across relaunches for
+/// fast resume by design).
+///
+/// The whole scan runs under the directory's `.lvu-index-ownership.lock`
+/// — the same guard every index creation takes first (see
+/// `DiskService::open_budgeted`, verified as the sole production creator
+/// of `*.rows.idx` files). A racing launcher therefore cannot create or
+/// lock an overflow file mid-sweep: it blocks on (or retries past) the
+/// guard while we hold it, so the stale-descriptor race (open + probe one
+/// inode, unlink a replaced pathname) cannot occur. A racing sweeper
+/// serializes on the same guard.
+///
+/// Returns the number of files removed. Best-effort and bounded: entry
+/// and time ceilings truncate the scan conservatively (unseen debris waits
+/// for a later launch), and every per-file failure is skipped, never fatal
+/// to startup.
+pub fn sweep_stale_window_indexes(artifact_dir: &Path) -> usize {
+    // Serialize with creators; skip the sweep (don't stall startup) if a
+    // wedged holder keeps the guard past the bound.
+    let guard_deadline = std::time::Instant::now() + SWEEP_OWNERSHIP_TIMEOUT;
+    let _guard = loop {
+        match crate::index::try_ownership_lock(&artifact_dir.join(".sweep-probe")) {
+            Ok(Some(guard)) => break Some(guard),
+            Ok(None) => {
+                if std::time::Instant::now() >= guard_deadline {
+                    return 0;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return 0,
+        }
+    };
+    let entries = match std::fs::read_dir(artifact_dir) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    let start = std::time::Instant::now();
+    let mut removed = 0usize;
+    // Filter our own control files lazily (no pre-scan): they are neither
+    // candidates nor scan budget, so they must not consume the ceiling
+    // that bounds real entries below.
+    let entries = entries.filter(|entry| {
+        entry
+            .as_ref()
+            .map(|entry| {
+                let name = entry.file_name();
+                !is_sweep_control_file(&name)
+            })
+            .unwrap_or(true)
+    });
+    for (scanned, entry) in entries.enumerate() {
+        // Count and ceiling-check FIRST, before any fallible decode: I/O
+        // errors, non-UTF8 names and foreign entries must consume scan
+        // budget exactly like candidates, or an unbounded run of them
+        // bypasses both ceilings.
+        if scanned >= SWEEP_ENTRY_CEILING || start.elapsed() >= SWEEP_TIME_CEILING {
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_window_overflow_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        // Probe while holding: index files are locked with fs2 flock
+        // locks (see `DiskService::open`), so the probe uses the same
+        // domain — an fcntl probe would not see an flock lock and could
+        // sweep a live file. A racing launcher that loses this probe
+        // skips the file, and one that won it keeps us out, so removal
+        // below never races a live owner.
+        let acquirable = {
+            use fs2::FileExt;
+            file.try_lock_exclusive().is_ok()
+        };
+        if !acquirable {
+            continue;
+        }
+        // Remove while still holding the probe lock: a racing launcher
+        // try-locks during this window, fails, and retries against the
+        // gone file (recreating it) instead of inhabiting an unlinked
+        // ghost. A racing sweeper fails its own probe and skips.
+        let removed_file = std::fs::remove_file(&path).is_ok();
+        drop(file);
+        if removed_file {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(test)]
+mod window_overflow_tests {
+    use super::{is_window_overflow_name, overflow_artifact_path, sanitize_window_tag};
+    use std::path::Path;
+
+    #[test]
+    fn sanitize_accepts_only_window_pid_tags() {
+        // Exactly what the application mints; everything else disables
+        // the fallback loudly (contend-then-fail) instead of filtering
+        // silently into collisions or unsweepable names.
+        assert_eq!(
+            sanitize_window_tag("window-1234"),
+            Some("window-1234".to_owned())
+        );
+        assert_eq!(sanitize_window_tag("window-0"), Some("window-0".to_owned()));
+        assert_eq!(sanitize_window_tag(""), None);
+        assert_eq!(sanitize_window_tag("window-"), None);
+        assert_eq!(sanitize_window_tag("window-abc"), None);
+        assert_eq!(sanitize_window_tag("../evil"), None);
+        assert_eq!(sanitize_window_tag("window-1/x.rows.idx"), None);
+        assert_eq!(sanitize_window_tag("window-1x"), None);
+        assert_eq!(sanitize_window_tag("other-99"), None);
+        assert_eq!(sanitize_window_tag("window-12345678901234567"), None);
+    }
+
+    #[test]
+    fn overflow_names_keep_stem_and_match_sweep_pattern() {
+        let primary = Path::new(
+            "/cache/derived/8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.rows.idx",
+        );
+        let overflow = overflow_artifact_path(primary, "window-99");
+        assert_eq!(
+            overflow,
+            Path::new(
+                "/cache/derived/8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-99.rows.idx"
+            )
+        );
+        assert!(is_window_overflow_name(
+            overflow.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(!is_window_overflow_name(
+            primary.file_name().unwrap().to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn sweep_pattern_ignores_primaries_and_foreign_names() {
+        assert!(!is_window_overflow_name("notes.txt"));
+        assert!(!is_window_overflow_name("a.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.other.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.window-.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.window-x.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.window-1x.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.c.d.rows.idx"));
+        assert!(!is_window_overflow_name("a.b.window-1.rows.idx.bak"));
+        assert!(is_window_overflow_name("a.b.window-7.rows.idx"));
+        assert!(is_window_overflow_name("a.b.window-0.rows.idx"));
+    }
+}
+
 async fn open_index(
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     token: WorkerToken,
     artifact: &Path,
     journal_identity: [u8; 16],
     config: &LiveConfig,
     updates: &mpsc::Sender<WorkerUpdate>,
     cancelled: &mut watch::Receiver<bool>,
-) -> Option<Result<(DiskService, bool, BudgetVerification), (std::io::ErrorKind, String)>> {
+) -> Option<Result<(DiskService, bool, BudgetVerification, PathBuf), (std::io::ErrorKind, String)>>
+{
     let budget = IndexBudget {
         per_source: config.maximum_index_bytes_per_source,
         total: config.maximum_total_index_bytes,
         reconciliation_limit: config.maximum_sources.saturating_mul(4).clamp(64, 4096),
     };
+    let overflow_tag = config.window_tag.as_deref().and_then(sanitize_window_tag);
+    let mut current = artifact.to_path_buf();
+    let mut overflowed = false;
     let deadline = tokio::time::Instant::now() + config.index_lock_retry_window;
     let mut backoff = INDEX_LOCK_RETRY_FIRST_BACKOFF;
     let mut attempts: u32 = 0;
@@ -2164,7 +2418,7 @@ async fn open_index(
     loop {
         attempts = attempts.saturating_add(1);
         let opened = DiskService::open(
-            artifact.to_path_buf(),
+            current.clone(),
             handle.source_id(),
             token.generation,
             config.index_page_records,
@@ -2174,11 +2428,23 @@ async fn open_index(
         )
         .await;
         let (kind, error) = match opened {
-            Ok(value) => return Some(Ok(value)),
+            Ok((disk, rebuilt, budget)) => return Some(Ok((disk, rebuilt, budget, current))),
             Err(failure) => failure,
         };
         if kind != std::io::ErrorKind::WouldBlock {
             return Some(Err((kind, error)));
+        }
+        if !overflowed && let Some(tag) = overflow_tag.as_deref() {
+            // The primary is owned by another live window: build this
+            // window's own derived index beside it instead of queueing 30s
+            // behind a lock that only frees when that window exits. The
+            // overflow name keeps the canonical stem so budget accounting
+            // and source attribution keep working; lifecycle is bounded by
+            // `sweep_stale_window_indexes`. No sleep: this is a different
+            // file, nothing to wait for.
+            overflowed = true;
+            current = overflow_artifact_path(&current, tag);
+            continue;
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -2243,7 +2509,7 @@ fn jittered(backoff: Duration, source: SourceId, attempt: u32) -> Duration {
 }
 
 async fn serve_and_emit(
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     token: WorkerToken,
     config: &LiveConfig,
     disk: &DiskService,
@@ -2293,7 +2559,7 @@ async fn emit(
 }
 
 async fn serve_request(
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     disk: &DiskService,
     config: &LiveConfig,
     request: &Request,
@@ -2359,7 +2625,7 @@ fn settled_index_state(
 }
 
 fn progress_update(
-    handle: &SourceHandle,
+    handle: &AnySourceHandle,
     generation: u64,
     epoch: u64,
     indexed_records: u64,

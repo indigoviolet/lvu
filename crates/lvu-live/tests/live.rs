@@ -135,7 +135,9 @@ async fn live_file_arrival_is_nonblocking_and_selection_survives_tail_growth() {
     let manager = SourceManager::new(&capture_root, runtime_config()).unwrap();
     let handle = manager.start(file_source(id, &input, true)).await.unwrap();
     let provider = LiveRowProvider::new(live_config(&root)).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     let initial = provider.page("raw", ViewportRequest { start: 0, len: 5 });
     assert!(
@@ -195,7 +197,9 @@ async fn command_invalid_utf8_partial_records_and_empty_indexing_are_explicit() 
     let mut config = live_config(&root);
     config.maximum_display_bytes = 4;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     let status = provider.view_status("raw").unwrap();
     assert_eq!(status.indexed_physical_records, 0);
@@ -232,7 +236,9 @@ async fn large_history_pages_backwards_with_cache_independent_of_total() {
     config.cache_rows = 6;
     config.cache_bytes = 1024;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&provider, id, 600).await;
     let tail = wait_page(&provider, "raw", 594, 6).await;
@@ -286,7 +292,9 @@ async fn derived_index_disk_limit_is_explicit_and_does_not_change_journal() {
     config.maximum_index_bytes_per_source = 140;
     config.cache_rows = 1;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -324,7 +332,9 @@ async fn two_views_share_one_source_worker_and_cache() {
     let handle = manager.start(file_source(id, &input, false)).await.unwrap();
     wait_runtime(&handle, |state, _| state == RuntimeState::Stopped).await;
     let provider = LiveRowProvider::new(live_config(&root)).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("a", vec![id]).unwrap();
     provider.register_raw_view("b", vec![id]).unwrap();
     wait_index(&provider, id, 3).await;
@@ -357,8 +367,12 @@ async fn one_raw_view_pages_multiple_source_journals_with_stable_ids() {
     wait_runtime(&first, |state, _| state == RuntimeState::Stopped).await;
     wait_runtime(&second, |state, _| state == RuntimeState::Stopped).await;
     let provider = LiveRowProvider::new(live_config(&root)).unwrap();
-    provider.register_source(first).unwrap();
-    provider.register_source(second).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(first))
+        .unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(second))
+        .unwrap();
     provider
         .register_raw_view("both", vec![first_id, second_id])
         .unwrap();
@@ -385,7 +399,9 @@ async fn source_generation_replacement_fences_stale_cache_and_rebuilds() {
     let first = manager.start(file_source(id, &input, false)).await.unwrap();
     wait_runtime(&first, |state, _| state == RuntimeState::Stopped).await;
     let provider = LiveRowProvider::new(live_config(&root)).unwrap();
-    provider.register_source(first.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(first.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&provider, id, 1).await;
     assert_eq!(wait_page(&provider, "raw", 0, 1).await[0].text, "old");
@@ -394,7 +410,9 @@ async fn source_generation_replacement_fences_stale_cache_and_rebuilds() {
     fs::write(&input, b"new\n").unwrap();
     let second = manager.start(file_source(id, &input, false)).await.unwrap();
     wait_runtime(&second, |state, _| state == RuntimeState::Stopped).await;
-    provider.register_source(second).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(second))
+        .unwrap();
     assert!(
         provider
             .page("raw", ViewportRequest { start: 0, len: 1 })
@@ -423,7 +441,9 @@ async fn corrupt_index_rebuilds_without_changing_journal() {
     let handle = manager.start(file_source(id, &input, false)).await.unwrap();
     wait_runtime(&handle, |state, _| state == RuntimeState::Stopped).await;
     let provider = LiveRowProvider::new(live_config(&root)).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&provider, id, 2).await;
     provider.shutdown().await;
@@ -436,7 +456,9 @@ async fn corrupt_index_rebuilds_without_changing_journal() {
     fs::write(provider.index_path(id), b"corrupt derived index").unwrap();
 
     let provider = LiveRowProvider::new(live_config(&root)).unwrap();
-    provider.register_source(handle).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&provider, id, 2).await;
     assert_eq!(
@@ -469,7 +491,9 @@ async fn shutdown_cancels_workers_with_full_bounded_queues() {
     config.update_queue_capacity = 1;
     config.request_queue_capacity = 1;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     for start in 0..20 {
         let _ = provider.page("raw", ViewportRequest { start, len: 1 });
@@ -478,7 +502,7 @@ async fn shutdown_cancels_workers_with_full_bounded_queues() {
         .await
         .expect("adapter shutdown blocked on full queues");
     assert!(matches!(
-        provider.register_source(handle),
+        provider.register_source(lvu_shared::AnySourceHandle::Local(handle)),
         Err(AdapterError::Closed)
     ));
     assert!(matches!(
@@ -507,7 +531,9 @@ async fn viewport_request_is_served_before_large_history_finishes_indexing() {
     config.index_page_records = 1;
     config.update_queue_capacity = 2;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
 
     tokio::time::timeout(Duration::from_secs(4), async {
@@ -541,7 +567,9 @@ async fn valid_partial_page_suffix_is_rolled_back_and_reindexed() {
     let mut config = live_config(&root);
     config.index_page_records = 4;
     let first = LiveRowProvider::new(config.clone()).unwrap();
-    first.register_source(handle.clone()).unwrap();
+    first
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     wait_index(&first, id, 4).await;
     let artifact = first.index_path(id);
     first.shutdown().await;
@@ -556,7 +584,9 @@ async fn valid_partial_page_suffix_is_rolled_back_and_reindexed() {
         .unwrap();
 
     let second = LiveRowProvider::new(config).unwrap();
-    second.register_source(handle).unwrap();
+    second
+        .register_source(lvu_shared::AnySourceHandle::Local(handle))
+        .unwrap();
     second.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&second, id, 4).await;
     assert_eq!(
@@ -582,13 +612,17 @@ async fn changed_page_budget_rebuilds_index_before_serving_history() {
     let mut config = live_config(&root);
     config.index_page_records = 4;
     let first = LiveRowProvider::new(config.clone()).unwrap();
-    first.register_source(handle.clone()).unwrap();
+    first
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     wait_index(&first, id, 4).await;
     first.shutdown().await;
 
     config.index_page_bytes = 1;
     let second = LiveRowProvider::new(config).unwrap();
-    second.register_source(handle).unwrap();
+    second
+        .register_source(lvu_shared::AnySourceHandle::Local(handle))
+        .unwrap();
     second.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&second, id, 4).await;
     assert_eq!(wait_page(&second, "raw", 3, 1).await[0].text, "four");
@@ -606,8 +640,12 @@ async fn registration_is_idempotent_and_index_has_single_provider_owner() {
     wait_runtime(&handle, |state, _| state == RuntimeState::Stopped).await;
     let config = live_config(&root);
     let owner = LiveRowProvider::new(config.clone()).unwrap();
-    owner.register_source(handle.clone()).unwrap();
-    owner.register_source(handle.clone()).unwrap();
+    owner
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
+    owner
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     owner.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&owner, id, 1).await;
 
@@ -615,7 +653,9 @@ async fn registration_is_idempotent_and_index_has_single_provider_owner() {
     // for the owner instead of taking it, and instead of giving up: the wait is
     // what makes an ordinary shutdown race survivable.
     let contender = LiveRowProvider::new(config).unwrap();
-    contender.register_source(handle).unwrap();
+    contender
+        .register_source(lvu_shared::AnySourceHandle::Local(handle))
+        .unwrap();
     contender.register_raw_view("contender", vec![id]).unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -666,7 +706,9 @@ async fn invalid_utf8_projection_fits_tiny_cache_and_remains_displayable() {
     config.cache_bytes = 256;
     config.maximum_display_bytes = 1024;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&provider, id, 1).await;
     let row = wait_page(&provider, "raw", 0, 1).await.remove(0);
@@ -715,7 +757,9 @@ async fn bounded_unverified_reconciliation_is_reported_without_deleting_unknown_
         5 * 1024 * 1024 * 1024
     );
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -784,8 +828,12 @@ async fn global_index_budget_bounds_concurrent_source_growth_and_preserves_captu
     config.maximum_index_bytes_per_source = 1024;
     config.maximum_total_index_bytes = 240;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(first).unwrap();
-    provider.register_source(second).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(first))
+        .unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(second))
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             provider.drain_ready_updates(64);
@@ -845,7 +893,9 @@ async fn unused_cleanup_releases_global_budget_for_a_later_index() {
     config.maximum_total_index_bytes = 100;
 
     let original = LiveRowProvider::new(config.clone()).unwrap();
-    original.register_source(first).unwrap();
+    original
+        .register_source(lvu_shared::AnySourceHandle::Local(first))
+        .unwrap();
     wait_index(&original, first_id, 1).await;
     let old_path = original.index_path(first_id);
     original.shutdown().await;
@@ -861,7 +911,9 @@ async fn unused_cleanup_releases_global_budget_for_a_later_index() {
     );
 
     let replacement = LiveRowProvider::new(config).unwrap();
-    replacement.register_source(second).unwrap();
+    replacement
+        .register_source(lvu_shared::AnySourceHandle::Local(second))
+        .unwrap();
     wait_index(&replacement, second_id, 1).await;
     assert_eq!(derived_index_bytes(&root.path().join("derived")), 100);
     replacement.shutdown().await;
@@ -882,7 +934,9 @@ async fn capture_continues_after_global_index_limit_and_indexed_history_remains_
     config.index_page_records = 1;
     config.maximum_total_index_bytes = 100;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&provider, id, 1).await;
 
@@ -938,8 +992,12 @@ async fn restart_counts_existing_indexes_and_cross_provider_reservations_do_not_
     config.maximum_total_index_bytes = 160;
     let first_provider = LiveRowProvider::new(config.clone()).unwrap();
     let second_provider = LiveRowProvider::new(config.clone()).unwrap();
-    first_provider.register_source(a.clone()).unwrap();
-    second_provider.register_source(b.clone()).unwrap();
+    first_provider
+        .register_source(lvu_shared::AnySourceHandle::Local(a.clone()))
+        .unwrap();
+    second_provider
+        .register_source(lvu_shared::AnySourceHandle::Local(b.clone()))
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             first_provider.drain_ready_updates(32);
@@ -961,8 +1019,12 @@ async fn restart_counts_existing_indexes_and_cross_provider_reservations_do_not_
     second_provider.shutdown().await;
 
     let restarted = LiveRowProvider::new(config).unwrap();
-    restarted.register_source(a).unwrap();
-    restarted.register_source(b).unwrap();
+    restarted
+        .register_source(lvu_shared::AnySourceHandle::Local(a))
+        .unwrap();
+    restarted
+        .register_source(lvu_shared::AnySourceHandle::Local(b))
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             restarted.drain_ready_updates(32);
@@ -1006,14 +1068,18 @@ async fn active_providers_must_share_one_cap_but_restart_can_change_it() {
     small.index_page_records = 1;
     small.maximum_total_index_bytes = 100;
     let owner = LiveRowProvider::new(small).unwrap();
-    owner.register_source(first).unwrap();
+    owner
+        .register_source(lvu_shared::AnySourceHandle::Local(first))
+        .unwrap();
     wait_index(&owner, ids[0], 1).await;
 
     let mut large = live_config(&root);
     large.index_page_records = 1;
     large.maximum_total_index_bytes = 200;
     let mismatched = LiveRowProvider::new(large.clone()).unwrap();
-    mismatched.register_source(second.clone()).unwrap();
+    mismatched
+        .register_source(lvu_shared::AnySourceHandle::Local(second.clone()))
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             mismatched.drain_ready_updates(16);
@@ -1037,7 +1103,9 @@ async fn active_providers_must_share_one_cap_but_restart_can_change_it() {
     owner.shutdown().await;
 
     let restarted = LiveRowProvider::new(large).unwrap();
-    restarted.register_source(second).unwrap();
+    restarted
+        .register_source(lvu_shared::AnySourceHandle::Local(second))
+        .unwrap();
     wait_index(&restarted, ids[1], 1).await;
     assert_eq!(derived_index_bytes(&root.path().join("derived")), 200);
     restarted.shutdown().await;
@@ -1061,7 +1129,9 @@ async fn shared_cache_binds_indexes_to_distinct_capture_root_journals() {
 
     let config = live_config(&root);
     let first_provider = LiveRowProvider::new(config.clone()).unwrap();
-    first_provider.register_source(first_handle).unwrap();
+    first_provider
+        .register_source(lvu_shared::AnySourceHandle::Local(first_handle))
+        .unwrap();
     first_provider
         .register_raw_view("first", vec![source_id])
         .unwrap();
@@ -1085,7 +1155,9 @@ async fn shared_cache_binds_indexes_to_distinct_capture_root_journals() {
     // Keep the first provider alive: the second journal must neither reuse its
     // offsets nor collide with its active ownership lock.
     let second_provider = LiveRowProvider::new(config).unwrap();
-    second_provider.register_source(second_handle).unwrap();
+    second_provider
+        .register_source(lvu_shared::AnySourceHandle::Local(second_handle))
+        .unwrap();
     second_provider
         .register_raw_view("second", vec![source_id])
         .unwrap();
@@ -1127,7 +1199,9 @@ async fn a_momentarily_locked_index_is_waited_out_rather_than_abandoned() {
 
     // Build the index once so its exact path exists, then let that owner go.
     let first = LiveRowProvider::new(live_config(&root)).unwrap();
-    first.register_source(handle.clone()).unwrap();
+    first
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     first.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&first, id, 3).await;
     first.shutdown().await;
@@ -1147,7 +1221,9 @@ async fn a_momentarily_locked_index_is_waited_out_rather_than_abandoned() {
     FileExt::try_lock_exclusive(&holder).expect("the released index can be taken");
 
     let second = LiveRowProvider::new(live_config(&root)).unwrap();
-    second.register_source(handle.clone()).unwrap();
+    second
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     second.register_raw_view("raw", vec![id]).unwrap();
     let before_contention = RowProvider::revision(&second, "raw");
 
@@ -1231,7 +1307,9 @@ async fn an_index_held_past_the_retry_window_becomes_a_reported_failure() {
     wait_runtime(&handle, |_, records| records >= 1).await;
 
     let first = LiveRowProvider::new(live_config(&root)).unwrap();
-    first.register_source(handle.clone()).unwrap();
+    first
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     first.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&first, id, 1).await;
     first.shutdown().await;
@@ -1268,7 +1346,9 @@ async fn an_index_held_past_the_retry_window_becomes_a_reported_failure() {
     config.index_lock_retry_window = Duration::from_millis(120);
     config.index_lock_retry_ceiling = Duration::from_millis(20);
     let second = LiveRowProvider::new(config).unwrap();
-    second.register_source(handle.clone()).unwrap();
+    second
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     second.register_raw_view("raw", vec![id]).unwrap();
 
     let failed = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1331,7 +1411,9 @@ async fn an_unaccountable_index_cache_still_serves_a_new_source_and_says_so() {
     wait_runtime(&handle, |_, records| records >= 3).await;
 
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
 
     let rows = wait_page(&provider, "raw", 0, 3).await;
@@ -1382,7 +1464,9 @@ async fn a_moving_viewport_is_served_its_newest_window_not_a_backlog() {
     let mut config = live_config(&root);
     config.cache_rows = 32;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&provider, id, 600).await;
 
@@ -1471,7 +1555,9 @@ async fn oversized_window_keeps_drawable_prefix_under_byte_cap() {
     config.cache_rows = 32;
     config.cache_bytes = 400;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&provider, id, 8).await;
 
@@ -1524,7 +1610,9 @@ async fn overlapping_windows_keep_prefix_order_and_stable_ids() {
     let mut config = live_config(&root);
     config.cache_rows = 4;
     let provider = LiveRowProvider::new(config).unwrap();
-    provider.register_source(handle.clone()).unwrap();
+    provider
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&provider, id, 12).await;
     assert_eq!(provider.source_status(id).unwrap().index, IndexState::Ready);
@@ -1592,4 +1680,294 @@ async fn overlapping_windows_keep_prefix_order_and_stable_ids() {
     assert!(stats.pending_requests <= 2, "{stats:?}");
     let _ = handle.stop().await;
     provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_windows_share_one_journal_through_overflow_indexes() {
+    // Two providers over ONE derived dir and ONE live source: the first
+    // takes the canonical index, the second overflows to its window-suffixed
+    // sibling instead of failing terminally on the exclusive lock. Both
+    // serve identical rows with identical stable ids: the shared journal
+    // and capture stay single, only the writable derived index is private.
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("app.log");
+    fs::write(&input, b"first\nsecond\n").unwrap();
+    let id = SourceId::new();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager.start(file_source(id, &input, true)).await.unwrap();
+    wait_runtime(&handle, |state, records| {
+        state == RuntimeState::Running && records >= 2
+    })
+    .await;
+
+    let mut config_a = live_config(&root);
+    config_a.window_tag = Some("window-1".into());
+    let mut config_b = live_config(&root);
+    config_b.window_tag = Some("window-2".into());
+    let provider_a = LiveRowProvider::new(config_a).unwrap();
+    let provider_b = LiveRowProvider::new(config_b).unwrap();
+    provider_a
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
+    provider_b
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
+    provider_a.register_raw_view("raw", vec![id]).unwrap();
+    provider_b.register_raw_view("raw", vec![id]).unwrap();
+    wait_index(&provider_a, id, 2).await;
+    wait_index(&provider_b, id, 2).await;
+    let rows_a = wait_page(&provider_a, "raw", 0, 2).await;
+    let rows_b = wait_page(&provider_b, "raw", 0, 2).await;
+    assert_eq!(rows_a[0].text, "first");
+    assert_eq!(rows_b[0].text, "first");
+    assert_eq!(
+        rows_a[0].id, rows_b[0].id,
+        "stable ids must match across windows sharing one journal"
+    );
+
+    // Exactly two derived indexes: the canonical primary plus one
+    // window-suffixed overflow (either window may win the primary; the
+    // loser overflows). The shared journal was never duplicated.
+    let mut indexes: Vec<String> = fs::read_dir(root.path().join("derived"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rows.idx"))
+        .collect();
+    indexes.sort();
+    assert_eq!(indexes.len(), 2, "primary plus one overflow: {indexes:?}");
+    let dot_parts = |name: &String| {
+        name.strip_suffix(".rows.idx")
+            .unwrap_or_default()
+            .split('.')
+            .count()
+    };
+    assert!(
+        indexes.iter().any(|name| dot_parts(name) == 2),
+        "canonical primary present: {indexes:?}"
+    );
+    assert!(
+        indexes.iter().any(|name| dot_parts(name) == 3
+            && (name.contains(".window-1.") || name.contains(".window-2."))),
+        "window-suffixed overflow present: {indexes:?}"
+    );
+    let _ = handle.stop().await;
+    provider_a.shutdown().await;
+    provider_b.shutdown().await;
+}
+
+#[test]
+fn sweep_removes_only_dead_window_overflow() {
+    use fs2::FileExt;
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("derived");
+    fs::create_dir_all(&dir).unwrap();
+    let primary =
+        "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.rows.idx";
+    let dead = "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-99.rows.idx";
+    let live = "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-100.rows.idx";
+    let foreign = "notes.txt";
+    let foreign_shaped = "a.b.c.rows.idx";
+    for name in [primary, dead, live, foreign, foreign_shaped] {
+        fs::write(dir.join(name), b"x").unwrap();
+    }
+    // Non-UTF8 names can never match the overflow pattern, but they must
+    // still consume scan budget exactly like any other entry (never bypass
+    // the ceilings) and must never be removed.
+    use std::os::unix::ffi::OsStringExt;
+    let non_utf8: Vec<std::ffi::OsString> = vec![
+        std::ffi::OsString::from_vec(b"\xff\xfe.rows.idx".to_vec()),
+        std::ffi::OsString::from_vec(b"a.b.\xff.window-1.rows.idx".to_vec()),
+    ];
+    for name in &non_utf8 {
+        fs::write(dir.join(name), b"x").unwrap();
+    }
+    // A live owner holds its overflow exclusive for its whole lifetime.
+    let live_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(live))
+        .unwrap();
+    live_file.try_lock_exclusive().unwrap();
+    // The primary is locked too: primaries are never swept regardless.
+    let primary_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(primary))
+        .unwrap();
+    primary_file.try_lock_exclusive().unwrap();
+
+    let removed = lvu_live::sweep_stale_window_indexes(&dir);
+    assert_eq!(removed, 1, "exactly the dead overflow goes");
+    assert!(dir.join(primary).exists(), "primary kept");
+    assert!(!dir.join(dead).exists(), "dead overflow swept");
+    assert!(dir.join(live).exists(), "live overflow kept");
+    assert!(dir.join(foreign).exists(), "foreign files ignored");
+    assert!(
+        dir.join(foreign_shaped).exists(),
+        "non-window shapes ignored"
+    );
+    for name in &non_utf8 {
+        assert!(
+            dir.join(name).exists(),
+            "non-UTF8 entries ignored: {name:?}"
+        );
+    }
+
+    // A missing directory sweeps to zero, never an error.
+    assert_eq!(
+        lvu_live::sweep_stale_window_indexes(&root.path().join("absent")),
+        0
+    );
+}
+
+#[test]
+fn sweep_serializes_with_creators_through_the_ownership_guard() {
+    // The sweep must hold the same `.lvu-index-ownership.lock` every index
+    // creation takes first: while a creator (simulated here by holding the
+    // guard directly) is inside, the sweep skips entirely instead of
+    // racing open+probe against an unlink. Deterministic: no timing, just
+    // lock ownership.
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("derived");
+    fs::create_dir_all(&dir).unwrap();
+    let dead = "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-99.rows.idx";
+    fs::write(dir.join(dead), b"x").unwrap();
+    let guard = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(".lvu-index-ownership.lock"))
+        .unwrap();
+    guard.try_lock_exclusive().unwrap();
+    let start = std::time::Instant::now();
+    assert_eq!(
+        lvu_live::sweep_stale_window_indexes(&dir),
+        0,
+        "sweep must skip while a creator holds the ownership guard"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "skip must be bounded, not endless: {:?}",
+        start.elapsed()
+    );
+    assert!(dir.join(dead).exists(), "nothing removed under contention");
+    drop(guard);
+    assert_eq!(
+        lvu_live::sweep_stale_window_indexes(&dir),
+        1,
+        "released guard lets the sweep proceed"
+    );
+    assert!(!dir.join(dead).exists());
+}
+
+#[test]
+fn swept_pathname_recreates_cleanly_with_no_ghost() {
+    // Stale-descriptor regression: after the sweep unlinks a dead
+    // overflow file, the same pathname must recreate, lock, and serve
+    // bytes normally — never an unlinked ghost or residue.
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("derived");
+    fs::create_dir_all(&dir).unwrap();
+    let name = "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-77.rows.idx";
+    fs::write(dir.join(name), b"stale-bytes").unwrap();
+    assert_eq!(lvu_live::sweep_stale_window_indexes(&dir), 1);
+    assert!(!dir.join(name).exists(), "swept pathname is gone");
+    let fresh = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(name))
+        .unwrap();
+    fresh.try_lock_exclusive().expect("recreated file locks");
+    use std::io::{Read, Seek, SeekFrom};
+    fresh.try_clone().unwrap().write_all(b"live-bytes").unwrap();
+    let mut back = String::new();
+    let mut reader = fresh;
+    reader.seek(SeekFrom::Start(0)).unwrap();
+    reader.read_to_string(&mut back).unwrap();
+    assert_eq!(back, "live-bytes");
+}
+
+#[test]
+fn sweep_never_removes_live_replacement_under_concurrent_traffic() {
+    // Synchronized sweeper/creator concurrency: a creator holds each live
+    // overflow file across a barrier rendezvous while the sweeper runs, so
+    // every sweep overlaps a live hold deterministically (no timing luck).
+    // Live replacements must survive every sweep; released files sweep.
+    use std::sync::{Arc, Barrier};
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("derived");
+    fs::create_dir_all(&dir).unwrap();
+    let dir = Arc::new(dir);
+    let barrier = Arc::new(Barrier::new(2));
+    let worker = {
+        let dir = Arc::clone(&dir);
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            for round in 0..10u32 {
+                let name = format!(
+                    "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-{}.rows.idx",
+                    500 + round
+                );
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(dir.join(&name))
+                    .unwrap();
+                file.try_lock_exclusive().unwrap();
+                barrier.wait();
+                barrier.wait();
+                drop(file);
+                fs::remove_file(dir.join(&name)).ok();
+            }
+        })
+    };
+    for _ in 0..10u32 {
+        barrier.wait();
+        lvu_live::sweep_stale_window_indexes(&dir);
+        barrier.wait();
+    }
+    worker.join().unwrap();
+    // After the traffic stops, nothing live remains and any residue sweeps.
+    let remaining: Vec<_> = fs::read_dir(dir.as_path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rows.idx"))
+        .collect();
+    assert!(
+        remaining.is_empty(),
+        "no residue after joined traffic: {remaining:?}"
+    );
+}
+
+#[test]
+fn sweep_scan_stops_at_the_entry_ceiling() {
+    // 5000 dead overflows: the sweep must stop at its fixed entry ceiling
+    // rather than scanning choosing a subset — exactly the ceiling count
+    // goes, the rest waits for a later launch.
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("derived");
+    fs::create_dir_all(&dir).unwrap();
+    for round in 0..5000u32 {
+        let name = format!(
+            "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-{}.rows.idx",
+            10000 + round
+        );
+        fs::write(dir.join(name), b"x").unwrap();
+    }
+    let removed = lvu_live::sweep_stale_window_indexes(&dir);
+    assert_eq!(removed, 4096, "scan stops at the fixed entry ceiling");
+    let left: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rows.idx"))
+        .collect();
+    assert_eq!(left.len(), 5000 - 4096, "remainder waits for later");
 }

@@ -369,6 +369,28 @@ fn ownership_lock(path: &Path) -> io::Result<File> {
     Ok(lock)
 }
 
+/// Nonblocking variant for the stale-window sweep: index creation takes
+/// the blocking form above before creating or locking any `*.rows.idx`
+/// file, so a sweeper holding this guard excludes every creator (and a
+/// second sweeper) for the whole scan. `Ok(None)` means held elsewhere —
+/// the sweep skips rather than waits unboundedly.
+pub(crate) fn try_ownership_lock(path: &Path) -> io::Result<Option<File>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("index has no parent directory"))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(parent.join(".lvu-index-ownership.lock"))?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(Some(lock)),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Whether the shared on-disk index total could be accounted for.
 ///
 /// Bounded reconciliation stops after a fixed number of directory entries, so a
@@ -761,6 +783,86 @@ fn decode_entry(bytes: &[u8; ENTRY_LEN as usize]) -> io::Result<IndexEntry> {
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// Sweep/creator exclusion through the REAL ownership path: a creator
+/// opens (create+lock) the same overflow pathname via `open_budgeted`
+/// while a sweeper runs under a barrier rendezvous, so every sweep
+/// overlaps a live hold deterministically. Live-held replacements must
+/// survive every sweep (no stale-descriptor unlink of a live file);
+/// the abandoned file sweeps afterwards and the pathname relocks
+/// cleanly. No deadlock: neither side holds the ownership guard across
+/// a barrier wait (both take it only inside open/sweep calls).
+#[cfg(test)]
+mod sweep_exclusion_tests {
+    use super::{DiskIndex, IndexBudget};
+    use crate::provider::sweep_stale_window_indexes;
+    use lvu_core::SourceId;
+    use std::sync::{Arc, Barrier};
+    use tempfile::TempDir;
+
+    fn budget() -> IndexBudget {
+        IndexBudget {
+            per_source: 1024 * 1024,
+            total: 1024 * 1024,
+            reconciliation_limit: 64,
+        }
+    }
+
+    #[test]
+    fn live_replacement_survives_concurrent_sweep_through_real_open() {
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("derived");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = SourceId::new();
+        let name = format!(
+            "{}.00000000-0000-0000-0000-000000000000.window-4242.rows.idx",
+            source.0
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let worker = {
+            let dir = dir.clone();
+            let barrier = Arc::clone(&barrier);
+            let name = name.clone();
+            std::thread::spawn(move || {
+                for _ in 0..10u32 {
+                    let (_disk, _, _) = DiskIndex::open_budgeted(
+                        &dir.join(&name),
+                        source,
+                        1,
+                        4,
+                        1024,
+                        [0; 16],
+                        budget(),
+                    )
+                    .expect("creator opens and locks through the real path");
+                    barrier.wait();
+                    barrier.wait();
+                    // `disk` drops here: lock released, file abandoned.
+                }
+            })
+        };
+        for _ in 0..10u32 {
+            barrier.wait();
+            let removed = sweep_stale_window_indexes(&dir);
+            assert_eq!(removed, 0, "live-held replacement must survive every sweep");
+            assert!(
+                dir.join(&name).exists(),
+                "live file intact under concurrent sweep"
+            );
+            barrier.wait();
+        }
+        worker.join().unwrap();
+        assert_eq!(
+            sweep_stale_window_indexes(&dir),
+            1,
+            "abandoned file sweeps after traffic"
+        );
+        assert!(!dir.join(&name).exists());
+        let (_disk, _, _) =
+            DiskIndex::open_budgeted(&dir.join(&name), source, 1, 4, 1024, [0; 16], budget())
+                .expect("pathname relocks cleanly after sweep");
+    }
 }
 
 #[cfg(test)]
