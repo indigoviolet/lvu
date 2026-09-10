@@ -2583,3 +2583,39 @@ installed-package PTYs remain required before undrafting. This entry records
 local acceptance and tagging, not public release or installation completion.
 Shared-capture work remains on its separate branch; paused long-running work
 has not resumed. All earlier diagnostic and baseline evidence remains retained.
+
+
+### v0.1.6 published and installed — 2026-09-10
+
+Release `v0.1.6` is public at 05:44:57 UTC from exact source
+`697865e493b1607b63423f5f2646e3339de73c3e`, annotated tag object
+`4e5237cd97a9309ed2360082b610404785449cfb`. Workflow `34440412338`
+completed all four native archives and draft publication successfully. Final
+notes were applied before undrafting. The immutable source gate passed 1510
+Rust tests (seven ignored), clippy with warnings denied, 105 bridge tests and
+all 80 PTY suites. Independent acceptance consistency review found no findings.
+
+Delivery evidence is retained under `muse-v016-prep/v016-delivery/` on the
+build volume. `driver-verifyonly.log` records exit zero and 71 passing checks.
+The original tap-push process exit status was not recoverable; instead, local
+and remote tap commit `8fce418c7ff069530942a9e63927c0cdde1f98ec`, a clean tree
+and the formula's equality to the rendered candidate were verified. No push
+was repeated merely to recover a status.
+
+`installer-run.log` records exit zero and activation after provenance, resources,
+helper/bridge execution and eleven installed PTYs. Official Linux archive SHA256:
+`efc28fe5a2046d98997a9e9531761719dec0df579d7d78674422282f96baad59`.
+Installed binary SHA256:
+`11e61015e073dd63f0073636a3ed404acb8318a47dc956d9fa2284f476250c80`.
+Tree-manifest SHA256:
+`fa8a03434e5faf7887955fd05a6f437162c9fc5aaf315b492633b5c1ba06dd58`.
+`versions/latest` now points to `v0.1.6`; its JSON record and full-tree manifest
+remain under `versions/records/`. The record's `release_draft: true` describes
+the installation-time state; publication followed successfully afterward.
+Post-publication documentation is on the integration branch, leaving the tag
+unchanged. Independent final delivery review is proceeding separately.
+
+Shared capture/controller integration remains separate unfinished work. Remote
+union commit module `0989d6d` has narrow source clearance, but its fixed digest
+amendment and wire/window integration still require review and runtime proof.
+All paused soak and long-query investigations remain paused.

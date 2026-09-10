@@ -164,3 +164,17 @@ remain open in TODO.md.
   invalid-draft retention, stale-save fencing and saved-zone startup/restart.
   Exact-source acceptance and all four archives passed; the installed Linux
   archive passed eight actual PTY suites. See the work ledger for evidence.
+
+
+## v0.1.6 — 2026-09-10
+
+- Live unions of existing views shipped with native filters/grouping, retained
+  original identities, accepted dependency fences and restart persistence.
+- Enrichment-derived shared keys shipped through the Union chooser, including
+  exact integers, raw namesake exclusion, creation-time key pinning and manual
+  pin/unpin persistence. Legacy saved correlation behavior remains compatible.
+- Exact-value enrichment colour classification shipped for ordinary and union
+  views with first-match order and restart persistence.
+- Exact-source acceptance passed 1510 Rust tests and all 80 PTY suites; all four
+  release archives passed CI and installed Linux acceptance passed eleven PTYs.
+  See the work ledger for exact source, hashes and delivery evidence.

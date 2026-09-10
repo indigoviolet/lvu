@@ -6,7 +6,7 @@ validation evidence lives in the [work ledger](docs/work-ledger.md).
 
 ## v0.1.6 — 2026-09-10
 
-Prepared release; full acceptance and publication are pending.
+Published with all four native archives; exact-source and installed-archive acceptance passed.
 
 ### Features
 
