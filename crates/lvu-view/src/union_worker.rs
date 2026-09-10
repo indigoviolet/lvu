@@ -2613,15 +2613,20 @@ mod tests {
         let mut reservation = Reservation::new(Arc::clone(&adapter.budget));
         let mut carrier_bytes = 0;
         let input = ctx.spec.inputs[0].clone();
-        let work = visit_union_input(
-            &ctx,
-            &input,
-            frozen,
-            &mut remaining_rows,
-            &mut remaining_bytes,
-            &mut reservation,
-            &mut carrier_bytes,
-        )
+        // Production visitation runs on the dedicated `lvu-view-union` OS
+        // thread. Mirror that blocking context here instead of starting the
+        // replay's current-thread runtime from inside this Tokio test task.
+        let work = tokio::task::block_in_place(|| {
+            visit_union_input(
+                &ctx,
+                &input,
+                frozen,
+                &mut remaining_rows,
+                &mut remaining_bytes,
+                &mut reservation,
+                &mut carrier_bytes,
+            )
+        })
         .expect("visit succeeds");
         assert_eq!(work.rows.len(), 2);
         let raw_total: u64 = work
