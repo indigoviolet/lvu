@@ -2948,3 +2948,25 @@ Nonblocking submission and same-nonce/digest recovery remain contracts until
 the real transport is implemented and tested. Controller owner5b received this
 clearance and the deadline/recovery requirements. No primary integration, RPC
 or app acceptance is claimed by this source clearance.
+
+
+### Combined shared-capture acceptance candidate — 2026-09-10
+
+Worker dependency `4a7cd29` received Sol97 source/evidence clearance: exact
+parent `2ad1495`, clean three-path scope, 111 library and five real-worker
+tests, check and Clippy passing. The final source-bound gate is
+`lvu-shared-capture-logs/4a7cd29-final-gate-r2.log`, SHA-256
+`f6bad759a412113f95b70fee607860ab1282bbe2072441ac4117f7b026ea5f8d`.
+
+Controller owner5b delivered combined `6c806ed`, including that dependency.
+The final four-file fix gives contending windows separate derived index files
+while retaining shared original journals and stable identities. Owner reports
+full same-cache two-window acceptance and sequential shutdown/reopen passing.
+Evidence under `lvu-muse-multi-source-gate/`: `overflow-gate-20260910T200000Z.log`,
+`two-window-acceptance-final2-20260910T203000Z.log` and
+`sequential-probe2-20260910T203000Z.log`. Earlier shared-cache failure and
+split-cache diagnostic evidence remain retained; the final test uses the
+ordinary shared cache. Sol97 is reviewing exact index ownership/sweep safety,
+closure of controller findings and acceptance source binding. This is owner
+acceptance evidence pending independent review, not primary integration or
+published shared-capture behavior.
