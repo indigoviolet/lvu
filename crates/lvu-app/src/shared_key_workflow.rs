@@ -437,4 +437,27 @@ mod tests {
         };
         assert!(begin_from_frozen_summary(&mut controller, origin(5), &summary).is_ok());
     }
+
+    #[test]
+    fn heterogeneous_union_key_requires_authority_on_the_selected_row() {
+        let mut accepted = None;
+        observe_origin_row(
+            &mut accepted,
+            row(9, Some((serde_json::json!("api"), "String"))),
+            "request_key",
+        )
+        .unwrap();
+        let resolved = finish_origin(accepted, "request_key", 3, 5).unwrap();
+        assert_eq!(resolved.0.value(), &ExactScalar::String("api".into()));
+
+        let mut raw_namesake = row(10, Some((serde_json::json!("api"), "String")));
+        raw_namesake.fields.remove("request_key");
+        raw_namesake.field_types.remove("request_key");
+        raw_namesake.omitted_fields.insert(
+            "request_key".into(),
+            "accepted output unavailable for this union row".into(),
+        );
+        let error = observe_origin_row(&mut None, raw_namesake, "request_key").unwrap_err();
+        assert!(error.contains("unavailable for the selected record"));
+    }
 }

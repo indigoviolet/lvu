@@ -567,7 +567,7 @@ pub fn execute_batch_with_native_predicate(
     input: &DataFrame,
     query: BatchQuery<'_>,
     native_predicate: Option<Expr>,
-    column_color_authority: &[String],
+    column_color_authority: &[(String, Expr)],
 ) -> BatchResult {
     execute_batch_with_predicates(
         input,
@@ -594,7 +594,7 @@ fn execute_batch_with_predicates(
     query: BatchQuery<'_>,
     exact_constraint: Option<&ExactFieldConstraint>,
     native_predicate: Option<Expr>,
-    column_color_authority: Option<&[String]>,
+    column_color_authority: Option<&[(String, Expr)]>,
 ) -> BatchResult {
     let mut frame = input.clone();
     let expected_height = frame.height();
@@ -920,14 +920,15 @@ fn execute_batch_with_predicates(
         // on its own — after its stage is removed while other stages (and
         // the raw projection) remain, the lingering rule silently unpaints
         // instead of falling back to raw. Union callers provide the
-        // intersection of structurally accepted frozen-input outputs.
-        let accepted = column_color_authority.map_or_else(
-            || query.stages.iter().any(|stage| stage.name == *column),
-            |outputs| outputs.iter().any(|output| output == column),
-        );
-        if !accepted {
-            continue;
-        }
+        // per-row provenance expressions derived from the frozen inputs.
+        let authority = match column_color_authority {
+            Some(outputs) => match outputs.iter().find(|(output, _)| output == column) {
+                Some((_, authority)) => Some(authority.clone()),
+                None => continue,
+            },
+            None if query.stages.iter().any(|stage| stage.name == *column) => None,
+            None => continue,
+        };
         // A failed stage is recorded in `failed_fields` and contributes no
         // column; both silently match nothing — the caller keeps its last
         // good view, exactly as roles fall back when their output
@@ -943,10 +944,9 @@ fn execute_batch_with_predicates(
         // their canonical text form) while null stays null and therefore
         // never matches. An empty `want` matches only literal empty-string
         // ready cells — never nulls, never everything.
-        let mask = predicate_mask_expr(
-            &frame,
-            col(column).cast(DataType::String).eq(lit(want.as_str())),
-        );
+        let equality = col(column).cast(DataType::String).eq(lit(want.as_str()));
+        let predicate = authority.map_or(equality.clone(), |authority| equality.and(authority));
+        let mask = predicate_mask_expr(&frame, predicate);
         match mask.and_then(|mask| {
             selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
         }) {

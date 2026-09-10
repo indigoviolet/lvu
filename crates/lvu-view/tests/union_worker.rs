@@ -149,6 +149,39 @@ fn apply_slash_enrichment(adapter: &mut NativeViewAdapter, view: &str, source: &
         .unwrap();
 }
 
+fn apply_slash_enrichment_after_filter(
+    adapter: &mut NativeViewAdapter,
+    view: &str,
+    source: &str,
+    revision: u64,
+) {
+    let base = QueryConstraints {
+        text: Some(TextConstraint {
+            literal: "ts".into(),
+            case_insensitive: true,
+        }),
+        time_basis: lvu::TimeBasis::Event,
+        ..QueryConstraints::default()
+    };
+    let mut constraints = base.clone();
+    constraints.enrichments = vec![lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId(format!("{view}-capture")),
+        source: source.into(),
+        command: None,
+    }];
+    adapter
+        .submit(QueryRequest {
+            view_id: view.into(),
+            generation: revision,
+            revision,
+            base_revision: revision - 1,
+            base_constraints: base,
+            purpose: QueryPurpose::Enrichment,
+            constraints,
+        })
+        .unwrap();
+}
+
 async fn wait_applied(adapter: &mut NativeViewAdapter, revision: u64) {
     let done = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -569,6 +602,58 @@ async fn malformed_utf8_expansion_is_charged_before_carrier_retention() {
         0,
         "Polars is never entered after carrier admission fails"
     );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_colour_rule_vectors_are_reserved_before_native_evaluation() {
+    let api_rows = (0..20)
+        .map(|index| format!("api row {index}\n"))
+        .collect::<String>();
+    let worker_rows = (0..20)
+        .map(|index| format!("worker row {index}\n"))
+        .collect::<String>();
+    // Forty one-rule rows fit this budget; sixteen complete native match
+    // vectors alone require 40 * 16 * 96 bytes, before the selected-ID set
+    // and final map. The reservation must reject before the Polars boundary.
+    let (_root, manager, api, worker, mut adapter) =
+        setup_raw_bytes_with_budget(48 * 1_024, api_rows.as_bytes(), worker_rows.as_bytes()).await;
+    wait_runtime(&api, 20).await;
+    wait_runtime(&worker, 20).await;
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    let (probe, counters) = phase_probe();
+    adapter.arm_union_phase_test_probe("union", probe).unwrap();
+    let mut candidate = raw_candidate(1);
+    candidate.color_rules = (0..lvu::MAX_COLOR_RULES)
+        .map(|_| lvu::ColorRule {
+            predicate: "row".into(),
+            color: lvu::RuleColor::Red,
+            column: None,
+            value: None,
+        })
+        .collect();
+    adapter
+        .submit_union_candidate(candidate, &|_| None)
+        .unwrap();
+    let error = wait_union(&mut adapter, 1)
+        .unwrap()
+        .error
+        .expect("the rule-multiplied workspace must reject");
+    assert!(error.contains("memory budget"), "{error}");
+    assert_eq!(
+        counters[0].load(std::sync::atomic::Ordering::Acquire),
+        40,
+        "the bounded inputs were visited before workspace admission"
+    );
+    assert_eq!(
+        counters[1].load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "native merge/colour evaluation must not start before reservation"
+    );
+
     adapter.shutdown();
     manager.shutdown().await;
 }
@@ -1111,7 +1196,7 @@ async fn native_advanced_filters_post_dedup_and_preserve_last_good() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn union_derived_inventory_requires_every_frozen_input_to_accept_the_output() {
+async fn union_derived_inventory_preserves_winning_input_authority() {
     let (root, manager, api, _worker, mut adapter) = setup().await;
     let mut file = OpenOptions::new()
         .append(true)
@@ -1155,9 +1240,10 @@ async fn union_derived_inventory_requires_every_frozen_input_to_accept_the_outpu
     assert_eq!(frozen.summary().view_id, "union");
     assert_eq!(frozen.summary().applied_revision, 1);
     assert_eq!(frozen.summary().applied_generation, 1);
-    assert!(
-        frozen.summary().accepted_enrichment_outputs.is_empty(),
-        "the other input's raw choice field cannot confer derived authority"
+    assert_eq!(
+        frozen.summary().accepted_enrichment_outputs,
+        vec!["choice"],
+        "an accepted winning-input output remains available to Fields"
     );
     let rows = std::thread::spawn(move || {
         let mut rows = Vec::new();
@@ -1171,9 +1257,24 @@ async fn union_derived_inventory_requires_every_frozen_input_to_accept_the_outpu
     })
     .join()
     .unwrap();
-    assert!(
-        rows.iter().any(|row| row.fields.contains_key("choice")),
-        "the typed column remains available even though it is not accepted-derived authority"
+    let overlapping_raw = rows
+        .iter()
+        .find(|row| {
+            row.record.record_id.sequence == 6
+                && String::from_utf8_lossy(&row.record.bytes).contains("\"choice\":\"raw-name\"")
+        })
+        .expect("the overlapping record retains its original raw namesake");
+    assert_eq!(
+        overlapping_raw.fields.get("choice"),
+        Some(&serde_json::json!("api")),
+        "the first-kept input's accepted value is authoritative for the winning identity"
+    );
+    assert_eq!(
+        overlapping_raw
+            .field_types
+            .get("choice")
+            .map(String::as_str),
+        Some("String")
     );
     assert!(
         union_rows(&mut adapter).iter().all(|row| row
@@ -1181,6 +1282,143 @@ async fn union_derived_inventory_requires_every_frozen_input_to_accept_the_outpu
             .iter()
             .all(|(name, _)| name != lvu_view::COLOR_RULE_DETAIL)),
         "a raw namesake must not acquire union classifier authority"
+    );
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heterogeneous_union_keeps_winning_row_derived_authority_only() {
+    let (root, manager, api, worker, mut adapter) = setup().await;
+    let mut worker_file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("worker.log"))
+        .unwrap();
+    writeln!(
+        worker_file,
+        "{{\"ts\":\"2026-03-04T05:06:13Z\",\"severity\":\"api\",\"svc\":\"worker\"}}"
+    )
+    .unwrap();
+    worker_file.flush().unwrap();
+    wait_runtime(&worker, 7).await;
+    apply_slash_enrichment_after_filter(
+        &mut adapter,
+        "view-a",
+        r#"/svc\":\"(?P<severity>api)/"#,
+        2,
+    );
+    wait_applied(&mut adapter, 2).await;
+    let started = std::time::Instant::now();
+    loop {
+        adapter.drain_updates(64);
+        if adapter.status("view-b").is_some_and(|status| {
+            status
+                .high_watermarks
+                .iter()
+                .any(|(source, high)| *source == worker.source_id() && *high == Some(6))
+        }) {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    adapter
+        .register_union_view("union", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    let mut union_candidate = candidate(1, &api, &worker, 2, 1);
+    union_candidate.inputs[0].applied_generation = 2;
+    union_candidate.color_rules = vec![lvu::ColorRule::column_rule(
+        "severity".into(),
+        "api".into(),
+        lvu::RuleColor::Red,
+    )];
+    adapter
+        .submit_union_candidate(union_candidate, &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+
+    let rows = union_rows(&mut adapter);
+    assert_eq!(rows.len(), 13);
+    for row in &rows {
+        let painted = row
+            .details
+            .iter()
+            .any(|(name, value)| name == lvu_view::COLOR_RULE_DETAIL && value == "1");
+        let ready = row
+            .details
+            .iter()
+            .any(|(name, value)| name == "derived_ready.severity" && value == "api");
+        if row.id.source_id == api.source_id().0.to_string() {
+            assert!(painted && ready);
+            assert!(row.fields.contains(&("severity".into(), "api".into())));
+        } else {
+            assert!(!painted && !ready, "raw/missing B rows have no authority");
+            assert!(row.fields.contains(&("severity".into(), "null".into())));
+        }
+    }
+    assert!(
+        rows.iter()
+            .any(|row| row.id.source_id == worker.source_id().0.to_string()
+                && row.text.contains("\"severity\":\"api\"")),
+        "the raw namesake remains intact as original context"
+    );
+
+    let frozen = adapter
+        .freeze_input("union", FrozenInputLimits::default())
+        .unwrap();
+    assert_eq!(
+        frozen.summary().accepted_enrichment_outputs,
+        vec!["severity"]
+    );
+    let precise = std::thread::spawn(move || {
+        let mut rows = Vec::new();
+        frozen
+            .visit_precise(&AtomicBool::new(false), |batch| {
+                rows.extend(batch.rows);
+                Ok(())
+            })
+            .unwrap();
+        rows
+    })
+    .join()
+    .unwrap();
+    assert!(precise.iter().any(|row| {
+        row.record.record_id.source_id == api.source_id()
+            && row.fields.get("severity") == Some(&serde_json::json!("api"))
+            && row.field_types.get("severity").is_some()
+    }));
+    let raw_namesake = precise
+        .iter()
+        .find(|row| {
+            row.record.record_id.source_id == worker.source_id()
+                && String::from_utf8_lossy(&row.record.bytes).contains("\"severity\":\"api\"")
+        })
+        .expect("raw B namesake survives in original bytes");
+    assert!(!raw_namesake.fields.contains_key("severity"));
+    assert_eq!(
+        raw_namesake
+            .omitted_fields
+            .get("severity")
+            .map(String::as_str),
+        Some("accepted output unavailable for this union row")
+    );
+
+    let mut shared_key = candidate(2, &api, &worker, 2, 1);
+    shared_key.inputs[0].applied_generation = 2;
+    shared_key.filter.exact_key =
+        Some(ExactFieldConstraint::new("severity", ExactScalar::string("api").unwrap()).unwrap());
+    adapter
+        .submit_union_candidate(shared_key, &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 2).unwrap().error, None);
+    let selected = union_rows(&mut adapter);
+    assert_eq!(selected.len(), 6);
+    assert!(
+        selected
+            .iter()
+            .all(|row| row.id.source_id == api.source_id().0.to_string()),
+        "the B raw namesake cannot satisfy the derived shared-key predicate"
     );
 
     adapter.shutdown();

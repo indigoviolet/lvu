@@ -48,9 +48,9 @@
 
 use super::export::{FrozenInput, FrozenInputError, FrozenInputLimits};
 use super::union::{
-    StoredUnionInput, UnionCandidateSpec, UnionCompletion, UnionFilterSpec, UnionFrozenInput,
-    UnionFrozenRow, UnionLimits, detect_union_cycle, lossy_utf8_len, union_frozen_inputs,
-    union_row_carrier_bytes, union_workspace_bytes, validate_union_spec,
+    INPUT_COLUMN, StoredUnionInput, UnionCandidateSpec, UnionCompletion, UnionFilterSpec,
+    UnionFrozenInput, UnionFrozenRow, UnionLimits, detect_union_cycle, lossy_utf8_len,
+    union_frozen_inputs, union_row_carrier_bytes, union_workspace_bytes, validate_union_spec,
 };
 use super::{
     Appended, AutoLine, ContinuationRule, GroupRange, MAX_CONFIGURED_GROUP_STORED,
@@ -63,7 +63,7 @@ use super::{
 use lvu_core::{RecordId, SourceId};
 use lvu_query::{
     BatchQuery, BatchValidity, CompiledDefinition, KeyFlag, TextSearch, exact_column_expr,
-    exact_key_flags, execute_batch_with_native_predicate, non_null_flags,
+    exact_key_flags, execute_batch_with_native_predicate, non_null_flags, scalar_projection,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -965,6 +965,7 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
             rows: work.rows,
         });
     }
+    let accepted_enrichment_outputs = accepted_enrichment_outputs(&metas);
     // Deterministic test barrier, if armed: every input is frozen and
     // visited, nothing is merged or published yet.
     if let Some(barrier) = &ctx.test_barrier {
@@ -1007,16 +1008,9 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
     let identity_index_bytes = retained_rows
         .checked_mul(96)
         .ok_or_else(|| "union identity index size overflow".to_owned())?;
-    // At most one rule index is retained per published identity. Reserve the
-    // same conservative per-entry envelope as the ordinary membership path
-    // before native colour evaluation allocates its result map.
-    let color_match_bytes = if prepared_filter.color_rules_source.is_empty() {
-        0
-    } else {
-        retained_rows
-            .checked_mul(96)
-            .ok_or_else(|| "union colour match size overflow".to_owned())?
-    };
+    let color_match_bytes =
+        union_color_workspace_bytes(retained_rows, &prepared_filter.color_rules_source)?;
+    let derived_bytes = union_derived_workspace_bytes(&decoded_inputs, &metas)?;
     // Configured grouping temporarily carries the engine flag vector and the
     // identity-indexed flag map together. Reserve both before either native
     // helper or map builder runs; Run keys may retain the full exact-key
@@ -1041,6 +1035,7 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
         .and_then(|bytes| bytes.checked_add(identity_index_bytes))
         .and_then(|bytes| bytes.checked_add(configured_grouping_bytes))
         .and_then(|bytes| bytes.checked_add(color_match_bytes))
+        .and_then(|bytes| bytes.checked_add(derived_bytes))
         .ok_or_else(|| "union workspace size overflow".to_owned())?;
     let additional = reserved_bytes
         .checked_sub(carrier_bytes)
@@ -1053,15 +1048,20 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
     }
     let merged = union_frozen_inputs(&ctx.spec.union_view_id, &decoded_inputs, &ctx.limits)
         .map_err(|error| error.to_string())?;
-    let accepted_enrichment_outputs = common_accepted_enrichment_outputs(&metas);
-    let exact = ctx
-        .spec
-        .filter
-        .exact_key
-        .as_ref()
-        .map(|key| exact_column_expr(&merged, key))
-        .transpose()
-        .map_err(|error| error.to_string())?;
+    let exact = match ctx.spec.filter.exact_key.as_ref() {
+        Some(key) => {
+            let exact = exact_column_expr(&merged, key).map_err(|error| error.to_string())?;
+            let authority = accepted_output_authority(&metas, key.field())?.ok_or_else(|| {
+                format!(
+                    "exact key column {:?} is not an accepted enrichment output",
+                    key.field()
+                )
+            })?;
+            Some(exact.and(authority))
+        }
+        None => None,
+    };
+    let column_color_authority = accepted_output_authorities(&metas)?;
     check_cancelled(&ctx.cancel, &ctx.shared)?;
     let result = execute_batch_with_native_predicate(
         &merged,
@@ -1075,7 +1075,7 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
             column_colors: &prepared_filter.column_colors,
         },
         exact,
-        &accepted_enrichment_outputs,
+        &column_color_authority,
     );
     check_cancelled(&ctx.cancel, &ctx.shared)?;
     if result.generation != ctx.generation
@@ -1113,6 +1113,13 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
             .saturating_add(1);
         return Err(format!("colour rule {position}: {}", diagnostic.message));
     }
+    let (derived, precise_derived, derived_bytes) = union_derived_projection(
+        &result.enriched_rows,
+        &decoded_inputs,
+        &metas,
+        &accepted_enrichment_outputs,
+        &result.matched_ids,
+    )?;
     publish_union(
         ctx,
         &fence,
@@ -1122,6 +1129,9 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
         result.color_matches,
         decoded_inputs,
         accepted_enrichment_outputs,
+        derived,
+        precise_derived,
+        derived_bytes,
         prepared_filter,
         reservation,
     )
@@ -1473,20 +1483,243 @@ fn current_source_fence_with_guarded(
     }
 }
 
-fn common_accepted_enrichment_outputs(inputs: &[FrozenUnionMeta]) -> Vec<String> {
+fn accepted_enrichment_outputs(inputs: &[FrozenUnionMeta]) -> Vec<String> {
     let mut outputs = inputs
-        .first()
-        .map(|input| input.accepted_enrichment_outputs.clone())
-        .unwrap_or_default();
-    outputs.retain(|output| {
-        inputs
-            .iter()
-            .skip(1)
-            .all(|input| input.accepted_enrichment_outputs.contains(output))
-    });
+        .iter()
+        .flat_map(|input| input.accepted_enrichment_outputs.iter().cloned())
+        .collect::<Vec<_>>();
     outputs.sort();
     outputs.dedup();
     outputs
+}
+
+fn input_accepts_output(inputs: &[FrozenUnionMeta], input: usize, output: &str) -> bool {
+    inputs.get(input).is_some_and(|input| {
+        input
+            .accepted_enrichment_outputs
+            .iter()
+            .any(|accepted| accepted == output)
+    })
+}
+
+fn accepted_output_authority(
+    inputs: &[FrozenUnionMeta],
+    output: &str,
+) -> Result<Option<polars::prelude::Expr>, String> {
+    use polars::prelude::{col, lit};
+    let mut authority: Option<polars::prelude::Expr> = None;
+    for (position, input) in inputs.iter().enumerate() {
+        if !input
+            .accepted_enrichment_outputs
+            .iter()
+            .any(|accepted| accepted == output)
+        {
+            continue;
+        }
+        let position = u32::try_from(position)
+            .map_err(|_| "union input position exceeds UInt32 provenance".to_owned())?;
+        let owns = col(INPUT_COLUMN).eq(lit(position));
+        authority = Some(authority.map_or(owns.clone(), |prior| prior.or(owns)));
+    }
+    Ok(authority)
+}
+
+fn accepted_output_authorities(
+    inputs: &[FrozenUnionMeta],
+) -> Result<Vec<(String, polars::prelude::Expr)>, String> {
+    accepted_enrichment_outputs(inputs)
+        .into_iter()
+        .map(|output| {
+            let authority = accepted_output_authority(inputs, &output)?
+                .ok_or_else(|| format!("accepted output {output:?} has no input provenance"))?;
+            Ok((output, authority))
+        })
+        .collect()
+}
+
+fn union_input_positions(frame: &polars::prelude::DataFrame) -> Result<Vec<usize>, String> {
+    let inputs = frame
+        .column(INPUT_COLUMN)
+        .map_err(|_| "union frame has no input provenance".to_owned())?;
+    (0..frame.height())
+        .map(|index| {
+            inputs
+                .get(index)
+                .map_err(|error| error.to_string())?
+                .try_extract::<u32>()
+                .map(|position| position as usize)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+fn union_color_workspace_bytes(rows: u64, rules: &[lvu::ColorRule]) -> Result<u64, String> {
+    if rules.is_empty() {
+        return Ok(0);
+    }
+    // The engine currently materialises one complete StableRecordId vector
+    // per rule. Reserve all of them, plus the selected-ID vector, publication
+    // membership set and final first-match map, before entering native
+    // evaluation. MAX_COLOR_RULES bounds the multiplier at sixteen.
+    let identity_copies = u64::try_from(rules.len())
+        .ok()
+        .and_then(|rules| rules.checked_add(3))
+        .and_then(|copies| copies.checked_mul(96))
+        .and_then(|per_row| per_row.checked_mul(rows))
+        .ok_or_else(|| "union colour match size overflow".to_owned())?;
+    let strings = rules.iter().try_fold(0u64, |total, rule| {
+        let bytes = rule
+            .predicate
+            .len()
+            .saturating_add(rule.column.as_ref().map_or(0, String::len))
+            .saturating_add(rule.value.as_ref().map_or(0, String::len))
+            .saturating_add(rule.color.label().len())
+            .saturating_add(192);
+        total.checked_add(bytes as u64)
+    });
+    identity_copies
+        .checked_add(strings.ok_or_else(|| "union colour rule size overflow".to_owned())?)
+        .ok_or_else(|| "union colour workspace size overflow".to_owned())
+}
+
+fn scalar_json_bytes(value: &serde_json::Value) -> Result<u64, String> {
+    match value {
+        serde_json::Value::Null => Ok(4),
+        serde_json::Value::Bool(_) => Ok(5),
+        serde_json::Value::Number(number) => Ok(number.to_string().len() as u64),
+        serde_json::Value::String(text) => (text.len() as u64)
+            .checked_add(2)
+            .ok_or_else(|| "union derived value size overflow".to_owned()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            Err("union accepted enrichment output is not an exact scalar value".to_owned())
+        }
+    }
+}
+
+fn union_derived_workspace_bytes(
+    inputs: &[UnionFrozenInput],
+    metas: &[FrozenUnionMeta],
+) -> Result<u64, String> {
+    if metas
+        .iter()
+        .all(|input| input.accepted_enrichment_outputs.is_empty())
+    {
+        return Ok(0);
+    }
+    let mut bytes = 0u64;
+    let mut rows = 0u64;
+    for (input, meta) in inputs.iter().zip(metas) {
+        rows = rows
+            .checked_add(input.rows.len() as u64)
+            .ok_or_else(|| "union derived row count overflow".to_owned())?;
+        for row in &input.rows {
+            for output in &meta.accepted_enrichment_outputs {
+                let Some(value) = row.fields.get(output) else {
+                    continue;
+                };
+                let dtype = row.field_types.get(output).map_or(0, String::len);
+                let scalar = scalar_json_bytes(value)?;
+                let entry = 36u64
+                    .checked_add((output.len().saturating_mul(2)) as u64)
+                    .and_then(|size| size.checked_add(dtype as u64))
+                    .and_then(|size| size.checked_add(scalar))
+                    .and_then(|size| size.checked_add(512 + 160))
+                    .ok_or_else(|| "union derived projection size overflow".to_owned())?;
+                bytes = bytes
+                    .checked_add(entry)
+                    .ok_or_else(|| "union derived projection size overflow".to_owned())?;
+            }
+        }
+    }
+    // One temporary scalar projection and the per-input winner indexes exist
+    // beside the retained display and precise maps.
+    bytes
+        .checked_add(
+            rows.checked_mul(704)
+                .ok_or_else(|| "union derived workspace size overflow".to_owned())?,
+        )
+        .ok_or_else(|| "union derived workspace size overflow".to_owned())
+}
+
+type FrozenDerived = HashMap<(String, u64, String), (serde_json::Value, String)>;
+
+fn union_derived_projection(
+    frame: &polars::prelude::DataFrame,
+    inputs: &[UnionFrozenInput],
+    metas: &[FrozenUnionMeta],
+    outputs: &[String],
+    matched_ids: &[lvu_query::StableRecordId],
+) -> Result<
+    (
+        HashMap<(String, u64, String), Option<String>>,
+        FrozenDerived,
+        u64,
+    ),
+    String,
+> {
+    if outputs.is_empty() {
+        return Ok((HashMap::new(), HashMap::new(), 0));
+    }
+    let positions = union_input_positions(frame)?;
+    let selected: HashSet<(&str, u64)> = matched_ids
+        .iter()
+        .map(|id| (id.source_id.as_str(), id.sequence))
+        .collect();
+    let indexes = inputs
+        .iter()
+        .map(|input| {
+            input
+                .rows
+                .iter()
+                .map(|row| {
+                    (
+                        (
+                            row.record_id.source_id.0.to_string(),
+                            row.record_id.sequence,
+                        ),
+                        row,
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+    let mut display = HashMap::new();
+    let mut precise = HashMap::new();
+    let mut bytes = 0u64;
+    for output in outputs {
+        let projection = scalar_projection(frame, output, 512)?;
+        for ((id, value), input) in projection.into_iter().zip(&positions) {
+            if !selected.contains(&(id.source_id.as_str(), id.sequence))
+                || !input_accepts_output(metas, *input, output)
+            {
+                continue;
+            }
+            let Some(row) = indexes
+                .get(*input)
+                .and_then(|index| index.get(&(id.source_id.clone(), id.sequence)))
+            else {
+                return Err("union derived projection lost winning input provenance".into());
+            };
+            let (Some(typed), Some(dtype)) = (row.fields.get(output), row.field_types.get(output))
+            else {
+                continue;
+            };
+            let key = (id.source_id, id.sequence, output.clone());
+            bytes = bytes
+                .checked_add(
+                    key.0.len() as u64
+                        + key.2.len() as u64 * 2
+                        + value.as_ref().map_or(1, String::len) as u64
+                        + dtype.len() as u64
+                        + scalar_json_bytes(typed)?
+                        + 160,
+                )
+                .ok_or_else(|| "union derived publication size overflow".to_owned())?;
+            display.insert(key.clone(), value);
+            precise.insert(key, (typed.clone(), dtype.clone()));
+        }
+    }
+    Ok((display, precise, bytes))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1504,20 +1737,23 @@ type UnionGroupingFlags = HashMap<(String, u64), UnionGroupingFlag>;
 fn union_configured_grouping_flags(
     frame: &polars::prelude::DataFrame,
     rule: &ContinuationRule,
-    accepted_outputs: &[String],
+    inputs: &[FrozenUnionMeta],
 ) -> Result<Option<UnionGroupingFlags>, String> {
     let Some(column) = rule.configured_column() else {
         return Ok(None);
     };
-    if !accepted_outputs.iter().any(|output| output == column) {
+    if accepted_output_authority(inputs, column)?.is_none() {
         return Err(format!(
             "grouping column {column:?} is not an accepted enrichment output; add it in Enrichment first"
         ));
     }
+    let positions = union_input_positions(frame)?;
     let mut flags = HashMap::with_capacity(frame.height());
     match rule {
         ContinuationRule::Filter { .. } => {
-            for (id, starts) in non_null_flags(frame, column)? {
+            for ((id, starts), input) in non_null_flags(frame, column)?.into_iter().zip(&positions)
+            {
+                let starts = starts && input_accepts_output(inputs, *input, column);
                 flags.insert(
                     (id.source_id, id.sequence),
                     if starts {
@@ -1529,10 +1765,17 @@ fn union_configured_grouping_flags(
             }
         }
         ContinuationRule::Run { .. } => {
-            for (id, key) in exact_key_flags(frame, column).map_err(|error| match error {
-                lvu_query::KeyError::Unavailable(message)
-                | lvu_query::KeyError::Unsupported(message) => message,
-            })? {
+            for ((id, mut key), input) in exact_key_flags(frame, column)
+                .map_err(|error| match error {
+                    lvu_query::KeyError::Unavailable(message)
+                    | lvu_query::KeyError::Unsupported(message) => message,
+                })?
+                .into_iter()
+                .zip(&positions)
+            {
+                if !input_accepts_output(inputs, *input, column) {
+                    key = KeyFlag::Null;
+                }
                 flags.insert(
                     (id.source_id, id.sequence),
                     match key {
@@ -1802,21 +2045,19 @@ fn publish_union(
     engine_color_matches: BTreeMap<String, Vec<lvu_query::StableRecordId>>,
     decoded_inputs: Vec<UnionFrozenInput>,
     accepted_enrichment_outputs: Vec<String>,
+    derived: HashMap<(String, u64, String), Option<String>>,
+    precise_derived: FrozenDerived,
+    derived_bytes: u64,
     prepared_filter: PreparedUnionFilter,
     mut reservation: Reservation,
 ) -> Result<(), String> {
     use super::union::{SEQUENCE_COLUMN, SOURCE_ID_COLUMN, UNION_TS_COLUMN};
     use polars::prelude::AnyValue;
     let height = matched_ids.len();
-    // A union exposes an enrichment output only when every accepted input
-    // structurally produced it at its frozen fence. This conservative
-    // intersection prevents a raw same-named field in another input from
-    // acquiring derived authority for configured grouping or shared-key
-    // selection on the union view.
     let configured_grouping_flags = prepared_filter
         .grouping
         .as_ref()
-        .map(|rule| union_configured_grouping_flags(&merged, rule, &accepted_enrichment_outputs))
+        .map(|rule| union_configured_grouping_flags(&merged, rule, &frozen_inputs))
         .transpose()?
         .flatten();
     // Display rank per identity, in engine output order.
@@ -1934,6 +2175,9 @@ fn publish_union(
     if publication_bytes > reservation.bytes {
         return Err("union membership exceeds the memory budget".into());
     }
+    publication_bytes = publication_bytes
+        .checked_add(derived_bytes)
+        .ok_or_else(|| "union derived publication size overflow".to_owned())?;
     let matched: HashSet<(&str, u64)> = matched_ids
         .iter()
         .map(|id| (id.source_id.as_str(), id.sequence))
@@ -2060,8 +2304,9 @@ fn publish_union(
         bytes,
         budget: Arc::clone(&ctx.budget),
         enrichment_names: accepted_enrichment_outputs,
-        derived: HashMap::new(),
+        derived,
         derived_errors: HashSet::new(),
+        frozen_derived: Some(precise_derived),
         color_matches,
         color_rules: prepared_filter.color_rules_source.clone(),
         advanced: None,

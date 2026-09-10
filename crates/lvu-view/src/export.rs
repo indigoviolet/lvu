@@ -971,13 +971,44 @@ fn visit_frozen_input(
                         || is_selected(frozen.membership.as_deref(), source.id, record)
                 })
                 .map(|(index, record)| {
-                    input_row(
+                    let mut row = input_row(
                         record,
                         &enriched.enriched_rows,
                         index,
                         precise_values,
                         &enrichment_names,
-                    )
+                    )?;
+                    if let Some(authoritative) = frozen
+                        .membership
+                        .as_ref()
+                        .and_then(|membership| membership.frozen_derived.as_ref())
+                    {
+                        for name in &enrichment_names {
+                            let key = (
+                                record.record_id.source_id.0.to_string(),
+                                record.record_id.sequence,
+                                name.clone(),
+                            );
+                            match authoritative.get(&key) {
+                                Some((value, dtype)) => {
+                                    row.fields.insert(name.clone(), value.clone());
+                                    if precise_values {
+                                        row.field_types.insert(name.clone(), dtype.clone());
+                                    }
+                                    row.omitted_fields.remove(name);
+                                }
+                                None => {
+                                    row.fields.remove(name);
+                                    row.field_types.remove(name);
+                                    row.omitted_fields.insert(
+                                        name.clone(),
+                                        "accepted output unavailable for this union row".into(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(row)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             visit_input_rows(selected, limits, cancel, visitor, &mut stats)?;

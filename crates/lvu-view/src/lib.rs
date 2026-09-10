@@ -560,6 +560,11 @@ struct Membership {
     /// projection of the same cell succeeds; consumers proving per-row
     /// validity read this alongside `derived`, never the value text.
     derived_errors: HashSet<(String, u64, String)>,
+    /// Union-only typed accepted cells keyed by stable identity and output.
+    /// `None` means ordinary replay owns the authoritative stage evaluation;
+    /// `Some` makes frozen union replay overlay only winning-input accepted
+    /// values and suppress raw same-named fields on every other row.
+    frozen_derived: Option<HashMap<(String, u64, String), (serde_json::Value, String)>>,
     /// Which colour rule painted each row: `(source, sequence)` to the index of
     /// the first rule whose predicate matched. Only matched rows appear.
     color_matches: HashMap<(String, u64), u16>,
@@ -675,6 +680,7 @@ impl Reservation {
             enrichment_names,
             derived,
             derived_errors,
+            frozen_derived: None,
             basis,
             color_matches,
             color_rules,
@@ -7299,6 +7305,7 @@ mod gap_tests {
             enrichment_names: Vec::new(),
             derived: HashMap::new(),
             derived_errors: HashSet::new(),
+            frozen_derived: None,
             color_matches: HashMap::new(),
             color_rules: Vec::new(),
             advanced: None,
@@ -7464,6 +7471,7 @@ mod order_tests {
             enrichment_names: Vec::new(),
             derived: HashMap::new(),
             derived_errors: HashSet::new(),
+            frozen_derived: None,
             color_matches: HashMap::new(),
             color_rules: Vec::new(),
             advanced: None,
