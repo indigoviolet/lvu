@@ -2204,6 +2204,14 @@ fn is_window_overflow_name(file_name: &str) -> bool {
     }
 }
 
+/// Our own control files, compared as `OsStr` (no decode): neither sweep
+/// candidates nor scan budget. The ownership lock file is created by the
+/// guard acquisition above, so it is always present during a sweep; the
+/// budget name mirrors `index::BUDGET_FILE`.
+fn is_sweep_control_file(name: &std::ffi::OsStr) -> bool {
+    name == ".lvu-index-ownership.lock" || name == ".lvu-index-budget"
+}
+
 /// Cap on directory entries inspected per sweep: startup must not stall
 /// scanning an unbounded cache, so the sweep stops here and leaves the
 /// rest for a later launch (debris is crash-only; live files are never
@@ -2259,13 +2267,26 @@ pub fn sweep_stale_window_indexes(artifact_dir: &Path) -> usize {
     };
     let start = std::time::Instant::now();
     let mut removed = 0usize;
-    let mut scanned = 0usize;
-    for entry in entries {
-        // Our own control files are neither candidates nor scan budget:
-        // skipping them keeps the ceiling meaningful for real entries.
-        // (The ownership lock file is created by the guard acquisition
-        // above, so it is always present during a sweep; the budget name
-        // mirrors `index::BUDGET_FILE`.)
+    // Filter our own control files lazily (no pre-scan): they are neither
+    // candidates nor scan budget, so they must not consume the ceiling
+    // that bounds real entries below.
+    let entries = entries.filter(|entry| {
+        entry
+            .as_ref()
+            .map(|entry| {
+                let name = entry.file_name();
+                !is_sweep_control_file(&name)
+            })
+            .unwrap_or(true)
+    });
+    for (scanned, entry) in entries.enumerate() {
+        // Count and ceiling-check FIRST, before any fallible decode: I/O
+        // errors, non-UTF8 names and foreign entries must consume scan
+        // budget exactly like candidates, or an unbounded run of them
+        // bypasses both ceilings.
+        if scanned >= SWEEP_ENTRY_CEILING || start.elapsed() >= SWEEP_TIME_CEILING {
+            break;
+        }
         let Ok(entry) = entry else {
             continue;
         };
@@ -2273,13 +2294,6 @@ pub fn sweep_stale_window_indexes(artifact_dir: &Path) -> usize {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name == ".lvu-index-ownership.lock" || name == ".lvu-index-budget" {
-            continue;
-        }
-        if scanned >= SWEEP_ENTRY_CEILING || start.elapsed() >= SWEEP_TIME_CEILING {
-            break;
-        }
-        scanned += 1;
         if !is_window_overflow_name(name) {
             continue;
         }

@@ -1771,6 +1771,17 @@ fn sweep_removes_only_dead_window_overflow() {
     for name in [primary, dead, live, foreign, foreign_shaped] {
         fs::write(dir.join(name), b"x").unwrap();
     }
+    // Non-UTF8 names can never match the overflow pattern, but they must
+    // still consume scan budget exactly like any other entry (never bypass
+    // the ceilings) and must never be removed.
+    use std::os::unix::ffi::OsStringExt;
+    let non_utf8: Vec<std::ffi::OsString> = vec![
+        std::ffi::OsString::from_vec(b"\xff\xfe.rows.idx".to_vec()),
+        std::ffi::OsString::from_vec(b"a.b.\xff.window-1.rows.idx".to_vec()),
+    ];
+    for name in &non_utf8 {
+        fs::write(dir.join(name), b"x").unwrap();
+    }
     // A live owner holds its overflow exclusive for its whole lifetime.
     let live_file = fs::OpenOptions::new()
         .read(true)
@@ -1796,6 +1807,12 @@ fn sweep_removes_only_dead_window_overflow() {
         dir.join(foreign_shaped).exists(),
         "non-window shapes ignored"
     );
+    for name in &non_utf8 {
+        assert!(
+            dir.join(name).exists(),
+            "non-UTF8 entries ignored: {name:?}"
+        );
+    }
 
     // A missing directory sweeps to zero, never an error.
     assert_eq!(
