@@ -138,9 +138,20 @@ impl SharedKeyController {
         }
     }
 
-    pub fn cancel(&mut self) {
+    /// Cancel only the lookup that owns `lookup_generation`. A stale job may
+    /// remain reachable after a newer selection begins; cancelling that old
+    /// handle must not erase the newer pending authority.
+    pub fn cancel(&mut self, lookup_generation: u64) -> bool {
+        if !self
+            .pending
+            .as_ref()
+            .is_some_and(|(generation, _)| *generation == lookup_generation)
+        {
+            return false;
+        }
         self.pending = None;
         self.error = None;
+        true
     }
 }
 

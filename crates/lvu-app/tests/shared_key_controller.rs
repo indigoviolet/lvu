@@ -139,9 +139,26 @@ fn cancel_drops_only_pending_resolution() {
     let mut controller = SharedKeyController::default();
     let first = controller.begin(origin(1, 1), &outputs()).unwrap();
     controller.complete(first, Some((1, 1)), Ok((key(42), "Int64".into(), true)));
-    controller.begin(origin(2, 1), &outputs()).unwrap();
-    controller.cancel();
+    let pending = controller.begin(origin(2, 1), &outputs()).unwrap();
+    assert!(controller.cancel(pending));
     assert!(controller.pending().is_none());
     assert!(controller.error().is_none());
     assert_eq!(controller.last_proven().unwrap().constraint, key(42));
+}
+
+#[test]
+fn stale_job_cancel_does_not_erase_newer_pending_generation() {
+    let mut controller = SharedKeyController::default();
+    let old = controller.begin(origin(1, 1), &outputs()).unwrap();
+    let current = controller.begin(origin(2, 2), &outputs()).unwrap();
+
+    assert!(!controller.cancel(old));
+    assert_eq!(
+        controller.pending().map(|(generation, _)| generation),
+        Some(current)
+    );
+    assert!(matches!(
+        controller.complete(current, Some((2, 2)), Ok((key(42), "Int64".into(), true))),
+        SharedKeyCompletion::Accepted(_)
+    ));
 }

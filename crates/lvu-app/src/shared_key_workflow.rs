@@ -17,8 +17,8 @@ use std::sync::{
 use lvu_core::{ExactFieldConstraint, RecordId};
 use lvu_query::exact_key_for_record;
 use lvu_view::{
-    FrozenInput, FrozenInputLimits, FrozenInputRow, NativeViewAdapter, UnionFrozenInput,
-    UnionFrozenRow, UnionLimits, union_frozen_inputs,
+    FrozenInput, FrozenInputLimits, FrozenInputRow, FrozenInputSummary, NativeViewAdapter,
+    UnionFrozenInput, UnionFrozenRow, UnionLimits, union_frozen_inputs,
 };
 
 use crate::shared_key_controller::{SharedKeyCompletion, SharedKeyController, SharedKeyOrigin};
@@ -88,7 +88,7 @@ impl SharedKeyResolutionJob {
 
     pub fn cancel(&mut self, controller: &mut SharedKeyController) {
         self.cancel.store(true, Ordering::Release);
-        controller.cancel();
+        controller.cancel(self.generation);
         self.settled = true;
     }
 }
@@ -111,30 +111,16 @@ pub fn begin_shared_key_resolution(
     controller: &mut SharedKeyController,
     adapter: &NativeViewAdapter,
     origin: SharedKeyOrigin,
-    accepted_enrichment_outputs: &[String],
 ) -> Result<SharedKeyResolutionJob, SharedKeyCompletion> {
-    let generation = controller
-        .begin(origin.clone(), accepted_enrichment_outputs)
-        .map_err(SharedKeyCompletion::Rejected)?;
     let frozen = match adapter.freeze_input(&origin.view_id, shared_key_input_limits()) {
         Ok(frozen) => frozen,
         Err(error) => {
-            return Err(controller.complete(
-                generation,
-                Some((origin.accepted_revision, origin.applied_generation)),
-                Err(format!(
-                    "could not freeze the accepted origin view: {error}"
-                )),
-            ));
+            return Err(SharedKeyCompletion::Rejected(format!(
+                "could not freeze the accepted origin view: {error}"
+            )));
         }
     };
-    let frozen_fence = (
-        frozen.summary().applied_revision,
-        frozen.summary().applied_generation,
-    );
-    if frozen_fence != (origin.accepted_revision, origin.applied_generation) {
-        return Err(controller.complete(generation, Some(frozen_fence), Err(String::new())));
-    }
+    let generation = begin_from_frozen_summary(controller, origin.clone(), frozen.summary())?;
 
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
@@ -171,6 +157,25 @@ pub fn begin_shared_key_resolution(
         receiver,
         settled: false,
     })
+}
+
+fn begin_from_frozen_summary(
+    controller: &mut SharedKeyController,
+    origin: SharedKeyOrigin,
+    summary: &FrozenInputSummary,
+) -> Result<u64, SharedKeyCompletion> {
+    if summary.view_id != origin.view_id
+        || (summary.applied_revision, summary.applied_generation)
+            != (origin.accepted_revision, origin.applied_generation)
+    {
+        return Err(SharedKeyCompletion::Stale);
+    }
+    // Authority comes only from the same fenced accepted snapshot that will
+    // be replayed below. A UI/app inventory may be useful for presentation,
+    // but can neither add nor remove authority here. Raw views carry none.
+    controller
+        .begin(origin, &summary.accepted_enrichment_outputs)
+        .map_err(SharedKeyCompletion::Rejected)
 }
 
 fn resolve_frozen_origin(
@@ -399,7 +404,39 @@ mod tests {
     #[test]
     fn raw_namesake_without_structural_accepted_output_never_starts() {
         let mut controller = SharedKeyController::default();
-        assert!(controller.begin(origin(5), &[]).is_err());
+        // The raw row can contain the same name and a caller/UI can claim it
+        // in a hint, but neither is an argument to the authority function.
+        let raw_only = row(9, Some((serde_json::json!(42), "UInt64")));
+        let forged_ui_hint = ["request_key".to_owned()];
+        assert!(raw_only.fields.contains_key(&forged_ui_hint[0]));
+        let summary = FrozenInputSummary {
+            view_id: "origin".into(),
+            applied_revision: 3,
+            applied_generation: 5,
+            selected_records: None,
+            sources: Vec::new(),
+            accepted_enrichment_outputs: Vec::new(),
+        };
+        assert!(matches!(
+            begin_from_frozen_summary(&mut controller, origin(5), &summary),
+            Err(SharedKeyCompletion::Rejected(_))
+        ));
         assert!(controller.pending().is_none());
+    }
+
+    #[test]
+    fn slash_output_from_same_frozen_summary_has_authority() {
+        let mut controller = SharedKeyController::default();
+        let summary = FrozenInputSummary {
+            view_id: "origin".into(),
+            applied_revision: 3,
+            applied_generation: 5,
+            selected_records: Some(1),
+            sources: Vec::new(),
+            // The view layer obtains this from compiled membership stages;
+            // slash capture syntax and assignments arrive identically here.
+            accepted_enrichment_outputs: vec!["request_key".into()],
+        };
+        assert!(begin_from_frozen_summary(&mut controller, origin(5), &summary).is_ok());
     }
 }

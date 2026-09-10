@@ -6,16 +6,24 @@ It never acquires another source and never uses the legacy correlation mapper.
 """
 
 import pathlib
+import re
 import sys
 import tempfile
 import time
 
-from test_enrichment_chain_pty import close_editor, open_step_editor, paste, stop
+from test_enrichment_chain_pty import (
+    close_details,
+    close_editor,
+    open_step_editor,
+    paste,
+    stop,
+)
 from test_lvu_pty import PtyApp, open_advanced_filter
 from test_union_pty import wait_closed
 
 
 EXACT = 9_007_199_254_740_993  # above f64's exact integer range
+STABLE_ID = re.compile(r"stable display id:\s*([0-9a-f-]{36}:\d+)")
 
 
 def switch_to(app, marker, *, exclude="Union of", attempts=8):
@@ -50,6 +58,48 @@ def add_enrichment(app, source):
         timeout=20,
     )
     close_editor(app)
+
+
+def selected_stable_id(app, marker):
+    app.send(b"d")
+    app.wait_for("Selected event details")
+    text = app.wait_until(
+        lambda screen: "stable display id:" in screen
+        and marker in screen[screen.index("stable display id:") :],
+        f"details identify selected record {marker!r}",
+    )
+    match = STABLE_ID.search(text)
+    assert match is not None, ("stable display id is not machine-readable", text)
+    stable_id = match.group(1)
+    close_details(app)
+    return stable_id
+
+
+def union_stable_id(app, marker, restored_markers):
+    """Narrow with the union's ordinary search, observe identity, then clear."""
+    app.send(b"/")
+    app.wait_for("Filter")
+    app.send(marker.encode())
+    app.wait_until(
+        lambda text: "Applied" in text and marker in text,
+        f"union narrowed to {marker!r}",
+        timeout=15,
+    )
+    app.send(b"\x1b")
+    wait_closed(app, "┌ Filter", "identity search closed")
+    stable_id = selected_stable_id(app, marker)
+
+    app.send(b"/")
+    app.wait_for("Filter")
+    app.send(b"\x7f" * len(marker))
+    app.wait_until(
+        lambda text: all(value in text for value in restored_markers),
+        "identity search cleared back to exact-key membership",
+        timeout=15,
+    )
+    app.send(b"\x1b")
+    wait_closed(app, "┌ Filter", "cleared identity search closed")
+    return stable_id
 
 
 def select_field(app, field):
@@ -109,8 +159,10 @@ def numeric_restart_live_and_namesake(binary):
         try:
             switch_to(app, "api-selected")
             add_enrichment(app, "request_key = pl.col('api_id').cast(pl.UInt64)")
+            api_origin_id = selected_stable_id(app, "api-selected")
             switch_to(app, "worker-selected")
             add_enrichment(app, "request_key = pl.col('worker_id').cast(pl.UInt64)")
+            worker_origin_id = selected_stable_id(app, "worker-selected")
             switch_to(app, "api-selected")
             create_from_selected_key(app)
 
@@ -122,6 +174,12 @@ def numeric_restart_live_and_namesake(binary):
                 timeout=25,
             )
             assert "api-other" not in merged and "worker-other" not in merged, merged
+            assert union_stable_id(
+                app, "api-selected", ("api-selected", "worker-selected")
+            ) == api_origin_id
+            assert union_stable_id(
+                app, "worker-selected", ("api-selected", "worker-selected")
+            ) == worker_origin_id
 
             with worker.open("a") as stream:
                 stream.write(
@@ -141,9 +199,17 @@ def numeric_restart_live_and_namesake(binary):
             paste(app, "pl.col(")
             app.send(b"\r")
             app.wait_for("compiler rejected expression", timeout=15)
-            assert "live-match" in app.text(), app.text()
             app.send(b"\x1b")
-            app.wait_for("live-match")
+            rollback = app.wait_until(
+                lambda text: "api-selected" in text
+                and "worker-selected" in text
+                and "live-match" in text,
+                "invalid candidate preserved complete in-process last-good membership",
+                timeout=15,
+            )
+            assert "api-other" not in rollback, rollback
+            assert "worker-other" not in rollback, rollback
+            assert "live-other" not in rollback, rollback
 
             stop(app)
             app = PtyApp(binary, args, width=160, height=36, cwd=root, environment=env)
@@ -155,6 +221,12 @@ def numeric_restart_live_and_namesake(binary):
             )
             restored = app.text()
             assert "api-other" not in restored and "live-other" not in restored, restored
+            assert union_stable_id(
+                app, "api-selected", ("api-selected", "worker-selected", "live-match")
+            ) == api_origin_id
+            assert union_stable_id(
+                app, "worker-selected", ("api-selected", "worker-selected", "live-match")
+            ) == worker_origin_id
 
             # Remove the origin enrichment, leaving the raw namesake in the
             # source. Fields may still show that raw column, but structural
