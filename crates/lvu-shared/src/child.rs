@@ -98,10 +98,7 @@ pub fn parse_child_args(args: &[OsString]) -> Result<Option<ChildArgs>, String> 
 /// capture keeps), and policy refinements (follow / restart / header-aware
 /// presentation, mirroring the application's acquisition relation) stay
 /// application-side and are follow-up work, not silent worker invention.
-/// The identity helper canonicalizes absolute file aliases and encodes every
-/// path losslessly. Relative process context has already been rejected by
-/// the worker boundary before this hook runs.
-pub(crate) struct ChildAdmission;
+struct ChildAdmission;
 
 impl AdmissionHook for ChildAdmission {
     fn admit(&self, _definition: &SourceDefinition) -> AdmissionVerdict {
@@ -113,23 +110,14 @@ impl AdmissionHook for ChildAdmission {
         definition: &SourceDefinition,
         live: &[SourceDefinition],
     ) -> AdmissionVerdict {
-        // A pipe belongs to the attaching window. Even reusing an id must
-        // never turn a fresh attachment into `Present` for somebody else's
-        // writer; the manager will reject a reused id, while every fresh id
-        // gets its own reader below.
-        if matches!(definition.acquisition, lvu_core::Acquisition::Stdin) {
-            return AdmissionVerdict::Admit;
-        }
         for known in live {
             if known.id == definition.id {
                 return AdmissionVerdict::Present { live_id: known.id };
             }
-            if known.retention == definition.retention {
-                match acquisition_identical(&known.acquisition, &definition.acquisition) {
-                    Ok(true) => return AdmissionVerdict::Present { live_id: known.id },
-                    Ok(false) => {}
-                    Err(reason) => return AdmissionVerdict::Refuse(reason),
-                }
+            if known.retention == definition.retention
+                && acquisition_identical(&known.acquisition, &definition.acquisition)
+            {
+                return AdmissionVerdict::Present { live_id: known.id };
             }
         }
         AdmissionVerdict::Admit
@@ -140,94 +128,11 @@ impl AdmissionHook for ChildAdmission {
 /// form. `Acquisition` serializes deterministically for a fixed value
 /// (maps compare order-independently), so byte-identical wire meaning reads
 /// as identical here; any policy byte that differs keeps them distinct.
-fn acquisition_identical(
-    live: &lvu_core::Acquisition,
-    proposed: &lvu_core::Acquisition,
-) -> Result<bool, String> {
-    Ok(acquisition_identity(live)? == acquisition_identity(proposed)?)
-}
-
-/// Canonical worker-side identity key for one acquisition definition, or
-/// `None` for attachments with no shared identity (stdin pipelines are
-/// independent by invariant: every attachment needs its own capture).
-///
-/// Absolute file paths canonicalize through the filesystem, so direct,
-/// dot-dot and symlink spellings of one file share one key. Anything the
-/// filesystem cannot canonicalize (missing or unreadable files) keeps its
-/// absolute spelling: two spellings may then start duplicate captures, but
-/// never confuse two different files. Relative paths fail closed because
-/// only the originating window knows their base. Non-file acquisitions
-/// key on their whole structural form, exactly as `admit_known` compares
-/// them. Window-local names and ids are never part of the key: sharing one
-/// capture across windows that label it differently is the point. No
-/// behavior-affecting option is dropped: path, follow mode and retention
-/// all participate; the key is in-memory only and never logged, so
-/// credential-bearing fields travel no further than the definitions map
-/// already carries them.
-pub(crate) fn admission_key(
-    definition: &lvu_core::SourceDefinition,
-) -> Result<Option<String>, String> {
-    if matches!(definition.acquisition, lvu_core::Acquisition::Stdin) {
-        return Ok(None);
-    }
-    let acquisition = acquisition_identity(&definition.acquisition)?;
-    let retention = serde_json::to_string(&definition.retention)
-        .map_err(|error| format!("cannot key source retention: {error}"))?;
-    Ok(Some(format!("{acquisition}|{retention}")))
-}
-
-/// Serialize an acquisition after replacing every path with a tagged,
-/// lossless byte encoding. `PathBuf`'s JSON serializer rejects non-UTF-8 on
-/// Unix; doing that serialization first used to turn such definitions into
-/// keyless admissions and silently bypass duplicate prevention.
-fn acquisition_identity(acquisition: &lvu_core::Acquisition) -> Result<String, String> {
-    let mut normalized = acquisition.clone();
-    match &mut normalized {
-        lvu_core::Acquisition::File { path, .. } => {
-            if !path.is_absolute() {
-                return Err("file path must be absolute before worker admission".into());
-            }
-            let resolved = std::fs::canonicalize(&*path).unwrap_or_else(|_| path.clone());
-            *path = PathBuf::from(lossless_path_text(&resolved));
-        }
-        lvu_core::Acquisition::Command { command } => {
-            let cwd = command
-                .cwd
-                .as_mut()
-                .ok_or_else(|| "command cwd must be explicit before worker admission".to_owned())?;
-            if !cwd.is_absolute() {
-                return Err("command cwd must be absolute before worker admission".into());
-            }
-            *cwd = PathBuf::from(lossless_path_text(cwd));
-            if let lvu_core::CommandProgram::Exec { executable, .. } = &mut command.program {
-                *executable = PathBuf::from(lossless_path_text(executable));
-            }
-        }
-        lvu_core::Acquisition::Stdin | lvu_core::Acquisition::Http { .. } => {}
-    }
-    serde_json::to_string(&normalized)
-        .map_err(|error| format!("cannot key source acquisition: {error}"))
-}
-
-#[cfg(unix)]
-fn lossless_path_text(path: &std::path::Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    lossless_bytes_text(path.as_os_str().as_bytes())
-}
-
-#[cfg(not(unix))]
-fn lossless_path_text(path: &std::path::Path) -> String {
-    lossless_bytes_text(path.as_os_str().to_string_lossy().as_bytes())
-}
-
-fn lossless_bytes_text(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(4 + bytes.len() * 2);
-    encoded.push_str("hex:");
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
+fn acquisition_identical(live: &lvu_core::Acquisition, proposed: &lvu_core::Acquisition) -> bool {
+    serde_json::to_value(live)
+        .ok()
+        .zip(serde_json::to_value(proposed).ok())
+        .is_some_and(|(live, proposed)| live == proposed)
 }
 
 /// Run the child to completion on a fresh single-threaded runtime and
@@ -506,123 +411,6 @@ mod tests {
         );
         // Nothing live: admit.
         assert_eq!(hook.admit_known(&other, &[]), AdmissionVerdict::Admit);
-
-        let mut stdin = live.clone();
-        stdin.acquisition = lvu_core::Acquisition::Stdin;
-        assert_eq!(
-            hook.admit_known(&stdin, std::slice::from_ref(&stdin)),
-            AdmissionVerdict::Admit,
-            "every stdin attachment remains an independent pipeline"
-        );
-    }
-
-    #[test]
-    fn admission_key_unifies_absolute_aliases_of_one_file() {
-        let root = tempfile::tempdir().unwrap();
-        let direct = root.path().join("app.log");
-        std::fs::write(&direct, "one\n").unwrap();
-        let dotted = root.path().join(".").join("app.log");
-        let link = root.path().join("alias.log");
-        std::os::unix::fs::symlink(&direct, &link).unwrap();
-
-        let base = file_definition(20);
-        let key_of = |base: &SourceDefinition, path: std::path::PathBuf| {
-            let mut definition = base.clone();
-            if let lvu_core::Acquisition::File { path: slot, .. } = &mut definition.acquisition {
-                *slot = path;
-            }
-            admission_key(&definition)
-                .expect("key construction")
-                .expect("absolute files key")
-        };
-        let direct_key = key_of(&base, direct);
-        // Dot segments and symlinks resolve to the same identity: one
-        // capture, however windows spell the path.
-        assert_eq!(key_of(&base, dotted), direct_key);
-        assert_eq!(key_of(&base, link), direct_key);
-        // Window-local names and fresh ids never split the key.
-        let mut renamed = base.clone();
-        renamed.id = lvu_core::SourceId(uuid::Uuid::from_u128(21));
-        renamed.name = "other-window-label".into();
-        assert_eq!(key_of(&renamed, root.path().join("app.log")), direct_key);
-    }
-
-    #[test]
-    fn admission_key_keeps_behavior_affecting_options_distinct() {
-        let root = tempfile::tempdir().unwrap();
-        let direct = root.path().join("app.log");
-        std::fs::write(&direct, "one\n").unwrap();
-        let base = || {
-            let mut definition = file_definition(22);
-            if let lvu_core::Acquisition::File { path: slot, .. } = &mut definition.acquisition {
-                *slot = direct.clone();
-            }
-            definition
-        };
-        let key = admission_key(&base())
-            .expect("key construction")
-            .expect("absolute files key");
-        // Follow mode changes capture behavior: not the same acquisition.
-        let mut unfollowed = base();
-        if let lvu_core::Acquisition::File { follow, .. } = &mut unfollowed.acquisition {
-            *follow = false;
-        }
-        assert_ne!(
-            admission_key(&unfollowed).unwrap(),
-            Some(key.clone()),
-            "follow mode participates in the key"
-        );
-        // Retention changes what the capture keeps: never shared silently.
-        let mut retained = base();
-        retained.retention = Some(lvu_core::RetentionPolicy {
-            maximum_bytes: Some(1024),
-            maximum_age_seconds: None,
-        });
-        assert_ne!(admission_key(&retained).unwrap(), Some(key.clone()));
-        // A different file is its own capture even under one directory.
-        let mut other = base();
-        if let lvu_core::Acquisition::File { path: slot, .. } = &mut other.acquisition {
-            *slot = root.path().join("other.log");
-        }
-        // Nonexistent files keep their absolute spelling rather than
-        // refusing: spellings may duplicate, never confuse.
-        assert!(admission_key(&other).unwrap().is_some());
-        assert_ne!(admission_key(&other).unwrap(), Some(key));
-    }
-
-    #[test]
-    fn admission_key_refuses_relative_paths_and_leaves_stdin_unshared() {
-        // Only the originating window knows the base, so relative paths
-        // fail closed instead of becoming worker-cwd identities.
-        let mut relative = file_definition(23);
-        if let lvu_core::Acquisition::File { path: slot, .. } = &mut relative.acquisition {
-            *slot = PathBuf::from("logs/app.log");
-        }
-        assert!(admission_key(&relative).is_err());
-        // Stdin attachments are independent pipelines: no shared key.
-        let mut stdin = file_definition(24);
-        stdin.acquisition = lvu_core::Acquisition::Stdin;
-        assert_eq!(admission_key(&stdin).unwrap(), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn admission_key_is_lossless_for_non_utf8_file_paths() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let root = tempfile::tempdir().unwrap();
-        let key_for = |suffix: u8| {
-            let mut definition = file_definition(25);
-            if let lvu_core::Acquisition::File { path, .. } = &mut definition.acquisition {
-                *path = root
-                    .path()
-                    .join(std::ffi::OsString::from_vec(vec![b'l', b'o', b'g', suffix]));
-            }
-            admission_key(&definition)
-                .expect("non-UTF-8 key construction")
-                .expect("file key")
-        };
-        assert_ne!(key_for(0x80), key_for(0x81));
     }
 
     #[test]
