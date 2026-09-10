@@ -412,33 +412,38 @@ async fn malformed_column_shapes_reject_the_candidate() {
     manager.shutdown().await;
 }
 
-/// Removing the classified output stops painting even with a raw same-name
-/// field present: the worker emits no ready cells, so the lingering rule
-/// matches nothing and membership is untouched.
+/// Removing only the classified stage stops painting even with a raw
+/// same-name field present: the lingering rule names no compiled accepted
+/// output, so the raw projection must not satisfy it — while an unrelated
+/// retained stage keeps evaluating and membership is untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removed_output_unpaints_without_narrowing() {
     let root = TempDir::new().unwrap();
     let (manager, _handle, mut adapter) =
         setup(&root, "severity=low first\nseverity=high second\n", false).await;
 
-    let chain = vec![enrichment_step(
+    let shout = enrichment_step(
         "shout",
         "severity = pl.col(\"severity\").str.to_uppercase()",
-    )];
+    );
+    let other = enrichment_step("other", "marker = pl.lit(\"kept\")");
     let rule = lvu::ColorRule::column_rule("severity".into(), "LOW".into(), lvu::RuleColor::Red);
     let mut applied = request(1, 1, 0);
     applied.purpose = QueryPurpose::Enrichment;
-    applied.constraints.enrichments = chain.clone();
+    applied.constraints.enrichments = vec![shout.clone(), other.clone()];
     applied.constraints.color_rules = vec![rule.clone()];
     adapter.submit(applied).unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
     let rows = wait_page(&mut adapter, 2).await;
     assert_eq!(rule_of(&rows[0]).as_deref(), Some("1"));
 
+    // Remove only the classified stage: the unrelated stage stays accepted
+    // and the raw `severity=low` field stays visible, but nothing paints.
     let mut removed = request(2, 2, 1);
     removed.purpose = QueryPurpose::Enrichment;
-    removed.base_constraints.enrichments = chain;
+    removed.base_constraints.enrichments = vec![shout, other.clone()];
     removed.base_constraints.color_rules = vec![rule];
+    removed.constraints.enrichments = vec![other];
     removed.constraints.color_rules = vec![lvu::ColorRule::column_rule(
         "severity".into(),
         "LOW".into(),
@@ -452,6 +457,15 @@ async fn removed_output_unpaints_without_narrowing() {
         rows.iter().all(|row| rule_of(row).is_none()),
         "the raw same-name field feeds no rule: {:?}",
         rows[0].details
+    );
+    assert!(
+        rows.iter().all(|row| {
+            row.fields
+                .iter()
+                .any(|(field, value)| field == "marker" && value == "kept")
+        }),
+        "the retained stage keeps evaluating: {:?}",
+        rows[0].fields
     );
 
     adapter.shutdown();

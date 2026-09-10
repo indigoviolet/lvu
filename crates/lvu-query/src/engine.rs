@@ -441,18 +441,36 @@ pub struct BatchResult {
 
 /// Extracts a bounded caller-selected display projection aligned by the
 /// protected stable identity columns. Null values remain null.
+///
+/// One canonical text form is shared with native colour equality: float
+/// cells render through the same Polars cast the engine compares, so a
+/// value copied from display (`1.0`, `-0.0`) always matches the rule it
+/// names, while Rust display (`1`, `-0`) would silently miss. Integers,
+/// booleans and strings already agree between the two spellings.
 pub fn scalar_projection(
     frame: &DataFrame,
     name: &str,
     maximum_bytes: usize,
 ) -> Result<Vec<(StableRecordId, Option<String>)>, String> {
-    let (Ok(sources), Ok(sequences), Ok(values)) = (
+    let (Ok(sources), Ok(sequences), Ok(column)) = (
         frame.column(SOURCE_ID_COLUMN),
         frame.column(SEQUENCE_COLUMN),
         frame.column(name),
     ) else {
         return Err(format!("projection column {name:?} is unavailable"));
     };
+    let mut casted: Option<Column> = None;
+    if matches!(
+        column.dtype(),
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    ) {
+        casted = Some(
+            column
+                .cast(&DataType::String)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let values: &Column = casted.as_ref().unwrap_or(column);
     let mut projected = Vec::with_capacity(frame.height());
     for index in 0..frame.height() {
         let source_id = sources
@@ -854,10 +872,19 @@ pub fn execute_batch_with_exact_constraint(
         }
     }
     for (name, column, want) in query.column_colors {
+        // Only compiled accepted outputs classify: the frame also projects
+        // raw fields, so a same-named raw column must never satisfy a rule
+        // on its own — after its stage is removed while other stages (and
+        // the raw projection) remain, the lingering rule silently unpaints
+        // instead of falling back to raw. Union callers thread their own
+        // compiled stages through this same field.
+        if !query.stages.iter().any(|stage| stage.name == *column) {
+            continue;
+        }
         // A failed stage is recorded in `failed_fields` and contributes no
-        // column; a removed output is absent from the frame. Both silently
-        // match nothing — the caller keeps its last good view, exactly as
-        // roles fall back when their output disappears.
+        // column; both silently match nothing — the caller keeps its last
+        // good view, exactly as roles fall back when their output
+        // disappears.
         if failed_fields.iter().any(|field| field == column) {
             continue;
         }

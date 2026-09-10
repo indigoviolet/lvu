@@ -270,6 +270,29 @@ fn scalar_projection_preserves_strings_and_formats_only_supported_scalars() {
         vec![Some("42".into()), None]
     );
 
+    // Floats render in the canonical text form native colour equality
+    // compares — the same Polars cast, not Rust display — so a value copied
+    // from display always matches the rule it names.
+    let floats = df!(
+        SOURCE_ID_COLUMN => ["source", "source", "source", "source"],
+        SEQUENCE_COLUMN => [7_u64, 8, 9, 10],
+        "value" => [1.0f64, -0.0f64, 42.5f64, 1e21f64]
+    )
+    .unwrap();
+    assert_eq!(
+        scalar_projection(&floats, "value", 32)
+            .unwrap()
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>(),
+        vec![
+            Some("1.0".into()),
+            Some("-0.0".into()),
+            Some("42.5".into()),
+            Some("1e+21".into()),
+        ]
+    );
+
     let lists = df!(
         SOURCE_ID_COLUMN => ["source"],
         SEQUENCE_COLUMN => [6_u64],
@@ -2738,35 +2761,57 @@ fn absent_filter_aborts_candidate_and_preserves_published() {
 }
 
 /// Column classification rules evaluate natively over the typed enriched
-/// frame: full values decide, so strings sharing a display prefix still
-/// discriminate, numbers and booleans compare by canonical text form, nulls
-/// never match, empty wants match only empty cells, and failed or missing
-/// columns silently match nothing without failing the batch.
+/// frame and only for compiled stage outputs: full values decide, so strings
+/// sharing a display prefix still discriminate, numbers and booleans compare
+/// by canonical text form, nulls never match, empty wants match only empty
+/// cells, and failed, missing or never-produced columns silently match
+/// nothing without failing the batch. A raw same-name column present in the
+/// frame without a producing stage paints nothing.
 #[test]
 fn column_colors_match_typed_cells_exactly() {
     let prefix = "p".repeat(600);
     let long_a = format!("{prefix}A");
     let long_b = format!("{prefix}B");
+    let long_c = format!("{prefix}C");
     let frame = df!(
-        "_lvu_source_id" => ["s", "s"],
-        "_lvu_sequence" => [0u64, 1u64],
-        "big" => [long_a.clone(), long_b.clone()],
-        "num" => [42i64, 7i64],
-        "float" => [42.5f64, 1.0f64],
-        "flag" => [true, false],
-        "nothing" => [Option::<String>::None, None],
-        "empty" => ["", "x"],
+        "_lvu_source_id" => ["s", "s", "s"],
+        "_lvu_sequence" => [0u64, 1u64, 2u64],
+        "big" => [long_a.clone(), long_b.clone(), long_c.clone()],
+        "num" => [42i64, 7i64, 0i64],
+        "float" => [42.5f64, 1.0f64, -0.0f64],
+        "flag" => [true, false, false],
+        "nothing" => [Option::<String>::None, None, None],
+        "empty" => ["", "x", "y"],
+        // Raw projection namesake with no producing stage below.
+        "rawname" => ["a", "b", "c"],
     )
     .unwrap();
-    // A protected-name stage fails structurally: it contributes no column,
-    // so rules naming it must silently match nothing.
-    let failed = [EnrichmentStage {
-        name: "_lvu_bad".into(),
-        definition: definition("pl.lit(1)", lit(1), ExpressionKind::Enrichment),
-    }];
+    // Identity stages declare the compiled outputs under test; a
+    // protected-name stage fails structurally and contributes no column.
+    let identity = |name: &str| EnrichmentStage {
+        name: name.into(),
+        definition: definition(
+            &format!("col {name}"),
+            col(name),
+            ExpressionKind::Enrichment,
+        ),
+    };
+    let stages = vec![
+        identity("big"),
+        identity("num"),
+        identity("float"),
+        identity("flag"),
+        identity("nothing"),
+        identity("empty"),
+        EnrichmentStage {
+            name: "_lvu_bad".into(),
+            definition: definition("pl.lit(1)", lit(1), ExpressionKind::Enrichment),
+        },
+    ];
     let rules = vec![
         ("long-a".to_string(), "big".to_string(), long_a.clone()),
         ("long-b".to_string(), "big".to_string(), long_b.clone()),
+        ("long-c".to_string(), "big".to_string(), long_c.clone()),
         // The shared 512-byte prefix alone matches neither row exactly.
         ("prefix".to_string(), "big".to_string(), prefix.clone()),
         ("int".to_string(), "num".to_string(), "42".to_string()),
@@ -2780,6 +2825,22 @@ fn column_colors_match_typed_cells_exactly() {
             "float-truncated".to_string(),
             "float".to_string(),
             "42".to_string(),
+        ),
+        // Presented float values match exactly as displayed.
+        (
+            "float-one".to_string(),
+            "float".to_string(),
+            "1.0".to_string(),
+        ),
+        (
+            "float-negzero".to_string(),
+            "float".to_string(),
+            "-0.0".to_string(),
+        ),
+        (
+            "float-zero".to_string(),
+            "float".to_string(),
+            "0.0".to_string(),
         ),
         ("bool".to_string(), "flag".to_string(), "true".to_string()),
         (
@@ -2804,6 +2865,11 @@ fn column_colors_match_typed_cells_exactly() {
             "x".to_string(),
         ),
         (
+            "raw-namesake".to_string(),
+            "rawname".to_string(),
+            "a".to_string(),
+        ),
+        (
             "failed".to_string(),
             "_lvu_bad".to_string(),
             "1".to_string(),
@@ -2814,7 +2880,7 @@ fn column_colors_match_typed_cells_exactly() {
         BatchQuery {
             generation: 1,
             definition_generation: 1,
-            stages: &failed,
+            stages: &stages,
             filter: None,
             text_search: None,
             colors: &[],
@@ -2834,12 +2900,16 @@ fn column_colors_match_typed_cells_exactly() {
     // could not: each names exactly its own row.
     assert_eq!(sequences("long-a"), vec![0]);
     assert_eq!(sequences("long-b"), vec![1]);
+    assert_eq!(sequences("long-c"), vec![2]);
     assert!(sequences("prefix").is_empty());
     // Typed cells compare by canonical text form.
     assert_eq!(sequences("int"), vec![0]);
     assert!(sequences("int-padded").is_empty());
     assert_eq!(sequences("float"), vec![0]);
     assert!(sequences("float-truncated").is_empty());
+    assert_eq!(sequences("float-one"), vec![1]);
+    assert_eq!(sequences("float-negzero"), vec![2]);
+    assert!(sequences("float-zero").is_empty());
     assert_eq!(sequences("bool"), vec![0]);
     // Null is never equal to anything, not even its display text.
     assert!(sequences("null-text").is_empty());
@@ -2847,7 +2917,9 @@ fn column_colors_match_typed_cells_exactly() {
     // An empty want matches only literal empty-string ready cells.
     assert_eq!(sequences("empty"), vec![0]);
     assert!(sequences("empty-miss").is_empty());
-    // Failed and missing columns silently match nothing, never an error.
+    // Failed, missing and never-produced columns silently match nothing,
+    // never an error — including a raw frame column with no stage behind it.
     assert!(sequences("missing").is_empty());
+    assert!(sequences("raw-namesake").is_empty());
     assert!(sequences("failed").is_empty());
 }
