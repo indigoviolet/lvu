@@ -56,6 +56,10 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   never start it directly inside a disposable fixture environment. If using a
   caller-exported RUSTC_WRAPPER, preserve this separation yourself. Coordinate
   shared cache restarts between builds, normally under the validation lock.
+  For command-form validation locks, use `flock --close LOCK COMMAND ...`:
+  the flock parent holds the lock while compiler/cache descendants cannot inherit
+  its descriptor. An inherited descriptor can leave an idle sccache daemon holding
+  the validation lock after the gate exits.
   A running test with caching disabled does not use the daemon; restart during
   that test only after confirming no compiler is active and other builders hold.
   The fixture creator writes `.lvu-test-reproducer` at the disposable root;
