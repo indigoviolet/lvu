@@ -2356,6 +2356,20 @@ Primary prepared the app and lockfile version `0.1.6`; locked offline Cargo
 metadata agrees. The new gate producer differs from the preserved v0.1.5
 producer only in its expected version. The proposed installer adds the two
 union PTYs to the eight existing mandatory suites and retains explicit
-producer-hash authentication. Tool review is pending. No acceptance record or
+producer-hash authentication. Independent tooling review passed with no findings
+(`sol-runtime-review-scratch/v016-release-tool-delta-review.md`, SHA256
+`bd885eb2968688d21fdb15335add22ec991fdfd221919511f355f554480117cf`). No acceptance record or
 tag exists for this preparation; union shutdown and colour integration remain
 prerequisites to the combined release gate.
+
+The delivery owner subsequently reclaimed only the five approved reproducible
+build directories from superseded v0.1.4 gate target
+`release-984b6f0dda96c782de3fb7c3e9a9bf169db08eae-977250d2a08642b38f8e6b09b38c1bd6`.
+Both validation and Cargo locks were held; a privileged process-reference scan
+preceded deletion. Accepted app/TUI hashes matched before and after; installed
+v0.1.5, other targets, captures and proof were preserved. The proof records
+free space increasing from 7,712,157,696 to 11,602,841,600 bytes. Primary verified
+the proof hash and `mise run disk:check` passed at 11G free. Proof:
+`primary-astra-scratch/reclaim-984b-1789008971788034110.jsonl`, SHA256
+`db29b47a952fcfbfd767ebaefa991c11967a76c63e0401cbdfd0e55f52cf39d0`.
+Earlier lock-busy and self-lock-reference refusals performed no deletion.
