@@ -6,7 +6,7 @@ app crate version and lockfile version must agree. Push the specific version tag
 rather than all local tags, and never move an existing version tag.
 See [versions](versions.md) for local installation and retention.
 
-**State: `v0.1.3` is tagged and published, with all four archives and the updated tap.** Steps 1-4
+**State: `v0.1.5` is tagged and published, with all four archives and the updated tap.** Steps 1-4
 retain the historical `v0.1.0` command examples; substitute the version being
 released rather than recreating a published tag.
 A reader arriving now starts at [step 5, cutting the next
@@ -129,9 +129,9 @@ gh run watch "$(gh run list --workflow release.yml --limit 1 --json databaseId -
 gh release view v0.1.0
 ```
 
-If a Darwin job failed, the release still publishes with whatever archives
-succeeded. That is deliberate: a Linux-only release beats no release. Note
-which targets are missing; step 3 needs to know.
+If any native job fails, keep the release draft and resolve the failure.
+Current publication requires all four verified archives and their checksums;
+a partial draft is not ready for the tap update or publication.
 
 ## 3. Render and publish the formula
 
@@ -145,8 +145,8 @@ gh release download v0.1.0 --repo indigoviolet/lvu -p SHA256SUMS -O - \
   | /path/to/lvu/packaging/homebrew/render-formula.sh 0.1.0 - > Formula/lvu.rb
 ```
 
-If a target is genuinely absent from the release, name it — the script fails
-rather than silently leaving a stale or invented checksum behind:
+The renderer supports explicitly missing targets for historical partial releases.
+Do not use this option for a new release; all four targets are required:
 
 ```sh
 gh release download v0.1.0 --repo indigoviolet/lvu -p SHA256SUMS -O - \
