@@ -146,6 +146,14 @@ fn timestamp_gutter_honors_the_display_zone() {
         "a configured offset travels to the gutter: {shifted}"
     );
     assert_ne!(utc, shifted);
+
+    // A role basis is already an instant. Berlin's repeated autumn wall-clock
+    // hour therefore needs no fold choice: each UTC instant formats with its
+    // actual offset and is never reinterpreted as local input.
+    let before_fold = lvu::app::format_display_time(1_792_888_200_000_000_000, "Europe/Berlin");
+    let after_fold = lvu::app::format_display_time(1_792_891_800_000_000_000, "Europe/Berlin");
+    assert!(before_fold.ends_with("+02:00"), "{before_fold}");
+    assert!(after_fold.ends_with("+01:00"), "{after_fold}");
 }
 
 #[test]

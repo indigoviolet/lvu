@@ -4,6 +4,17 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## v0.1.5 — prepared for release
+
+- Settings accepts IANA display zones such as `Europe/Berlin`, with the offset
+  determined for each instant, including daylight-saving transitions. UTC and
+  fixed offsets remain available. Timestamps show explicit offsets and dates
+  use the same zone; captured bytes and accepted event instants are unchanged.
+- Invalid custom zone drafts retain the last valid preview. Stale save
+  completions preserve newer drafts, and loaded zones apply at startup.
+
+Publication requires the integrated exact-source gate and archive acceptance.
+
 ## v0.1.4 — 2026-09-10
 
 [Published release](https://github.com/indigoviolet/lvu/releases/tag/v0.1.4),

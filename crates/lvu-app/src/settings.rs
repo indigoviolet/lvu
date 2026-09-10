@@ -112,13 +112,12 @@ pub enum Theme {
 #[serde(deny_unknown_fields)]
 pub struct AppearanceSettings {
     pub theme: Theme,
-    /// Fixed UTC offset the log viewport draws timestamps in, as a token
-    /// (`"Z"`, `"+02:00"`).
+    /// Zone the log viewport draws timestamps in, as an IANA name or fixed UTC
+    /// offset token (`"Europe/Berlin"`, `"Z"`, `"+02:00"`).
     ///
-    /// There is no timezone database in this build, so a named zone and its
-    /// daylight-saving transitions cannot be honoured; the Settings help line
-    /// says so, and every displayed time carries its offset. Absent in files
-    /// written before the field existed, which reads as UTC — what they showed.
+    /// Named zones apply their offset at each captured/event instant, including
+    /// daylight-saving transitions. Absent in files written before the field
+    /// existed, which reads as UTC — what they showed.
     #[serde(default = "default_display_zone")]
     pub display_zone: String,
     pub delight_enabled: bool,
@@ -241,12 +240,10 @@ impl Settings {
         validate_text("paseo.provider", &self.paseo.provider)?;
         validate_text("paseo.mode", &self.paseo.mode)?;
         validate_text("paseo.thinking", &self.paseo.thinking)?;
-        // An offset this build cannot read would silently display UTC. Refusing
-        // it at load says which value is wrong instead.
-        if lvu::app::time_zone_offset_minutes(&self.appearance.display_zone).is_none() {
+        if let Err(message) = lvu::app::validate_display_zone(&self.appearance.display_zone) {
             return Err(SettingsError::InvalidValue {
                 field: "appearance.display_zone",
-                message: "must be Z or a fixed UTC offset such as +02:00".into(),
+                message,
             });
         }
         validate_mib(
@@ -493,7 +490,7 @@ impl LoadedSettings {
                 value: settings.appearance.theme,
                 source: base.clone(),
             },
-            // No environment override: a display offset is a deliberate choice,
+            // No environment override: a display zone is a deliberate choice,
             // and an env var that silently reinterpreted every timestamp is
             // exactly the ambiguity this setting exists to remove.
             display_zone: EffectiveValue {

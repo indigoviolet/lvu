@@ -15,6 +15,7 @@ import shutil
 import sys
 import tempfile
 import time
+import tomllib
 
 from test_lvu_pty import PtyApp
 from test_enrichment_chain_pty import close_editor, open_step_editor, paste, stop
@@ -26,7 +27,8 @@ FAILURE_LOGDIR = pathlib.Path(
 
 SEVERITY = 'severity = pl.col("level").str.to_uppercase()'
 EVENT_TIME = 'event_time = pl.col("ts")'
-FIRST_TS = "2026-09-05T12:30:45.123456Z"
+FIRST_TS = "2026-01-15T12:00:00.123456Z"
+SECOND_TS = "2026-07-15T12:00:00.123457Z"
 
 
 def tooling_environment():
@@ -77,8 +79,31 @@ def gutter_starts_with(text, prefix):
     )
 
 
+def configure_named_zone(app):
+    """Edit, reject, repair, and persist an IANA display-zone draft."""
+    app.send(b",")
+    app.wait_for("[ Save ]", timeout=8.0)
+    app.send(b"\t" * 4 + b"\r")
+    app.wait_for("Custom IANA zone", timeout=8.0)
+    app.send(b"\x1b[A\r")  # UTC is first; Up wraps to the custom row.
+    app.send(b"Europe/Berlin")
+    app.wait_for("Europe/Berlin", timeout=8.0)
+
+    # Invalid editor work remains a draft. The already-valid Berlin preview
+    # stays active until the missing final character is restored.
+    app.send(b"\x7f\r")
+    invalid = app.wait_for("unknown time zone", timeout=8.0)
+    assert "Europe/Berli" in invalid, invalid
+    app.send(b"n\r")
+    app.wait_for("saved and applied", timeout=8.0)
+    app.send(b"\x1b")
+    app.wait_until(lambda text: "[ Save ]" not in text,
+                   "settings closes after named-zone save", timeout=8.0)
+
+
 def test_body(app, source):
     app.wait_for("level=info second", timeout=15.0)
+    configure_named_zone(app)
     # No automatic severity on the normal path: nothing uppercase prints it.
     assert "WARN" not in app.text(), app.text()
 
@@ -121,8 +146,8 @@ def test_body(app, source):
     # formatter (clock plus zone, as capture time does), never the enrichment's
     # verbatim UTC text: match the clock prefix the cell fits, and require the
     # placeholder gone on the same settled screen.
-    app.wait_until(lambda text: gutter_starts_with(text, "12:30:45")
-                   and gutter_starts_with(text, "12:30:46")
+    app.wait_until(lambda text: gutter_starts_with(text, "13:00:00.123+01:00")
+                   and gutter_starts_with(text, "14:00:00.123+02:00")
                    and not gutter_starts_with(text, "\u2014")
                    and "level=warn first" in text
                    and "level=info second" in text,
@@ -131,7 +156,7 @@ def test_body(app, source):
     # Live arrivals evaluate through the roles: lowercase error arrives and
     # the gutter shows canonical ERROR, which no earlier row carries.
     with open(source, "a") as handle:
-        handle.write("ts=2026-09-05T12:30:45.123458Z level=error late\n")
+        handle.write("ts=2026-07-15T12:00:01.123458Z level=error late\n")
         handle.flush()
     app.wait_until(lambda text: "level=error late" in text,
                    "late arrival served", timeout=15.0)
@@ -148,7 +173,7 @@ def run(binary):
         source = root / "events.log"
         source.write_text(
             f"ts={FIRST_TS} level=warn first\n"
-            "ts=2026-09-05T12:30:46.123457Z level=info second\n"
+            f"ts={SECOND_TS} level=info second\n"
         )
         environment = {**tooling, "XDG_CONFIG_HOME": str(root / "config"),
                        "XDG_DATA_HOME": str(root / "data"), "XDG_CACHE_HOME": str(root / "cache")}
@@ -163,6 +188,9 @@ def run(binary):
                 app.process.wait(timeout=5)
                 app.close()
 
+        saved = tomllib.loads((root / "config" / "lvu" / "settings.toml").read_text())
+        assert saved["appearance"]["display_zone"] == "Europe/Berlin", saved
+
         # Relaunch proves a clean quit restores a working app. Role and
         # basis persistence is proven below the UI instead: the saved
         # workspace carries chain, roles and the converged basis (inspected
@@ -173,7 +201,8 @@ def run(binary):
         # asserted, until restarts settle.
         reopened = PtyApp(binary, arguments, width=150, height=38, environment=environment)
         try:
-            reopened.wait_for("level=info second", timeout=15.0)
+            restored = reopened.wait_for("level=info second", timeout=15.0)
+            assert "tz:Europe/Berlin" in restored, restored
             stop(reopened)
         except BaseException as original:
             try:

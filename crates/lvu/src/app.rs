@@ -2074,7 +2074,7 @@ pub struct SettingsValues {
     pub mode: String,
     pub thinking: String,
     pub theme: ThemeId,
-    /// Fixed UTC offset token the log viewport formats times in.
+    /// IANA zone or fixed UTC offset token the log viewport formats times in.
     pub display_zone: String,
     pub delight_enabled: bool,
     pub reduced_motion: bool,
@@ -3853,6 +3853,7 @@ impl App {
     /// The effective settings `lvu-app` resolved. The Settings component owns
     /// the snapshot (§2.4); this stays as the shell's one-line entry point.
     pub fn configure_settings(&mut self, context: SettingsContext) {
+        self.appearance.display_zone = context.effective_display_zone.clone();
         self.layers.settings.configure(context);
     }
 
@@ -7813,10 +7814,9 @@ pub fn time_zone_choices() -> &'static [(&'static str, &'static str)] {
 /// what every log this tool has ever displayed already showed.
 pub const DEFAULT_DISPLAY_ZONE: &str = "Z";
 
-/// Minutes east of UTC for an offset token, or `None` when the token is not one
-/// this build knows. An unknown token reads as UTC rather than as an error: a
-/// settings file written by a newer version must not stop the log from being
-/// legible.
+/// Minutes east of UTC for a fixed-offset token, or `None` for a named or
+/// invalid zone. Named-zone resolution belongs to the instant formatter;
+/// settings validation distinguishes named zones from invalid input.
 pub fn time_zone_offset_minutes(token: &str) -> Option<i64> {
     if token == "Z" || token.eq_ignore_ascii_case("utc") {
         return Some(0);
@@ -7832,6 +7832,21 @@ pub fn time_zone_offset_minutes(token: &str) -> Option<i64> {
     (hours <= 23 && minutes <= 59).then_some(sign * (hours * 60 + minutes))
 }
 
+/// Validate a display-zone token without interpreting a local wall clock.
+///
+/// Fixed offsets retain their historical spelling and behavior. Named zones
+/// are parsed by `chrono-tz`, whose transition table is consulted later for
+/// each already-established UTC instant.
+pub fn validate_display_zone(token: &str) -> Result<(), String> {
+    if time_zone_offset_minutes(token).is_some() {
+        return Ok(());
+    }
+    token
+        .parse::<chrono_tz::Tz>()
+        .map(|_| ())
+        .map_err(|_| format!("unknown time zone `{token}`; use an IANA name such as Europe/Berlin, Z, or a fixed offset such as +02:00"))
+}
+
 /// The label the settings dropdown and the read-only rows show for a token.
 pub fn time_zone_label(token: &str) -> String {
     time_zone_choices()
@@ -7842,12 +7857,28 @@ pub fn time_zone_label(token: &str) -> String {
 
 /// One row's clock, in the display zone.
 ///
-/// The offset is fixed: this build carries no timezone database, so a named
-/// zone and its daylight-saving transitions cannot be honoured. The suffix is
-/// always shown for that reason — `14:30:00.000+02:00` says exactly what it
-/// means, where a bare `14:30` would not.
+/// The suffix is always explicit — `14:30:00.000+02:00` says exactly what the
+/// already-established instant means in this display zone, where a bare
+/// `14:30` would not. Named zones consult the native timezone database at that
+/// instant, so daylight-saving transitions never reinterpret capture or event
+/// timestamps and never require resolving an ambiguous local wall clock.
 pub fn format_display_time(unix_nanos: i64, zone: &str) -> String {
-    let offset = time_zone_offset_minutes(zone).unwrap_or(0);
+    if time_zone_offset_minutes(zone).is_none()
+        && let Ok(zone) = zone.parse::<chrono_tz::Tz>()
+        && let Some(utc) = chrono::DateTime::from_timestamp(
+            unix_nanos.div_euclid(1_000_000_000),
+            unix_nanos.rem_euclid(1_000_000_000) as u32,
+        )
+    {
+        return utc
+            .with_timezone(&zone)
+            .format("%H:%M:%S%.3f%:z")
+            .to_string();
+    }
+    format_display_time_at_fixed_offset(unix_nanos, time_zone_offset_minutes(zone).unwrap_or(0))
+}
+
+fn format_display_time_at_fixed_offset(unix_nanos: i64, offset: i64) -> String {
     let shifted = unix_nanos.saturating_add(offset.saturating_mul(60_000_000_000));
     let seconds = shifted.div_euclid(1_000_000_000);
     let millis = shifted.rem_euclid(1_000_000_000) / 1_000_000;
@@ -7870,7 +7901,7 @@ pub fn format_display_time(unix_nanos: i64, zone: &str) -> String {
 /// The width the log viewport's time column needs in a zone. UTC's `Z` is one
 /// character; an offset is six.
 pub fn display_time_width(zone: &str) -> u16 {
-    if time_zone_offset_minutes(zone).unwrap_or(0) == 0 {
+    if time_zone_offset_minutes(zone) == Some(0) {
         13
     } else {
         18
@@ -8022,10 +8053,19 @@ fn utc_syntax_error() -> String {
 ///
 /// The column is ten cells wide, so a date and not a timestamp: the moment a
 /// revision was saved is a day, and the revision id is what names it exactly.
-/// The zone matters even so — near midnight a fixed offset moves the date by a
-/// day, and a date column that disagreed with the log's clock would be worse
-/// than no date at all.
+/// The zone matters even so — near midnight its per-instant offset can move the
+/// date by a day, and a date column that disagreed with the log's clock would
+/// be worse than no date at all.
 pub fn format_display_date(unix_nanos: i64, zone: &str) -> String {
+    if time_zone_offset_minutes(zone).is_none()
+        && let Ok(zone) = zone.parse::<chrono_tz::Tz>()
+        && let Some(utc) = chrono::DateTime::from_timestamp(
+            unix_nanos.div_euclid(1_000_000_000),
+            unix_nanos.rem_euclid(1_000_000_000) as u32,
+        )
+    {
+        return utc.with_timezone(&zone).format("%Y-%m-%d").to_string();
+    }
     let shifted =
         unix_nanos.saturating_add(time_zone_offset_minutes(zone).unwrap_or(0) * 60_000_000_000);
     // `format_utc_nanos` is the calendar arithmetic; the date is its first ten

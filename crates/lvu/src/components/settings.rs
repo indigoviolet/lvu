@@ -27,6 +27,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     SettingsContext, SettingsRequest, SettingsValues, time_zone_choices, time_zone_label,
+    validate_display_zone,
 };
 use crate::component::{
     Appearance, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface, is_typed_char,
@@ -62,7 +63,7 @@ pub enum SettingsField {
     Mode,
     Thinking,
     Theme,
-    /// The fixed UTC offset the log viewport shows times in.
+    /// The IANA zone or fixed UTC offset the log viewport shows times in.
     DisplayZone,
     Delight,
     ReducedMotion,
@@ -89,18 +90,19 @@ impl SettingsField {
         Self::IndexPerSource,
     ];
 
-    /// The caret slot for an editable field. The toggles and the dropdown take
-    /// no text, so they have none.
+    /// The caret slot for an editable field. A custom display zone is text;
+    /// preset display zones use the same field as a dropdown.
     fn text_slot(self) -> Option<usize> {
         Some(match self {
             Self::Provider => 0,
             Self::Mode => 1,
             Self::Thinking => 2,
-            Self::RowCache => 3,
-            Self::Membership => 4,
-            Self::DiskTotal => 5,
-            Self::IndexPerSource => 6,
-            Self::Theme | Self::DisplayZone | Self::Delight | Self::ReducedMotion | Self::Ascii => {
+            Self::DisplayZone => 3,
+            Self::RowCache => 4,
+            Self::Membership => 5,
+            Self::DiskTotal => 6,
+            Self::IndexPerSource => 7,
+            Self::Theme | Self::Delight | Self::ReducedMotion | Self::Ascii => {
                 return None;
             }
         })
@@ -120,18 +122,20 @@ fn settings_choices(field: SettingsField) -> Vec<String> {
         SettingsField::DisplayZone => time_zone_choices()
             .iter()
             .map(|(label, _)| (*label).to_owned())
+            .chain(std::iter::once("Custom IANA zone…".to_owned()))
             .collect(),
         _ => Vec::new(),
     }
 }
 
-/// Where a stored zone token sits in the offered list. A token this build does
-/// not know reads as UTC, so an unrecognised setting still shows a legible log.
+/// Where a stored zone token sits in the offered list. Valid names use the
+/// custom editor row; invalid persisted values are rejected before this layer
+/// is configured.
 fn zone_index(token: &str) -> usize {
     time_zone_choices()
         .iter()
         .position(|(_, value)| *value == token)
-        .unwrap_or(0)
+        .unwrap_or(time_zone_choices().len())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,6 +168,13 @@ pub struct SettingsDialogState {
     /// a third would cost nothing.
     pub dropdown: Option<SettingsField>,
     pub choice_selected: usize,
+    /// Named zones are edited as text after choosing the custom row. Presets
+    /// remain the compact dropdown behavior existing settings users know.
+    pub zone_custom: bool,
+    /// Preview authority kept apart from the editable token. A stale save
+    /// acknowledgement may rebuild the other preview fields from a newer
+    /// draft, but an invalid zone draft must never reach `Appearance`.
+    pub last_valid_display_zone: String,
     pub details_scroll: usize,
     pub details_scroll_limit: usize,
 }
@@ -205,7 +216,7 @@ pub struct SettingsDialog {
     /// One caret per editable field, indexed by `SettingsField::text_slot`.
     /// `None` means the field has not been edited yet, so its caret is the end
     /// of the value — what `CursorBank::get_or_end` did for it before.
-    cursors: [Option<TextCursor>; 7],
+    cursors: [Option<TextCursor>; 8],
     geometry: SettingsGeometry,
     surface: Surface,
     pub outbox: Outbox<SettingsRequest>,
@@ -218,7 +229,7 @@ impl Default for SettingsDialog {
             context: None,
             next_generation: 1,
             state: None,
-            cursors: [None; 7],
+            cursors: [None; 8],
             geometry: SettingsGeometry::default(),
             surface: Surface::default(),
             outbox: Outbox::new(SETTINGS_OUTBOX_CAP),
@@ -268,6 +279,7 @@ impl SettingsDialog {
                 dialog.saving = false;
                 dialog.draft = context.saved.clone();
                 dialog.context = context.clone();
+                dialog.last_valid_display_zone = context.effective_display_zone.clone();
                 dialog.status_kind = SettingsStatus::Saved;
                 dialog.status = settings_restart_status(&context);
                 dialog.details_scroll = 0;
@@ -280,7 +292,7 @@ impl SettingsDialog {
                     delight_enabled: dialog.draft.delight_enabled,
                     reduced_motion: dialog.draft.reduced_motion,
                     ascii: dialog.draft.ascii,
-                    display_zone: dialog.draft.display_zone.clone(),
+                    display_zone: dialog.last_valid_display_zone.clone(),
                 })
             }
         } else {
@@ -395,6 +407,11 @@ impl SettingsDialog {
     /// default, `Save`.
     fn activate(&mut self, ctx: &mut Ctx<'_>) {
         match self.state.as_ref().map(|dialog| dialog.focus) {
+            Some(SettingsControl::Field(SettingsField::DisplayZone))
+                if self.state.as_ref().is_some_and(|dialog| dialog.zone_custom) =>
+            {
+                self.save()
+            }
             Some(SettingsControl::Field(
                 SettingsField::Theme
                 | SettingsField::DisplayZone
@@ -434,13 +451,28 @@ impl SettingsDialog {
                 ctx.appearance.theme_id = theme;
             }
             SettingsField::DisplayZone => {
-                let Some((_, token)) = time_zone_choices().get(index) else {
+                if let Some((_, token)) = time_zone_choices().get(index) {
+                    dialog.zone_custom = false;
+                    dialog.draft.display_zone = (*token).to_owned();
+                    // Previewed immediately, like the theme: the log behind the
+                    // dialog is the only honest preview of a time format.
+                    ctx.appearance.display_zone = (*token).to_owned();
+                    dialog.last_valid_display_zone = (*token).to_owned();
+                } else if index == time_zone_choices().len() {
+                    dialog.zone_custom = true;
+                    if time_zone_choices()
+                        .iter()
+                        .any(|(_, token)| *token == dialog.draft.display_zone)
+                    {
+                        dialog.draft.display_zone.clear();
+                    }
+                    self.cursors[SettingsField::DisplayZone.text_slot().unwrap()] =
+                        Some(TextCursor {
+                            char_index: dialog.draft.display_zone.chars().count(),
+                        });
+                } else {
                     return;
-                };
-                dialog.draft.display_zone = (*token).to_owned();
-                // Previewed immediately, like the theme: the log behind the
-                // dialog is the only honest preview of a time format.
-                ctx.appearance.display_zone = (*token).to_owned();
+                }
             }
             _ => return,
         }
@@ -466,7 +498,11 @@ impl SettingsDialog {
         let Some(dialog) = &mut self.state else {
             return;
         };
-        if dialog.saving {
+        if let Err(error) = validate_display_zone(&dialog.draft.display_zone) {
+            dialog.status_kind = SettingsStatus::Error;
+            dialog.status = error;
+            dialog.details_scroll = 0;
+        } else if dialog.saving {
             dialog.status_kind = SettingsStatus::Pending;
             dialog.status = "settings save already pending".into();
         } else if self.outbox.len() >= SETTINGS_QUEUE_LIMIT {
@@ -486,7 +522,7 @@ impl SettingsDialog {
     /// Line editing against the focused text field, using the dialog's own
     /// caret. Non-text controls have no field, so a character aimed at one is
     /// dropped — exactly as `edit_setting` dropped it.
-    fn edit_field(&mut self, command: EditCommand<'_>) {
+    fn edit_field(&mut self, command: EditCommand<'_>, ctx: &mut Ctx<'_>) {
         let Some(dialog) = &mut self.state else {
             return;
         };
@@ -512,7 +548,24 @@ impl SettingsDialog {
         );
         self.cursors[slot] = Some(cursor);
         if outcome.changed {
-            mark_settings_pending(dialog);
+            if field == SettingsField::DisplayZone {
+                match validate_display_zone(&dialog.draft.display_zone) {
+                    Ok(()) => {
+                        ctx.appearance.display_zone = dialog.draft.display_zone.clone();
+                        dialog.last_valid_display_zone = dialog.draft.display_zone.clone();
+                        mark_settings_pending(dialog);
+                    }
+                    Err(error) => {
+                        // An invalid draft is editable, but it cannot replace
+                        // the last valid preview behind the dialog.
+                        dialog.status_kind = SettingsStatus::Error;
+                        dialog.status = error;
+                        dialog.details_scroll = 0;
+                    }
+                }
+            } else {
+                mark_settings_pending(dialog);
+            }
         }
     }
 
@@ -547,7 +600,7 @@ impl SettingsDialog {
                 _ => None,
             };
             if let Some(command) = command {
-                self.edit_field(command);
+                self.edit_field(command, ctx);
                 return Outcome::Consumed;
             }
         }
@@ -564,18 +617,18 @@ impl SettingsDialog {
         // Left/Right are the caret's; the shell routed them through
         // `Action::TextMoveLeft`/`Right` for whichever field was editing.
         match key.code {
-            KeyCode::Left => self.edit_field(EditCommand::MoveLeft),
-            KeyCode::Right => self.edit_field(EditCommand::MoveRight),
+            KeyCode::Left => self.edit_field(EditCommand::MoveLeft, ctx),
+            KeyCode::Right => self.edit_field(EditCommand::MoveRight, ctx),
             KeyCode::Up | KeyCode::BackTab => self.move_focus(-1),
             KeyCode::Down | KeyCode::Tab => self.move_focus(1),
             // §8.4: Space toggles the focused checkbox or opens the focused
             // dropdown; it is not a second Enter, so it never saves.
             KeyCode::Char(' ') => self.cycle(ctx),
             KeyCode::Enter => self.activate(ctx),
-            KeyCode::Backspace => self.edit_field(EditCommand::Backspace),
+            KeyCode::Backspace => self.edit_field(EditCommand::Backspace, ctx),
             KeyCode::Char(character) if is_typed_char(&key) => {
                 let mut buffer = [0u8; 4];
-                self.edit_field(EditCommand::Insert(character.encode_utf8(&mut buffer)));
+                self.edit_field(EditCommand::Insert(character.encode_utf8(&mut buffer)), ctx);
             }
             _ => return Outcome::Ignored,
         }
@@ -593,7 +646,7 @@ impl SettingsDialog {
                 Some(SettingsHit::Choice(index)) => self.choose(index, ctx),
                 Some(SettingsHit::Control(control)) => {
                     self.focus_control(control);
-                    if matches!(
+                    let activates = matches!(
                         control,
                         SettingsControl::Field(
                             SettingsField::Theme
@@ -601,7 +654,13 @@ impl SettingsDialog {
                                 | SettingsField::ReducedMotion
                                 | SettingsField::Ascii
                         ) | SettingsControl::Save
-                    ) {
+                    ) || (control
+                        == SettingsControl::Field(SettingsField::DisplayZone)
+                        && self
+                            .state
+                            .as_ref()
+                            .is_some_and(|dialog| !dialog.zone_custom));
+                    if activates {
                         self.activate(ctx);
                     }
                 }
@@ -646,6 +705,10 @@ impl Component for SettingsDialog {
         };
         let generation = self.next_generation;
         self.next_generation = generation.saturating_add(1);
+        let zone_custom = time_zone_choices()
+            .iter()
+            .all(|(_, token)| *token != context.saved.display_zone);
+        let last_valid_display_zone = context.effective_display_zone.clone();
         self.state = Some(SettingsDialogState {
             generation,
             selected: 0,
@@ -657,12 +720,14 @@ impl Component for SettingsDialog {
             status: "Saved settings loaded; cache-limit changes apply after restart".into(),
             dropdown: None,
             choice_selected: 0,
+            zone_custom,
+            last_valid_display_zone,
             details_scroll: 0,
             details_scroll_limit: 0,
         });
         // A new dialog is a new caret identity, which is what bumping the
         // generation meant for `CursorBank`.
-        self.cursors = [None; 7];
+        self.cursors = [None; 8];
         self.geometry = SettingsGeometry::default();
         self.open = true;
     }
@@ -770,11 +835,8 @@ impl Component for SettingsDialog {
 
         let save_label = if dialog.saving { "Saving…" } else { "Save" };
         // §3: the anatomy has a help row, and this is the one thing about
-        // Settings a user cannot discover from the form itself. There is no
-        // timezone database in this build, so a display zone is a fixed offset
-        // and daylight saving is not applied — saying so is the difference
-        // between a limitation and a bug report.
-        let help = "Display zones are fixed UTC offsets: no timezone database, so daylight saving is not applied. Times always show their offset.";
+        // Settings a user cannot discover from the form itself.
+        let help = "Use an IANA zone such as Europe/Berlin for per-instant daylight saving, or a fixed UTC offset. Display only: captured/event instants never change. Times always show their offset.";
         let content = DialogContent {
             header: 0,
             body: natural_body,
@@ -897,22 +959,23 @@ impl Component for SettingsDialog {
             }
         }
 
-        // §8.3: the theme is a dropdown field, drawn in the field column like the
-        // text fields rather than as a button with its label inside.
-        for (index, field, label, value) in [
-            (
-                6u16,
-                Field::Theme,
-                "Theme",
-                values.theme.as_str().to_owned(),
-            ),
+        // §8.3: presets are dropdown fields. A named zone uses the same row as
+        // an editable field after the user chooses Custom IANA zone.
+        for (index, field, label, value) in [(
+            6u16,
+            Field::Theme,
+            "Theme",
+            values.theme.as_str().to_owned(),
+        )]
+        .into_iter()
+        .chain((!dialog.zone_custom).then(|| {
             (
                 7,
                 Field::DisplayZone,
                 "Times shown in",
                 time_zone_label(&values.display_zone),
-            ),
-        ] {
+            )
+        })) {
             let Some(rect) = row_rect(index) else {
                 continue;
             };
@@ -930,6 +993,37 @@ impl Component for SettingsDialog {
                 theme,
             );
             dropdown_anchors.push((field, anchor));
+        }
+
+        if dialog.zone_custom
+            && let Some(rect) = row_rect(7)
+        {
+            let field = Field::DisplayZone;
+            let control = Control::Field(field);
+            let focused = dialog.focus == control;
+            let caret = focused.then(|| self.caret_of(field, &values.display_zone));
+            let placed = render_labelled_field(
+                frame,
+                &mut controls_hit,
+                rect,
+                label_width,
+                "Times shown in",
+                &values.display_zone,
+                control,
+                focused,
+                caret,
+                theme,
+            );
+            if focused {
+                caret_cell = placed;
+            }
+            if let Some((anchor, _)) = controls_hit
+                .iter()
+                .rev()
+                .find(|(_, candidate)| *candidate == control)
+            {
+                dropdown_anchors.push((field, *anchor));
+            }
         }
 
         // §8.4: toggles are checkboxes sharing a row, not buttons with state in the
@@ -1067,12 +1161,12 @@ fn setting_field_mut(dialog: &mut SettingsDialogState, field: SettingsField) -> 
         SettingsField::Provider => &mut dialog.draft.provider,
         SettingsField::Mode => &mut dialog.draft.mode,
         SettingsField::Thinking => &mut dialog.draft.thinking,
+        SettingsField::DisplayZone => &mut dialog.draft.display_zone,
         SettingsField::RowCache => &mut dialog.draft.rows_mib,
         SettingsField::Membership => &mut dialog.draft.membership_mib,
         SettingsField::DiskTotal => &mut dialog.draft.disk_total_mib,
         SettingsField::IndexPerSource => &mut dialog.draft.index_per_source_mib,
         SettingsField::Theme
-        | SettingsField::DisplayZone
         | SettingsField::Delight
         | SettingsField::ReducedMotion
         | SettingsField::Ascii => unreachable!("only editable fields have a text slot"),

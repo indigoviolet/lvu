@@ -2148,3 +2148,21 @@ matches the acceptance record. The full volume soak remains unaccepted; no new
 cold-query, shutdown durability, or managed-memory performance claim follows.
 Named zones, union/shared-key composition, colour classification, shared capture
 and platform validation remain separate assignments.
+
+
+## 2026-09-10 — named zones integrated for v0.1.5 acceptance
+
+Applied the reviewed `9fc7e53..4b9d3b7b2583c1a04cdff70047a0a4ab13da580e`
+runtime/test delta onto the v0.1.4 publication documentation. The app and lock
+versions are now 0.1.5. Worker evidence: lvu 49/49, app settings 16/16, both
+crates all-target clippy, app build and real role PTY including Berlin winter,
+summer, invalid repair, save and restart. Final log SHA256:
+`5d30e583050cbbc1c481742a308fea61bb9cd2de93e62d57af574fb03ea6b167`, under
+`sol-named-timezones-4b9d3b7/final-gate.log` on the build volume.
+
+The earlier 8bf6551 restart failure remains preserved; saved settings were
+correct but startup did not apply the zone to Appearance. The final configuration
+assignment and regression are independently reviewed READY in
+`sol-review-scratch/named-zone-4b9d3b7-delta-review.md`. The full integrated
+release gate and archive validation are still required; no v0.1.5 tag or
+publication is claimed here. The installed release remains v0.1.4.

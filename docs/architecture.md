@@ -23,6 +23,12 @@ explicit legacy Event-basis evaluation remains a compatibility path. Assistance
 shortcuts use ordinary reviewed enrichments, with intent transferred to the
 candidate and consumed only by the accepted completion.
 
+Named display zones are integrated for v0.1.5 acceptance, outside the v0.1.4
+tag. Settings validates IANA names through chrono-tz and retains fixed-offset
+compatibility. Formatting maps an established UTC instant to its zone-specific
+offset and date; it does not resolve ambiguous local clocks or change query
+time authority. Startup installs the validated effective zone into Appearance.
+
 ## Component map
 
 | Component | Responsibility and starting points |

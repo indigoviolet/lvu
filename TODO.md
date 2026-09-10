@@ -28,6 +28,6 @@ integration and the relevant acceptance evidence.
 | --- | --- |
 | **Working** | Make colour classification consume enrichment outputs rather than define independent pattern predicates. Preserve raw-text search as an explicit convenience exception. |
 | **Working** | Replace raw-only special correlation extraction with enrichment-derived shared keys and ordinary filtering over union views. Preserve existing saved behavior until its replacement is integrated. |
-| **Working** | Display time zones are fixed UTC offsets only: no timezone database, so daylight saving is never applied and a named zone (`Europe/Berlin`) cannot be chosen. Every displayed timestamp carries its offset; the Settings help line says so. |
+| **Working** | Named display zones and per-instant daylight saving are integrated for v0.1.5 acceptance. Worker review and focused tests passed, including restart; the integrated release gate remains pending. |
 | **Working** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
 | **Working** | Validate installation/terminal/process behavior on macOS and Windows (audit in docs/portability.md, checklist in docs/mac-test-plan.md; no run yet). arm64 Linux archive is built and CI-executed but has had no human interactive acceptance. |
