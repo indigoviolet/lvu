@@ -56,13 +56,13 @@ jobs:
           # repositories.
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-          # Both Darwin archives are executed on native GitHub runners. Human
-          # Mac acceptance is still outstanding; they are unsigned and
+          # The Darwin archive is executed on a native GitHub runner. Human
+          # Mac acceptance is still outstanding; it is unsigned and
           # unnotarized. Release notes and the formula record these limits.
+          # Intel macOS left the supported set (Linux x86_64/arm64 and
+          # Apple-silicon macOS only); no x86_64-apple-darwin row exists.
           - target: aarch64-apple-darwin
             runner: macos-15
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
@@ -189,8 +189,9 @@ jobs:
 
             Linux archives are static musl builds and depend on no system libc.
 
-            **Human macOS acceptance remains outstanding.** Both archives are built
-            and executed on native GitHub runners, unsigned and unnotarized.
+            **Human macOS acceptance remains outstanding.** The Apple-silicon
+            archive is built and executed on a native GitHub runner, unsigned
+            and unnotarized. Intel macOS is not shipped.
             Report anything that does not work rather than assuming it is expected.
 
             Optional features have prerequisites the archive does not bundle:

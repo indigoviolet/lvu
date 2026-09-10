@@ -1,18 +1,10 @@
-# Template for the indigoviolet/homebrew-tap formula. Not a loadable formula:
-# every placeholder token is substituted by packaging/homebrew/render-formula.sh from a
-# published release's SHA256SUMS, so no checksum is ever typed by hand.
+# lvu 9.9.9, rendered by packaging/homebrew/render-formula.sh from the
+# release's SHA256SUMS. Edit packaging/homebrew/lvu.rb.in in the lvu repository
+# and re-render; hand edits here are lost on the next release.
 #
-#   packaging/homebrew/render-formula.sh 0.1.0 SHA256SUMS > Formula/lvu.rb
-#
-# Homebrew scans the version out of the release URL, so the formula carries no
-# `version` stanza; `brew audit --strict` rejects one as redundant.
-#
-# No bottles. The archives are prebuilt executables, so there is nothing to
-# compile and nothing to bottle; `brew install` just unpacks the release asset.
-#
-# The archive is relocatable: bin/lvu resolves libexec/lvu/{python,bridge}
-# from its own canonicalized path, so Homebrew's bin symlink works unchanged.
-### END TEMPLATE PREAMBLE
+# No bottles: the archives are prebuilt executables, so there is nothing to
+# compile. The archive is relocatable, so bin/lvu resolves libexec/lvu/* from
+# its own canonicalized path and Homebrew's bin symlink works unchanged.
 class Lvu < Formula
   desc "Live local log viewer for files, commands and stdin"
   homepage "https://github.com/indigoviolet/lvu"
@@ -40,16 +32,16 @@ class Lvu < Formula
       # verification); the archive is unsigned and unnotarized, and human
       # terminal acceptance is pending. Homebrew installs from its own
       # download, so no Gatekeeper quarantine attribute is set.
-      url "https://github.com/indigoviolet/lvu/releases/download/v@@VERSION@@/lvu-@@VERSION@@-aarch64-apple-darwin.tar.gz"
-      sha256 "@@SHA256_AARCH64_APPLE_DARWIN@@"
+      url "https://github.com/indigoviolet/lvu/releases/download/v9.9.9/lvu-9.9.9-aarch64-apple-darwin.tar.gz"
+      sha256 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
     end
     on_intel do
       # Retired from the supported set: render-formula.sh drops this block
       # unless --with-intel-darwin is passed to re-render a historical
       # release. The default formula never names this install target.
       # Also built on a macos-15 runner (cross-compiled or native) and untested.
-      url "https://github.com/indigoviolet/lvu/releases/download/v@@VERSION@@/lvu-@@VERSION@@-x86_64-apple-darwin.tar.gz"
-      sha256 "@@SHA256_X86_64_APPLE_DARWIN@@"
+      url "https://github.com/indigoviolet/lvu/releases/download/v9.9.9/lvu-9.9.9-x86_64-apple-darwin.tar.gz"
+      sha256 "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
     end
   end
 
@@ -59,12 +51,12 @@ class Lvu < Formula
     # the build runner's glibc and refuse to start on anything older. See
     # docs/distribution.md.
     on_arm do
-      url "https://github.com/indigoviolet/lvu/releases/download/v@@VERSION@@/lvu-@@VERSION@@-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "@@SHA256_AARCH64_UNKNOWN_LINUX_MUSL@@"
+      url "https://github.com/indigoviolet/lvu/releases/download/v9.9.9/lvu-9.9.9-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     end
     on_intel do
-      url "https://github.com/indigoviolet/lvu/releases/download/v@@VERSION@@/lvu-@@VERSION@@-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "@@SHA256_X86_64_UNKNOWN_LINUX_MUSL@@"
+      url "https://github.com/indigoviolet/lvu/releases/download/v9.9.9/lvu-9.9.9-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     end
   end
 
