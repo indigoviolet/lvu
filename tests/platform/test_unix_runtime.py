@@ -43,6 +43,7 @@ class OwnedProcessIdentity:
 class NativePty:
     def __init__(self, binary, arguments, environment, cwd, stdin_reader=None) -> None:
         self.master, self.slave = pty.openpty()
+        self.slave_name = os.ttyname(self.slave)
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 28, 120, 0, 0))
         self.before = termios.tcgetattr(self.slave)
         self.transcript = bytearray()
@@ -108,7 +109,16 @@ class NativePty:
             assert sequence in self.transcript, f"missing terminal restore sequence {sequence!r}"
 
     def assert_termios_unchanged(self) -> None:
-        assert termios.tcgetattr(self.slave) == self.before, "PTY termios was not restored"
+        # A hosted Darwin runner returned ENOTTY from the parent's original
+        # slave descriptor after the child session exited. Reopen the same
+        # harness-owned PTY without acquiring it as our controlling terminal;
+        # the exact termios comparison remains meaningful after child exit.
+        slave = os.open(self.slave_name, os.O_RDWR | os.O_NOCTTY)
+        try:
+            after = termios.tcgetattr(slave)
+        finally:
+            os.close(slave)
+        assert after == self.before, "PTY termios was not restored"
 
     def close(self) -> None:
         if self.process.poll() is None:

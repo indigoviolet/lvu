@@ -68,6 +68,7 @@ jobs:
       - name: Exercise native PTY, file capture, and orderly process cleanup
         if: matrix.scope == 'compile-runtime-install-tree'
         run: |
+          mise exec -- python tests/platform/test_unix_runtime_harness.py
           binary=$(find "$RUNNER_TEMP/stage" -path '*/bin/lvu' -type f -print -quit)
           test -n "$binary"
           mise exec -- python tests/platform/test_unix_runtime.py "$binary" \
