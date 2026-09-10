@@ -272,6 +272,26 @@ pub struct SuggestionOutcomeShape {
     pub accepted: bool,
 }
 
+impl StoreMethod {
+    /// The sending window for attachment checks. Every variant carries it;
+    /// the worker refuses mismatches before any store work.
+    pub fn window_id(&self) -> &str {
+        match self {
+            StoreMethod::Load { window_id, .. }
+            | StoreMethod::Save { window_id, .. }
+            | StoreMethod::CreateDerivedView { window_id, .. }
+            | StoreMethod::Recent { window_id, .. }
+            | StoreMethod::ListRecipes { window_id, .. }
+            | StoreMethod::RecipeHistory { window_id, .. }
+            | StoreMethod::SaveRecipe { window_id, .. }
+            | StoreMethod::ImportRecipe { window_id, .. }
+            | StoreMethod::ExportRecipe { window_id, .. }
+            | StoreMethod::RecordSuggestion { window_id, .. }
+            | StoreMethod::Flush { window_id, .. } => window_id,
+        }
+    }
+}
+
 /// Mediated-write replies: worker to window, mirroring `memory::Event` 1:1
 /// (`crates/lvu-app/src/memory.rs`). `{request_id}` echoes for routing;
 /// sequence and version echoes preserve the existing stale/conflict
@@ -362,6 +382,10 @@ pub enum StoreEvent {
     },
     Flushed {
         request_id: String,
+    },
+    FlushFailed {
+        request_id: String,
+        reason: String,
     },
     Fatal {
         reason: String,

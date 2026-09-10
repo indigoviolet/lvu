@@ -947,11 +947,21 @@ impl WorkerService {
         }
     }
 
-    /// Route one parsed store method: size-check at the real boundary (the
-    /// frame cap bounds the wire, this bounds the decoded value before any
-    /// store work), then the matching mediated call. Every arm maps 1:1 to
-    /// a `memory::Command` variant with identical success/failure shapes.
-    pub async fn dispatch_store(&self, method: StoreMethod) -> StoreEvent {
+    /// Route one parsed store method: window check, size-check at the real
+    /// boundary (the frame cap bounds the wire, this bounds the decoded
+    /// value before any store work), then the matching mediated call under
+    /// a bounded timeout. Every arm maps 1:1 to a `memory::Command` variant
+    /// with identical success/failure shapes. A timed-out dispatch reports
+    /// outcome-unknown rather than success or failure: the spawned store
+    /// work is not cancelled (it may still commit late), so neither claim
+    /// would be honest.
+    pub async fn dispatch_store(&self, attached: &str, method: StoreMethod) -> StoreEvent {
+        if method.window_id() != attached {
+            return store_failure(
+                method,
+                format!("window identity mismatch: attached as '{attached}'"),
+            );
+        }
         // Fixed-size methods (two short strings at most) skip the payload
         // check: the frame cap already bounded their wire bytes, and there
         // is no DTO to measure. Everything carrying a definition, view,
@@ -960,10 +970,19 @@ impl WorkerService {
             StoreMethod::Recent { .. } | StoreMethod::Flush { .. } => {}
             _ => {
                 if let Err(error) = check_store_size(&method) {
-                    return store_too_large(method, error);
+                    return store_failure(method, error.to_string());
                 }
             }
         }
+        let timeout = self.config.request_timeout;
+        let unknown = store_timeout(&method, timeout);
+        match tokio::time::timeout(timeout, self.dispatch_store_inner(method)).await {
+            Ok(event) => event,
+            Err(_) => unknown,
+        }
+    }
+
+    async fn dispatch_store_inner(&self, method: StoreMethod) -> StoreEvent {
         match method {
             StoreMethod::Load {
                 request_id,
@@ -1065,20 +1084,21 @@ impl WorkerService {
     }
 }
 
-/// An oversize-but-valid store command, refused explicitly per method so
-/// the caller learns which request died and why. Takes the method by value
-/// because the failure shapes need its correlation ids.
-fn store_too_large(method: StoreMethod, error: ProtocolError) -> StoreEvent {
-    let reason = error.to_string();
+/// A refused store command, mapped explicitly per method so the caller
+/// learns which request died and why. Takes the method by value because the
+/// failure shapes need its correlation ids; covers both oversize refusals
+/// and pre-dispatch rejections like window-identity mismatches.
+fn store_failure(method: StoreMethod, reason: String) -> StoreEvent {
     match method {
         StoreMethod::Load {
             request_id,
             definition,
+            view_id,
             ..
         } => StoreEvent::LoadFailed {
             request_id,
             source_id: definition.id,
-            view_id: lvu_core::ViewId(uuid::Uuid::nil()),
+            view_id,
             reason,
         },
         StoreMethod::Save {
@@ -1125,9 +1145,84 @@ fn store_too_large(method: StoreMethod, error: ProtocolError) -> StoreEvent {
         StoreMethod::RecordSuggestion { request_id, .. } => {
             StoreEvent::SuggestionFailed { request_id, reason }
         }
-        StoreMethod::Flush { .. } => {
-            unreachable!("fixed-size methods bypass the size check above")
+        // Only pre-store rejections (window mismatch) reach here: oversize
+        // checks skip fixed-size methods, and flush commits nothing.
+        StoreMethod::Flush { request_id, .. } => StoreEvent::FlushFailed { request_id, reason },
+    }
+}
+
+/// The outcome-unknown reply for a timed-out dispatch. Built by reference
+/// before the method moves into the timeout future: the spawned store work
+/// is not cancelled and may still commit late, so neither success nor
+/// failure would be honest. The reason names the bound and the request so a
+/// window can re-derive correlation (reload and compare versions).
+fn store_timeout(method: &StoreMethod, timeout: std::time::Duration) -> StoreEvent {
+    let reason =
+        format!("store request timed out after {timeout:?}; outcome unknown, reload to reconcile");
+    match method {
+        StoreMethod::Load {
+            request_id,
+            definition,
+            view_id,
+            ..
+        } => StoreEvent::LoadFailed {
+            request_id: request_id.clone(),
+            source_id: definition.id,
+            view_id: *view_id,
+            reason,
+        },
+        StoreMethod::Save {
+            request_id,
+            definition,
+            view_id,
+            sequence,
+            ..
         }
+        | StoreMethod::CreateDerivedView {
+            request_id,
+            definition,
+            view_id,
+            sequence,
+            ..
+        } => StoreEvent::SaveFailed {
+            request_id: request_id.clone(),
+            source_id: definition.id,
+            view_id: *view_id,
+            sequence: *sequence,
+            reason,
+            current_version: None,
+        },
+        StoreMethod::Recent { request_id, .. } => StoreEvent::RecentFailed {
+            request_id: request_id.clone(),
+            reason,
+        },
+        StoreMethod::ListRecipes {
+            request_id, meta, ..
+        }
+        | StoreMethod::RecipeHistory {
+            request_id, meta, ..
+        }
+        | StoreMethod::SaveRecipe {
+            request_id, meta, ..
+        }
+        | StoreMethod::ImportRecipe {
+            request_id, meta, ..
+        }
+        | StoreMethod::ExportRecipe {
+            request_id, meta, ..
+        } => StoreEvent::RecipeFailed {
+            request_id: request_id.clone(),
+            meta: *meta,
+            reason,
+        },
+        StoreMethod::RecordSuggestion { request_id, .. } => StoreEvent::SuggestionFailed {
+            request_id: request_id.clone(),
+            reason,
+        },
+        StoreMethod::Flush { request_id, .. } => StoreEvent::FlushFailed {
+            request_id: request_id.clone(),
+            reason,
+        },
     }
 }
 
@@ -1365,10 +1460,10 @@ impl WorkerService {
         value: serde_json::Value,
     ) -> DispatchOutcome {
         use DispatchOutcome::{Close, Reply};
-        if window.is_some()
+        if let Some((_, attached)) = window
             && let Ok(method) = serde_json::from_value::<StoreMethod>(value.clone())
         {
-            let event = self.dispatch_store(method).await;
+            let event = self.dispatch_store(attached, method).await;
             return Reply(vec![WorkerEvent::Store(event)]);
         }
         let request: WorkerRequest = match serde_json::from_value(value) {
@@ -2304,6 +2399,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timed_out_store_dispatch_reports_unknown_not_failure() {
+        use crate::protocol::StoreMethod;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config(root.path());
+        // A nanosecond bound no real store call can meet: the save awaits
+        // on store I/O, which yields, and the deadline is already past at
+        // the next poll — so this must take the timeout branch every run.
+        config.request_timeout = Duration::from_nanos(1);
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let source = SourceId(uuid::Uuid::from_u128(81));
+        let view = lvu_core::ViewId(uuid::Uuid::from_u128(82));
+        let event = service
+            .dispatch_store(
+                "w",
+                StoreMethod::Save {
+                    request_id: "slow".into(),
+                    window_id: "w".into(),
+                    sequence: 1,
+                    definition: file_definition(81, &root.path().join("v.log")),
+                    view_id: view,
+                    state: test_view(source, 82, 0),
+                    expected_version: None,
+                },
+            )
+            .await;
+        match event {
+            StoreEvent::SaveFailed {
+                request_id, reason, ..
+            } => {
+                assert_eq!(request_id, "slow");
+                assert!(
+                    reason.contains("unknown"),
+                    "timeout must not read as failure: {reason}"
+                );
+            }
+            other => panic!("expected outcome-unknown timeout, got {other:?}"),
+        }
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn store_dispatch_refuses_foreign_window_identity() {
+        use crate::protocol::StoreMethod;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let source = SourceId(uuid::Uuid::from_u128(83));
+        let view = lvu_core::ViewId(uuid::Uuid::from_u128(84));
+        let definition = file_definition(83, &root.path().join("v.log"));
+        let refused = service
+            .dispatch_store(
+                "window-1",
+                StoreMethod::Save {
+                    request_id: "foreign".into(),
+                    window_id: "window-2".into(),
+                    sequence: 1,
+                    definition,
+                    view_id: view,
+                    state: test_view(source, 84, 0),
+                    expected_version: None,
+                },
+            )
+            .await;
+        match refused {
+            StoreEvent::SaveFailed { reason, .. } => {
+                assert!(reason.contains("mismatch"), "{reason}")
+            }
+            other => panic!("expected window-identity refusal, got {other:?}"),
+        }
+        // The refusal precedes any store work: the view was never written.
+        match service
+            .dispatch_store(
+                "window-1",
+                StoreMethod::Recent {
+                    request_id: "after".into(),
+                    window_id: "window-1".into(),
+                },
+            )
+            .await
+        {
+            StoreEvent::Recent { sources, .. } => assert!(sources.is_empty()),
+            other => panic!("expected empty recent list, got {other:?}"),
+        }
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn oversize_load_refusal_echoes_actual_view_id() {
+        use crate::protocol::StoreMethod;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        // A Load carries no draft, so bloat the definition path instead:
+        // the serialized method still trips the transport bound, and the
+        // refusal happens before any store work touches the path.
+        let view = lvu_core::ViewId(uuid::Uuid::from_u128(86));
+        let oversized = StoreMethod::Load {
+            request_id: "big-load".into(),
+            window_id: "w".into(),
+            definition: file_definition(85, &root.path().join("x".repeat(300 * 1024))),
+            view_id: view,
+        };
+        match service.dispatch_store("w", oversized).await {
+            StoreEvent::LoadFailed {
+                request_id,
+                view_id: echoed,
+                reason,
+                ..
+            } => {
+                assert_eq!(request_id, "big-load");
+                assert_eq!(echoed, view);
+                assert!(
+                    reason.contains("limit") || reason.contains("bytes"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected oversize load refusal, got {other:?}"),
+        }
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn oversize_store_method_refused_at_dispatch_boundary() {
         use crate::protocol::StoreMethod;
 
@@ -2325,7 +2548,7 @@ mod tests {
             state,
             expected_version: None,
         };
-        match service.dispatch_store(oversized).await {
+        match service.dispatch_store("w", oversized).await {
             StoreEvent::SaveFailed { reason, .. } => {
                 assert!(
                     reason.contains("limit") || reason.contains("bytes"),
