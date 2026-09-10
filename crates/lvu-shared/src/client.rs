@@ -188,6 +188,17 @@ fn spawn_child(executable: &Path, capture_root: &Path, paths: &WorkerPaths) -> R
 
 /// A window's connection to its worker: strictly sequential requests,
 /// viewer lock held for the whole attachment (dropping detaches).
+///
+/// Exchange discipline (a shifted ack wedges every later request, so this
+/// is fail-closed): at most one exchange is ever in flight (`in_flight`
+/// is set before the first await and cleared only by a fully matched
+/// reply); every reply's correlation id is validated against the
+/// outstanding request; any mismatch, timeout, cancellation residue, or
+/// unexpected frame retires the connection (`retired`) instead of leaving
+/// a possibly-poisoned stream reusable. A retired client reports a clear
+/// error on every later operation; recovery is a fresh attach, which the
+/// election makes cheap. Refusals that carry the matching id are clean
+/// answers, not faults: they neither retire nor disturb reuse.
 pub struct WorkerClient {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: tokio::net::unix::OwnedWriteHalf,
@@ -198,6 +209,8 @@ pub struct WorkerClient {
     next_request: u64,
     read_buf: Vec<u8>,
     _viewer: ViewerGuard,
+    retired: bool,
+    in_flight: bool,
 }
 
 impl WorkerClient {
@@ -306,8 +319,11 @@ impl WorkerClient {
             next_request: 0,
             read_buf: vec![0u8; crate::READ_CHUNK_BYTES],
             _viewer: viewer,
+            retired: false,
+            in_flight: false,
         };
         let request_id = client.take_request_id();
+        let expected = request_id.clone();
         let reply = client
             .roundtrip(
                 WorkerRequest::Hello {
@@ -320,27 +336,25 @@ impl WorkerClient {
             )
             .await
             .map_err(Transport)?;
-        match reply.as_slice() {
-            [
-                WorkerEvent::Welcome {
-                    worker_pid,
-                    worker_session,
-                    protocol,
-                    sources,
-                    ..
-                },
-            ] if *protocol == PROTOCOL_VERSION => {
+        match primary(&reply, &expected) {
+            Some(WorkerEvent::Welcome {
+                worker_pid,
+                worker_session,
+                protocol,
+                sources,
+                ..
+            }) if *protocol == PROTOCOL_VERSION => {
                 client.worker_pid = *worker_pid;
                 client.worker_session = worker_session.clone();
                 Ok((client, sources.clone()))
             }
-            [WorkerEvent::Welcome { protocol, .. }] => Err(Refused(format!(
+            Some(WorkerEvent::Welcome { protocol, .. }) => Err(Refused(format!(
                 "worker speaks protocol {protocol}, this client speaks {PROTOCOL_VERSION}"
             ))),
-            [WorkerEvent::Refused { reason, .. }] => {
+            Some(WorkerEvent::Refused { reason, .. }) => {
                 Err(Refused(format!("worker refused attach: {reason}")))
             }
-            other => Err(Refused(format!("unexpected attach reply: {other:?}"))),
+            _ => Err(Refused(format!("unexpected attach reply: {reply:?}"))),
         }
     }
 
@@ -362,27 +376,71 @@ impl WorkerClient {
         id
     }
 
+    /// Open an exchange: refuse retired clients outright, and refuse a new
+    /// exchange while a previous one never completed (its late reply may
+    /// still be in the stream — typically a cancelled or timed-out await
+    /// that ran past us). The stuck case retires first: the stream cannot
+    /// be proven clean, so it is not reused.
+    async fn begin_exchange(&mut self) -> Result<(), String> {
+        if self.retired {
+            return Err(
+                "worker connection retired after a transport fault; re-attach for a fresh one"
+                    .into(),
+            );
+        }
+        if self.in_flight {
+            return Err(self
+                .retire(
+                    "previous exchange never completed (cancelled or lost without reply); \
+                     its late answer may still be in the stream, so the connection is retired",
+                )
+                .await);
+        }
+        self.in_flight = true;
+        Ok(())
+    }
+
+    /// Retire the connection: mark unusable, drop the in-flight claim,
+    /// and best-effort FIN the socket so the worker releases the viewer
+    /// promptly instead of at client drop. Returns the message it was
+    /// given, so call sites read `return Err(self.retire(reason).await)`.
+    async fn retire(&mut self, reason: impl Into<String>) -> String {
+        let reason = reason.into();
+        self.retired = true;
+        self.in_flight = false;
+        let _ = self.writer.shutdown().await;
+        reason
+    }
+
     /// Send one request value and collect its reply events, bounded. The
     /// frame cap is enforced on send; a reply that cannot be framed on the
     /// worker side fails the connection there, which surfaces here as EOF.
     /// Replies written back-to-back (a result plus its warning) may split
     /// across reads, so after the first events a short grace keeps reading
     /// for stragglers instead of dropping a warning silently.
+    ///
+    /// The returned batch always contains the matching primary reply (see
+    /// `check_batch`): anything else — timeout, EOF, a foreign id, an
+    /// unprompted kind — retires the connection instead of handing back a
+    /// possibly-shifted answer.
     async fn roundtrip(
         &mut self,
         request: WorkerRequest,
         timeout: Duration,
     ) -> Result<Vec<WorkerEvent>, String> {
+        let expected = request_request_id(&request).to_owned();
         let bytes = crate::encode_frame(
             &serde_json::to_value(&request)
                 .map_err(|error| format!("encode worker request: {error}"))?,
         )
         .map_err(|error| format!("worker request exceeds the wire cap: {error}"))?;
+        // Encoding happens before the exchange opens: nothing was sent, so
+        // a failure here leaves the stream clean and reusable.
+        self.begin_exchange().await?;
         let deadline = Instant::now() + timeout;
-        self.writer
-            .write_all(&bytes)
-            .await
-            .map_err(|error| format!("write worker request: {error}"))?;
+        if let Err(error) = self.writer.write_all(&bytes).await {
+            return Err(self.retire(format!("write worker request: {error}")).await);
+        }
         let mut events = Vec::new();
         let mut closed = false;
         loop {
@@ -402,29 +460,42 @@ impl WorkerClient {
                     closed = true;
                     break;
                 }
-                Ok(Err(error)) => return Err(format!("read worker reply: {error}")),
+                Ok(Err(error)) => {
+                    return Err(self.retire(format!("read worker reply: {error}")).await);
+                }
                 Ok(Ok(count)) => {
-                    let decoded = self
-                        .decoder
-                        .push_bytes(&self.read_buf[..count])
-                        .map_err(|error| format!("decode worker reply: {error}"))?;
+                    let decoded = match self.decoder.push_bytes(&self.read_buf[..count]) {
+                        Err(error) => {
+                            return Err(self.retire(format!("decode worker reply: {error}")).await);
+                        }
+                        Ok(values) => values,
+                    };
                     for value in decoded {
-                        events.push(
-                            serde_json::from_value::<WorkerEvent>(value).map_err(|error| {
-                                format!("unexpected worker reply shape: {error}")
-                            })?,
-                        );
+                        match serde_json::from_value::<WorkerEvent>(value) {
+                            Err(error) => {
+                                return Err(self
+                                    .retire(format!("unexpected worker reply shape: {error}"))
+                                    .await);
+                            }
+                            Ok(event) => events.push(event),
+                        }
                     }
                 }
             }
         }
         if events.is_empty() {
-            return Err(if closed {
-                "worker closed the connection".into()
-            } else {
-                format!("worker request timed out after {timeout:?}")
-            });
+            return Err(self
+                .retire(if closed {
+                    "worker closed the connection".to_owned()
+                } else {
+                    format!("worker request timed out after {timeout:?}; connection retired")
+                })
+                .await);
         }
+        if let Err(fault) = check_batch(&events, &expected) {
+            return Err(self.retire(fault).await);
+        }
+        self.in_flight = false;
         Ok(events)
     }
 
@@ -435,6 +506,7 @@ impl WorkerClient {
         definition: &SourceDefinition,
     ) -> Result<StartOutcome, String> {
         let request_id = self.take_request_id();
+        let expected = request_id.clone();
         let definition = serde_json::to_value(definition)
             .map_err(|error| format!("encode source definition: {error}"))?;
         let events = self
@@ -452,7 +524,7 @@ impl WorkerClient {
                 warning = Some(reason.clone());
             }
         }
-        match events.first() {
+        match primary(&events, &expected) {
             Some(WorkerEvent::Started {
                 source_id,
                 journal_path,
@@ -485,6 +557,7 @@ impl WorkerClient {
     /// Explicit stop of a running capture.
     pub async fn request_stop(&mut self, source_id: SourceId) -> Result<(), String> {
         let request_id = self.take_request_id();
+        let expected = request_id.clone();
         let events = self
             .roundtrip(
                 WorkerRequest::RequestStop {
@@ -494,7 +567,7 @@ impl WorkerClient {
                 CONTROL_ROUNDTRIP_TIMEOUT,
             )
             .await?;
-        match events.first() {
+        match primary(&events, &expected) {
             Some(WorkerEvent::Stopped { .. }) => Ok(()),
             Some(WorkerEvent::Refused { reason, .. }) => Err(reason.clone()),
             other => Err(format!("unexpected stop reply: {other:?}")),
@@ -505,6 +578,7 @@ impl WorkerClient {
     /// remembered definition; this never invents one.
     pub async fn request_restart(&mut self, source_id: SourceId) -> Result<StartOutcome, String> {
         let request_id = self.take_request_id();
+        let expected = request_id.clone();
         let events = self
             .roundtrip(
                 WorkerRequest::RequestRestart {
@@ -514,7 +588,7 @@ impl WorkerClient {
                 CONTROL_ROUNDTRIP_TIMEOUT,
             )
             .await?;
-        match events.first() {
+        match primary(&events, &expected) {
             Some(WorkerEvent::Started {
                 source_id,
                 journal_path,
@@ -544,6 +618,7 @@ impl WorkerClient {
         source_id: SourceId,
     ) -> Result<lvu_ingest::SourceProgress, String> {
         let request_id = self.take_request_id();
+        let expected = request_id.clone();
         let events = self
             .roundtrip(
                 WorkerRequest::RequestProgress {
@@ -553,23 +628,27 @@ impl WorkerClient {
                 crate::WORKER_HANDSHAKE_TIMEOUT,
             )
             .await?;
-        match events.first() {
+        match primary(&events, &expected) {
             Some(WorkerEvent::SourceProgress {
                 worker_session,
                 progress,
                 ..
             }) => {
                 if progress.source_id != source_id {
-                    return Err(format!(
-                        "worker answered progress for another source: {}",
-                        progress.source_id.0
-                    ));
+                    return Err(self
+                        .retire(format!(
+                            "worker answered progress for another source: {}; connection retired",
+                            progress.source_id.0
+                        ))
+                        .await);
                 }
                 if worker_session != &self.worker_session {
-                    return Err(
-                        "worker session changed mid-connection: re-attach instead of caching"
-                            .into(),
-                    );
+                    return Err(self
+                        .retire(
+                            "worker session changed mid-connection; re-attach instead of \
+                             caching: connection retired",
+                        )
+                        .await);
                 }
                 Ok(progress.clone())
             }
@@ -591,54 +670,113 @@ impl WorkerClient {
         if let Err(error) = check_store_size(&method) {
             return Err(error.to_string());
         }
+        let expected = method.request_id().to_owned();
         let bytes = crate::encode_frame(
             &serde_json::to_value(&method)
                 .map_err(|error| format!("encode store method: {error}"))?,
         )
         .map_err(|error| format!("store method exceeds the wire cap: {error}"))?;
+        // Encoding and size checks happen before the exchange opens:
+        // nothing was sent, so a failure here leaves the stream clean.
+        self.begin_exchange().await?;
         let deadline = Instant::now() + STORE_ROUNDTRIP_TIMEOUT;
-        self.writer
-            .write_all(&bytes)
-            .await
-            .map_err(|error| format!("write store method: {error}"))?;
+        if let Err(error) = self.writer.write_all(&bytes).await {
+            return Err(self.retire(format!("write store method: {error}")).await);
+        }
         loop {
             if Instant::now() >= deadline {
-                return Err(format!(
-                    "store request timed out after {STORE_ROUNDTRIP_TIMEOUT:?}"
-                ));
+                // Outcome unknown, never failure: the worker may still
+                // commit after our bound. The late answer must not meet a
+                // later request, so the connection retires with the report.
+                return Err(self
+                    .retire(format!(
+                        "store request timed out after {STORE_ROUNDTRIP_TIMEOUT:?}; \
+                         outcome unknown — the worker may still commit, reload to reconcile; \
+                         connection retired"
+                    ))
+                    .await);
             }
             let remaining = deadline - Instant::now();
-            let count = tokio::time::timeout(remaining, self.reader.read(&mut self.read_buf))
-                .await
-                .map_err(|_| format!("store request timed out after {STORE_ROUNDTRIP_TIMEOUT:?}"))?
-                .map_err(|error| format!("read store reply: {error}"))?;
+            let count =
+                match tokio::time::timeout(remaining, self.reader.read(&mut self.read_buf)).await {
+                    Err(_) => {
+                        return Err(self
+                            .retire(format!(
+                                "store request timed out after {STORE_ROUNDTRIP_TIMEOUT:?}; \
+                             outcome unknown — the worker may still commit, reload to reconcile; \
+                             connection retired"
+                            ))
+                            .await);
+                    }
+                    Ok(Err(error)) => {
+                        return Err(self.retire(format!("read store reply: {error}")).await);
+                    }
+                    Ok(Ok(count)) => count,
+                };
             if count == 0 {
-                return Err("worker closed the connection mid-request".into());
+                return Err(self
+                    .retire("worker closed the connection mid-request")
+                    .await);
             }
-            let decoded = self
-                .decoder
-                .push_bytes(&self.read_buf[..count])
-                .map_err(|error| format!("decode store reply: {error}"))?;
+            let decoded = match self.decoder.push_bytes(&self.read_buf[..count]) {
+                Err(error) => {
+                    return Err(self.retire(format!("decode store reply: {error}")).await);
+                }
+                Ok(values) => values,
+            };
             let mut decoded = decoded.into_iter();
             let Some(value) = decoded.next() else {
                 // Partial frame: keep reading.
                 continue;
             };
             if decoded.next().is_some() {
-                return Err("worker sent an unsolicited batch mid-request".into());
+                return Err(self
+                    .retire("worker sent an unsolicited batch mid-request")
+                    .await);
             }
-            let event: WorkerEvent = serde_json::from_value(value)
-                .map_err(|error| format!("unexpected store reply shape: {error}"))?;
-            // Strictly sequential requests: any `Store` reply on this
-            // connection answers the outstanding one. Anything else
-            // (status, notices) cannot arrive unsubscribed; refusal to
-            // guess treats it as a violation.
-            match event {
-                WorkerEvent::Store(store) => return Ok(store),
-                WorkerEvent::ShutdownNotice { reason } => {
-                    return Err(format!("worker is stopping: {reason}"));
+            let event: WorkerEvent = match serde_json::from_value(value) {
+                Err(error) => {
+                    return Err(self
+                        .retire(format!("unexpected store reply shape: {error}"))
+                        .await);
                 }
-                other => return Err(format!("unexpected event mid-request: {other:?}")),
+                Ok(event) => event,
+            };
+            // Exactly one frame answers one request here: anything else —
+            // a foreign id, a second kind, or a catastrophic Fatal that
+            // carries no correlation at all — retires instead of risking a
+            // shifted ack (a shifted Saved sequence would wedge every
+            // later acknowledgement).
+            match event {
+                WorkerEvent::Store(StoreEvent::Fatal { reason }) => {
+                    return Err(self
+                        .retire(format!("worker reported fatal mid-request: {reason}"))
+                        .await);
+                }
+                WorkerEvent::Store(store) => match store_event_request_id(&store) {
+                    Some(id) if id == expected => {
+                        self.in_flight = false;
+                        return Ok(store);
+                    }
+                    Some(id) => {
+                        return Err(self
+                            .retire(format!(
+                                "store reply id mismatch: expected {expected}, got {id}; \
+                                 connection retired"
+                            ))
+                            .await);
+                    }
+                    None => {
+                        return Err(self
+                            .retire("store reply without correlation; connection retired")
+                            .await);
+                    }
+                },
+                other => {
+                    return Err(self
+                        .retire(format!("unexpected event mid-request: {other:?}"))
+                        .await);
+                }
             }
         }
     }
@@ -696,6 +834,126 @@ impl WorkerClient {
         }
         Ok(())
     }
+}
+
+/// Correlation id of an outbound request. Every request variant carries
+/// one; replies echo it, and the client refuses answers that do not match
+/// the outstanding exchange.
+fn request_request_id(request: &WorkerRequest) -> &str {
+    match request {
+        WorkerRequest::Hello { request_id, .. }
+        | WorkerRequest::Goodbye { request_id, .. }
+        | WorkerRequest::RequestStart { request_id, .. }
+        | WorkerRequest::RequestStop { request_id, .. }
+        | WorkerRequest::RequestRestart { request_id, .. }
+        | WorkerRequest::StatusSubscribe { request_id, .. }
+        | WorkerRequest::StdinChunk { request_id, .. }
+        | WorkerRequest::RequestProgress { request_id, .. }
+        | WorkerRequest::StdinClose { request_id, .. } => request_id,
+    }
+}
+
+/// Correlation id of a store reply, if it carries one. Only `Fatal` (a
+/// worker-level catastrophe, never one request's answer) has none.
+/// Deliberately exhaustive over new variants: anything added later must be
+/// classified here as correlating or not, never silently inherit.
+fn store_event_request_id(event: &StoreEvent) -> Option<&str> {
+    match event {
+        StoreEvent::Loaded { request_id, .. }
+        | StoreEvent::LoadFailed { request_id, .. }
+        | StoreEvent::Saved { request_id, .. }
+        | StoreEvent::SaveFailed { request_id, .. }
+        | StoreEvent::DerivedViewCreated { request_id, .. }
+        | StoreEvent::Recent { request_id, .. }
+        | StoreEvent::RecentFailed { request_id, .. }
+        | StoreEvent::Recipes { request_id, .. }
+        | StoreEvent::RecipeHistory { request_id, .. }
+        | StoreEvent::RecipeSaved { request_id, .. }
+        | StoreEvent::RecipeExported { request_id, .. }
+        | StoreEvent::RecipeFailed { request_id, .. }
+        | StoreEvent::SuggestionRecorded { request_id, .. }
+        | StoreEvent::SuggestionFailed { request_id, .. }
+        | StoreEvent::Flushed { request_id, .. }
+        | StoreEvent::FlushFailed { request_id, .. } => Some(request_id),
+        StoreEvent::Fatal { .. } => None,
+    }
+}
+
+/// Correlation id of a worker event, if it carries one. Ancillary events
+/// (`ShutdownNotice`) ride reply batches without ids; `Store` delegates to
+/// the inner reply. Exhaustive for the same reason as above.
+fn event_request_id(event: &WorkerEvent) -> Option<&str> {
+    match event {
+        WorkerEvent::Welcome { request_id, .. }
+        | WorkerEvent::Started { request_id, .. }
+        | WorkerEvent::Refused { request_id, .. }
+        | WorkerEvent::Stopped { request_id, .. }
+        | WorkerEvent::StdinOpen { request_id, .. }
+        | WorkerEvent::SourceProgress { request_id, .. } => Some(request_id),
+        WorkerEvent::Store(inner) => store_event_request_id(inner),
+        WorkerEvent::ShutdownNotice { .. }
+        | WorkerEvent::SourceStatus { .. }
+        | WorkerEvent::StdinCredit { .. } => None,
+    }
+}
+
+/// Verify one collected reply batch against the outstanding request id.
+/// Returns `Ok` only when exactly the matching primary is present:
+/// ancillary `ShutdownNotice` events ride along unchecked, but a foreign
+/// id, a second primary, or an event kind that can never answer a control
+/// request (`Store`, `SourceStatus`, `StdinCredit`) is a transport fault.
+/// Callers retire on `Err` — the stream cannot be proven clean.
+fn check_batch(events: &[WorkerEvent], expected: &str) -> Result<(), String> {
+    let mut matched = false;
+    for event in events {
+        match event {
+            WorkerEvent::ShutdownNotice { .. } => {}
+            WorkerEvent::Store(_)
+            | WorkerEvent::SourceStatus { .. }
+            | WorkerEvent::StdinCredit { .. } => {
+                return Err(format!(
+                    "worker sent an unprompted {event:?} mid-request; connection retired"
+                ));
+            }
+            other => match event_request_id(other) {
+                Some(id) if id == expected => {
+                    if matched {
+                        return Err(format!(
+                            "worker sent two primaries for {expected}; connection retired"
+                        ));
+                    }
+                    matched = true;
+                }
+                Some(id) => {
+                    return Err(format!(
+                        "reply id mismatch: expected {expected}, got {id}; connection retired"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "worker sent an uncorrelated {event:?} mid-request; connection retired"
+                    ));
+                }
+            },
+        }
+    }
+    if matched {
+        Ok(())
+    } else {
+        Err(format!(
+            "worker reply carried no answer to {expected}; connection retired"
+        ))
+    }
+}
+
+/// The primary answer within a validated batch: the first event carrying
+/// the expected id. `check_batch` already guaranteed one exists; callers
+/// match its kind (a valid primary of the wrong kind for this operation
+/// is a logic surprise, not transport poison, so it stays reusable).
+fn primary<'a>(events: &'a [WorkerEvent], expected: &str) -> Option<&'a WorkerEvent> {
+    events
+        .iter()
+        .find(|event| event_request_id(event) == Some(expected))
 }
 
 /// Stamp the attached window identity onto an outbound store method. The
@@ -832,10 +1090,14 @@ mod tests {
     }
 
     /// A scripted peer speaking just enough worker to drive handshake and
-    /// progress polls: Welcome once, then one `SourceProgress` per request
-    /// from the script. Lets the validation rules fail deterministically
-    /// without a worker.
-    async fn scripted_peer(listener: tokio::net::UnixListener, replies: Vec<WorkerEvent>) {
+    /// progress polls. Each script entry builds one reply from the incoming
+    /// request's id (echoing is what a correct peer does); entries that
+    /// need a wrong id for violation coverage ignore it explicitly. Lets
+    /// the validation rules fail deterministically without a worker.
+    async fn scripted_peer(
+        listener: tokio::net::UnixListener,
+        replies: Vec<Box<dyn FnOnce(String) -> WorkerEvent + Send>>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (stream, _) = listener.accept().await.expect("peer accepts");
         let (reader, mut writer) = stream.into_split();
@@ -849,10 +1111,16 @@ mod tests {
                 return;
             }
             let values = decoder.push_bytes(&buffer[..count]).expect("peer decodes");
-            for _value in values {
-                let Some(reply) = replies.next() else {
+            for value in values {
+                let id = value
+                    .get("request_id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let Some(make) = replies.next() else {
                     return;
                 };
+                let reply = make(id);
                 let wire =
                     crate::encode_frame(&serde_json::to_value(&reply).expect("peer encodes"))
                         .expect("peer frames");
@@ -882,6 +1150,44 @@ mod tests {
         }
     }
 
+    fn welcome_reply(id: String) -> WorkerEvent {
+        WorkerEvent::Welcome {
+            request_id: id,
+            worker_pid: 1,
+            protocol: crate::protocol::PROTOCOL_VERSION,
+            worker_session: "session-test".into(),
+            sources: Vec::new(),
+        }
+    }
+
+    fn progress_reply(
+        session: &str,
+        progress: lvu_ingest::SourceProgress,
+    ) -> Box<dyn FnOnce(String) -> WorkerEvent + Send> {
+        let session = session.to_owned();
+        Box::new(move |id| WorkerEvent::SourceProgress {
+            request_id: id,
+            worker_session: session,
+            progress,
+        })
+    }
+
+    async fn connected_peer(
+        root: &std::path::Path,
+        socket: &std::path::Path,
+        window: &str,
+        pid: u32,
+        script: Vec<Box<dyn FnOnce(String) -> WorkerEvent + Send>>,
+    ) -> WorkerClient {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(scripted_peer(listener, script));
+        let (client, _) = WorkerClient::connect(root, socket, window, pid)
+            .await
+            .expect("connect");
+        assert_eq!(client.worker_session(), "session-test");
+        client
+    }
+
     #[tokio::test]
     async fn poll_progress_validates_identity_and_session() {
         let root = tempfile::tempdir().unwrap();
@@ -889,41 +1195,19 @@ mod tests {
             .ensure_directories()
             .expect("viewer directories");
         let socket = root.path().join("control.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let wanted = SourceId(uuid::Uuid::from_u128(701));
         let other = SourceId(uuid::Uuid::from_u128(702));
-        let welcome = WorkerEvent::Welcome {
-            request_id: "h".into(),
-            worker_pid: 1,
-            protocol: crate::protocol::PROTOCOL_VERSION,
-            worker_session: "session-test".into(),
-            sources: Vec::new(),
-        };
-        // Wrong source, then wrong session, then correct: the client must
-        // refuse the first two as violations and accept the third.
-        let script = vec![
-            welcome,
-            WorkerEvent::SourceProgress {
-                request_id: "p1".into(),
-                worker_session: "session-test".into(),
-                progress: peer_progress(other, 3),
-            },
-            WorkerEvent::SourceProgress {
-                request_id: "p2".into(),
-                worker_session: "session-other".into(),
-                progress: peer_progress(wanted, 3),
-            },
-            WorkerEvent::SourceProgress {
-                request_id: "p3".into(),
-                worker_session: "session-test".into(),
-                progress: peer_progress(wanted, 3),
-            },
+        // Correct content first (proves the happy path through validation),
+        // then a foreign source: refused as a violation, not cached.
+        let script: Vec<Box<dyn FnOnce(String) -> WorkerEvent + Send>> = vec![
+            Box::new(welcome_reply),
+            progress_reply("session-test", peer_progress(wanted, 3)),
+            progress_reply("session-test", peer_progress(other, 3)),
         ];
-        tokio::spawn(scripted_peer(listener, script));
-        let (mut client, _) = WorkerClient::connect(root.path(), &socket, "window-t", 5001)
-            .await
-            .expect("connect");
-        assert_eq!(client.worker_session(), "session-test");
+        let mut client = connected_peer(root.path(), &socket, "window-t", 5001, script).await;
+        let progress = client.poll_progress(wanted).await.expect("valid poll");
+        assert_eq!(progress.source_id, wanted);
+        assert_eq!(progress.generation, 3);
         let error = client
             .poll_progress(wanted)
             .await
@@ -932,6 +1216,31 @@ mod tests {
             error.contains("another source"),
             "identity violation must name itself: {error}"
         );
+        // The violation retired the connection: no reuse, even though the
+        // stream still holds a live peer.
+        let error = client
+            .poll_progress(wanted)
+            .await
+            .expect_err("retired connection must refuse reuse");
+        assert!(
+            error.contains("retired"),
+            "retirement must name itself: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_progress_wrong_session_retires() {
+        let root = tempfile::tempdir().unwrap();
+        crate::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let wanted = SourceId(uuid::Uuid::from_u128(703));
+        let script: Vec<Box<dyn FnOnce(String) -> WorkerEvent + Send>> = vec![
+            Box::new(welcome_reply),
+            progress_reply("session-other", peer_progress(wanted, 3)),
+        ];
+        let mut client = connected_peer(root.path(), &socket, "window-t", 5002, script).await;
         let error = client
             .poll_progress(wanted)
             .await
@@ -940,9 +1249,216 @@ mod tests {
             error.contains("session changed"),
             "epoch violation must name itself: {error}"
         );
-        let progress = client.poll_progress(wanted).await.expect("valid poll");
-        assert_eq!(progress.source_id, wanted);
-        assert_eq!(progress.generation, 3);
-        assert_eq!(progress.records, 9);
+        let error = client
+            .poll_progress(wanted)
+            .await
+            .expect_err("retired connection must refuse reuse");
+        assert!(error.contains("retired"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn store_wrong_id_retires_without_shifted_ack() {
+        let root = tempfile::tempdir().unwrap();
+        crate::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        // A lying answer to the store: right shape, wrong correlation.
+        let script: Vec<Box<dyn FnOnce(String) -> WorkerEvent + Send>> = vec![
+            Box::new(welcome_reply),
+            Box::new(|_| {
+                WorkerEvent::Store(StoreEvent::RecentFailed {
+                    request_id: "WRONG".into(),
+                    reason: "boom".into(),
+                })
+            }),
+        ];
+        let mut client = connected_peer(root.path(), &socket, "window-t", 5003, script).await;
+        let error = client
+            .store(StoreMethod::Recent {
+                request_id: "unused".into(),
+                window_id: "window-t".into(),
+            })
+            .await
+            .expect_err("foreign id must be refused");
+        assert!(
+            error.contains("mismatch"),
+            "id violation must name itself: {error}"
+        );
+        // The late-or-wrong answer must never become someone else's ack:
+        // the next operation fails retired without reading the stream.
+        let error = client
+            .store(StoreMethod::Recent {
+                request_id: "unused".into(),
+                window_id: "window-t".into(),
+            })
+            .await
+            .expect_err("retired connection must refuse reuse");
+        assert!(error.contains("retired"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn roundtrip_timeout_retires_before_late_reply() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Peer answers hello at once, then sits on the next request past
+        // the test's short bound before delivering the (correct!) late
+        // answer. Correctness of the late bytes must not resurrect the
+        // already-timed-out exchange.
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (stream, _) = listener.accept().await.expect("peer accepts");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut decoder = FrameDecoder::new();
+            let mut buffer = vec![0u8; crate::READ_CHUNK_BYTES];
+            let mut requests = 0u32;
+            loop {
+                let count = reader.read(&mut buffer).await.expect("peer reads");
+                if count == 0 {
+                    return;
+                }
+                let values = decoder.push_bytes(&buffer[..count]).expect("peer decodes");
+                for value in values {
+                    requests += 1;
+                    let id = value
+                        .get("request_id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let reply = if requests == 1 {
+                        WorkerEvent::Welcome {
+                            request_id: id,
+                            worker_pid: 1,
+                            protocol: crate::protocol::PROTOCOL_VERSION,
+                            worker_session: "session-test".into(),
+                            sources: Vec::new(),
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        WorkerEvent::Refused {
+                            request_id: id,
+                            reason: "late".into(),
+                        }
+                    };
+                    let wire =
+                        crate::encode_frame(&serde_json::to_value(&reply).expect("peer encodes"))
+                            .expect("peer frames");
+                    writer.write_all(&wire).await.expect("peer writes");
+                }
+            }
+        });
+        crate::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let (mut client, _) = WorkerClient::connect(root.path(), &socket, "window-t", 5004)
+            .await
+            .expect("connect");
+        // Private roundtrip with a short bound: the peer's 300ms nap
+        // outlasts it, so this times out and retires.
+        let error = client
+            .roundtrip(
+                WorkerRequest::StatusSubscribe {
+                    request_id: "slow".into(),
+                },
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("slow peer must time out");
+        assert!(error.contains("timed out"), "{error}");
+        // Let the late (correct!) answer land in the socket buffer, then
+        // prove the next exchange refuses retired instead of consuming it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let error = client
+            .roundtrip(
+                WorkerRequest::StatusSubscribe {
+                    request_id: "next".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("retired connection must refuse reuse");
+        assert!(error.contains("retired"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cancelled_exchange_retires_before_next_operation() {
+        let root = tempfile::tempdir().unwrap();
+        crate::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Peer answers hello, then never answers polls: the poll task
+        // blocks until aborted.
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (stream, _) = listener.accept().await.expect("peer accepts");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut decoder = FrameDecoder::new();
+            let mut buffer = vec![0u8; crate::READ_CHUNK_BYTES];
+            let mut hellos = 0u32;
+            loop {
+                let count = reader.read(&mut buffer).await.expect("peer reads");
+                if count == 0 {
+                    return;
+                }
+                let values = decoder.push_bytes(&buffer[..count]).expect("peer decodes");
+                for value in values {
+                    let id = value
+                        .get("request_id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    hellos += 1;
+                    if hellos == 1 {
+                        let welcome = WorkerEvent::Welcome {
+                            request_id: id,
+                            worker_pid: 1,
+                            protocol: crate::protocol::PROTOCOL_VERSION,
+                            worker_session: "session-test".into(),
+                            sources: Vec::new(),
+                        };
+                        let wire = crate::encode_frame(
+                            &serde_json::to_value(&welcome).expect("peer encodes"),
+                        )
+                        .expect("peer frames");
+                        writer.write_all(&wire).await.expect("peer writes");
+                    }
+                    // Polls are never answered: the exchange stays open.
+                }
+            }
+        });
+        let (client, _) = WorkerClient::connect(root.path(), &socket, "window-t", 5005)
+            .await
+            .expect("connect");
+        // Shared the way the feeder shares it: aborting the task drops a
+        // held async-mutex guard cleanly, while the in-flight flag stays
+        // set — exactly the residue the next operation must refuse.
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+        let wanted = SourceId(uuid::Uuid::from_u128(704));
+        let stalled = {
+            let shared = std::sync::Arc::clone(&shared);
+            tokio::spawn(async move { shared.lock().await.poll_progress(wanted).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stalled.abort();
+        // Deterministic abort delivery: the join reports cancellation, so
+        // the exchange below provably follows it.
+        assert!(stalled.await.unwrap_err().is_cancelled());
+        // The aborted exchange never completed: the next operation retires
+        // instead of reusing a stream that may still deliver its answer.
+        let error = shared
+            .lock()
+            .await
+            .poll_progress(wanted)
+            .await
+            .expect_err("cancelled exchange must retire the client");
+        assert!(
+            error.contains("retired") || error.contains("never completed"),
+            "{error}"
+        );
     }
 }

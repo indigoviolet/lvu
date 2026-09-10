@@ -314,6 +314,26 @@ impl StoreMethod {
             | StoreMethod::Flush { window_id, .. } => window_id,
         }
     }
+
+    /// The correlation id echoed back in the reply. The client validates
+    /// every reply against the outstanding request: a mismatch means the
+    /// stream is confused (late/aborted reply meeting a new request), and
+    /// the connection is retired rather than risking a shifted ack.
+    pub fn request_id(&self) -> &str {
+        match self {
+            StoreMethod::Load { request_id, .. }
+            | StoreMethod::Save { request_id, .. }
+            | StoreMethod::CreateDerivedView { request_id, .. }
+            | StoreMethod::Recent { request_id, .. }
+            | StoreMethod::ListRecipes { request_id, .. }
+            | StoreMethod::RecipeHistory { request_id, .. }
+            | StoreMethod::SaveRecipe { request_id, .. }
+            | StoreMethod::ImportRecipe { request_id, .. }
+            | StoreMethod::ExportRecipe { request_id, .. }
+            | StoreMethod::RecordSuggestion { request_id, .. }
+            | StoreMethod::Flush { request_id, .. } => request_id,
+        }
+    }
 }
 
 /// Mediated-write replies: worker to window, mirroring `memory::Event` 1:1

@@ -33,9 +33,11 @@ use tokio::sync::Mutex;
 
 use crate::{RemoteSourceHandle, WorkerClient};
 
-/// Default poll cadence: bounded staleness around one second while capture
-/// is active. Stale is safe (delays tails, never wrong data); every answer
-/// is sampled live, so staleness never exceeds the poll interval.
+/// Default poll cadence: how often ticks are ISSUED, not a staleness
+/// maximum. The shared client mutex serializes polls with saves, so one
+/// slow exchange delays the next tick: actual staleness also includes
+/// queue wait plus RPC plus the bounded publish I/O. Stale stays safe
+/// (delays tails, never wrong data); every answer is sampled live.
 pub const DEFAULT_FEED_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Poll one snapshot and publish it into `handle`. Returns whether the
@@ -139,9 +141,13 @@ mod tests {
         path
     }
 
-    /// Scripted peer: Welcome once, then one progress answer per request
-    /// from the script. Mirrors the client.rs harness.
-    async fn scripted_peer(listener: tokio::net::UnixListener, replies: Vec<WorkerEvent>) {
+    /// Scripted peer: each script entry builds one reply from the incoming
+    /// request's id (echoing is what a correct peer does). Mirrors the
+    /// client.rs harness.
+    async fn scripted_peer(
+        listener: tokio::net::UnixListener,
+        replies: Vec<Box<dyn FnOnce(String) -> WorkerEvent + Send>>,
+    ) {
         let (stream, _) = listener.accept().await.expect("peer accepts");
         let (reader, mut writer) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(reader);
@@ -154,10 +160,16 @@ mod tests {
                 return;
             }
             let values = decoder.push_bytes(&buffer[..count]).expect("peer decodes");
-            for _value in values {
-                let Some(reply) = replies.next() else {
+            for value in values {
+                let id = value
+                    .get("request_id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let Some(make) = replies.next() else {
                     return;
                 };
+                let reply = make(id);
                 let wire = encode_frame(&serde_json::to_value(&reply).expect("peer encodes"))
                     .expect("peer frames");
                 writer.write_all(&wire).await.expect("peer writes");
@@ -165,16 +177,26 @@ mod tests {
         }
     }
 
+    fn welcome_reply(id: String) -> WorkerEvent {
+        WorkerEvent::Welcome {
+            request_id: id,
+            worker_pid: 1,
+            protocol: crate::protocol::PROTOCOL_VERSION,
+            worker_session: "session-feed".into(),
+            sources: Vec::new(),
+        }
+    }
+
     fn progress_reply(
-        request_id: &str,
         session: &str,
         progress: lvu_ingest::SourceProgress,
-    ) -> WorkerEvent {
-        WorkerEvent::SourceProgress {
-            request_id: request_id.into(),
-            worker_session: session.into(),
+    ) -> Box<dyn FnOnce(String) -> WorkerEvent + Send> {
+        let session = session.to_owned();
+        Box::new(move |id| WorkerEvent::SourceProgress {
+            request_id: id,
+            worker_session: session,
             progress,
-        }
+        })
     }
 
     #[tokio::test]
@@ -187,20 +209,13 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let source_id = SourceId(uuid::Uuid::from_u128(801));
         let journal = build_journal(root.path(), source_id, &["a", "b", "c"]);
-        let welcome = WorkerEvent::Welcome {
-            request_id: "h".into(),
-            worker_pid: 1,
-            protocol: crate::protocol::PROTOCOL_VERSION,
-            worker_session: "session-feed".into(),
-            sources: Vec::new(),
-        };
         // Initial poll, fresh tick, then a regressed generation: accepted,
         // accepted, refused-with-cache-untouched.
-        let script = vec![
-            welcome,
-            progress_reply("p1", "session-feed", peer_progress(source_id, 1, 3)),
-            progress_reply("p2", "session-feed", peer_progress(source_id, 1, 5)),
-            progress_reply("p3", "session-feed", peer_progress(source_id, 0, 99)),
+        let script: Vec<Box<dyn FnOnce(String) -> WorkerEvent + Send>> = vec![
+            Box::new(welcome_reply),
+            progress_reply("session-feed", peer_progress(source_id, 1, 3)),
+            progress_reply("session-feed", peer_progress(source_id, 1, 5)),
+            progress_reply("session-feed", peer_progress(source_id, 0, 99)),
         ];
         tokio::spawn(scripted_peer(listener, script));
         let (client, _) = WorkerClient::connect(root.path(), &socket, "window-f", 5201)
@@ -240,6 +255,49 @@ mod tests {
         );
         assert_eq!(handle.progress().records, 5);
         assert_eq!(handle.progress().generation, 1);
+    }
+
+    #[tokio::test]
+    async fn feed_wrong_id_fails_loudly() {
+        // The 0523 smoking gun: a peer answering with a foreign correlation
+        // id must fail the feed, never pass silently and cache another
+        // request's answer.
+        let root = tempfile::tempdir().unwrap();
+        crate::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let source_id = SourceId(uuid::Uuid::from_u128(802));
+        let journal = build_journal(root.path(), source_id, &["a"]);
+        let lying = peer_progress(source_id, 1, 1);
+        let script: Vec<Box<dyn FnOnce(String) -> WorkerEvent + Send>> = vec![
+            Box::new(welcome_reply),
+            Box::new(|_| WorkerEvent::SourceProgress {
+                request_id: "WRONG".into(),
+                worker_session: "session-feed".into(),
+                progress: lying,
+            }),
+        ];
+        tokio::spawn(scripted_peer(listener, script));
+        let (client, _) = WorkerClient::connect(root.path(), &socket, "window-f", 5202)
+            .await
+            .expect("connect");
+        let client = Arc::new(Mutex::new(client));
+        let handle = RemoteSourceHandle::new(
+            source_id,
+            &journal,
+            "session-feed".into(),
+            peer_progress(source_id, 0, 0),
+            RemoteConfig::default(),
+        )
+        .expect("register");
+        let error = feed_once(&client, &handle, "session-feed")
+            .await
+            .expect_err("foreign id must fail the feed");
+        assert!(error.contains("mismatch"), "{error}");
+        // Nothing was cached from the lying answer.
+        assert_eq!(handle.progress().records, 0);
     }
 
     #[test]
