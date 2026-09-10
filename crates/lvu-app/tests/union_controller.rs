@@ -39,6 +39,7 @@ fn candidate(view: &str, revision: u64, inputs: &[(&str, u64, u64)]) -> UnionCan
             })
             .collect(),
         filter: UnionFilterSpec::default(),
+        color_rules: Vec::new(),
     }
 }
 

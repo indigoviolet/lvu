@@ -57,8 +57,8 @@ use super::{
     MAX_GROUP_LINE_DISPLAY_BYTES, MAX_GROUP_LINES, MAX_GROUP_PAYLOAD_BYTES, Membership,
     MemoryBudget, NO_BASIS_TIME, Published, Reservation, SEQUENCE_BYTES, SOURCE_OVERHEAD,
     ScanState, Shared, SourceMatches, SourceTimeBounds, ViewError, ViewQueryStatus,
-    ViewRegistration, ViewState, auto_group_within_span, display_projection_bytes,
-    group_state_bytes, merge_order,
+    ViewRegistration, ViewState, auto_group_within_span, color_match_bytes,
+    display_projection_bytes, group_state_bytes, merge_order,
 };
 use lvu_core::{RecordId, SourceId};
 use lvu_query::{
@@ -172,12 +172,14 @@ pub(crate) struct UnionViewState {
     retry_not_before: Option<Instant>,
     retry_delay: Duration,
     published_filter: UnionFilterSpec,
+    published_color_rules: Vec<lvu::ColorRule>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct UnionDependencyAttempt {
     inputs: Vec<StoredUnionInput>,
     filter: UnionFilterSpec,
+    color_rules: Vec<lvu::ColorRule>,
     registered_sources: Vec<SourceId>,
     source_fences: Vec<(String, Vec<super::union::UnionSourceFence>)>,
     /// A definition fence can stay unchanged while its accepted membership
@@ -212,6 +214,7 @@ impl UnionViewState {
             retry_not_before: None,
             retry_delay: UNION_RETRY_INITIAL,
             published_filter: UnionFilterSpec::default(),
+            published_color_rules: Vec::new(),
         }
     }
 }
@@ -221,6 +224,7 @@ fn dependency_attempt(
     union_view_id: &str,
     inputs: &[StoredUnionInput],
     filter: &UnionFilterSpec,
+    color_rules: &[lvu::ColorRule],
     refresh_input_fences: bool,
 ) -> Option<UnionDependencyAttempt> {
     let registered_sources = shared
@@ -249,6 +253,7 @@ fn dependency_attempt(
     Some(UnionDependencyAttempt {
         inputs: current_inputs,
         filter: filter.clone(),
+        color_rules: color_rules.to_vec(),
         registered_sources,
         source_fences,
         input_publication_revisions,
@@ -263,6 +268,9 @@ struct PreparedUnionFilter {
     advanced: Option<CompiledDefinition>,
     grouping_source: Option<String>,
     grouping: Option<ContinuationRule>,
+    color_rules_source: Vec<lvu::ColorRule>,
+    colors: Vec<(String, TextSearch)>,
+    column_colors: Vec<(String, String, String)>,
 }
 
 /// Union-sized freeze limits from the remaining merge budget.
@@ -421,9 +429,19 @@ impl super::NativeViewAdapter {
                     .or(state.rejected_attempt.as_ref())
             })
             .flatten();
-        let (inputs, filter) = attempted
-            .map(|attempt| (attempt.inputs.as_slice(), &attempt.filter))
-            .unwrap_or((&state.inputs, &state.published_filter));
+        let (inputs, filter, color_rules) = attempted
+            .map(|attempt| {
+                (
+                    attempt.inputs.as_slice(),
+                    &attempt.filter,
+                    attempt.color_rules.as_slice(),
+                )
+            })
+            .unwrap_or((
+                &state.inputs,
+                &state.published_filter,
+                &state.published_color_rules,
+            ));
         if state.published_revision == 0 && attempted.is_none() {
             return Some(false);
         }
@@ -454,7 +472,14 @@ impl super::NativeViewAdapter {
         if !needs_refresh {
             return Some(false);
         }
-        let current = dependency_attempt(&shared, union_view_id, inputs, filter, true);
+        let current = dependency_attempt(
+            &shared,
+            union_view_id,
+            inputs,
+            filter,
+            color_rules,
+            true,
+        );
         if current.as_ref() == state.rejected_attempt.as_ref() {
             return Some(false);
         }
@@ -521,6 +546,7 @@ impl super::NativeViewAdapter {
                 &candidate.union_view_id,
                 &candidate.inputs,
                 &candidate.filter,
+                &candidate.color_rules,
                 false,
             );
             let Some(state) = shared.union_views.get_mut(&candidate.union_view_id) else {
@@ -981,6 +1007,16 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
     let identity_index_bytes = retained_rows
         .checked_mul(96)
         .ok_or_else(|| "union identity index size overflow".to_owned())?;
+    // At most one rule index is retained per published identity. Reserve the
+    // same conservative per-entry envelope as the ordinary membership path
+    // before native colour evaluation allocates its result map.
+    let color_match_bytes = if prepared_filter.color_rules_source.is_empty() {
+        0
+    } else {
+        retained_rows
+            .checked_mul(96)
+            .ok_or_else(|| "union colour match size overflow".to_owned())?
+    };
     // Configured grouping temporarily carries the engine flag vector and the
     // identity-indexed flag map together. Reserve both before either native
     // helper or map builder runs; Run keys may retain the full exact-key
@@ -1004,6 +1040,7 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
         .and_then(|overhead| workspace.checked_add(overhead))
         .and_then(|bytes| bytes.checked_add(identity_index_bytes))
         .and_then(|bytes| bytes.checked_add(configured_grouping_bytes))
+        .and_then(|bytes| bytes.checked_add(color_match_bytes))
         .ok_or_else(|| "union workspace size overflow".to_owned())?;
     let additional = reserved_bytes
         .checked_sub(carrier_bytes)
@@ -1016,6 +1053,7 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
     }
     let merged = union_frozen_inputs(&ctx.spec.union_view_id, &decoded_inputs, &ctx.limits)
         .map_err(|error| error.to_string())?;
+    let accepted_enrichment_outputs = common_accepted_enrichment_outputs(&metas);
     let exact = ctx
         .spec
         .filter
@@ -1033,9 +1071,11 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
             stages: &[],
             filter: prepared_filter.advanced.as_ref(),
             text_search: prepared_filter.search.as_ref(),
-            colors: &[],
+            colors: &prepared_filter.colors,
+            column_colors: &prepared_filter.column_colors,
         },
         exact,
+        &accepted_enrichment_outputs,
     );
     check_cancelled(&ctx.cancel, &ctx.shared)?;
     if result.generation != ctx.generation
@@ -1060,19 +1100,40 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
             message
         });
     }
+    if let Some(diagnostic) = result
+        .color_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.state == lvu_query::DerivedState::Error)
+    {
+        let position = diagnostic
+            .field
+            .as_deref()
+            .and_then(|field| field.parse::<usize>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        return Err(format!("colour rule {position}: {}", diagnostic.message));
+    }
     publish_union(
         ctx,
         &fence,
         metas,
         result.enriched_rows,
         result.matched_ids,
+        result.color_matches,
         decoded_inputs,
+        accepted_enrichment_outputs,
         prepared_filter,
         reservation,
     )
 }
 
 fn prepare_union_filter(ctx: &UnionJobCtx) -> Result<PreparedUnionFilter, String> {
+    if ctx.spec.color_rules.len() > lvu::MAX_COLOR_RULES {
+        return Err(format!(
+            "a union takes at most {} colour rules",
+            lvu::MAX_COLOR_RULES
+        ));
+    }
     let cached = {
         let shared = ctx.shared.lock().expect("view state poisoned");
         shared
@@ -1084,6 +1145,7 @@ fn prepare_union_filter(ctx: &UnionJobCtx) -> Result<PreparedUnionFilter, String
         && cached.search_source == ctx.spec.filter.search
         && cached.advanced_source == ctx.spec.filter.advanced_polars
         && cached.grouping_source == ctx.spec.filter.grouping
+        && cached.color_rules_source == ctx.spec.color_rules
     {
         return Ok(cached);
     }
@@ -1111,6 +1173,34 @@ fn prepare_union_filter(ctx: &UnionJobCtx) -> Result<PreparedUnionFilter, String
         .as_deref()
         .map(ContinuationRule::parse)
         .transpose()?;
+    let mut colors = Vec::new();
+    let mut column_colors = Vec::new();
+    for (index, rule) in ctx.spec.color_rules.iter().enumerate() {
+        let position = index + 1;
+        if rule.is_column() {
+            let column = rule.column.clone().unwrap_or_default();
+            if column.trim().is_empty() {
+                return Err(format!("colour rule {position}: no column to classify"));
+            }
+            let Some(value) = rule.value.clone() else {
+                return Err(format!("colour rule {position}: no value to match"));
+            };
+            column_colors.push((index.to_string(), column, value));
+            continue;
+        }
+        if rule.predicate.trim().is_empty() {
+            return Err(format!("colour rule {position}: predicate is empty"));
+        }
+        let compiled = if TextSearch::is_polars(&rule.predicate) {
+            let definition = compile_union_filter(ctx, &rule.predicate)
+                .map_err(|error| format!("colour rule {position}: {error}"))?;
+            TextSearch::parse(rule.predicate.clone(), Some(&definition))
+        } else {
+            TextSearch::parse(rule.predicate.clone(), None)
+        }
+        .map_err(|error| format!("colour rule {position}: {error}"))?;
+        colors.push((index.to_string(), compiled));
+    }
     Ok(PreparedUnionFilter {
         search_source: ctx.spec.filter.search.clone(),
         advanced_source: ctx.spec.filter.advanced_polars.clone(),
@@ -1118,6 +1208,9 @@ fn prepare_union_filter(ctx: &UnionJobCtx) -> Result<PreparedUnionFilter, String
         advanced,
         grouping_source: ctx.spec.filter.grouping.clone(),
         grouping,
+        color_rules_source: ctx.spec.color_rules.clone(),
+        colors,
+        column_colors,
     })
 }
 
@@ -1378,6 +1471,22 @@ fn current_source_fence_with_guarded(
             })
             .collect(),
     }
+}
+
+fn common_accepted_enrichment_outputs(inputs: &[FrozenUnionMeta]) -> Vec<String> {
+    let mut outputs = inputs
+        .first()
+        .map(|input| input.accepted_enrichment_outputs.clone())
+        .unwrap_or_default();
+    outputs.retain(|output| {
+        inputs
+            .iter()
+            .skip(1)
+            .all(|input| input.accepted_enrichment_outputs.contains(output))
+    });
+    outputs.sort();
+    outputs.dedup();
+    outputs
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1690,7 +1799,9 @@ fn publish_union(
     frozen_inputs: Vec<FrozenUnionMeta>,
     merged: polars::prelude::DataFrame,
     matched_ids: Vec<lvu_query::StableRecordId>,
+    engine_color_matches: BTreeMap<String, Vec<lvu_query::StableRecordId>>,
     decoded_inputs: Vec<UnionFrozenInput>,
+    accepted_enrichment_outputs: Vec<String>,
     prepared_filter: PreparedUnionFilter,
     mut reservation: Reservation,
 ) -> Result<(), String> {
@@ -1702,18 +1813,6 @@ fn publish_union(
     // intersection prevents a raw same-named field in another input from
     // acquiring derived authority for configured grouping or shared-key
     // selection on the union view.
-    let mut accepted_enrichment_outputs = frozen_inputs
-        .first()
-        .map(|input| input.accepted_enrichment_outputs.clone())
-        .unwrap_or_default();
-    accepted_enrichment_outputs.retain(|output| {
-        frozen_inputs
-            .iter()
-            .skip(1)
-            .all(|input| input.accepted_enrichment_outputs.contains(output))
-    });
-    accepted_enrichment_outputs.sort();
-    accepted_enrichment_outputs.dedup();
     let configured_grouping_flags = prepared_filter
         .grouping
         .as_ref()
@@ -1835,6 +1934,33 @@ fn publish_union(
     if publication_bytes > reservation.bytes {
         return Err("union membership exceeds the memory budget".into());
     }
+    let matched: HashSet<(&str, u64)> = matched_ids
+        .iter()
+        .map(|id| (id.source_id.as_str(), id.sequence))
+        .collect();
+    let mut color_matches: HashMap<(String, u64), u16> = HashMap::new();
+    for (name, ids) in engine_color_matches {
+        let Ok(index) = name.parse::<u16>() else {
+            continue;
+        };
+        for id in ids {
+            if !matched.contains(&(id.source_id.as_str(), id.sequence)) {
+                continue;
+            }
+            let key = (id.source_id, id.sequence);
+            match color_matches.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    *entry.get_mut() = (*entry.get()).min(index);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    publication_bytes = publication_bytes
+                        .checked_add(color_match_bytes(&entry.key().0))
+                        .ok_or_else(|| "union colour match size overflow".to_owned())?;
+                    entry.insert(index);
+                }
+            }
+        }
+    }
     let union_basis = frozen_inputs
         .first()
         .map(|work| work.basis)
@@ -1936,8 +2062,8 @@ fn publish_union(
         enrichment_names: accepted_enrichment_outputs,
         derived: HashMap::new(),
         derived_errors: HashSet::new(),
-        color_matches: HashMap::new(),
-        color_rules: Vec::new(),
+        color_matches,
+        color_rules: prepared_filter.color_rules_source.clone(),
         advanced: None,
         enrichment: Vec::new(),
         evaluation_page_bytes: ctx.page_bytes,
@@ -2082,6 +2208,7 @@ fn publish_union(
     state.published_generation = ctx.spec.generation;
     state.prepared_filter = Some(prepared_filter);
     state.published_filter = ctx.spec.filter.clone();
+    state.published_color_rules = ctx.spec.color_rules.clone();
     state.rejected_attempt = None;
     state.retry_attempt = None;
     state.retry_not_before = None;
@@ -2182,6 +2309,7 @@ mod tests {
                     applied_generation: 0,
                 }],
                 filter: Default::default(),
+                color_rules: Vec::new(),
             },
             generation: 1,
             cancel: Arc::new(AtomicBool::new(false)),

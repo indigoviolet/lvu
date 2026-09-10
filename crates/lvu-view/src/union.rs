@@ -354,6 +354,10 @@ pub struct UnionCandidateSpec {
     pub generation: u64,
     pub inputs: Vec<StoredUnionInput>,
     pub filter: UnionFilterSpec,
+    /// Presentation-only rules evaluated over the merged typed frame. They
+    /// persist through the view's existing colour-rule storage rather than
+    /// duplicating state in [`StoredUnionShape`].
+    pub color_rules: Vec<lvu::ColorRule>,
 }
 
 /// A finished union job for the composition tick to collect.

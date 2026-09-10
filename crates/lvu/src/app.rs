@@ -4529,7 +4529,6 @@ impl App {
             if !restored.applied_enrichments.is_empty()
                 || !restored.applied_enrichment.is_empty()
                 || restored.applied_capture_time.is_some()
-                || !restored.color_rules.is_empty()
                 || union
                     .exact_key
                     .as_ref()
@@ -6210,6 +6209,11 @@ impl App {
                 state.search.applied = constraint_text(&constraints);
                 state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
                 state.grouping.applied = constraints.grouping.clone().unwrap_or_default();
+                state.color_rules = constraints.color_rules.clone();
+                if state.pending_color_rules == Some((generation, union_revision)) {
+                    state.pending_color_rules = None;
+                    state.color_rules_error = None;
+                }
                 state.applied_query_revision = union_revision;
                 state.applied_generation = generation;
                 clear_accepted_pending(&mut state.search, union_revision);

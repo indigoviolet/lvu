@@ -362,6 +362,7 @@ fn candidate_filtered(
             exact_key: None,
             ..UnionFilterSpec::default()
         },
+        color_rules: Vec::new(),
     }
 }
 
@@ -383,6 +384,7 @@ fn raw_candidate(revision: u64) -> UnionCandidateSpec {
             },
         ],
         filter: UnionFilterSpec::default(),
+        color_rules: Vec::new(),
     }
 }
 
@@ -404,6 +406,7 @@ fn duplicate_projection_candidate(revision: u64, filter: UnionFilterSpec) -> Uni
             },
         ],
         filter,
+        color_rules: Vec::new(),
     }
 }
 
@@ -468,6 +471,7 @@ async fn union_publishes_both_sources_in_ts_order() {
                     generation: 1,
                     inputs: vec![],
                     filter: UnionFilterSpec::default(),
+                    color_rules: Vec::new(),
                 },
                 &|_| None,
             )
@@ -1134,11 +1138,14 @@ async fn union_derived_inventory_requires_every_frozen_input_to_accept_the_outpu
     adapter
         .register_union_view("union", vec![api.source_id()])
         .unwrap();
+    let mut candidate = duplicate_projection_candidate(1, UnionFilterSpec::default());
+    candidate.color_rules = vec![lvu::ColorRule::column_rule(
+        "choice".into(),
+        "raw-name".into(),
+        lvu::RuleColor::Red,
+    )];
     adapter
-        .submit_union_candidate(
-            duplicate_projection_candidate(1, UnionFilterSpec::default()),
-            &|_| None,
-        )
+        .submit_union_candidate(candidate, &|_| None)
         .unwrap();
     assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
 
@@ -1168,6 +1175,68 @@ async fn union_derived_inventory_requires_every_frozen_input_to_accept_the_outpu
         rows.iter().any(|row| row.fields.contains_key("choice")),
         "the typed column remains available even though it is not accepted-derived authority"
     );
+    assert!(
+        union_rows(&mut adapter).iter().all(|row| row
+            .details
+            .iter()
+            .all(|(name, _)| name != lvu_view::COLOR_RULE_DETAIL)),
+        "a raw namesake must not acquire union classifier authority"
+    );
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn union_colour_rules_preserve_native_classifier_authority_and_rule_order() {
+    let (_root, manager, api, _worker, mut adapter) = setup().await;
+    adapter
+        .register_view("view-loser", vec![api.source_id()])
+        .unwrap();
+    adapter
+        .register_view("view-winner", vec![api.source_id()])
+        .unwrap();
+    apply_slash_enrichment(&mut adapter, "view-loser", r#"/svc\":\"(?P<choice>api)/"#);
+    wait_applied(&mut adapter, 1).await;
+    apply_slash_enrichment(&mut adapter, "view-winner", r#"/svc\":\"(?P<choice>api)/"#);
+    wait_applied(&mut adapter, 1).await;
+    adapter
+        .register_union_view("union", vec![api.source_id()])
+        .unwrap();
+
+    let mut candidate = duplicate_projection_candidate(1, UnionFilterSpec::default());
+    candidate.color_rules = vec![
+        lvu::ColorRule {
+            predicate: "05:06:00".into(),
+            color: lvu::RuleColor::Red,
+            column: None,
+            value: None,
+        },
+        lvu::ColorRule::column_rule("choice".into(), "api".into(), lvu::RuleColor::Blue),
+    ];
+    adapter
+        .submit_union_candidate(candidate, &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+
+    let rows = union_rows(&mut adapter);
+    assert_eq!(rows.len(), 6);
+    for row in rows {
+        let rule = row
+            .details
+            .iter()
+            .find(|(name, _)| name == lvu_view::COLOR_RULE_DETAIL)
+            .map(|(_, value)| value.as_str());
+        if row.text.contains("05:06:00") {
+            assert_eq!(rule, Some("1"), "the earlier legacy rule wins");
+        } else {
+            assert_eq!(
+                rule,
+                Some("2"),
+                "the accepted slash-derived classifier paints through the union"
+            );
+        }
+    }
 
     adapter.shutdown();
     manager.shutdown().await;

@@ -553,19 +553,29 @@ pub enum BatchValidity {
 }
 
 pub fn execute_batch(input: &DataFrame, query: BatchQuery<'_>) -> BatchResult {
-    execute_batch_with_predicates(input, query, None, None)
+    execute_batch_with_predicates(input, query, None, None, None)
 }
 
 /// Execute the ordinary query predicates AND one caller-provided native
 /// expression. Union views use this for the canonical exact-key expression
-/// over their already concatenated/deduplicated typed frame; evaluation,
-/// Boolean validation and stable-ID selection remain in this engine.
+/// over their already concatenated/deduplicated typed frame. Their accepted
+/// enrichment-output inventory supplies classifier authority because those
+/// stages were replayed while freezing the inputs, not re-run here.
+/// Evaluation, Boolean validation and stable-ID selection remain in this
+/// engine.
 pub fn execute_batch_with_native_predicate(
     input: &DataFrame,
     query: BatchQuery<'_>,
     native_predicate: Option<Expr>,
+    column_color_authority: &[String],
 ) -> BatchResult {
-    execute_batch_with_predicates(input, query, None, native_predicate)
+    execute_batch_with_predicates(
+        input,
+        query,
+        None,
+        native_predicate,
+        Some(column_color_authority),
+    )
 }
 
 /// Executes an exact-field constraint in the same native Polars predicate plan
@@ -576,7 +586,7 @@ pub fn execute_batch_with_exact_constraint(
     query: BatchQuery<'_>,
     exact_constraint: Option<&ExactFieldConstraint>,
 ) -> BatchResult {
-    execute_batch_with_predicates(input, query, exact_constraint, None)
+    execute_batch_with_predicates(input, query, exact_constraint, None, None)
 }
 
 fn execute_batch_with_predicates(
@@ -584,6 +594,7 @@ fn execute_batch_with_predicates(
     query: BatchQuery<'_>,
     exact_constraint: Option<&ExactFieldConstraint>,
     native_predicate: Option<Expr>,
+    column_color_authority: Option<&[String]>,
 ) -> BatchResult {
     let mut frame = input.clone();
     let expected_height = frame.height();
@@ -908,9 +919,13 @@ fn execute_batch_with_predicates(
         // raw fields, so a same-named raw column must never satisfy a rule
         // on its own — after its stage is removed while other stages (and
         // the raw projection) remain, the lingering rule silently unpaints
-        // instead of falling back to raw. Union callers thread their own
-        // compiled stages through this same field.
-        if !query.stages.iter().any(|stage| stage.name == *column) {
+        // instead of falling back to raw. Union callers provide the
+        // intersection of structurally accepted frozen-input outputs.
+        let accepted = column_color_authority.map_or_else(
+            || query.stages.iter().any(|stage| stage.name == *column),
+            |outputs| outputs.iter().any(|output| output == column),
+        );
+        if !accepted {
             continue;
         }
         // A failed stage is recorded in `failed_fields` and contributes no
