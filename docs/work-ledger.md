@@ -2330,3 +2330,24 @@ Both logs remain under `lvu-muse-union-logs/targeted-*-20260910.log` on the volu
 Actual UI validation is still running; no release acceptance is claimed yet.
 Long-running test infrastructure work is paused and preserved at `581b780`
 while feature integration takes priority.
+
+## 2026-09-10 — enrichment colour classification integrated
+
+Merged colour candidate `e5d0038` as `5a04c00`. Its final test amendment is
+byte-equivalent to independently diagnosed `8314aa7`: the 80-column status
+fitter intentionally omits `enrich:on`, and the applied dialog reports two
+rules rather than the stale singular assertion. The corrected combined FOLLOW
+workflow observes published Column/Value inventory and the exact applied
+two-rule state. The focused actual PTY passed in 3.9 seconds against preserved
+`b405582` binary SHA256
+`2ae75229c943ee7592bd6272f3209997f41422aab388fa27708258cd233b24b7`.
+Evidence: build-volume
+`lvu-sol-enrichment-correlation-colour-fix-pty-r2.log`.
+
+The earlier apparent colour pipeline stall was a test assertion failure.
+Independent inspection also confirmed the accepted-output authority and float
+canonicalization fixes. This is not combined release acceptance: the integrated
+union worker still needs the new colour query field and actual union colour
+constraint handling. That seam is assigned to the colour integration owner;
+the union owner separately investigates shutdown timeouts in actual union PTYs.
+No full matrix or new release is claimed by this merge.
