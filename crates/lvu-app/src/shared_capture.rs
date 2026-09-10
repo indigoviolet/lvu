@@ -89,12 +89,12 @@ pub fn worker_route(session_present: bool, definition: &SourceDefinition) -> boo
 ///   window itself cannot read its cwd — then the start fails HERE with an
 ///   actionable error naming the path (never a cwd-ambiguous RPC for the
 ///   worker to guess at).
-/// - `Acquisition::Command.cwd` is always `Some(absolute)` on the wire,
-///   with one degraded exception: `None` stays `None` only when the window
-///   cannot read its cwd (local-spawn parity — a local spawn would inherit
-///   an unreadable cwd too). In particular `None` on the wire never means
-///   "worker cwd preferred"; a worker that cannot accept an unspecified
-///   cwd should reject it rather than spawn worker-relative.
+/// - `Acquisition::Command.cwd` is always `Some(absolute)` on the wire:
+///   explicit absolute kept, explicit relative joined to the origin,
+///   absent filled with the origin window cwd. No command crosses with an
+///   unknown cwd — shell text runs under it and children spawn in it, so
+///   the worker never inherits its own cwd by omission (this matches the
+///   worker's required boundary: explicit absolute command cwd).
 /// - `CommandProgram::Exec` executables: bare names (`tool`, no separator)
 ///   keep PATH semantics verbatim; explicit relative programs with a
 ///   separator (`./tool`, `bin/tool`) anchor against the EFFECTIVE command
@@ -136,7 +136,11 @@ fn resolve_for_worker(
         Acquisition::Command { command } => {
             // Effective cwd: explicit absolute kept; explicit relative
             // joined to the origin; None MEANS the origin window cwd and is
-            // filled in so the wire definition carries it explicitly.
+            // filled in so the wire definition carries it explicitly. A
+            // command with no determinable cwd is refused: shell text runs
+            // under it and children spawn in it, so an unknown cwd would
+            // silently bind to the worker cwd. (File acquisitions with
+            // absolute paths still proceed — provably origin-independent.)
             let effective_cwd: Option<PathBuf> = match (&command.cwd, cwd) {
                 (Some(dir), _) if !dir.is_relative() => Some(dir.clone()),
                 (Some(dir), Some(origin)) => Some(origin.join(dir)),
@@ -147,7 +151,12 @@ fn resolve_for_worker(
                         dir.display()
                     ));
                 }
-                (None, None) => None,
+                (None, None) => {
+                    return Err(
+                        "shared capture cannot determine the command working directory: originating window cwd is unavailable and no explicit cwd was given; retry with an absolute cwd"
+                            .to_owned(),
+                    );
+                }
             };
             command.cwd = effective_cwd.clone();
             // Bare program names keep PATH semantics; only explicit
@@ -1154,15 +1163,15 @@ mod tests {
         let error = resolve_for_worker(&rel_cwd, None).expect_err("relative cwd needs an origin");
         assert!(error.contains("sub"), "refusal must name the cwd: {error}");
 
-        // None cwd with no origin is degraded parity (a local spawn would
-        // inherit the same unreadable cwd): Ok, and still None — never
-        // silently rebound to something else.
+        // None cwd with no origin: refused — a command with no
+        // determinable working directory would silently bind to the
+        // worker cwd. There is no worker-inheritance fallback.
         let none_cwd = test_command_definition(24, test_shell("true"), None);
-        let kept = resolve_for_worker(&none_cwd, None).expect("none cwd is representable");
-        match &kept.acquisition {
-            lvu_core::Acquisition::Command { command } => assert_eq!(command.cwd, None),
-            other => panic!("expected command acquisition, saw {other:?}"),
-        }
+        let error = resolve_for_worker(&none_cwd, None).expect_err("unknown command cwd must fail");
+        assert!(
+            error.contains("working directory"),
+            "refusal must name the missing cwd: {error}"
+        );
 
         // An explicit relative program is anchorable whenever the EFFECTIVE
         // cwd is absolute — even with no origin to consult.
@@ -1186,7 +1195,8 @@ mod tests {
         }
 
         // ...but with neither an explicit cwd nor an origin there is
-        // nothing faithful to anchor against: refuse, naming the program.
+        // nothing faithful to anchor against: refused (the unknown-cwd
+        // refusal fires first), never worker-relative.
         let unanchorable = test_command_definition(
             26,
             lvu_core::CommandProgram::Exec {
@@ -1197,28 +1207,32 @@ mod tests {
         );
         let error = resolve_for_worker(&unanchorable, None).expect_err("nothing to anchor against");
         assert!(
-            error.contains("tool"),
-            "refusal must name the program: {error}"
+            error.contains("working directory"),
+            "refusal must name the missing cwd: {error}"
         );
 
-        // A bare program name with no origin stays a PATH lookup verbatim.
+        // A bare program name stays a PATH lookup verbatim whenever the
+        // cwd is known (absolute here, so no origin is needed).
         let bare = test_command_definition(
             27,
             lvu_core::CommandProgram::Exec {
                 executable: PathBuf::from("tool"),
                 args: vec!["--flag".to_owned()],
             },
-            None,
+            Some(PathBuf::from("/base")),
         );
         let kept = resolve_for_worker(&bare, None).expect("bare program is representable");
         match &kept.acquisition {
-            lvu_core::Acquisition::Command { command } => match &command.program {
-                lvu_core::CommandProgram::Exec { executable, args } => {
-                    assert_eq!(executable, &PathBuf::from("tool"));
-                    assert_eq!(args, &vec!["--flag".to_owned()]);
+            lvu_core::Acquisition::Command { command } => {
+                assert_eq!(command.cwd, Some(PathBuf::from("/base")));
+                match &command.program {
+                    lvu_core::CommandProgram::Exec { executable, args } => {
+                        assert_eq!(executable, &PathBuf::from("tool"));
+                        assert_eq!(args, &vec!["--flag".to_owned()]);
+                    }
+                    other => panic!("program kind must survive, saw {other:?}"),
                 }
-                other => panic!("program kind must survive, saw {other:?}"),
-            },
+            }
             other => panic!("expected command acquisition, saw {other:?}"),
         }
     }

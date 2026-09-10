@@ -282,6 +282,30 @@ struct StartedSource {
     view_id: String,
     handle: lvu_shared::AnySourceHandle,
     origin: Option<StartOrigin>,
+    /// Id proposed at spawn, for pending-map removal. Always equals
+    /// `definition.id` on local starts; on a worker dedup Present the
+    /// worker answers with the winner's id in `definition.id` while the
+    /// pending maps were keyed by this proposal.
+    proposed_id: SourceId,
+}
+
+/// Adopt the worker-canonical capture identity: on a fresh admit the
+/// worker echoes the proposed id (no-op); on a dedup Present it returns
+/// the winner's, and every downstream registration, view, map, and notice
+/// must use the winner — the proposed id names nothing once the worker
+/// has spoken. The local spelling (name, path, options) is preserved
+/// byte-identical; only the id is worker-authoritative. Failure paths
+/// must never stop the worker capture from the winner id: it may be
+/// another window's live capture (see the settlement and startup
+/// cleanups, which stay manager-scoped).
+fn adopt_winner_identity(
+    definition: SourceDefinition,
+    winner: SourceId,
+) -> (SourceDefinition, String) {
+    let mut definition = definition;
+    definition.id = winner;
+    let view_id = view_id(winner);
+    (definition, view_id)
 }
 
 #[derive(Clone)]
@@ -966,8 +990,12 @@ impl Composition {
                 Ok(started) => {
                     let source_id = started.definition.id;
                     let definition = started.definition.clone();
-                    self.pending_starts.remove(&source_id);
-                    self.pending_definitions.remove(&source_id);
+                    // Pending maps were keyed by the spawn-time proposal;
+                    // the worker may have answered with a dedup winner id,
+                    // so removal uses the proposal while everything below
+                    // uses the canonical winner.
+                    self.pending_starts.remove(&started.proposed_id);
+                    self.pending_definitions.remove(&started.proposed_id);
                     let origin = started.origin.clone().expect("dynamic start origin");
                     match register_started(adapter, app, &mut self.sources, started) {
                         Ok(view_id) => {
@@ -988,6 +1016,10 @@ impl Composition {
                             self.note_start_succeeded(app, &origin, &view_id);
                         }
                         Err(message) => {
+                            // Manager-scoped rollback only: a worker-owned
+                            // capture is never stopped here — it may be
+                            // another window's live capture. The winner id
+                            // simply misses in the local manager.
                             if let Some(handle) = self.manager.source(source_id) {
                                 self.runtime.spawn(async move {
                                     let _ = handle.stop().await;
@@ -5156,12 +5188,17 @@ impl Composition {
                     .start_source(&definition, origin_cwd.as_deref())
                     .await
                 {
-                    Ok(started) => Ok(StartedSource {
-                        definition,
-                        view_id,
-                        handle: lvu_shared::AnySourceHandle::Remote(started.handle),
-                        origin: Some(origin.clone()),
-                    }),
+                    Ok(started) => {
+                        let (definition, view_id) =
+                            adopt_winner_identity(definition, started.remote.source_id);
+                        Ok(StartedSource {
+                            definition,
+                            view_id,
+                            handle: lvu_shared::AnySourceHandle::Remote(started.handle),
+                            origin: Some(origin.clone()),
+                            proposed_id: source_id,
+                        })
+                    }
                     Err(error) => Err(StartFailure {
                         source_id,
                         origin,
@@ -5174,6 +5211,7 @@ impl Composition {
                         view_id,
                         handle: lvu_shared::AnySourceHandle::Local(handle),
                         origin: Some(origin.clone()),
+                        proposed_id: source_id,
                     }),
                     Err(error) => Err(StartFailure {
                         source_id,
@@ -7863,6 +7901,8 @@ async fn run() -> Result<(), String> {
         let source_id = started.definition.id;
         let definition = started.definition.clone();
         if let Err(error) = register_started(&adapter, &mut app, &mut source_ids, started) {
+            // Manager-scoped rollback only (see the settlement path): a
+            // worker-owned capture may belong to another window.
             if let Some(handle) = manager.source(source_id) {
                 let _ = handle.stop().await;
             }
@@ -8096,7 +8136,10 @@ async fn run() -> Result<(), String> {
     let memory_flush_result =
         composition.flush_memory(&mut app, &adapter, std::time::Duration::from_millis(500));
     timing.mark("memory-flush");
-    composition.memory.stop();
+    // Bounded acknowledged stop (queued saves, then the shared session
+    // drain for shared mode): a stop/drain failure joins the lifecycle
+    // report below instead of a clean shutdown.
+    let memory_stop_result = composition.memory.stop();
     adapter.shutdown();
     timing.mark("view-adapter");
     let cleanup_result = cleanup(raw.as_ref(), &manager).await;
@@ -8119,6 +8162,7 @@ async fn run() -> Result<(), String> {
     let lifecycle_error = memory_flush_result
         .err()
         .into_iter()
+        .chain(memory_stop_result.err())
         .chain(investigation_shutdown_result.err())
         .chain(source_ai_shutdown_result.err())
         .chain(ai_shutdown_result.err())
@@ -8239,21 +8283,26 @@ async fn resume_definition(
             .start_source(&definition, origin_cwd.as_deref())
             .await
             .map_err(|error| format!("resume {name} on shared worker: {error}"))?;
+        let proposed_id = definition.id;
+        let (definition, view_id) = adopt_winner_identity(definition, started.remote.source_id);
         return Ok(StartedSource {
             definition,
             view_id,
             handle: lvu_shared::AnySourceHandle::Remote(started.handle),
             origin: None,
+            proposed_id,
         });
     }
     let handle = control_source(Arc::clone(manager), definition.clone(), true)
         .await?
         .ok_or_else(|| format!("resume {name}: capture did not start"))?;
+    let proposed_id = definition.id;
     Ok(StartedSource {
         definition,
         view_id,
         handle: lvu_shared::AnySourceHandle::Local(handle),
         origin: None,
+        proposed_id,
     })
 }
 
@@ -8270,22 +8319,27 @@ async fn start_definition(
             .start_source(&definition, origin_cwd.as_deref())
             .await
             .map_err(|error| format!("start {} on shared worker: {}", definition.name, error))?;
+        let proposed_id = definition.id;
+        let (definition, view_id) = adopt_winner_identity(definition, started.remote.source_id);
         return Ok(StartedSource {
             definition,
             view_id,
             handle: lvu_shared::AnySourceHandle::Remote(started.handle),
             origin: None,
+            proposed_id,
         });
     }
     let handle = manager
         .start(definition.clone())
         .await
         .map_err(|error| format!("start {}: {error}", definition.name))?;
+    let proposed_id = definition.id;
     Ok(StartedSource {
         definition,
         view_id,
         handle: lvu_shared::AnySourceHandle::Local(handle),
         origin: None,
+        proposed_id,
     })
 }
 
@@ -8299,11 +8353,13 @@ async fn start_stdin_definition(
         .start_with_reader(definition.clone(), reader)
         .await
         .map_err(|error| format!("start {}: {error}", definition.name))?;
+    let proposed_id = definition.id;
     Ok(StartedSource {
         definition,
         view_id,
         handle: lvu_shared::AnySourceHandle::Local(handle),
         origin: None,
+        proposed_id,
     })
 }
 
@@ -10147,7 +10203,7 @@ mod tests {
             Some("reviewed agent source started"),
             "single success keeps its exact historical notice"
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10192,7 +10248,7 @@ mod tests {
             app.layers.source.state().ai.progress,
             "started 0 of 1 reviewed source; failed: solo: source admission limit reached"
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10362,7 +10418,7 @@ mod tests {
         ]);
         let (definitions, _) = super::parse_source_proposals(&envelope, directory.path()).unwrap();
         assert_eq!(definitions.len(), 2);
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10393,6 +10449,26 @@ mod tests {
             follow: true,
         };
         definition
+    }
+
+    /// A worker dedup Present returns the winner's id for a distinct
+    /// proposal: registration must take the winner while the local
+    /// spelling (name, path, options) survives byte-identical, and the
+    /// view id must derive from the winner — never the proposal.
+    #[test]
+    fn adopt_winner_identity_takes_worker_id_keeps_spelling() {
+        let dir = std::env::temp_dir();
+        let proposed = batch_file_at(71, &dir.join("winner.log"));
+        let proposed_id = proposed.id;
+        let winner = lvu_core::SourceId(uuid::Uuid::from_u128(72));
+        let (definition, view_id) = super::adopt_winner_identity(proposed.clone(), winner);
+        assert_eq!(definition.id, winner);
+        assert_ne!(definition.id, proposed_id);
+        assert_eq!(view_id, super::view_id(winner));
+        assert_ne!(view_id, super::view_id(proposed_id));
+        let mut expected = proposed;
+        expected.id = winner;
+        assert_eq!(definition, expected);
     }
 
     fn batch_command(id: u128, restart: lvu_core::RestartPolicy) -> lvu_core::SourceDefinition {
@@ -10580,7 +10656,7 @@ mod tests {
             other => panic!("unsupported schema must refuse, got {other:?}"),
         };
         assert!(message.contains("schema"), "{message}");
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10654,7 +10730,7 @@ mod tests {
             message.contains("already starting"),
             "refusal must say a start is in flight: {message}"
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10702,7 +10778,7 @@ mod tests {
             app.source_notice.as_deref(),
             Some("started 2 of 2 reviewed sources (1 already present)"),
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10773,7 +10849,7 @@ mod tests {
             Some(vec![newer.id]),
             "the newer proposal must survive the old settlement untouched"
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10812,7 +10888,7 @@ mod tests {
             app.source_notice.as_deref(),
             Some("reviewed agent source started")
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
 
@@ -10965,7 +11041,7 @@ mod tests {
             !composition.ai_apply_batches.contains_key(&BATCH_GENERATION),
             "settled batches must not leak trackers"
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         for (_, stopped) in manager.shutdown().await {
             assert!(stopped.expect("admitted capture stops").complete);
         }
@@ -11038,7 +11114,7 @@ mod tests {
                 .source_ai_proposals
                 .contains_key(&BATCH_GENERATION)
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         for (_, stopped) in manager.shutdown().await {
             assert!(stopped.expect("retried capture stops").complete);
         }
@@ -11776,7 +11852,7 @@ for line in sys.stdin:
                 .as_deref()
                 .is_some_and(|notice| notice.contains("view admission limit"))
         );
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         assert!(manager.shutdown().await.is_empty());
     }
 
@@ -11909,7 +11985,7 @@ for line in sys.stdin:
             Some(super::InvestigationWork::Unresolved { generation: 22, .. })
         ));
 
-        composition.memory.stop();
+        let _ = composition.memory.stop();
         assert!(manager.shutdown().await.is_empty());
     }
 

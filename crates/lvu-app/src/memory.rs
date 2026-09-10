@@ -78,7 +78,11 @@ enum Command {
     ExportRecipe(RecipeRequestMeta, lvu_core::RecipeId, uuid::Uuid, PathBuf),
     RecordSuggestion(RecipeOutcome),
     Flush(SyncSender<Result<(), String>>),
-    Stop,
+    /// Bounded acknowledged teardown: the worker sends its teardown result
+    /// (the shared backend's session drain included) before exiting, so a
+    /// full queue, a disconnect, or a drain failure can never report a
+    /// clean stop. Same rendezvous shape as `Flush`.
+    Stop(SyncSender<Result<(), String>>),
 }
 #[derive(Debug)]
 pub enum Event {
@@ -107,7 +111,7 @@ pub enum Event {
 pub struct MemoryWorker {
     tx: SyncSender<Command>,
     rx: Receiver<Event>,
-    _join: thread::JoinHandle<()>,
+    join: Option<thread::JoinHandle<()>>,
     phase: Arc<AtomicU8>,
 }
 impl MemoryWorker {
@@ -132,7 +136,7 @@ impl MemoryWorker {
         Self {
             tx,
             rx,
-            _join: join,
+            join: Some(join),
             phase,
         }
     }
@@ -288,9 +292,93 @@ impl MemoryWorker {
             }
         }
     }
-    pub fn stop(&self) {
-        let _ = self.tx.try_send(Command::Stop);
+    pub fn stop(&mut self) -> Result<(), String> {
+        stop_thread(&self.tx, &mut self.join, "memory worker")
     }
+}
+
+/// Bound for a `Stop` to enter a full command queue: the worker drains
+/// FIFO, so a full queue means teardown waits behind real work, not a
+/// wedge. Past the bound the stop reports instead of discarding.
+const STOP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound for the teardown acknowledgement (queued work, then the shared
+/// backend's session drain) plus the thread join. Past the bound the stop
+/// reports and the thread is left detached to die with the process —
+/// never a silent clean report, never a hung shutdown.
+const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Bounded acknowledged stop shared by both backends: deliver `Stop`
+/// reliably (retry while full, bounded), await the worker's teardown ack
+/// (bounded), then join the thread. Every failure mode — full queue past
+/// the bound, disconnect, teardown error, ack timeout — returns `Err`;
+/// only a joined thread after an `Ok` ack returns `Ok`. Stopping twice is
+/// harmless: with no thread left there is nothing to stop.
+fn stop_thread(
+    tx: &SyncSender<Command>,
+    join: &mut Option<thread::JoinHandle<()>>,
+    backend: &str,
+) -> Result<(), String> {
+    let Some(handle) = join.take() else {
+        return Ok(());
+    };
+    // Dropping the taken handle on any early return below detaches the
+    // thread to die with the process; every such path reports Err.
+    let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+    let deadline = std::time::Instant::now() + STOP_DELIVERY_TIMEOUT;
+    let mut command = Command::Stop(ack_tx);
+    let delivered = loop {
+        match tx.try_send(command) {
+            Ok(()) => break true,
+            Err(TrySendError::Full(value)) if std::time::Instant::now() < deadline => {
+                command = value;
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(TrySendError::Full(_)) => {
+                return Err(format!(
+                    "{backend} stop could not enqueue past {STOP_DELIVERY_TIMEOUT:?} (queue full); worker thread not joined"
+                ));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // Receiver gone: the thread already exited without our
+                // Stop. No ack will ever arrive; join reaps it below, and
+                // a panic payload still surfaces as Err.
+                break false;
+            }
+        }
+    };
+    if delivered {
+        match ack_rx.recv_timeout(STOP_ACK_TIMEOUT) {
+            Ok(result) => {
+                // The thread acks immediately before breaking, so this
+                // join reaps an exiting thread; a panic between the two
+                // still surfaces below.
+                handle
+                    .join()
+                    .map_err(|_| format!("{backend} worker thread panicked during stop"))?;
+                result.map_err(|error| format!("{backend} stop teardown failed: {error}"))?;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The thread died before acking: join surfaces its panic,
+                // or reports the unexplained death when it somehow exited.
+                handle
+                    .join()
+                    .map_err(|_| format!("{backend} worker thread panicked during stop"))?;
+                return Err(format!(
+                    "{backend} worker thread died before acknowledging stop"
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "{backend} stop acknowledgement timed out after {STOP_ACK_TIMEOUT:?}; worker thread not joined"
+                ));
+            }
+        }
+    } else {
+        handle
+            .join()
+            .map_err(|_| format!("{backend} worker thread panicked during stop"))?;
+    }
+    Ok(())
 }
 
 /// Durable-state sink behind one stable call surface: the process-local
@@ -404,7 +492,7 @@ impl Memory {
             Memory::Shared(shared) => shared.flush(timeout),
         }
     }
-    pub fn stop(&self) {
+    pub fn stop(&mut self) -> Result<(), String> {
         match self {
             Memory::Local(worker) => worker.stop(),
             Memory::Shared(shared) => shared.stop(),
@@ -421,7 +509,7 @@ impl Memory {
 pub struct SharedMemory {
     tx: SyncSender<Command>,
     rx: Receiver<Event>,
-    _join: thread::JoinHandle<()>,
+    join: Option<thread::JoinHandle<()>>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -437,7 +525,7 @@ impl SharedMemory {
         Self {
             tx,
             rx,
-            _join: join,
+            join: Some(join),
             stopped,
         }
     }
@@ -629,10 +717,14 @@ impl SharedMemory {
             }
         }
     }
-    fn stop(&self) {
+    /// Bounded acknowledged stop: no further commands are accepted, the
+    /// queued `Stop` drains the session (flush + goodbye) on the worker
+    /// thread, and the teardown result plus the thread join gate the
+    /// return. A second call is a harmless no-op.
+    fn stop(&mut self) -> Result<(), String> {
         self.stopped
             .store(true, std::sync::atomic::Ordering::Release);
-        let _ = self.tx.try_send(Command::Stop);
+        stop_thread(&self.tx, &mut self.join, "shared store")
     }
 }
 
@@ -845,10 +937,13 @@ fn shared_worker(
                         break;
                     }
                 }
-                Command::Stop => {
+                Command::Stop(done) => {
                     // Drain the worker session (flush + goodbye) before
-                    // this thread ends, mirroring local teardown order.
-                    let _ = store.drain_and_detach().await;
+                    // this thread ends, mirroring local teardown order —
+                    // and ACKNOWLEDGE it: a drain failure must surface
+                    // from `stop`, never report clean.
+                    let result = store.drain_and_detach().await;
+                    let _ = done.send(result);
                     break;
                 }
             }
@@ -899,7 +994,7 @@ fn worker(
                 Command::Load(..) => 2,
                 Command::Save(..) => 3,
                 Command::Flush(..) => 6,
-                Command::Stop => 7,
+                Command::Stop(..) => 7,
                 _ => 5,
             },
             Ordering::Relaxed,
@@ -1390,7 +1485,12 @@ fn worker(
                 };
                 let _ = done.send(result);
             }
-            Command::Stop => break,
+            Command::Stop(done) => {
+                // Local teardown has no fallible step past the queue: the
+                // explicit flush before stop already settled durability.
+                let _ = done.send(Ok(()));
+                break;
+            }
         }
         phase.store(1, Ordering::Relaxed);
     }
@@ -2270,7 +2370,7 @@ mod tests {
         let worker = MemoryWorker {
             tx,
             rx,
-            _join: join,
+            join: Some(join),
             phase: Arc::new(AtomicU8::new(1)),
         };
         let definition = definition();
@@ -2286,7 +2386,7 @@ mod tests {
     #[test]
     fn stale_save_sequence_cannot_regress_latest_state() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let mut worker = MemoryWorker::start(temp.path().to_path_buf());
         let definition = definition();
         let id = ViewId::new();
         worker
@@ -2301,7 +2401,7 @@ mod tests {
             store.get_view(id).unwrap().unwrap().applied_search,
             "latest"
         );
-        worker.stop();
+        worker.stop().expect("clean stop joins");
     }
 
     #[test]
@@ -2331,7 +2431,8 @@ mod tests {
                 "latest",
             ))))
             .unwrap();
-        commands_tx.send(Command::Stop).unwrap();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(0);
+        commands_tx.send(Command::Stop(stop_tx)).unwrap();
         let root = temp.path().to_path_buf();
         let phase = Arc::new(AtomicU8::new(0));
         let worker_phase = Arc::clone(&phase);
@@ -2348,6 +2449,10 @@ mod tests {
         }
         saved.sort_unstable();
         assert_eq!(saved, vec![1, 2]);
+        stop_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stop ack")
+            .expect("clean teardown");
         join.join().unwrap();
         // One commit, not two: the coalesced save inserts version 0 with the
         // latest state. Two serial commits would have left version 1.
@@ -2390,7 +2495,8 @@ mod tests {
         commands_tx.send(Command::Save(Box::new(failing))).unwrap();
         let (ack_tx, ack_rx) = mpsc::sync_channel(0);
         commands_tx.send(Command::Flush(ack_tx)).unwrap();
-        commands_tx.send(Command::Stop).unwrap();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(0);
+        commands_tx.send(Command::Stop(stop_tx)).unwrap();
         let root = temp.path().to_path_buf();
         let phase = Arc::new(AtomicU8::new(0));
         let worker_phase = Arc::clone(&phase);
@@ -2417,6 +2523,10 @@ mod tests {
             flush.unwrap_err().contains("bookmark source"),
             "flush surfaces the entry failure"
         );
+        stop_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stop ack")
+            .expect("clean teardown");
         join.join().unwrap();
         // Nothing became durable.
         let store = WorkspaceStore::open(temp.path()).unwrap();
@@ -2467,10 +2577,10 @@ mod tests {
         let phase = Arc::new(AtomicU8::new(0));
         let worker_phase = Arc::clone(&phase);
         let join = thread::spawn(move || worker(root, commands_rx, events_tx, worker_phase));
-        let worker = MemoryWorker {
+        let mut worker = MemoryWorker {
             tx: commands_tx,
             rx: events_rx,
-            _join: join,
+            join: Some(join),
             phase,
         };
         let (events, result) = worker.flush(Duration::from_secs(2));
@@ -2495,8 +2605,7 @@ mod tests {
             store.get_view(third_view).unwrap().unwrap().applied_search,
             "third"
         );
-        worker.stop();
-        worker._join.join().unwrap();
+        worker.stop().expect("stop joins after the batch");
     }
 
     #[test]
@@ -2526,7 +2635,8 @@ mod tests {
             ))
             .unwrap();
         commands_tx.send(Command::Recent).unwrap();
-        commands_tx.send(Command::Stop).unwrap();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(0);
+        commands_tx.send(Command::Stop(stop_tx)).unwrap();
         let root = temp.path().to_path_buf();
         let phase = Arc::new(AtomicU8::new(0));
         let worker_phase = Arc::clone(&phase);
@@ -2552,6 +2662,10 @@ mod tests {
         // The Load emits Loaded then its own Recent, so four events arrive;
         // the first three already prove the order Saved < Loaded < Recent.
         assert_eq!(order, vec!["saved", "loaded", "recent"]);
+        stop_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stop ack")
+            .expect("clean teardown");
         join.join().unwrap();
         let store = WorkspaceStore::open(temp.path()).unwrap();
         assert_eq!(
@@ -2598,7 +2712,12 @@ mod tests {
             events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::Recent(_)
         ));
-        commands_tx.send(Command::Stop).unwrap();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(0);
+        commands_tx.send(Command::Stop(stop_tx)).unwrap();
+        stop_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stop ack")
+            .expect("clean teardown");
         join.join().unwrap();
     }
 
@@ -2621,10 +2740,10 @@ mod tests {
         commands_tx
             .send(Command::Save(Box::new(request(1, definition, id, "final"))))
             .unwrap();
-        let worker = MemoryWorker {
+        let mut worker = MemoryWorker {
             tx: commands_tx,
             rx: events_rx,
-            _join: join,
+            join: Some(join),
             phase,
         };
         let (events, result) = worker.flush(Duration::from_secs(2));
@@ -2637,8 +2756,7 @@ mod tests {
         );
         let store = WorkspaceStore::open(temp.path()).unwrap();
         assert_eq!(store.get_view(id).unwrap().unwrap().applied_search, "final");
-        worker.stop();
-        worker._join.join().unwrap();
+        worker.stop().expect("stop joins after the batch");
     }
 
     #[test]
@@ -2649,7 +2767,7 @@ mod tests {
         let worker = MemoryWorker {
             tx,
             rx,
-            _join: thread::spawn(|| {}),
+            join: Some(thread::spawn(|| {})),
             phase: Arc::new(AtomicU8::new(1)),
         };
         let error = worker.flush(Duration::ZERO).1.unwrap_err();
@@ -2663,13 +2781,15 @@ mod tests {
         );
         assert!(error.contains("worker: waiting for command"), "{error}");
         assert!(matches!(commands.try_recv(), Ok(Command::Flush(_))));
-        worker._join.join().unwrap();
+        // The no-op thread already exited; dropping detaches it. This test
+        // never stops the worker, so no ack or join applies.
+        drop(worker);
     }
 
     #[test]
     fn failed_save_is_acknowledged_and_makes_flush_fail() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let mut worker = MemoryWorker::start(temp.path().to_path_buf());
         let definition = definition();
         let view_id = ViewId::new();
         worker
@@ -2695,7 +2815,7 @@ mod tests {
             external.get_view(view_id).unwrap().unwrap().applied_search,
             "external"
         );
-        worker.stop();
+        worker.stop().expect("clean stop joins");
     }
 
     #[test]
@@ -2734,7 +2854,7 @@ mod tests {
     #[test]
     fn autosave_keeps_accepted_filter_separate_from_unfinished_draft() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let mut worker = MemoryWorker::start(temp.path().to_path_buf());
         let definition = definition();
         let view_id = ViewId::new();
         let mut value = request(1, definition, view_id, "accepted");
@@ -2835,13 +2955,13 @@ mod tests {
             restored.grouping_error.as_deref(),
             Some("unfinished grouping edit")
         );
-        worker.stop();
+        worker.stop().expect("clean stop joins");
     }
 
     #[test]
     fn automatic_grouping_token_round_trips_without_changing_custom_storage() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let mut worker = MemoryWorker::start(temp.path().to_path_buf());
         let view_id = ViewId::new();
         let mut value = request(1, definition(), view_id, "accepted");
         value.state.applied_grouping = lvu::grouping::AUTO_GROUPING_TOKEN.into();
@@ -2864,13 +2984,13 @@ mod tests {
             lvu::grouping::AUTO_GROUPING_TOKEN
         );
         assert_eq!(restored.grouping_draft, lvu::grouping::AUTO_GROUPING_TOKEN);
-        worker.stop();
+        worker.stop().expect("clean stop joins");
     }
 
     #[test]
     fn rolling_capture_policy_round_trips_without_persisting_resolved_bounds() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let mut worker = MemoryWorker::start(temp.path().to_path_buf());
         let definition = definition();
         let view_id = ViewId::new();
         let mut value = request(1, definition, view_id, "accepted");
@@ -2883,7 +3003,7 @@ mod tests {
         value.state.time_recent_draft = "30s".into();
         worker.save(Box::new(value)).unwrap();
         assert!(worker.flush(Duration::from_secs(1)).1.is_ok());
-        worker.stop();
+        worker.stop().expect("clean stop joins");
 
         let stored = WorkspaceStore::open(temp.path())
             .unwrap()
@@ -3083,7 +3203,7 @@ mod tests {
     async fn shared_memory_save_load_roundtrip() {
         let root = TempDir::new().unwrap();
         let store = shared_fixture(root.path(), 6201).await;
-        let memory = SharedMemory::wrap(store);
+        let mut memory = SharedMemory::wrap(store);
         let definition = definition();
         let view = ViewId::new();
         memory
@@ -3104,14 +3224,14 @@ mod tests {
             Event::Loaded(..) => {}
             other => panic!("expected loaded, got {other:?}"),
         }
-        memory.stop();
+        memory.stop().expect("clean stop joins");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_memory_flush_acks_after_saves() {
         let root = TempDir::new().unwrap();
         let store = shared_fixture(root.path(), 6202).await;
-        let memory = SharedMemory::wrap(store);
+        let mut memory = SharedMemory::wrap(store);
         let definition = definition();
         let view = ViewId::new();
         memory
@@ -3126,14 +3246,14 @@ mod tests {
             events.iter().any(|event| matches!(event, Event::Saved(..))),
             "flush drains the save acks first"
         );
-        memory.stop();
+        memory.stop().expect("clean stop joins");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_memory_stop_rejects_later_saves() {
         let root = TempDir::new().unwrap();
         let store = shared_fixture(root.path(), 6203).await;
-        let memory = SharedMemory::wrap(store);
+        let mut memory = SharedMemory::wrap(store);
         let definition = definition();
         let view = ViewId::new();
         memory
@@ -3141,7 +3261,7 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         poll_until(&memory, deadline, |event| matches!(event, Event::Saved(..))).await;
-        memory.stop();
+        memory.stop().expect("clean stop joins");
         // After stop the shim refuses submission with the request back,
         // mirroring a disconnected local worker — never silently dropped.
         match memory.save(Box::new(request(2, definition, view, "seek"))) {
@@ -3151,6 +3271,58 @@ mod tests {
         assert!(memory.poll().is_none());
     }
 
+    /// A drain failure must surface from `stop`, never report clean: the
+    /// store is pre-detached (deterministically broken connection), so the
+    /// worker thread's session drain fails and the ack carries the error
+    /// through the join.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_stop_reports_drain_failure() {
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6212).await;
+        store
+            .drain_and_detach()
+            .await
+            .expect("first drain detaches cleanly");
+        let mut memory = SharedMemory::wrap(store);
+        let error = memory.stop().expect_err("broken drain must fail stop");
+        assert!(
+            !error.is_empty(),
+            "drain failure must explain itself: {error:?}"
+        );
+    }
+
+    /// Stop delivers behind queued work instead of discarding on a full
+    /// queue: tiny capacities force enqueue pressure, yet every save is
+    /// acknowledged, the ack is Ok, and the thread is joined (a second
+    /// stop is a harmless Ok).
+    #[test]
+    fn stop_delivers_behind_queued_work_acks_and_joins() {
+        let temp = TempDir::new().unwrap();
+        let mut worker = MemoryWorker::start_with_capacities(temp.path().to_path_buf(), 1, 8);
+        let definition = definition();
+        let view = ViewId::new();
+        for sequence in 1..=3u64 {
+            let request = request(sequence, definition.clone(), view, "queued");
+            // Retry like any producer: capacity 1 means the queue may be
+            // momentarily full while the worker drains it.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match worker.save(Box::new(request.clone())) {
+                    Ok(()) => break,
+                    Err(_) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "queue never drained for sequence {sequence}"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            }
+        }
+        worker.stop().expect("reliable stop joins after the batch");
+        worker.stop().expect("second stop is harmless");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_memory_conflict_makes_flush_fail_closed() {
         // A peer-winning conflict must stay represented at shutdown like
@@ -3158,7 +3330,7 @@ mod tests {
         // of a clean exit over undurable state.
         let root = TempDir::new().unwrap();
         let store = shared_fixture(root.path(), 6211).await;
-        let memory = SharedMemory::wrap(store);
+        let mut memory = SharedMemory::wrap(store);
         let definition = definition();
         let view = ViewId::new();
         memory
@@ -3194,7 +3366,7 @@ mod tests {
         }
         let (_, result) = memory.flush(Duration::from_secs(10));
         assert!(result.is_err(), "flush must report the failed save");
-        memory.stop();
+        memory.stop().expect("clean stop joins");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3204,7 +3376,7 @@ mod tests {
         // never touches versions, so the valid save commits at once.
         let root = TempDir::new().unwrap();
         let store = shared_fixture(root.path(), 6212).await;
-        let memory = SharedMemory::wrap(store);
+        let mut memory = SharedMemory::wrap(store);
         let definition = definition();
         let view = ViewId::new();
         let mut invalid = request(1, definition.clone(), view, "bad");
@@ -3227,7 +3399,7 @@ mod tests {
         poll_until(&memory, deadline, |event| matches!(event, Event::Saved(..))).await;
         let (_, recovered) = memory.flush(Duration::from_secs(10));
         recovered.expect("flush acknowledges after recovery");
-        memory.stop();
+        memory.stop().expect("clean stop joins");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3236,7 +3408,7 @@ mod tests {
         // only a saved revision clears them.
         let root = TempDir::new().unwrap();
         let store = shared_fixture(root.path(), 6213).await;
-        let memory = SharedMemory::wrap(store);
+        let mut memory = SharedMemory::wrap(store);
         let meta = lvu::RecipeRequestMeta {
             request_id: 1,
             dialog_id: 2,
@@ -3261,7 +3433,7 @@ mod tests {
         }
         let (_, result) = memory.flush(Duration::from_secs(10));
         assert!(result.is_err(), "flush must report the recipe failure");
-        memory.stop();
+        memory.stop().expect("clean stop joins");
     }
 }
 

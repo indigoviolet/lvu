@@ -291,6 +291,132 @@ async fn two_windows_share_one_capture_through_real_worker() {
     );
 }
 
+/// Production `ChildAdmission` dedup across two real windows: the same file
+/// proposed under two DISTINCT ids admits once — the second start presents
+/// the winner's canonical id (never a second acquisition) — both windows
+/// read the same journal through independent readers, and a failed
+/// operation from the second window (a stale-versioned save conflict)
+/// leaves the winner's capture undamaged: appends still flow and the
+/// winner's next save still commits.
+#[tokio::test]
+async fn second_window_presents_winner_identity_with_distinct_proposal() {
+    let scenario = tokio::time::timeout(Duration::from_secs(120), async {
+        let root = tempfile::tempdir().expect("scratch root");
+        let capture_root = root.path().join("captures");
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\n").expect("seed log");
+        let bin = worker_bin();
+
+        // Window A admits the file under its proposed id: the worker
+        // echoes it back on a fresh admit.
+        let (mut first, _) = WorkerClient::attach(&bin, &capture_root, "window-a", 4101)
+            .await
+            .expect("window A attaches");
+        let proposed_a = file_definition(41, &log);
+        let winner = match first
+            .request_start(&proposed_a)
+            .await
+            .expect("window A starts capture")
+        {
+            StartOutcome::Started { source_id, .. } => source_id,
+            StartOutcome::StdinBound { .. } => panic!("file start must not bind stdin"),
+        };
+        assert_eq!(winner, proposed_a.id);
+
+        // Window B proposes the SAME file under a DISTINCT id: production
+        // admission must Present the winner, not admit a second capture.
+        let (mut second, _) = WorkerClient::attach(&bin, &capture_root, "window-b", 4102)
+            .await
+            .expect("window B attaches");
+        let proposed_b = file_definition(42, &log);
+        assert_ne!(proposed_b.id, proposed_a.id);
+        let presented = match second
+            .request_start(&proposed_b)
+            .await
+            .expect("window B starts same file")
+        {
+            StartOutcome::Started { source_id, .. } => source_id,
+            StartOutcome::StdinBound { .. } => panic!("file start must not bind stdin"),
+        };
+        assert_eq!(
+            presented, winner,
+            "distinct proposal of the same file must present the winner"
+        );
+
+        // Independent readers, one capture: B tails the winner's journal
+        // through its own reader and sees A's rows.
+        std::fs::write(&log, "one\ntwo\n").expect("append log");
+        let journal = second
+            .request_start(&proposed_b)
+            .await
+            .expect("re-proposal still presents");
+        let journal_path = match journal {
+            StartOutcome::Started { journal_path, .. } => journal_path,
+            StartOutcome::StdinBound { .. } => panic!("file start must not bind stdin"),
+        };
+        let tail = FileJournalTail::new(winner, &journal_path);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let page = loop {
+            if let Ok(page) = tail.read_page(0, 128, 1024 * 1024)
+                && page.records.len() >= 2
+            {
+                break page;
+            }
+            if Instant::now() >= deadline {
+                panic!("B never read the winner's rows");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(page.records.len(), 2);
+
+        // A failed operation from B (stale-versioned save) must not damage
+        // the winner: the conflict is reported, then A's rows still flow
+        // and A's next save still commits. B saves under the WINNER id —
+        // exactly what the fixed controller sends after adopting the
+        // canonical identity — so the conflict is versioned, not a stray
+        // source key.
+        let mut adopted_b = proposed_b.clone();
+        adopted_b.id = winner;
+        let view = lvu_core::ViewId(uuid::Uuid::from_u128(43));
+        match second
+            .store(save_method("window-b", 1, &adopted_b, view, Some(99)))
+            .await
+            .expect("stale save answers")
+        {
+            StoreEvent::SaveFailed { .. } => {}
+            other => panic!("expected stale conflict, got {other:?}"),
+        }
+        std::fs::write(&log, "one\ntwo\nthree\n").expect("append after conflict");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(page) = tail.read_page(0, 128, 1024 * 1024)
+                && page.records.len() >= 3
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("winner capture stopped flowing after B's failed save");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        match first
+            .store(save_method("window-a", 1, &proposed_a, view, None))
+            .await
+            .expect("winner saves")
+        {
+            StoreEvent::Saved { .. } => {}
+            other => panic!("winner save must still commit, got {other:?}"),
+        }
+
+        first.shutdown().await.expect("window A drains");
+        second.shutdown().await.expect("window B drains");
+    })
+    .await;
+    if scenario.is_err() {
+        panic!("dedup scenario exceeded 120s");
+    }
+}
+
 /// A killed worker leaves its socket file stale with no live owner. The
 /// next attach must elect a replacement (which unlinks the stale file and
 /// binds) and come back with a welcome from the NEW worker — not reuse the
