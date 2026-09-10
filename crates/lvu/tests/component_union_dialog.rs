@@ -156,10 +156,10 @@ fn short_dialog_scrolls_highlight_and_mouse_uses_visible_global_index() {
             let line = (0..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>();
-            line.find("Extra view 8")
+            line.find("Extra view 7")
                 .map(|x| (u16::try_from(x).unwrap(), y))
         })
-        .expect("next visible candidate");
+        .expect("scrolled highlighted candidate");
     app.handle(
         Action::Raw(RawEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -169,9 +169,14 @@ fn short_dialog_scrolls_highlight_and_mouse_uses_visible_global_index() {
         })),
         &provider,
     );
+    let after_mouse = screen(&draw(&provider, &mut app, 80, 12));
+    assert!(
+        after_mouse.contains("1 of 14 views selected"),
+        "mouse hit must use the scrolled global index: {after_mouse}"
+    );
+    key(&mut app, &provider, KeyCode::Char(' '));
     key(&mut app, &provider, KeyCode::Enter);
     let requests = app.layers.union.take_requests();
     let lvu::UnionDialogRequest::Create { inputs, .. } = &requests[0];
     assert!(inputs.contains(&"extra-7".to_owned()));
-    assert!(inputs.contains(&"extra-8".to_owned()));
 }
