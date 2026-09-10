@@ -6,15 +6,19 @@ app crate version and lockfile version must agree. Push the specific version tag
 rather than all local tags, and never move an existing version tag.
 See [versions](versions.md) for local installation and retention.
 
-**State: `v0.1.6` is tagged and published, with all four archives and the updated tap.** Steps 1-4
-retain the historical `v0.1.0` command examples; substitute the version being
-released rather than recreating a published tag.
-A reader arriving now starts at [step 5, cutting the next
-version](#5-cutting-the-next-version), which sends you back through 1-4 with the new
-number. Steps 1-4 are written from a Linux checkout, which is where v0.1.0 was
-cut; where a step cannot work on macOS it says so.
+Support scope as of 2026-09-10 is Linux x86_64/arm64 and Apple-silicon macOS.
+Intel Macs and Windows are unsupported. Historical four-archive releases remain
+immutable. The existing matrix and four-archive commands below still describe
+the previous distribution policy; align automation and these commands before
+the next publication, as tracked in TODO.md.
 
-The exact commands that publish a release. Every step here has been executed
+**State: `v0.1.6` is tagged and published, with all four historical archives and the updated tap.**
+Steps 1–4 retain the historical `v0.1.0` procedure for reference only. Their
+four-archive requirements and publication commands are not instructions for
+the next release. First align the workflow, renderer, verification and this
+runbook with the three supported targets tracked in TODO.md.
+
+Historical publication commands follow. Every step here has been executed
 for real, on `v0.1.0`, and the two install paths in step 4 were verified from a
 clean machine afterwards. See [distribution](distribution.md) for what the
 archives contain and why the Linux target is musl, and
@@ -130,8 +134,9 @@ gh release view v0.1.0
 ```
 
 If any native job fails, keep the release draft and resolve the failure.
-Current publication requires all four verified archives and their checksums;
-a partial draft is not ready for the tap update or publication.
+The historical procedure required all four verified archives and checksums.
+Do not use this procedure for the next release until supported-target alignment
+is complete.
 
 ## 3. Render and publish the formula
 
@@ -146,7 +151,8 @@ gh release download v0.1.0 --repo indigoviolet/lvu -p SHA256SUMS -O - \
 ```
 
 The renderer supports explicitly missing targets for historical partial releases.
-Do not use this option for a new release; all four targets are required:
+The example below is historical only. The renderer and its verification must
+be aligned with the supported targets before use for a new release:
 
 ```sh
 gh release download v0.1.0 --repo indigoviolet/lvu -p SHA256SUMS -O - \
@@ -285,9 +291,12 @@ brew install uv node     # or: mise use -g uv node
 `v0.1.6` is published. Use `0.1.7` for the next release after its integrated
 features pass the checks above; the examples below do not authorize an early tag.
 
-Publication requires all four native archives and their checksums to pass
-verification. The historical partial-release procedure above is not the current
-acceptance policy.
+Before executing the versioning/publication sequence below, finish supported-
+target alignment in the workflow, renderer, verification and runbook. The next
+release requires verified Linux x86_64, Linux arm64 and Apple-silicon macOS
+archives and checksums. Intel Darwin is excluded. The existing four-archive
+automation is not ready for this policy; these commands remain non-actionable
+until that tracked work lands.
 
 ```sh
 git status --short --branch # use the reviewed integration/release checkout

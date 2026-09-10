@@ -2682,3 +2682,62 @@ Alt-A Advanced tab instead of the retired `p` shortcut. This is a help-text-only
 correction for the next release; the immutable v0.1.6 help remains historical.
 No key binding or execution path changed. Formatting and whitespace checks
 passed; no build or PTY was needed for this string-only edit.
+
+
+### Supervisor handover and disk inventory — 2026-09-10
+
+Successor supervisor recovered the predecessor's explicit goal from Paseo logs:
+parallel TODO implementation and independent review, with frequent validated
+versioned releases. Current integration is clean at handover `b287894`;
+v0.1.6 delivery remains complete. No new runtime acceptance is inferred.
+
+Read-only allocated-size inventory measured lvu-build at 85.68 GiB: worktree
+targets 38.213, release/integration targets 27.797, primary target 3.381, compiler
+cache 10.032, and scratch/proof/other 6.255 GiB. Volume free space was 4.0 GiB.
+Ordinary janitor dry-run offered 0.01 decimal GB; stale-flags dry-run offered
+1.62 decimal GB of old-flag artifacts (452 units in the w22 target), plus
+0.01 decimal GB of temporary fixtures, for 1.63 decimal GB total. Release/integration
+name patterns are absent from normal target discovery; existing worktree
+retirement requires containment in main, while current work lands on the
+integration branch. These retention gaps explain accumulated build bulk.
+Evidence: `supervisor-disk-audit-20260910/{usage.tsv,usage-errors.txt,findings.md}`
+on the build volume. No deletion or build was performed. A broader release-target
+retirement inventory is assigned to the existing release owner. The earlier a97
+plan is not execution evidence; future disposal must hold locks throughout and
+refresh live-use checks, rather than merely probe a lock and release it.
+
+TODO now separates controller, admission, failed-flush, remote-union and actual
+two-window acceptance work. Shared-memory candidate `0614340` is committed but
+its new tests remain unrun under the disk hold. Existing Sol reviewers were
+closed at handover; a fresh Sol reviewer is assigned disk/status review and
+independent source review of that candidate. No worker compile-context overlays
+are accepted for integration.
+
+The user explicitly excludes Intel Macs and Windows from support. Current
+README and acceptance scope now say so; historical audit/release evidence remains
+intact. Existing automation still contains Intel distribution and Windows
+diagnostic jobs; aligning that automation before the next release is open work.
+Documentation validation: Git whitespace checks only; no runtime changed.
+
+The supervisor subsequently executed the narrow superseded-a97 cleanup using
+the existing executor with both validation and Cargo locks held via
+`flock --close`. The first invocation refused before mutation because the
+worker plan's lvu hash was wrong. Direct comparison with `accepted.json` found
+the real binary unchanged at `049911103cf7df9e18e5b7825c4776b0ee90fce2ddb9cb4069b47a1e3442c21e`;
+using that recorded hash allowed execution. The privileged process scan
+reported zero refused and zero denied references. Both binaries matched before
+and after; only deps/build/fingerprint/incremental/tmp bulk was removed.
+Free space rose from 4,236,435,456 to 8,741,441,536 bytes (4.20 GiB reclaimed),
+and versions/latest remains v0.1.6. Proof is
+`supervisor-disk-audit-20260910/reclaim-a97-proof.jsonl`. Captures, release
+records, logs and other targets were untouched. The shared-memory owner is
+now authorized to run the bounded candidate gate under the released lock.
+
+Independent Sol review confirmed the disk accounting and guarded cleanup.
+The handover documentation was amended before publication: `0614340` adds
+three test functions (invalid-save and recovery share one test), the old
+four-archive release procedure is explicitly historical and not executable
+for the next release, and the stale Windows acceptance reference is removed.
+The 1.62 GB stale-artifact subtotal is distinguished from the 1.63 GB dry-run
+total including fixtures. Git whitespace checks passed. Source review and
+runtime validation of `0614340` remain separate pending work.

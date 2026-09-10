@@ -2,6 +2,9 @@
 
 Status: prepared for published `v0.1.6`; not executed by this documentation refresh.
 
+This checklist covers Apple-silicon macOS only. Intel Macs and Windows are
+unsupported; historical Intel archive evidence below is retained for provenance.
+
 This checklist validates the immutable published macOS distribution in a real
 terminal emulator. It is not evidence that the checks passed. Record every
 result against the exact executable and resources described below; do not
@@ -31,7 +34,6 @@ clipboard, resize, or Option/Meta checks below.
 Run the checklist on each supported machine/terminal combination being claimed:
 
 - Apple silicon with the native arm64 Homebrew package.
-- Intel macOS with the native x86_64 Homebrew package.
 - Terminal.app and iTerm2, separately.
 
 Use a normal interactive terminal with `brew`, `python3`, `shasum`, and `ps`

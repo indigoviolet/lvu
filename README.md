@@ -25,8 +25,10 @@ mise, globally or in a project's `mise.toml`:
 mise use -g github:indigoviolet/lvu
 ```
 
-Linux x86_64 is what the release was tested on. macOS is untested; if you try
-it, an issue saying what happened helps. Windows is untested and not packaged.
+Supported platforms are Linux x86_64/arm64 and Apple-silicon macOS. Linux x86_64
+has full release acceptance; Apple-silicon macOS has automated installation and
+terminal-cleanup checks, with human terminal acceptance still outstanding.
+Intel Macs and Windows are unsupported.
 
 Build from source with [mise](https://mise.jdx.dev/) if there is no package
 for your platform:

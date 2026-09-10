@@ -1,5 +1,10 @@
 # Platform validation evidence
 
+Current support scope (2026-09-10): Linux x86_64/arm64 and Apple-silicon macOS.
+Intel Macs and Windows are unsupported. Their entries below preserve historical
+audit/CI evidence, not acceptance targets. Existing CI still includes those jobs;
+removing them is tracked in TODO.md.
+
 Audit baseline: source `9fc7e5363d975c231b7f5d8fe1e16c3e249a7752`, 2026-09-09.
 This is an evidence map, not a claim that every packaged platform is supported.
 Published release evidence below retains the historical v0.1.3 checks.
@@ -128,10 +133,10 @@ On macOS, replace `flock ...` with another exclusive lock mechanism used by the
 host and pass `--expect-piped-stdin unsupported`. When pointing the runtime
 harness at a staged archive, add `--require-installed-resources`.
 
-## First implementation blockers
+## Historical portability blockers
 
-The smallest honest next changes are separate product assignments, not hidden
-inside this validation patch:
+The following list records the original portability assessment. Windows items
+are out of current scope, not assigned product work:
 
 1. Gate the handle-relative journal implementation in `lvu-core` and fail
    closed on Windows until real handle identity/enumeration exists. Replacing

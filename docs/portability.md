@@ -1,12 +1,14 @@
 # Portability audit: macOS and Windows
 
+Scope update (2026-09-10): Intel Macs and Windows are unsupported. This document
+preserves historical findings; its Windows proposals are not current roadmap
+items. Current macOS acceptance covers Apple silicon only; see TODO.md.
+
 Status: audit only, 2026-09-07. Evidence is read from the source at main
 `bef81ce`. **No macOS or Windows build, test or terminal session was performed.**
 The only Rust target installed on this host is `x86_64-unknown-linux-gnu`
 (`rustup target list --installed`), so every non-Linux statement below is a
-source-level reading, not a verified result. Nothing here may be cited as
-platform acceptance for the TODO row "Validate supported installation, terminal
-and process behavior on macOS and Windows".
+source-level reading, not a verified result. This historical audit establishes no current platform acceptance.
 
 Resolved since this audit (2026-09-08): §6's compile-time helper resolution
 is gone, `crates/lvu-app/src/resources.rs` resolves the helper and the bridge
