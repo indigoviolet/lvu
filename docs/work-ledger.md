@@ -2496,3 +2496,17 @@ Formatting and diff checks passed. The compiler cache limit
 was reduced from 20 GiB to 15 GiB to reserve space for a fresh release target;
 cache eviction preserved binaries, captures and all retained gate evidence.
 Neither the diagnostic runs nor focused repairs constitute release acceptance.
+
+Correlation coverage repair `7b2488ff5982afb7c50a316c1793b1cf0499eeac`
+is integrated as `9f9f759`. It explicitly opens the legacy component for its
+compatibility tests while testing new Fields actions through the shared-key
+Union chooser. Frozen row/field evidence and scrolled selection are asserted.
+The actual correlation PTY now normalizes differently named keys through
+accepted enrichments, checks cancellation, native union membership, original
+identities and restart persistence. Owner validation passed 13 correlation
+component tests, 10 Fields tests, the exact scrolling test and the PTY.
+Evidence: `lvu-muse-union-logs/correlation-shared-key-7b2488f-r7-rust.log`
+and `correlation-shared-key-7b2488f-r6-pty.log` in the same directory.
+The combined source is being frozen for a fresh full release gate; the previous
+failed gate and diagnostic logs remain preserved. Independent coverage review
+is proceeding separately and remains a release condition.

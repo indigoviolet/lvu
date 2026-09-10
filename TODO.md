@@ -27,7 +27,7 @@ integration and the relevant acceptance evidence.
 
 | Status | Work |
 | --- | --- |
-| **Working** | Make colour classification consume enrichment outputs rather than define independent pattern predicates. Preserve raw-text search as an explicit convenience exception. Ordinary-view implementation integrated; union colour threading and combined release acceptance remain pending. |
+| **Working** | Make colour classification consume enrichment outputs rather than define independent pattern predicates. Preserve raw-text search as an explicit convenience exception. Ordinary and union implementations integrated, with focused UI acceptance passed; combined release acceptance remains pending. |
 | **Working** | Replace raw-only special correlation extraction with enrichment-derived shared keys and ordinary filtering over union views. Preserve existing saved behavior. Replacement integrated; final UI and release acceptance pending. |
 | **Working** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
 | **Working** | Validate installation/terminal/process behavior on macOS and Windows (audit in docs/portability.md, checklist in docs/mac-test-plan.md). Automated arm64 macOS install-tree, kernel-PTY and process-cleanup validation is integrated; Intel macOS compile checks passed. Human terminal-emulator checks remain open, and Windows remains unsupported. arm64 Linux archive is built and CI-executed but has had no human interactive acceptance. |
