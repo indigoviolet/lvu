@@ -196,6 +196,15 @@ impl RemoteSourceHandle {
         self.inner.source_id
     }
 
+    /// The worker lifetime this handle is bound to, for stamping requests
+    /// and detecting replacement without touching capture state.
+    /// Coordinated accessor (5b-owned seam addition): feeders and the
+    /// union transport read it; updates still go only through
+    /// `update_progress`.
+    pub fn worker_session(&self) -> &str {
+        &self.inner.worker_session
+    }
+
     /// Latest accepted canonical snapshot. Mirrors the local watch read:
     /// always current, never torn, never synthesized. Reads the publication
     /// slot only, never the IO-guarded state mutex, so UI getters never
@@ -868,6 +877,18 @@ impl AnySourceHandle {
         match self {
             Self::Local(handle) => Some(handle),
             Self::Remote(_) => None,
+        }
+    }
+
+    /// The worker session a remote handle is bound to, or `None` for local
+    /// handles (same-process publication needs no epoch). Feeder and union
+    /// transport callers stamp requests with it and detect replacement
+    /// through it; the frozen value comes from attach time, never re-read.
+    /// Coordinated addition for the union transport + feeder wiring.
+    pub fn remote_worker_session(&self) -> Option<&str> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(handle) => Some(handle.worker_session()),
         }
     }
 }
