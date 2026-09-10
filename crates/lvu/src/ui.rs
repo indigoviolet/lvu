@@ -299,6 +299,7 @@ fn render_layers<P: RowProvider>(
                 layers.investigation.render(frame, area, &ctx)
             }
             crate::component::LayerId::Correlation => layers.correlation.render(frame, area, &ctx),
+            crate::component::LayerId::Union => layers.union.render(frame, area, &ctx),
             crate::component::LayerId::ViewSummary => layers.view_summary.render(frame, area, &ctx),
         };
         if is_top {

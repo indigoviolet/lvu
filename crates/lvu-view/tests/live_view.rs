@@ -988,6 +988,106 @@ async fn native_regex_enrichment_adds_named_columns_filters_and_survives_invalid
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frozen_inventory_tracks_only_accepted_slash_outputs_not_raw_namesakes() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(
+        &root,
+        "{\"request_key\":\"raw-name\",\"message\":\"derived=accepted/value\"}\n",
+        true,
+    )
+    .await;
+    let slash = r#"/derived=(?P<request_key>[^\"]+)/"#;
+
+    let mut accepted = request("view", 1, 1, 0, None, None);
+    accepted.purpose = QueryPurpose::Enrichment;
+    accepted.constraints.enrichments = enrichment(slash);
+    let accepted_constraints = accepted.constraints.clone();
+    adapter.submit(accepted).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+
+    let frozen = adapter
+        .freeze_input("view", FrozenInputLimits::default())
+        .unwrap();
+    assert_eq!(frozen.summary().view_id, "view");
+    assert_eq!(frozen.summary().applied_revision, 1);
+    assert_eq!(frozen.summary().applied_generation, 1);
+    assert_eq!(
+        frozen.summary().accepted_enrichment_outputs,
+        ["request_key"]
+    );
+    let accepted_rows = std::thread::spawn(move || {
+        let mut rows = Vec::new();
+        frozen
+            .visit_precise(&AtomicBool::new(false), |batch| {
+                rows.extend(batch.rows);
+                Ok(())
+            })
+            .unwrap();
+        rows
+    })
+    .join()
+    .unwrap();
+    assert_eq!(accepted_rows.len(), 1);
+    assert_eq!(accepted_rows[0].fields["request_key"], "accepted/value");
+    assert_eq!(accepted_rows[0].field_types["request_key"], "String");
+
+    let mut rejected = request("view", 2, 2, 1, None, None);
+    rejected.purpose = QueryPurpose::Enrichment;
+    rejected.base_constraints = accepted_constraints.clone();
+    rejected.constraints = accepted_constraints.clone();
+    rejected.constraints.enrichments = enrichment("request_key = pl.col('missing')");
+    adapter.submit(rejected).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_err());
+    let after_rejection = adapter
+        .freeze_input("view", FrozenInputLimits::default())
+        .unwrap();
+    assert_eq!(after_rejection.summary().view_id, "view");
+    assert_eq!(after_rejection.summary().applied_revision, 1);
+    assert_eq!(after_rejection.summary().applied_generation, 1);
+    assert_eq!(
+        after_rejection.summary().accepted_enrichment_outputs,
+        ["request_key"]
+    );
+    drop(after_rejection);
+
+    let mut removed = request("view", 3, 3, 1, None, None);
+    removed.purpose = QueryPurpose::Enrichment;
+    removed.base_constraints = accepted_constraints;
+    adapter.submit(removed).unwrap();
+    assert!(wait_completion(&mut adapter, 3).await.result.is_ok());
+    let after_removal = adapter
+        .freeze_input("view", FrozenInputLimits::default())
+        .unwrap();
+    assert_eq!(after_removal.summary().view_id, "view");
+    assert_eq!(after_removal.summary().applied_revision, 3);
+    assert_eq!(after_removal.summary().applied_generation, 3);
+    assert!(
+        after_removal
+            .summary()
+            .accepted_enrichment_outputs
+            .is_empty()
+    );
+    let raw_rows = std::thread::spawn(move || {
+        let mut rows = Vec::new();
+        after_removal
+            .visit_precise(&AtomicBool::new(false), |batch| {
+                rows.extend(batch.rows);
+                Ok(())
+            })
+            .unwrap();
+        rows
+    })
+    .join()
+    .unwrap();
+    assert_eq!(raw_rows.len(), 1);
+    assert_eq!(raw_rows[0].fields["request_key"], "raw-name");
+
+    adapter.shutdown();
+    drop(handle);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordered_typed_enrichment_additions_retain_prior_stages_and_remove_explicitly() {
     let root = TempDir::new().unwrap();
     let (manager, handle, mut adapter) = setup(

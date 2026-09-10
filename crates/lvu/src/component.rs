@@ -89,6 +89,9 @@ pub enum LayerId {
     /// Correlate across sources: opened from Fields by `Replace`, never
     /// directly, so its palette entries anchor to the Fields verb.
     Correlation,
+    /// Union of accepted views: opened from the palette onto the active
+    /// view, which arrives pre-selected as the first input.
+    Union,
     /// The read-only stack of everything applied to the active view
     /// (`dialog-system.md` §12.22). A launcher: its one verb replaces it with
     /// the dialog that owns the selected row.
@@ -162,6 +165,9 @@ pub enum Open {
     Ask(crate::components::ask::AskOpen),
     Investigation,
     Correlation(crate::components::correlation::CorrelationOpen),
+    /// Union of accepted views, optionally constrained by a selected accepted
+    /// enrichment output.
+    Union(crate::components::union_dialog::UnionOpen),
 }
 
 impl LayerId {
@@ -188,6 +194,7 @@ impl LayerId {
             LayerId::Ask => CommandId::AskAi,
             LayerId::Investigation => CommandId::Investigations,
             LayerId::Correlation => CommandId::CorrelateField,
+            LayerId::Union => CommandId::UnionViews,
             LayerId::ViewSummary => CommandId::ViewSummary,
         }
     }
@@ -217,6 +224,7 @@ impl Open {
             Open::Ask(_) => LayerId::Ask,
             Open::Investigation => LayerId::Investigation,
             Open::Correlation(_) => LayerId::Correlation,
+            Open::Union(_) => LayerId::Union,
         }
     }
 
@@ -268,6 +276,8 @@ impl Open {
             // Correlation freezes the active view as the origin every
             // completion is fenced against.
             Open::Correlation(_) => true,
+            // Union pre-selects the active view as its first input.
+            Open::Union(_) => true,
         }
     }
 }

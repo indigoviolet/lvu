@@ -717,9 +717,9 @@ impl FieldsDialog {
         Outcome::Consumed
     }
 
-    /// Correlation is its own layer (`components/correlation.rs`): this one
-    /// hands it the frozen record and the field and is replaced by it, so the
-    /// lookup's pending state is shown where the answer will land.
+    /// Reuse the union chooser for a shared-key union. The application proves
+    /// that the selected name is an accepted enrichment output and resolves
+    /// the native value before it registers the new view.
     fn correlate(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         let Some(row) = anchored_row(ctx.views, ctx.provider) else {
             ctx.notice("field data is pending or unavailable");
@@ -730,8 +730,18 @@ impl FieldsDialog {
             return Outcome::Consumed;
         };
         self.open = false;
-        Outcome::Replace(crate::component::Open::Correlation(
-            crate::components::correlation::CorrelationOpen { row: row.id, field },
+        let Some(origin_view_id) = ctx.views.active_id().map(str::to_owned) else {
+            ctx.notice("field data is pending or unavailable");
+            return Outcome::Consumed;
+        };
+        Outcome::Replace(crate::component::Open::Union(
+            crate::components::union_dialog::UnionOpen::SharedKey(
+                crate::components::union_dialog::SharedKeyUnionOrigin {
+                    origin_view_id,
+                    row_id: row.id,
+                    field,
+                },
+            ),
         ))
     }
 

@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock, RwLockReadGuard,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -499,6 +499,7 @@ impl SourceManager {
             last_error: None,
         };
         let (progress_tx, progress_rx) = watch::channel(initial.clone());
+        let progress_publication = Arc::new(RwLock::new(()));
         let writer = spawn_writer(
             source_id,
             journal_path.clone(),
@@ -517,6 +518,7 @@ impl SourceManager {
             },
             config.clone(),
             progress_tx.clone(),
+            progress_publication.clone(),
             initial,
         )
         .await?;
@@ -570,6 +572,7 @@ impl SourceManager {
             control: control_tx,
             page_sender: writer.page_sender.clone(),
             progress: progress_rx,
+            progress_publication,
             history: history_rx,
             page_gate: page_gate.clone(),
             max_page_records: config.max_page_records,
@@ -707,6 +710,7 @@ pub struct SourceHandle {
     control: mpsc::Sender<Control>,
     page_sender: mpsc::Sender<PageRequest>,
     progress: watch::Receiver<SourceProgress>,
+    progress_publication: Arc<RwLock<()>>,
     history: watch::Receiver<Arc<SourceHistory>>,
     page_gate: Arc<Semaphore>,
     max_page_records: usize,
@@ -719,6 +723,22 @@ impl SourceHandle {
     }
     pub fn progress(&self) -> SourceProgress {
         self.progress.borrow().clone()
+    }
+
+    /// Pins progress publication while a consumer performs a short atomic
+    /// final check and install. Capture remains unlocked during all expensive
+    /// preparation; only the watch publication itself takes the write side.
+    pub fn lock_progress(&self) -> SourceProgressGuard<'_> {
+        let publication = self
+            .progress_publication
+            .read()
+            .expect("source progress publication lock poisoned");
+        let progress = self.progress.borrow();
+        SourceProgressGuard {
+            _publication: publication,
+            generation: progress.generation,
+            high_watermark: progress.high_watermark,
+        }
     }
     pub fn subscribe(&self) -> watch::Receiver<SourceProgress> {
         self.progress.clone()
@@ -825,6 +845,22 @@ impl SourceHandle {
                 .map_err(RuntimeError::from)
         })
         .await?
+    }
+}
+
+pub struct SourceProgressGuard<'a> {
+    _publication: RwLockReadGuard<'a, ()>,
+    generation: u64,
+    high_watermark: Option<RecordId>,
+}
+
+impl SourceProgressGuard<'_> {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn high_watermark(&self) -> Option<RecordId> {
+        self.high_watermark
     }
 }
 

@@ -75,6 +75,11 @@ pub struct FrozenInputSummary {
     /// Exact for an applied filtered view. Raw views require a bounded scan.
     pub selected_records: Option<u64>,
     pub sources: Vec<FrozenInputSource>,
+    /// Compiled output names from this exact accepted membership. This is the
+    /// authority for workflows selecting derived cells; raw fields and caller
+    /// inventories are not evidence. Slash captures are already expanded by
+    /// compilation before they reach this list.
+    pub accepted_enrichment_outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,7 +137,28 @@ impl FrozenInput {
         cancel: &AtomicBool,
         mut visitor: impl FnMut(FrozenInputBatch) -> Result<(), String>,
     ) -> Result<FrozenInputStats, FrozenInputError> {
-        visit_frozen_input(&self.frozen, self.limits, cancel, false, &mut visitor)
+        visit_frozen_input(
+            &self.frozen,
+            self.limits,
+            cancel,
+            false,
+            false,
+            &mut visitor,
+        )
+    }
+
+    /// Precise replay for consumers that need native dtype evidence: every
+    /// visited row carries `field_types` for each field, at the cost of
+    /// recording whole-value omissions instead of failing on them. Unlike the
+    /// assistance sampling path this never includes source context: only
+    /// membership-selected records are visited, so counts stay exact. Added
+    /// for union merges, which decode typed values under dtype authority.
+    pub fn visit_precise(
+        &self,
+        cancel: &AtomicBool,
+        mut visitor: impl FnMut(FrozenInputBatch) -> Result<(), String>,
+    ) -> Result<FrozenInputStats, FrozenInputError> {
+        visit_frozen_input(&self.frozen, self.limits, cancel, false, true, &mut visitor)
     }
 }
 
@@ -485,6 +511,12 @@ impl NativeViewAdapter {
             .map_err(|_| ViewError::SnapshotCapacity)?;
         let lease = JobLease(Arc::clone(&self.snapshot_jobs));
         let frozen = self.freeze_snapshot_through(view_id, through)?;
+        let mut accepted_enrichment_outputs = frozen
+            .membership
+            .as_ref()
+            .map_or_else(Vec::new, |membership| membership.enrichment_names.clone());
+        accepted_enrichment_outputs.sort();
+        accepted_enrichment_outputs.dedup();
         let summary = FrozenInputSummary {
             view_id: frozen.view_id.clone(),
             applied_revision: frozen.applied_revision,
@@ -502,6 +534,7 @@ impl NativeViewAdapter {
                     high_watermark: source.high_watermark,
                 })
                 .collect(),
+            accepted_enrichment_outputs,
         };
         Ok(FrozenInput {
             frozen,
@@ -786,6 +819,7 @@ fn visit_frozen_input(
     limits: FrozenInputLimits,
     cancel: &AtomicBool,
     source_context_for_empty_matches: bool,
+    precise_values: bool,
     visitor: &mut impl FnMut(FrozenInputBatch) -> Result<(), String>,
 ) -> Result<FrozenInputStats, FrozenInputError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -939,7 +973,7 @@ fn visit_frozen_input(
                         record,
                         &enriched.enriched_rows,
                         index,
-                        source_context_for_empty_matches,
+                        precise_values,
                         &enrichment_names,
                     )
                 })

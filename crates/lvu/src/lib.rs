@@ -28,15 +28,18 @@ pub use app::{
     CaptureTimePolicy, CaptureTimeRange, ColorRule, CorrelationRequest, CorrelationSourceChoice,
     DiscoveryItem, DiscoveryUiRequest, EnrichmentDefinition, EnrichmentStageId, FieldStatsRequest,
     Focus, InvestigationItem, InvestigationRequest, InvestigationStage, MAX_COLOR_RULES,
-    PathCompletionRequest, PersistentViewState, QueryCompletion, QueryConstraints, QueryFailure,
-    QueryPurpose, QueryRequest, RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest,
-    RecipeRequestMeta, RuleColor, SettingsContext, SettingsRequest, SettingsValues,
-    SourceAiPreview, SourceAiPreviewItem, SourceAiRequest, SourceAiStage, SourceControlRequest,
-    SourceItem, SourceKind, SourceLaunchRequest, StorageCategory, StorageEntry, StorageRequest,
-    StorageRequestKind, StorageSnapshot, TextConstraint, TimeBasis, ViewDialogMode,
-    ViewForkRequest, ViewItem, ViewMutationRequest, ViewRole, WholeViewStats,
+    PathCompletionRequest, PersistentUnion, PersistentUnionInput, PersistentViewState,
+    QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose, QueryRequest, RecipeConfig,
+    RecipeDialogMode, RecipeItem, RecipeRequest, RecipeRequestMeta, RuleColor, SettingsContext,
+    SettingsRequest, SettingsValues, SourceAiPreview, SourceAiPreviewItem, SourceAiRequest,
+    SourceAiStage, SourceControlRequest, SourceItem, SourceKind, SourceLaunchRequest,
+    StorageCategory, StorageEntry, StorageRequest, StorageRequestKind, StorageSnapshot,
+    TextConstraint, TimeBasis, ViewDialogMode, ViewForkRequest, ViewItem, ViewMutationRequest,
+    ViewRole, WholeViewStats,
 };
 pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
+pub use components::union::UnionDialogRequest;
+pub use components::union_dialog::{SharedKeyUnionOrigin, UnionOpen};
 pub use provider::{
     ContextPage, DisplayRow, FoldNormalisation, FoldRequest, FoldScopeRequest, FoldSummary,
     GapDirection, GapHit, RowId, RowPage, RowProvider, TimeBounds, ViewportRequest,

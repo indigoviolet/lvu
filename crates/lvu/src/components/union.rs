@@ -1,0 +1,331 @@
+//! Union dialog draft state: `view1 + view2` as one timestamp-ordered view.
+//!
+//! Ownership: union-views worktree. This file is std-only state plus the
+//! fence helper shared by the dialog and the application shell; the
+//! `Component` implementation (render/input/geometry) lives in
+//! `union_dialog.rs`, and shell registration (`components/mod.rs` slot,
+//! `LayerId`, palette) is listed under `PROPOSED HOOKS` until assigned.
+//!
+//! The dialog edits a DRAFT (the input list) while the ACCEPTED union —
+//! input view IDs fenced on their accepted revisions AND generations — keeps
+//! serving rows. Accepting records every input's current accepted state as
+//! the new fence baseline; an input that advances afterwards marks the union
+//! stale (refresh, not failure) and live appends re-merge on the new baseline.
+//! Rejecting a candidate preserves the entire last-good chain: accepted
+//! inputs, revisions and live refresh are untouched and the draft stays
+//! editable. Structural validation here (count, duplicates, self-reference)
+//! mirrors `lvu-view/src/union.rs`, which remains authoritative at execution
+//! time; this layer pre-validates so the dialog can explain a bad spec before
+//! submitting it.
+//!
+//! Deliberately dependency-light (std only): nothing here decides row
+//! membership or order — that is `lvu-view::union`'s job through Polars.
+//!
+//! The dialog, app fence/controller, native worker and additive persistence
+//! hooks are integrated. This module remains the single std-only draft and
+//! cycle-validation boundary; it does not acquire sources or evaluate rows.
+
+/// Dialog-side bound mirroring `lvu-view`'s `MAX_UNION_INPUTS`.
+///
+/// The execution layer re-checks; this bound only keeps the draft list itself
+/// bounded so the dialog never offers what submission must refuse.
+pub const MAX_UNION_DIALOG_INPUTS: usize = 8;
+
+/// Longest view identity the draft accepts, mirroring the execution bound.
+pub const MAX_UNION_DIALOG_VIEW_ID_BYTES: usize = 256;
+
+/// One accepted union input: the view ID plus the accepted revision AND
+/// generation the union was fenced on. Both fence the candidate: a revision
+/// move means new definitions, a generation move means the source restarted
+/// underneath the membership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnionInputRef {
+    pub view_id: String,
+    pub accepted_revision: u64,
+    pub applied_generation: u64,
+}
+
+/// The accepted union a view is serving: its own ID, the fenced inputs, and
+/// the union revision that published them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedUnion {
+    pub union_view_id: String,
+    pub inputs: Vec<UnionInputRef>,
+    pub revision: u64,
+}
+
+/// Draft state of the union dialog. Accepted state lives on the view (see
+/// module docs); this struct only carries what the dialog edits plus the last
+/// rejection, so reopening resumes the edit.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UnionDialog {
+    inputs: Vec<String>,
+    name: String,
+    error: Option<String>,
+    pending_generation: Option<u64>,
+}
+
+impl UnionDialog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Draft input IDs in the order the union merges them (ties break by
+    /// this order, so it is significant and persisted).
+    pub fn inputs(&self) -> &[String] {
+        &self.inputs
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+    }
+
+    /// The last rejection, if any. Kept beside the editable draft: the
+    /// accepted union (where one exists) is unaffected.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn pending_generation(&self) -> Option<u64> {
+        self.pending_generation
+    }
+
+    /// Add one input view to the draft. Rejects over-long IDs, duplicates and
+    /// anything past the dialog bound with an actionable message.
+    pub fn add_input(&mut self, view_id: impl Into<String>) -> Result<(), String> {
+        let view_id = view_id.into();
+        if view_id.is_empty() || view_id.len() > MAX_UNION_DIALOG_VIEW_ID_BYTES {
+            return Err(format!(
+                "view identity must be 1..={} bytes",
+                MAX_UNION_DIALOG_VIEW_ID_BYTES
+            ));
+        }
+        if self.inputs.contains(&view_id) {
+            return Err(format!("'{view_id}' is already an input of this union"));
+        }
+        if self.inputs.len() >= MAX_UNION_DIALOG_INPUTS {
+            return Err(format!(
+                "a union takes at most {MAX_UNION_DIALOG_INPUTS} input views"
+            ));
+        }
+        self.inputs.push(view_id);
+        self.error = None;
+        Ok(())
+    }
+
+    /// Remove one draft input. Removing the last input is allowed in the
+    /// draft; creation still requires at least two (see `validate_for_create`).
+    pub fn remove_input(&mut self, view_id: &str) -> bool {
+        let before = self.inputs.len();
+        self.inputs.retain(|id| id != view_id);
+        let removed = self.inputs.len() != before;
+        if removed {
+            self.error = None;
+        }
+        removed
+    }
+
+    /// Structural validation before submission: at least two inputs, within
+    /// the bound, no duplicates, and never the union view itself.
+    pub fn validate_for_create(&self, union_view_id: &str) -> Result<(), String> {
+        if self.inputs.len() < 2 {
+            return Err("a union needs at least two input views".into());
+        }
+        if self.inputs.len() > MAX_UNION_DIALOG_INPUTS {
+            return Err(format!(
+                "a union takes at most {MAX_UNION_DIALOG_INPUTS} input views"
+            ));
+        }
+        validate_union_ids(union_view_id, &self.inputs)
+    }
+
+    /// Cycle check against the stored dependency graph: a real depth-first
+    /// search reporting ANY cycle in the reachable subgraph with its path.
+    ///
+    /// `resolve` maps a union view ID to its own STORED input IDs (`None` for
+    /// ordinary views). No edge is truncated: a stored union declaring more
+    /// than the dialog bound fails closed. Bounded like the execution check;
+    /// corrupt graphs report rather than hanging the dialog.
+    pub fn validate_no_cycle(
+        &self,
+        union_view_id: &str,
+        resolve: impl Fn(&str) -> Option<Vec<String>>,
+    ) -> Result<(), String> {
+        const MAX_VISITED: usize = 64;
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum Mark {
+            Gray,
+            Black,
+        }
+        fn visit<F>(
+            node: &str,
+            resolve: &F,
+            marks: &mut std::collections::HashMap<String, Mark>,
+            stack: &mut Vec<String>,
+        ) -> Result<(), String>
+        where
+            F: Fn(&str) -> Option<Vec<String>>,
+        {
+            match marks.get(node) {
+                Some(Mark::Black) => return Ok(()),
+                Some(Mark::Gray) => {
+                    let start = stack.iter().position(|id| id == node).unwrap_or(0);
+                    let mut path = stack[start..].to_vec();
+                    path.push(node.to_owned());
+                    return Err(format!(
+                        "union inputs contain a cycle: {}",
+                        path.join(" -> ")
+                    ));
+                }
+                None => {}
+            }
+            if marks.len() >= MAX_VISITED {
+                return Err(format!(
+                    "dependency graph exceeds {MAX_VISITED} views; refusing the union"
+                ));
+            }
+            marks.insert(node.to_owned(), Mark::Gray);
+            stack.push(node.to_owned());
+            if let Some(inputs) = resolve(node) {
+                if inputs.len() > MAX_UNION_DIALOG_INPUTS {
+                    return Err(format!(
+                        "stored union '{node}' declares {} inputs, above the {} bound",
+                        inputs.len(),
+                        MAX_UNION_DIALOG_INPUTS
+                    ));
+                }
+                for input in &inputs {
+                    visit(input, resolve, marks, stack)?;
+                }
+            }
+            stack.pop();
+            marks.insert(node.to_owned(), Mark::Black);
+            Ok(())
+        }
+        let mut marks = std::collections::HashMap::new();
+        let mut stack = vec![union_view_id.to_owned()];
+        marks.insert(union_view_id.to_owned(), Mark::Gray);
+        for input in &self.inputs {
+            visit(input, &resolve, &mut marks, &mut stack)?;
+        }
+        Ok(())
+    }
+
+    /// Accept the draft into a fenced union description.
+    ///
+    /// `current_revision`/`current_generation` report each input's CURRENT
+    /// accepted state (`None` for an unknown/closed view). The returned value
+    /// records those as the fence baseline the execution layer publishes under;
+    /// any input that advances afterwards is a refresh, and any input that
+    /// vanished is a rejection that preserves the prior union.
+    pub fn accept(
+        &mut self,
+        union_view_id: &str,
+        revision: u64,
+        current_revision: impl Fn(&str) -> Option<u64>,
+        current_generation: impl Fn(&str) -> Option<u64>,
+    ) -> Result<AcceptedUnion, String> {
+        self.validate_for_create(union_view_id)?;
+        let inputs = fence_union_inputs(&self.inputs, current_revision, current_generation)
+            .inspect_err(|message| {
+                self.error = Some(message.clone());
+            })?;
+        self.error = None;
+        self.pending_generation = None;
+        Ok(AcceptedUnion {
+            union_view_id: union_view_id.to_owned(),
+            inputs,
+            revision,
+        })
+    }
+
+    /// Record a rejection without disturbing accepted state: the draft stays
+    /// editable and the caller keeps serving its prior union.
+    pub fn reject_candidate(&mut self, message: impl Into<String>) {
+        self.error = Some(message.into());
+        self.pending_generation = None;
+    }
+
+    /// Mark a submission in flight. A second submit while one is pending is a
+    /// no-op for the caller to refuse, not a second query.
+    pub fn mark_pending(&mut self, generation: u64) -> bool {
+        if self.pending_generation.is_some() {
+            return false;
+        }
+        self.pending_generation = Some(generation);
+        true
+    }
+
+    /// True when any fenced input has advanced past (or vanished from) the
+    /// revisions `accepted` published under — i.e. the union wants a refresh.
+    /// Generation moves count like revision moves: a restarted source is new
+    /// membership even at an old revision.
+    pub fn accepted_is_stale(
+        accepted: &AcceptedUnion,
+        current_revision: impl Fn(&str) -> Option<u64>,
+        current_generation: impl Fn(&str) -> Option<u64>,
+    ) -> bool {
+        accepted.inputs.iter().any(|input| {
+            current_revision(&input.view_id) != Some(input.accepted_revision)
+                || current_generation(&input.view_id) != Some(input.applied_generation)
+        })
+    }
+}
+
+/// Fence input view IDs on their current accepted state: the shared helper
+/// the dialog and the application shell both build candidates through, so
+/// creation-time and submit-time fencing cannot drift apart.
+pub fn fence_union_inputs(
+    inputs: &[String],
+    current_revision: impl Fn(&str) -> Option<u64>,
+    current_generation: impl Fn(&str) -> Option<u64>,
+) -> Result<Vec<UnionInputRef>, String> {
+    let mut fenced = Vec::with_capacity(inputs.len());
+    for view_id in inputs {
+        match (current_revision(view_id), current_generation(view_id)) {
+            (Some(accepted_revision), Some(applied_generation)) => fenced.push(UnionInputRef {
+                view_id: view_id.clone(),
+                accepted_revision,
+                applied_generation,
+            }),
+            _ => return Err(format!("input view '{view_id}' is unavailable")),
+        }
+    }
+    Ok(fenced)
+}
+
+/// What the union dialog asks the application shell to do. The shell owns
+/// view identities, revision fences and adapter submission; the dialog only
+/// carries the user's selection. The shell derives the name ("Union of A,
+/// B", renamable through the ordinary Rename flow).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnionDialogRequest {
+    /// Create a union view over these input view IDs. The shell fences
+    /// revisions, registers the view and submits the first candidate;
+    /// failures return through `rejected` with the draft intact.
+    Create {
+        inputs: Vec<String>,
+        shared_key: Option<super::union_dialog::SharedKeyUnionOrigin>,
+    },
+}
+
+/// Shared structural rule: no duplicates and never the union view itself.
+/// The count floor lives with the caller (`validate_for_create` here,
+/// `validate_union_spec` in `lvu-view`), because an empty draft is editable
+/// while an empty submission is not.
+fn validate_union_ids(union_view_id: &str, inputs: &[String]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::with_capacity(inputs.len());
+    for view_id in inputs {
+        if view_id == union_view_id {
+            return Err(format!("a union cannot contain itself ('{view_id}')"));
+        }
+        if !seen.insert(view_id) {
+            return Err(format!("'{view_id}' is listed twice"));
+        }
+    }
+    Ok(())
+}

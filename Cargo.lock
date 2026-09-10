@@ -1790,6 +1790,7 @@ dependencies = [
  "lvu-live",
  "lvu-query",
  "polars",
+ "ratatui",
  "regex",
  "serde",
  "serde_json",

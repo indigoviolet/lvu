@@ -66,6 +66,7 @@ pub enum CommandId {
     ViewClone,
     ViewRename,
     ViewSources,
+    UnionViews,
     Recipes,
     RecipeBrowse,
     RecipeSave,
@@ -161,6 +162,7 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::ViewClone,
     CommandId::ViewRename,
     CommandId::ViewSources,
+    CommandId::UnionViews,
     CommandId::Recipes,
     CommandId::RecipeBrowse,
     CommandId::RecipeSave,
@@ -1327,6 +1329,17 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
                 "what is applied",
             ],
             Action::Open(crate::component::Open::ViewSummary),
+            view_reason,
+        ),
+        command(
+            CommandId::UnionViews,
+            "Union views",
+            "Merge two or more views into one timestamp-ordered view",
+            "Views",
+            &["merge views", "combine", "union", "timestamp order"],
+            Action::Open(crate::component::Open::Union(
+                crate::components::union_dialog::UnionOpen::Plain,
+            )),
             view_reason,
         ),
         command(
