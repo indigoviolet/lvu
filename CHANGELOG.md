@@ -15,7 +15,8 @@ Prepared release; full acceptance and publication are pending.
   accepted inputs after restart.
 - Use accepted enrichment columns as shared keys across union inputs, including
   exact integers beyond floating-point precision. Raw same-name fields do not
-  acquire derived authority.
+  acquire derived authority. The selected key is pinned when the union is
+  created; later manual pin changes survive restart.
 - Classify rows by an enrichment column's exact value in ordinary and union
   views. Ordered rules retain first-match precedence and survive restart;
   raw-text rules remain an explicit convenience option.

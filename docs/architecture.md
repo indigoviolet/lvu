@@ -432,6 +432,9 @@ frozen membership; its output inventory comes from accepted compiled stages,
 including slash captures. A raw same-name field cannot supply authority. Native
 Polars evaluates the exact constraint, and only an accepted first publication
 installs the union and its key. Cancellation is generation-scoped.
+New shared-key union creation initializes a pin for that exact key column.
+Plain unions start without automatic pins. Restores use persisted presentation
+state, so later manual pins and unpins are not reset by the key constraint.
 
 The worker reserves shared memory before retaining row carriers, including
 lossy UTF-8 expansion. Publication rechecks input definition/data fences and
