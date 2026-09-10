@@ -123,27 +123,16 @@ def open_enrichment_and_save_step(app: PtyApp, expression: str, marker: str) -> 
 
 
 def open_rules_and_add_column_value(app: PtyApp, value: str) -> None:
-    # With accepted enrichment outputs present, Add starts a column rule:
-    # the caret lands in its Value field beside a Column chooser. Acceptance
-    # (enrich:on) and membership publication reach the dialog through
-    # different channels, so a freshly accepted chain can briefly read as
-    # output-free; an untouched legacy Add removes itself on Esc, making a
-    # bounded retry honest rather than a weaker assertion.
-    for attempt in range(6):
-        app.send(b"c")
-        app.wait_for("Colour rules")
-        app.send(b"\x1ba")
-        try:
-            app.wait_for("Value", timeout=4.0)
-            app.wait_for("Column", timeout=4.0)
-            break
-        except AssertionError:
-            app.send(b"\x1b")
-            app.wait_until(
-                lambda text: "Colour rules" not in text, "dialog closed"
-            )
-            if attempt == 5:
-                raise
+    # The step editor closes only after the adapter has published membership
+    # and the app has accepted its completion. Prove that exact publication
+    # here: Add must immediately bind the slash-derived output and expose its
+    # Value and Column controls. Retrying would hide a missing-inventory race
+    # by allowing a later refresh to repair it.
+    app.send(b"c")
+    app.wait_for("Colour rules")
+    app.send(b"\x1ba")
+    app.wait_for("Value", timeout=4.0)
+    app.wait_for("Column", timeout=4.0)
     app.send(value.encode())
     app.wait_for(value)
 
@@ -289,23 +278,18 @@ def column_story(app: PtyApp) -> None:
     )
     assert "Enriched" not in selected, f"unexpected fork yet\n{selected}"
     open_enrichment_and_save_step(app, "/(?P<severity>ERROR)/", "severity")
-    # Wait for the accepted chain itself (not merely served rows, which can
-    # still be the pre-enrichment membership while the new query runs), or
-    # the rules dialog would see no classifiable outputs. `enrich:on` is the
-    # status proof the chain is applied, on a fork or in place.
+    # Returning from the step editor is the accepted-completion event. At 80
+    # columns the status fitter intentionally drops the low-priority
+    # `enrich:on` segment to keep FOLLOW, the row range and the two help doors,
+    # so waiting for that elided text would time out after acceptance. The
+    # chooser below is stronger: it reads the adapter's published accepted
+    # output inventory and cannot succeed on the pre-enrichment membership.
     painted_ready = row_foreground(app, "ready eve", 1)
     plain_error = row_foreground(app, "ERROR eve", 1)
-    app.wait_until(
-        lambda text: "enrich:on" in text
-        and "raw view" not in text
-        and "ERROR eve" in text,
-        "the enrichment settled",
-        timeout=45.0,
-    )
     open_rules_and_add_column_value(app, "ERROR")
     app.send(b"\r")  # Apply
     app.wait_until(
-        lambda text: "Colour rules" not in text or "rule painting" in text,
+        lambda text: "Applied" in text and "2 rules painting this view" in text,
         "the column rule was applied",
         timeout=15.0,
     )
