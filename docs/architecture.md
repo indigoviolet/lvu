@@ -400,7 +400,33 @@ and no measured contrast guarantee. Fields opens for empty or unavailable data,
 freezes the selected record identity and permits raw-context inspection.
 
 
-### Field correlation across sources
+### Live unions and shared enrichment keys
+
+The working tree integrates live union views and shared-key filtering; UI and
+release acceptance are still pending. `components/union_dialog.rs` provides one
+checklist for selecting existing views. `lvu-app/union_controller.rs` and the
+composition root submit revision-fenced work to `lvu-view/union_worker.rs`.
+Inputs share their existing captures. Native query execution combines accepted
+frozen rows, keeps the first selected input for duplicate record identities,
+and orders surviving rows by accepted timestamp with missing times last.
+Equal times use input order and stable record identity. Ordinary text, advanced
+filters and grouping operate downstream of the union.
+
+Fields `r` opens that same checklist for a selected accepted enrichment output.
+`shared_key_workflow.rs` resolves the precise typed cell from the same fenced
+frozen membership; its output inventory comes from accepted compiled stages,
+including slash captures. A raw same-name field cannot supply authority. Native
+Polars evaluates the exact constraint, and only an accepted first publication
+installs the union and its key. Cancellation is generation-scoped.
+
+The worker reserves shared memory before retaining row carriers, including
+lossy UTF-8 expansion. Publication rechecks input definition/data fences and
+linearizes with raw source publication. Rejected candidates retain the accepted
+view. Transient failures retry with bounded backoff; terminal source-set drift
+remains rejected until the dependency changes. Stored union validation precedes
+restore mutation; role selections and ordinary grouping survive round trips.
+
+### Legacy field correlation compatibility
 
 `lvu-core/correlation.rs` owns the exact typed scalar, the single-field
 `ExactFieldConstraint` and `FieldCorrelation`, which maps *each source id* to
@@ -408,8 +434,7 @@ the field carrying one identity. Sources name the same identity differently, so
 the mapping is explicit and per source; a source absent from it contributes no
 records and its field name is never inferred from another source's.
 
-`r` in Fields freezes the selected record identity and hands it to the
-Correlation layer (`components/correlation.rs`), which queues a fenced
+The retained legacy Correlation layer (`components/correlation.rs`) queues a fenced
 `CorrelationRequest` and shows the lookup running in the frame the mapping
 will land in. `NativeViewAdapter::submit_correlation_lookup` runs one
 bounded, cancellable lookup on its own thread: a page-by-page scan for that

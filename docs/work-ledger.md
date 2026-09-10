@@ -2311,3 +2311,22 @@ Artifact manifest SHA256:
 Artifacts remain at build-volume `platform-validation-hosted-34428200565-attempt-1`.
 Prior failed runs and the superseded self-referencing local manifest remain
 preserved. No new release or human macOS/Windows runtime acceptance is claimed.
+
+
+## 2026-09-10 — live unions and shared keys integrated for acceptance
+
+Merged `3a32a6c641d8d0a5de31ddb7d78908af2b149c4f` as `044daeb`, preserving
+the accepted `2a636c0` baseline. Final bounded worker review found no remaining
+defect in transient retry, pre-retention memory charging, source publication
+or accepted shared-key authority. Independent persistence review passed
+transactional restore, role preservation and exact-key/grouping round trips.
+Reports remain in `sol-union-review-scratch/union-3a32a6c-final-bounded-review.md`
+and the review conversations.
+
+Owner validation passed the transactional restore test, all 15 union-worker
+tests and targeted clippy. Initial `606232a` worker-test compilation failed on
+a missing `FrozenInputLimits` import; `3a32a6c` changes only that test import.
+Both logs remain under `lvu-muse-union-logs/targeted-*-20260910.log` on the volume.
+Actual UI validation is still running; no release acceptance is claimed yet.
+Long-running test infrastructure work is paused and preserved at `581b780`
+while feature integration takes priority.
