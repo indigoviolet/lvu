@@ -1658,6 +1658,7 @@ dependencies = [
  "lvu-live",
  "lvu-memory",
  "lvu-query",
+ "lvu-shared",
  "lvu-view",
  "mimalloc",
  "serde",

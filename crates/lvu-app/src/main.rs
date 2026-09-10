@@ -7432,6 +7432,11 @@ async fn run() -> Result<(), String> {
         // The diagnostic lives beside the input handling it explains (§8.10).
         return lvu::keys::report();
     }
+    if let Some(child) = lvu_shared::parse_child_args(&arguments)? {
+        // Background capture worker: awaited on this runtime (never a
+        // nested one), exits with the worker's code without terminal setup.
+        std::process::exit(lvu_shared::run_child(child).await);
+    }
     let Some(options) = parse_args(arguments, std::io::stdin().is_terminal())? else {
         print_help();
         return Ok(());
