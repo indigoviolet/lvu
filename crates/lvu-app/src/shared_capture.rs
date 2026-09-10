@@ -95,6 +95,17 @@ impl SharedStore {
         })
     }
 
+    /// Wrap an existing attachment (tests, or wiring that attached
+    /// first and sessions later). The version map starts empty: bases
+    /// accrue from saves and loads on this session only.
+    pub fn from_client(client: WorkerClient) -> Self {
+        Self {
+            client,
+            bases: SaveBases::new(),
+            next_request: 1,
+        }
+    }
+
     fn take_request_id(&mut self) -> String {
         let id = format!("shared-{}", self.next_request);
         self.next_request += 1;
@@ -168,10 +179,11 @@ impl SharedStore {
         definition: SourceDefinition,
         view_id: ViewId,
     ) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
         let event = self
             .client
             .store(StoreMethod::Load {
-                request_id: self.take_request_id(),
+                request_id,
                 window_id: String::new(),
                 definition,
                 view_id,
@@ -209,10 +221,11 @@ impl SharedStore {
     /// peer, until a reconciled reload reseeds.
     pub async fn save_view(&mut self, request: &SaveRequest) -> Result<MemoryEvent, String> {
         let expected_version = self.bases.base_for(request.view_id);
+        let request_id = self.take_request_id();
         let event = self
             .client
             .store(StoreMethod::Save {
-                request_id: self.take_request_id(),
+                request_id,
                 window_id: String::new(),
                 sequence: request.sequence,
                 definition: request.definition.clone(),
@@ -227,6 +240,7 @@ impl SharedStore {
                 view_id,
                 sequence,
                 version,
+                ..
             } => {
                 self.bases.note_saved(view_id, version);
                 Ok(MemoryEvent::Saved(source_id, view_id, sequence))
@@ -256,10 +270,11 @@ impl SharedStore {
         &mut self,
         request: &SaveRequest,
     ) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
         let event = self
             .client
             .store(StoreMethod::CreateDerivedView {
-                request_id: self.take_request_id(),
+                request_id,
                 window_id: String::new(),
                 sequence: request.sequence,
                 definition: request.definition.clone(),
@@ -286,10 +301,11 @@ impl SharedStore {
 
     /// List recent sources through the worker.
     pub async fn recent_sources(&mut self) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
         let event = self
             .client
             .store(StoreMethod::Recent {
-                request_id: self.take_request_id(),
+                request_id,
                 window_id: String::new(),
             })
             .await?;
@@ -307,10 +323,11 @@ impl SharedStore {
         meta: &RecipeRequestMeta,
         context: &Option<SuggestionContext>,
     ) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
         let event = self
             .client
             .store(StoreMethod::ListRecipes {
-                request_id: self.take_request_id(),
+                request_id,
                 window_id: String::new(),
                 meta: wire_meta(meta),
                 context: context.as_ref().map(wire_context),
@@ -336,10 +353,11 @@ impl SharedStore {
         meta: &RecipeRequestMeta,
         id: lvu_core::RecipeId,
     ) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
         let event = self
             .client
             .store(StoreMethod::RecipeHistory {
-                request_id: self.take_request_id(),
+                request_id,
                 window_id: String::new(),
                 meta: wire_meta(meta),
                 recipe_id: id,
@@ -364,10 +382,11 @@ impl SharedStore {
         expected_revision: Option<uuid::Uuid>,
         context: &Option<SuggestionContext>,
     ) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
         let event = self
             .client
             .store(StoreMethod::SaveRecipe {
-                request_id: self.take_request_id(),
+                request_id,
                 window_id: String::new(),
                 meta: wire_meta(meta),
                 recipe,
@@ -392,10 +411,11 @@ impl SharedStore {
         meta: &RecipeRequestMeta,
         path: PathBuf,
     ) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
         let event = self
             .client
             .store(StoreMethod::ImportRecipe {
-                request_id: self.take_request_id(),
+                request_id,
                 window_id: String::new(),
                 meta: wire_meta(meta),
                 path,
@@ -420,10 +440,11 @@ impl SharedStore {
         revision: uuid::Uuid,
         path: PathBuf,
     ) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
         let event = self
             .client
             .store(StoreMethod::ExportRecipe {
-                request_id: self.take_request_id(),
+                request_id,
                 window_id: String::new(),
                 meta: wire_meta(meta),
                 recipe_id: recipe,
@@ -449,10 +470,11 @@ impl SharedStore {
         &mut self,
         outcome: &RecipeOutcome,
     ) -> Result<Option<MemoryEvent>, String> {
+        let request_id = self.take_request_id();
         let event = self
             .client
             .store(StoreMethod::RecordSuggestion {
-                request_id: self.take_request_id(),
+                request_id,
                 window_id: String::new(),
                 outcome: wire_outcome(outcome),
             })
@@ -507,4 +529,272 @@ fn wire_outcome(outcome: &RecipeOutcome) -> SuggestionOutcomeShape {
 fn unexpected_reply(method: &str, event: &StoreEvent) -> String {
     let _ = event;
     format!("shared store answered {method} with an unexpected reply shape")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use lvu_shared::{AdmissionHook, AdmissionVerdict, WorkerConfig, WorkerService};
+
+    struct AdmitAll;
+
+    impl AdmissionHook for AdmitAll {
+        fn admit(&self, _definition: &SourceDefinition) -> AdmissionVerdict {
+            AdmissionVerdict::Admit
+        }
+    }
+
+    fn test_definition(id: u128, path: &Path) -> SourceDefinition {
+        SourceDefinition {
+            schema_version: 1,
+            id: SourceId(uuid::Uuid::from_u128(id)),
+            name: format!("log-{id}"),
+            acquisition: lvu_core::Acquisition::File {
+                path: path.to_path_buf(),
+                follow: true,
+            },
+            identity_hints: Default::default(),
+            retention: None,
+        }
+    }
+
+    fn test_request(sequence: u64, definition: &SourceDefinition, view: ViewId) -> SaveRequest {
+        SaveRequest {
+            sequence,
+            definition: definition.clone(),
+            view_id: view,
+            state: lvu::PersistentViewState::default(),
+        }
+    }
+
+    /// One serving worker plus its socket: windows attach with distinct
+    /// viewer pids (the election refuses two takes of one slot).
+    struct Fixture {
+        capture_root: PathBuf,
+        socket: PathBuf,
+    }
+
+    async fn serving(root: &Path) -> Fixture {
+        let capture_root = root.join("captures");
+        let paths = lvu_shared::WorkerPaths::new(&capture_root);
+        paths.ensure_directories().unwrap();
+        let config = WorkerConfig {
+            capture_root: capture_root.clone(),
+            workspace_root: capture_root.join("workspace"),
+            socket_path: paths.socket_path(),
+            viewer_grace: Duration::from_millis(100),
+            request_timeout: Duration::from_secs(10),
+        };
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket_path()).unwrap();
+        tokio::spawn(async move {
+            service.serve(listener).await;
+        });
+        Fixture {
+            capture_root,
+            socket: paths.socket_path(),
+        }
+    }
+
+    async fn attach_window(fixture: &Fixture, window: &str, pid: u32) -> SharedStore {
+        let (client, _) =
+            WorkerClient::connect(&fixture.capture_root, &fixture.socket, window, pid)
+                .await
+                .expect("window attaches");
+        SharedStore::from_client(client)
+    }
+
+    #[tokio::test]
+    async fn load_seeds_base_then_save_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("v.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let fixture = serving(root.path()).await;
+        let mut window = attach_window(&fixture, "window-a", 6101).await;
+        let definition = test_definition(21, &log);
+        let view = ViewId(uuid::Uuid::from_u128(22));
+        // Fresh save inserts at version 0 with no base.
+        match window
+            .save_view(&test_request(1, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::Saved(_, _, sequence) => assert_eq!(sequence, 1),
+            other => panic!("expected saved, got {other:?}"),
+        }
+        // Reload reseeds the committed version as the base...
+        let views = match window
+            .load_views(definition.clone(), view)
+            .await
+            .expect("load answers")
+        {
+            MemoryEvent::Loaded(_, _, views) => views,
+            other => panic!("expected loaded, got {other:?}"),
+        };
+        assert!(views.iter().any(|loaded| loaded.id == view));
+        // ...so the next save carries truth and commits.
+        match window
+            .save_view(&test_request(2, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::Saved(_, _, sequence) => assert_eq!(sequence, 2),
+            other => panic!("expected saved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_then_save_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("v.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let fixture = serving(root.path()).await;
+        let mut window = attach_window(&fixture, "window-a", 6102).await;
+        let definition = test_definition(23, &log);
+        let view = ViewId(uuid::Uuid::from_u128(24));
+        match window
+            .create_derived_view(&test_request(1, &definition, view))
+            .await
+            .expect("create answers")
+        {
+            MemoryEvent::DerivedViewCreated(created, Ok(())) => assert_eq!(created, view),
+            other => panic!("expected created, got {other:?}"),
+        }
+        // The echoed version seeded the base: this save commits, it does
+        // not conflict-forever on a missing base.
+        match window
+            .save_view(&test_request(2, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::Saved(_, _, sequence) => assert_eq!(sequence, 2),
+            other => panic!("expected saved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn conflict_then_automatic_change_still_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("v.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let fixture = serving(root.path()).await;
+        let mut first = attach_window(&fixture, "window-a", 6103).await;
+        let mut second = attach_window(&fixture, "window-b", 6104).await;
+        let definition = test_definition(25, &log);
+        let view = ViewId(uuid::Uuid::from_u128(26));
+        // Window A commits version 0; window B loads (seeding its base)
+        // and wins version 1 against it.
+        match first
+            .save_view(&test_request(1, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::Saved(..) => {}
+            other => panic!("expected saved, got {other:?}"),
+        }
+        match second
+            .load_views(definition.clone(), view)
+            .await
+            .expect("load answers")
+        {
+            MemoryEvent::Loaded(..) => {}
+            other => panic!("expected loaded, got {other:?}"),
+        }
+        match second
+            .save_view(&test_request(1, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::Saved(..) => {}
+            other => panic!("expected saved, got {other:?}"),
+        }
+        // Window A's stale save loses with the conflict surfaced...
+        match first
+            .save_view(&test_request(2, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::SaveFailed(..) => {}
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        // ...and the automatic follow-up (same stale draft, new sequence,
+        // e.g. a bookmark tick) is refused AGAIN — the base never moved,
+        // so the peer is never overwritten.
+        match first
+            .save_view(&test_request(3, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::SaveFailed(..) => {}
+            other => panic!("expected repeated conflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn conflict_then_reload_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("v.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let fixture = serving(root.path()).await;
+        let mut first = attach_window(&fixture, "window-a", 6105).await;
+        let mut second = attach_window(&fixture, "window-b", 6106).await;
+        let definition = test_definition(27, &log);
+        let view = ViewId(uuid::Uuid::from_u128(28));
+        // Window A commits version 0; window B loads first (a baseless
+        // first save against A's row would conflict by design) and wins
+        // version 1.
+        match first
+            .save_view(&test_request(1, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::Saved(..) => {}
+            other => panic!("expected saved, got {other:?}"),
+        }
+        match second
+            .load_views(definition.clone(), view)
+            .await
+            .expect("load answers")
+        {
+            MemoryEvent::Loaded(..) => {}
+            other => panic!("expected loaded, got {other:?}"),
+        }
+        match second
+            .save_view(&test_request(1, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::Saved(..) => {}
+            other => panic!("expected saved, got {other:?}"),
+        }
+        // Window A loses against window B's version 1...
+        match first
+            .save_view(&test_request(2, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::SaveFailed(..) => {}
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        // ...reloads (reseeding the base to truth), merges, and converges.
+        match first
+            .load_views(definition.clone(), view)
+            .await
+            .expect("load answers")
+        {
+            MemoryEvent::Loaded(..) => {}
+            other => panic!("expected loaded, got {other:?}"),
+        }
+        match first
+            .save_view(&test_request(3, &definition, view))
+            .await
+            .expect("save answers")
+        {
+            MemoryEvent::Saved(..) => {}
+            other => panic!("expected recovery save, got {other:?}"),
+        }
+    }
 }

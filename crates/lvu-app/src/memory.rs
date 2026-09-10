@@ -75,6 +75,7 @@ enum Command {
     Flush(SyncSender<Result<(), String>>),
     Stop,
 }
+#[derive(Debug)]
 pub enum Event {
     Loaded(SourceId, ViewId, Vec<WorkingView>),
     LoadFailed(SourceId, ViewId, String),
