@@ -2259,10 +2259,13 @@ pub fn sweep_stale_window_indexes(artifact_dir: &Path) -> usize {
     };
     let start = std::time::Instant::now();
     let mut removed = 0usize;
-    for (scanned, entry) in entries.enumerate() {
-        if scanned >= SWEEP_ENTRY_CEILING || start.elapsed() >= SWEEP_TIME_CEILING {
-            break;
-        }
+    let mut scanned = 0usize;
+    for entry in entries {
+        // Our own control files are neither candidates nor scan budget:
+        // skipping them keeps the ceiling meaningful for real entries.
+        // (The ownership lock file is created by the guard acquisition
+        // above, so it is always present during a sweep; the budget name
+        // mirrors `index::BUDGET_FILE`.)
         let Ok(entry) = entry else {
             continue;
         };
@@ -2270,6 +2273,13 @@ pub fn sweep_stale_window_indexes(artifact_dir: &Path) -> usize {
         let Some(name) = name.to_str() else {
             continue;
         };
+        if name == ".lvu-index-ownership.lock" || name == ".lvu-index-budget" {
+            continue;
+        }
+        if scanned >= SWEEP_ENTRY_CEILING || start.elapsed() >= SWEEP_TIME_CEILING {
+            break;
+        }
+        scanned += 1;
         if !is_window_overflow_name(name) {
             continue;
         }

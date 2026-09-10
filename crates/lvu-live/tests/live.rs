@@ -1824,10 +1824,16 @@ fn sweep_serializes_with_creators_through_the_ownership_guard() {
         .open(dir.join(".lvu-index-ownership.lock"))
         .unwrap();
     guard.try_lock_exclusive().unwrap();
+    let start = std::time::Instant::now();
     assert_eq!(
         lvu_live::sweep_stale_window_indexes(&dir),
         0,
         "sweep must skip while a creator holds the ownership guard"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "skip must be bounded, not endless: {:?}",
+        start.elapsed()
     );
     assert!(dir.join(dead).exists(), "nothing removed under contention");
     drop(guard);
@@ -1866,4 +1872,85 @@ fn swept_pathname_recreates_cleanly_with_no_ghost() {
     reader.seek(SeekFrom::Start(0)).unwrap();
     reader.read_to_string(&mut back).unwrap();
     assert_eq!(back, "live-bytes");
+}
+
+#[test]
+fn sweep_never_removes_live_replacement_under_concurrent_traffic() {
+    // Synchronized sweeper/creator concurrency: a creator holds each live
+    // overflow file across a barrier rendezvous while the sweeper runs, so
+    // every sweep overlaps a live hold deterministically (no timing luck).
+    // Live replacements must survive every sweep; released files sweep.
+    use std::sync::{Arc, Barrier};
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("derived");
+    fs::create_dir_all(&dir).unwrap();
+    let dir = Arc::new(dir);
+    let barrier = Arc::new(Barrier::new(2));
+    let worker = {
+        let dir = Arc::clone(&dir);
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            for round in 0..10u32 {
+                let name = format!(
+                    "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-{}.rows.idx",
+                    500 + round
+                );
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(dir.join(&name))
+                    .unwrap();
+                file.try_lock_exclusive().unwrap();
+                barrier.wait();
+                barrier.wait();
+                drop(file);
+                fs::remove_file(dir.join(&name)).ok();
+            }
+        })
+    };
+    for _ in 0..10u32 {
+        barrier.wait();
+        lvu_live::sweep_stale_window_indexes(&dir);
+        barrier.wait();
+    }
+    worker.join().unwrap();
+    // After the traffic stops, nothing live remains and any residue sweeps.
+    let remaining: Vec<_> = fs::read_dir(dir.as_path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rows.idx"))
+        .collect();
+    assert!(
+        remaining.is_empty(),
+        "no residue after joined traffic: {remaining:?}"
+    );
+}
+
+#[test]
+fn sweep_scan_stops_at_the_entry_ceiling() {
+    // 5000 dead overflows: the sweep must stop at its fixed entry ceiling
+    // rather than scanning choosing a subset — exactly the ceiling count
+    // goes, the rest waits for a later launch.
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("derived");
+    fs::create_dir_all(&dir).unwrap();
+    for round in 0..5000u32 {
+        let name = format!(
+            "8a1ac925-d5e9-5c44-a112-f5e8d62858c8.18a07b39-8626-424d-9317-fcf37d8efc9f.window-{}.rows.idx",
+            10000 + round
+        );
+        fs::write(dir.join(name), b"x").unwrap();
+    }
+    let removed = lvu_live::sweep_stale_window_indexes(&dir);
+    assert_eq!(removed, 4096, "scan stops at the fixed entry ceiling");
+    let left: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rows.idx"))
+        .collect();
+    assert_eq!(left.len(), 5000 - 4096, "remainder waits for later");
 }
