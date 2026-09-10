@@ -15,6 +15,8 @@
 //! attach; handshakes and probes carry explicit deadlines. Queues refuse
 //! rather than grow; failures are explicit strings, never panics on I/O.
 
+pub mod child;
+pub mod client;
 pub mod election;
 pub mod frame;
 pub mod lifetime;
@@ -23,6 +25,11 @@ pub mod spawn;
 pub mod tail;
 pub mod worker;
 
+pub use child::{ChildArgs, parse_child_args, run_child_blocking};
+pub use client::{
+    CONTROL_ROUNDTRIP_TIMEOUT, STORE_ROUNDTRIP_TIMEOUT, StartOutcome, WorkerClient,
+    child_argv_tail, default_window_id, ensure_worker,
+};
 pub use election::{
     ElectionError, OwnerGuard, ViewerGuard, WorkerPaths, live_viewers, owner_is_live,
     try_take_owner,

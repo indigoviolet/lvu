@@ -61,8 +61,21 @@ pub const STATUS_INTERVAL: Duration = Duration::from_secs(2);
 /// Admission decision hook, implemented by the application with its real
 /// acquisition comparator (duplicate identity/acquisition detection). The
 /// worker never invents admission policy; it only enforces the verdict.
+/// `admit_known` additionally sees the worker's live definitions so a
+/// standalone child (which has no application process to ask) can refuse a
+/// second acquisition of the same capture; the default keeps the old
+/// behavior for hooks that carry their own live state.
 pub trait AdmissionHook: Send + Sync {
     fn admit(&self, definition: &SourceDefinition) -> AdmissionVerdict;
+
+    fn admit_known(
+        &self,
+        definition: &SourceDefinition,
+        live: &[SourceDefinition],
+    ) -> AdmissionVerdict {
+        let _ = live;
+        self.admit(definition)
+    }
 }
 
 /// Mirrors the application's admission outcomes without depending on it.
@@ -372,7 +385,11 @@ impl WorkerService {
         self: &Arc<Self>,
         definition: SourceDefinition,
     ) -> Result<StartedOutcome, String> {
-        match self.admission.admit(&definition) {
+        // Snapshot of live definitions for hooks that dedup against worker
+        // state (the standalone child); hooks carrying their own live state
+        // keep using `admit` through the default.
+        let live: Vec<SourceDefinition> = self.definitions.lock().await.values().cloned().collect();
+        match self.admission.admit_known(&definition, &live) {
             AdmissionVerdict::Refuse(reason) => Err(reason),
             AdmissionVerdict::Present { live_id } => Ok(StartedOutcome::Present { live_id }),
             AdmissionVerdict::Admit => self.start_admitted(definition).await,
