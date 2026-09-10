@@ -2,17 +2,18 @@
 
 Audit baseline: source `9fc7e5363d975c231b7f5d8fe1e16c3e249a7752`, 2026-09-09.
 This is an evidence map, not a claim that every packaged platform is supported.
-The published release evidence is for the immutable v0.1.3 source
-`8ca75d0074aa85964f5d493d88d1be3a48fcc0f4`; current-source rows say so when
-their dedicated hosted run is still pending.
+Published release evidence below retains the historical v0.1.3 checks.
+The latest dedicated hosted run is `34428200565`, which tested synthetic merge
+`5b3ac599eb27fd8db480049c37795cde8f5ce782` of reviewed candidate `9dff245`
+into `c8eda166` (the v0.1.5 runtime plus documentation and janitor changes).
 
 ## Evidence matrix
 
 | Boundary | Linux | Native macOS | Native Windows |
 | --- | --- | --- | --- |
-| Workspace compile | Accepted by the v0.1.3 release gate; current source also has Linux acceptance in the work ledger. | Hosted run 34423899078 compiled every target on both native architectures. | **Blocked in current source.** The first compiler boundary is `lvu-core/src/journal.rs`: Unix fd imports and metadata identity methods are not target-gated. Unix-only subprocess code in `lvu-query` and `lvu-command-enrich` remains latent behind that dependency failure. |
+| Workspace compile | Accepted by the v0.1.3 release gate; current source also has Linux acceptance in the work ledger. | Hosted run 34428200565 compiled every target on both native architectures. | **Blocked in current source.** The first compiler boundary is `lvu-core/src/journal.rs`: Unix fd imports and metadata identity methods are not target-gated. Unix-only subprocess code in `lvu-query` and `lvu-command-enrich` remains latent behind that dependency failure. |
 | Packaged/install-tree startup | v0.1.3 archive and installed archive passed executable/resource/helper checks and PTY acceptance. | Both v0.1.3 archives executed `packaging/stage.sh` on native hosted runners, including resource lookup and a real helper compile. No actual Homebrew or mise install was run on a Mac. | No archive or install exists because the workspace does not compile. |
-| File capture and terminal cleanup | Full Linux PTY evidence is recorded in `docs/work-ledger.md`. | Source uses the same `/dev/tty`, termios and Unix process-group paths. Current-source native kernel-PTY evidence is **pending** the dedicated workflow. This is not Terminal.app or iTerm2 evidence. | No evidence. Crossterm would use its separate Windows console backend; the Unix PTY harness is not equivalent to ConPTY. |
+| File capture and terminal cleanup | Full Linux PTY evidence is recorded in `docs/work-ledger.md`. | Source uses the same `/dev/tty`, termios and Unix process-group paths. Run 34428200565 passed arm64 kernel-PTY file capture, Ctrl-C restoration, orderly command cleanup and injected-failure cleanup. This is not Intel runtime, Terminal.app or iTerm2 evidence. | No evidence. Crossterm would use its separate Windows console backend; the Unix PTY harness is not equivalent to ConPTY. |
 | Command process cleanup | Orderly stop/quit and Linux parent-death cleanup are tested. | Unix process-group cleanup exists for orderly stop/quit. Darwin has no Linux `PR_SET_PDEATHSIG` equivalent here, so `SIGKILL` can orphan the owned command tree. | Immediate-child kill exists behind Tokio, but process-group helpers are no-ops. Descendant cleanup is not implemented; Job Objects are required before command capture can be supported. |
 | Piped stdin while keyboard remains interactive | Supported and covered by the Linux PTY suite. | Explicitly returns `Unsupported` for a FIFO because reopening `/proc/self/fd/0` is Linux-only. The dedicated harness treats this exact diagnostic as a known limitation. | Explicitly returns `stdin capture is not yet supported on this platform`; the app cannot currently compile far enough to exercise it. |
 | Derived-index cleanup | Linux handle-relative enumeration and exchange/unlink are implemented and tested. | Enumeration and reviewed exchange/unlink return `Unsupported`; ordinary raw capture remains durable, but storage cleanup is unavailable. | Handle-relative open is unsupported, and non-Unix identity fallbacks are not sufficient for safe cleanup. |
@@ -36,6 +37,30 @@ array expansion under `set -u`; no arm64 install-tree or runtime result may be
 claimed from that run. Windows stopped first in `lvu-core/src/journal.rs`; its
 artifact records seven exact Unix-fd/metadata diagnostics and is blocker
 evidence, not Windows support.
+
+## Final hosted result
+
+Run [34428200565](https://github.com/indigoviolet/lvu/actions/runs/34428200565),
+attempt 1, passed. Its PR head is `9dff245ddcf0c217116b168fe7262eb47c65bb2e`;
+Actions executed the synthetic merge named above. Both Darwin all-target
+compiles passed. Arm64 also passed development install-tree staging, bundled
+helper/bridge resource lookup, file capture, terminal restoration and orderly
+command cleanup. Normal and deliberately injected-failure paths each recorded
+two owned processes and zero survivors. The injected record correctly reports
+`accepted: false`; the ordinary record reports `accepted: true`. Intel runtime
+was intentionally skipped. Windows reproduced the exact known compiler blockers
+and remains unsupported.
+
+The arm64 runtime binary SHA256 is
+`57bff924a16028d3226f857b5415ba256fbd7db893a7b876c99f13ace8f24b8a`.
+The retained 14-file artifact manifest SHA256 is
+`02ecf666e826a50807a12aecd9285ebbdb39b59e0c4b343544fa246668458ebb`,
+under build-volume `platform-validation-hosted-34428200565-attempt-1`.
+Independent review verified every extracted file against its ZIP member, source
+and binary bindings, verdict polarity and process cleanup. The earlier packaging
+and post-exit PTY-observation failures remain preserved as superseded evidence.
+Human terminal-emulator checks and the implementation limitations below remain
+open; this result does not claim broad platform support.
 
 ## Dedicated hosted workflow
 

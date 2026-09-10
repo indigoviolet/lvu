@@ -1,9 +1,12 @@
 # macOS acceptance test plan
 
-For an agent or a person with no prior knowledge of lvu, on macOS. No lvu
-binary has ever been run on a Mac by a human; CI proves only that the archive
-starts, resolves its payload and compiles a Polars expression. Everything below
-is therefore unverified on this platform, and a failure here is news.
+For an agent or a person with no prior knowledge of lvu, on macOS. No
+human acceptance has been recorded on a Mac. Hosted arm64 CI now also covers
+file capture, kernel-PTY terminal restoration and orderly process cleanup; see
+[platform evidence](platform-validation.md). The human terminal-emulator checks
+below remain unverified. This checklist retains its historical v0.1.0-specific
+steps; record the actual installed version and do not treat those older labels
+as current release evidence.
 
 **Build under test: `v0.1.0` from the tap.** Steps marked *(post-0.1.0)* need a
 build from `main` and must be skipped otherwise; each says what 0.1.0 does

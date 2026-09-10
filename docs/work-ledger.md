@@ -2289,3 +2289,25 @@ Free space increased by 3,933,835,264 bytes; `mise run disk:check` passed with
 `b939daca706dc272e7346b4346390d2cfa2b487d803b44d5a97363591f55689b`.
 This cleanup preserves the unresolved methodology evidence; it does not prove
 the cause of the earlier throughput variability.
+
+
+## 2026-09-10 — native platform validation integrated
+
+Merged reviewed candidate `9dff245ddcf0c217116b168fe7262eb47c65bb2e` after
+hosted run 34428200565 attempt 1 passed. Actions executed synthetic merge
+`5b3ac599eb27fd8db480049c37795cde8f5ce782`, whose parents bind the existing
+`c8eda166` baseline and exact candidate. Arm64 Darwin passed all-target compile,
+portable staging, installed resources, kernel PTY, terminal restoration, orderly
+and injected-failure cleanup. Intel Darwin passed compile only; Windows passed
+its exact known-blocker characterization and remains unsupported.
+
+Primary rechecked all 14 retained manifest entries. Independent review also
+compared extracted bytes against original ZIP members and verified source,
+binary, verdict and owned-process bindings. Review SHA256:
+`d814b0b7c282d4a91e11753b7ba0c5c907444e02cce78ea060eb5172feaa98b0`
+(`sol-runtime-review-scratch/platform-validation-9dff245-hosted-final-evidence-review.md`).
+Artifact manifest SHA256:
+`02ecf666e826a50807a12aecd9285ebbdb39b59e0c4b343544fa246668458ebb`.
+Artifacts remain at build-volume `platform-validation-hosted-34428200565-attempt-1`.
+Prior failed runs and the superseded self-referencing local manifest remain
+preserved. No new release or human macOS/Windows runtime acceptance is claimed.
