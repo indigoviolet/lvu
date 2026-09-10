@@ -2763,3 +2763,30 @@ in `supervisor-disk-audit-20260910/`: `retire-2a636c02-proof.jsonl`,
 `retire-8ca75d00-proof.jsonl` and `retire-accepted.py`. The executor exited zero,
 and documentation whitespace checks passed. No product build/test was run by
 this cleanup.
+
+
+### Shared-capture review disposition — 2026-09-10
+
+Independent Sol review narrowly clears failure-tracking delta `31b6158` against
+its capture baseline `12623d3`. Failed view/recipe saves remain authoritative
+after events are consumed, matching successful recovery clears only the
+appropriate state, and Flush preserves recipe-first failure priority. Three
+new test functions exist; 27 memory tests passed. The zero-match autosave filter
+is excluded. The retained gate exited 101 on two controller-context lints;
+source clearance does not accept the integrated controller. The controller owner
+is authorized to apply only this delta, never its baseline or context overlays.
+
+Controller ancestry `44aff3f → f20a436 → e401aa5 → fb7304b` remains unaccepted.
+Review found startup acquisition still local, stop queue failure ignored, detach
+results discarded and the thread unjoined. Repairs are assigned. Its final log
+records 94/17/3 passing counts but omits source/command binding; it is not
+independent evidence of exact-commit or workspace-wide clippy acceptance.
+
+Window candidate `ae31b72` is also held: required shared exports/accessors were
+temporary validation context absent from its committed dependency tree. Its
+receipt loop lacks an overall deadline, and digest completeness depends on
+constructor invariants. No reachable digest collision was found. Receipt and
+final-install fencing passed static inspection; tests used an in-process
+transport. The owner is repairing wait bounds and digest coupling, while shared
+API owners coordinate checked-in prerequisites. Real worker RPC and application
+acceptance remain required. No product changes were integrated by this update.
