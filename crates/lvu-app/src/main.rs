@@ -8877,7 +8877,7 @@ fn help_text() -> String {
          --resources         Report resolved helper/bridge resources and exit\n\n\
          With no sources, the terminal opens an Add source dialog. Tab completes file\n\
          paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery; Ctrl-A asks agent for a reviewed source definition.\n\
-         With sources, / opens literal search, p advanced Polars, e enrichment,
+         With sources, / opens Filter; Alt-A selects Advanced, e opens enrichment,
          A opens definition Ask agent, I opens a snapshot investigation, and v manages views."
     )
 }

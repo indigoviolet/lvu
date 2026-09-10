@@ -2676,3 +2676,9 @@ release the probe before settlement, and retain the real guards until after
 settlement. This append proof does not cover all lifecycle races. Window-side
 commitment and final membership fencing are assigned independently; neither
 module tests nor this hook constitute remote-union app acceptance.
+
+The post-v0.1.6 source help now directs users to `/` and the Filter dialog's
+Alt-A Advanced tab instead of the retired `p` shortcut. This is a help-text-only
+correction for the next release; the immutable v0.1.6 help remains historical.
+No key binding or execution path changed. Formatting and whitespace checks
+passed; no build or PTY was needed for this string-only edit.
