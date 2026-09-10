@@ -2840,3 +2840,35 @@ to the hook owner. Exact four-record observation, real WouldBlock contention,
 guards held through settlement, bounded waits and default-off feature/export
 wiring otherwise passed static review. The retained gate has 21 passing tests
 but lacks self-contained command/commit binding; it does not cover this race.
+
+
+### Further delegated retirement and cache budget — 2026-09-10
+
+Agent a536 reports six further exclusively assigned targets retired: w22,
+unionviews, primary target, release18ac, integrationdc483 and release0e9.
+Executor exited zero; held locks and fresh privileged scans were clean, and
+named investigation/test-failure binaries were preserved with matching hashes.
+Reported gain is 29,009,895,424 bytes (27.018 GiB); a536's fourteen-target total
+is 46,646,763,520 bytes (43.443 GiB). Including the earlier primary release
+cleanup, cumulative reported reclamation is about 54.9 GiB. Proof:
+`primary-astra-scratch/retire-remaining-exclusive-20260910-proof.jsonl`.
+Primary records this delegated evidence without repeating the file/process
+checks. The current release697 target awaits explicit disk-agent handoff.
+
+The primary changed the repo-pinned compiler-cache cap from 10G to 3G to limit
+retained rebuild acceleration overhead. Disk agent765 owns the wrapper-based
+server restart and cache reduction under the validation lock after verifying
+no active compiler; neither restart nor eviction is yet claimed complete.
+No global tool setting changed, and no runtime code was modified.
+
+Agent a536 then reports release697 compiler-bulk retirement after explicit
+exclusive handoff from disk agent765. Only debug/deps, debug/build and
+debug/.fingerprint were removed. Original accepted record checks and both
+accepted binary hashes matched before/after; versions/latest remained v0.1.6.
+Executor exit zero and net gain 4,504,977,408 bytes are reported in
+`primary-astra-scratch/retire-release697-20260910-proof.jsonl`. Its cumulative
+fifteen-target retirement is 51,151,740,928 bytes. Reported lvu-build allocated
+size is now 28,881,498,112 bytes (26.9 GiB); volume free space is about 63 GiB.
+This agent's execution assignment is complete. Cache and remaining viewport
+retirement belong exclusively to765; primary has not repeated this pass's
+file/process checks.
