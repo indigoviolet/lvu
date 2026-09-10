@@ -2240,3 +2240,24 @@ Named zones are now published. The full 512 MiB volume soak remains unaccepted;
 union/shared keys, colour classification, shared capture and platform runtime
 acceptance remain separate unfinished work. No broader performance, durability,
 or platform-support milestone is claimed here.
+
+
+## 2026-09-10 — custom target ownership cleanup guard integrated
+
+Integrated reviewed `4d6a8e84ec9dfacba3ab5f1780c7aaf7ee4cb168` as
+`fa4c69d`. The janitor no longer infers a vanished owner from a custom target
+name alone. Bounded Cargo dep-info evidence identifies a unique owner; unknown,
+malformed, conflicting or exhausted evidence retains the target. Lazy scoped
+scandir enumeration consumes no entry beyond its aggregate cap. Conventional
+existing-worktree policy and uniquely evidenced vanished-owner cleanup remain.
+
+The active `lvu-muse-colour-target` exposed the original false positive. Its
+Cargo paths contain parent components, which the deliberately strict parser
+treats as unknown; retention is the intended outcome. Primary verified the
+review and evidence hashes and reran all 14 focused Python tests successfully.
+Review: `sol-runtime-review-scratch/janitor-target-ownership-4d6a8e8-review.md`
+on the build volume, SHA256
+`13dd6bb23d901a3a98942abb16ed18fd35c6919e3e55e521d07bffadeda59c8a`.
+Owner validation SHA256:
+`ee8ad8cc6fc590ea99a1ac2782a5b6ebb7f0456b26e5811f91bd0072918a7459`.
+No Cargo build or cleanup is claimed by this integration.
