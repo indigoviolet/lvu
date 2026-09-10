@@ -55,8 +55,8 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/crates/lvu-app/Cargo.t
 [ -n "$out" ] || out="$repo_root/target/packaging"
 
 case "$profile" in
-    release) cargo_profile_args=(--release); profile_dir="release" ;;
-    dev|debug) cargo_profile_args=(); profile_dir="debug" ;;
+    release) set -- --release; profile_dir="release" ;;
+    dev|debug) set --; profile_dir="debug" ;;
     *) echo "stage.sh: unsupported profile $profile" >&2; exit 2 ;;
 esac
 
@@ -69,7 +69,7 @@ echo "==> building lvu-app ($profile) for $target" >&2
 # The triple is passed to cargo rather than used only as a filename, so an
 # archive cannot be named for a platform it was not built for. Cargo puts an
 # explicitly targeted artifact under <target-dir>/<triple>/<profile>/.
-run cargo build -p lvu-app --locked --target "$target" "${cargo_profile_args[@]}"
+run cargo build -p lvu-app --locked --target "$target" "$@"
 # The workspace target directory can be shared with other checkouts, so the
 # freshly linked artifact is copied immediately rather than referenced later.
 binary="${CARGO_TARGET_DIR:-$repo_root/target}/$target/$profile_dir/lvu-app"
