@@ -26,15 +26,16 @@
 //! wiring, never dead design.
 #![allow(dead_code)]
 //!
-//! Version tracking mirrors the local worker thread's `versions` map: the
-//! last committed version per view travels as the next save's base, and a
-//! conflict teaches the winner's version (see `note_saved` / `note_failed`).
-//! One deliberate difference from local: local never learns on failure, but
-//! there a conflict means a foreign process touched the database behind its
-//! back; here the winner is a live peer whose version is truth, and holding
-//! a stale base would brick the view's persistence with no recovery path.
-//! The UX contract is unchanged either way: the failure surfaces as a
-//! conflict and only an explicit user rebase retries.
+//! Version tracking mirrors the local worker thread's `versions` map via
+//! [`SaveBases`](lvu_shared::SaveBases): the last committed version per
+//! view travels as the next save's base, loads reseed every returned view,
+//! derived creation seeds the echoed version, and a conflict keeps the
+//! last-success base (never adopts the peer's). Recovery is reload (which
+//! reseeds to truth) plus an explicit user merge — the merge UX itself is
+//! controller work at the cutover and is NOT claimed to exist here; what
+//! exists is the mechanism that makes it converge instead of conflicting
+//! forever, plus the guarantee that automatic saves after a conflict keep
+//! failing loudly rather than overwriting the peer.
 //!
 //! Flush needs no failure memory here, unlike the local worker thread: local
 //! saves are fire-and-forget (failures surface later via poll, so flush must
@@ -47,14 +48,13 @@
 //! client exists, so a remote stdin start is refused explicitly rather than
 //! hung) and HTTP stays refused, mirroring the runtime's supported set.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use lvu::{RecipeRequestMeta, app::RecipeOutcome};
 use lvu_core::{SourceDefinition, SourceId, ViewId};
 use lvu_shared::{
-    StartOutcome, StoreEvent, StoreMethod, SuggestionContextShape, SuggestionOutcomeShape,
-    WorkerClient,
+    SaveBases, StartOutcome, StoreEvent, StoreMethod, SuggestionContextShape,
+    SuggestionOutcomeShape, WorkerClient,
 };
 
 use crate::memory::{Event as MemoryEvent, SaveRequest, SuggestionContext};
@@ -69,11 +69,10 @@ pub struct RemoteSource {
 }
 
 /// One window's shared session: the worker connection plus the
-/// last-committed version per view (the compare-and-swap base, mirroring
-/// the local worker thread's `versions` map).
+/// compare-and-swap bases (see [`SaveBases`]).
 pub struct SharedStore {
     client: WorkerClient,
-    versions: HashMap<ViewId, u64>,
+    bases: SaveBases,
     next_request: u64,
 }
 
@@ -91,7 +90,7 @@ impl SharedStore {
             WorkerClient::attach(executable, capture_root, window_id, std::process::id()).await?;
         Ok(Self {
             client,
-            versions: HashMap::new(),
+            bases: SaveBases::new(),
             next_request: 1,
         })
     }
@@ -100,21 +99,6 @@ impl SharedStore {
         let id = format!("shared-{}", self.next_request);
         self.next_request += 1;
         id
-    }
-
-    /// Record a commit: the next save for this view carries it as base.
-    fn note_saved(&mut self, view_id: ViewId, version: u64) {
-        self.versions.insert(view_id, version);
-    }
-
-    /// Record a conflict loss: the winner's version becomes the base, so a
-    /// later save after an explicit user rebase can converge instead of
-    /// conflicting forever. The failure itself still surfaces to the
-    /// caller; learning the base never acks unwritten state.
-    fn note_failed(&mut self, view_id: ViewId, current_version: Option<u64>) {
-        if let Some(version) = current_version {
-            self.versions.insert(view_id, version);
-        }
     }
 
     /// Explicit user-approved acquisition through the worker. The definition
@@ -199,7 +183,13 @@ impl SharedStore {
                 view_id,
                 views,
                 ..
-            } => Ok(MemoryEvent::Loaded(source_id, view_id, views)),
+            } => {
+                // Mirror local load: every returned view's persisted version
+                // becomes its base, so the next save carries truth instead
+                // of None-against-an-existing-row.
+                self.bases.seed_from_loaded(&views);
+                Ok(MemoryEvent::Loaded(source_id, view_id, views))
+            }
             StoreEvent::LoadFailed {
                 source_id,
                 view_id,
@@ -214,8 +204,11 @@ impl SharedStore {
     /// none for a view never saved this session) travels as the
     /// compare-and-swap base; the reply updates it. The echoed sequence —
     /// not a version — is what the app correlates on, exactly like local.
+    /// A conflict keeps the last-success base (see [`SaveBases`]): the
+    /// automatic follow-up save is refused again, never overwriting the
+    /// peer, until a reconciled reload reseeds.
     pub async fn save_view(&mut self, request: &SaveRequest) -> Result<MemoryEvent, String> {
-        let expected_version = self.versions.get(&request.view_id).copied();
+        let expected_version = self.bases.base_for(request.view_id);
         let event = self
             .client
             .store(StoreMethod::Save {
@@ -235,7 +228,7 @@ impl SharedStore {
                 sequence,
                 version,
             } => {
-                self.note_saved(view_id, version);
+                self.bases.note_saved(view_id, version);
                 Ok(MemoryEvent::Saved(source_id, view_id, sequence))
             }
             StoreEvent::SaveFailed {
@@ -243,9 +236,9 @@ impl SharedStore {
                 view_id,
                 sequence,
                 reason,
-                current_version,
+                ..
             } => {
-                self.note_failed(view_id, current_version);
+                self.bases.note_failed(view_id);
                 Ok(MemoryEvent::SaveFailed(
                     source_id, view_id, sequence, reason,
                 ))
@@ -255,7 +248,10 @@ impl SharedStore {
     }
 
     /// Persist a derived view before it is shown, mirroring the local reply
-    /// contract: only success may make the view visible.
+    /// contract: only success may make the view visible. The worker answers
+    /// a create with `Saved` carrying the version read back post-commit
+    /// (there is no separate create event on the wire); that echoed version
+    /// seeds the base, mirroring local create seeding version 0.
     pub async fn create_derived_view(
         &mut self,
         request: &SaveRequest,
@@ -272,9 +268,18 @@ impl SharedStore {
             })
             .await?;
         match event {
-            StoreEvent::DerivedViewCreated { view_id, error, .. } => Ok(
-                MemoryEvent::DerivedViewCreated(view_id, error.map_or(Ok(()), Err)),
-            ),
+            StoreEvent::Saved {
+                view_id, version, ..
+            } => {
+                self.bases.seed_created(view_id, version);
+                Ok(MemoryEvent::DerivedViewCreated(view_id, Ok(())))
+            }
+            StoreEvent::SaveFailed {
+                view_id, reason, ..
+            } => {
+                self.bases.note_failed(view_id);
+                Ok(MemoryEvent::DerivedViewCreated(view_id, Err(reason)))
+            }
             unexpected => Err(unexpected_reply("create-derived-view", &unexpected)),
         }
     }
