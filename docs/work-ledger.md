@@ -2531,3 +2531,10 @@ and independent review remain pending; the amended source needs a full gate.
 The compiler cache cap is now 10 GiB to reserve that next target without
 deleting retained binaries or proof. Its lock-coordinated restart is logged in
 `primary-astra-scratch/sccache-10g-08fcfc4e9fd34a768f1d6ad3a739431d.log`.
+The server initialized eviction lazily on its first cacheable compile. A tiny
+maintenance-only library compile confirmed both cache size and cap at 10 GiB,
+leaving 10,828,181,504 bytes free. Evidence:
+`primary-astra-scratch/cache-cap-init-e514c9eaf4c14716934617354be75cb4/maintenance.log`.
+This was cache maintenance, not product validation. Integrated app Clippy with
+warnings denied passed separately in
+`primary-astra-scratch/autopin-integrated-clippy-3fe45c8f3b3b4f348acc873b8a1f0c48.log`.
