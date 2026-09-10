@@ -213,7 +213,9 @@ async fn setup(
     let view = ViewConfig::new(root.path().join("view-index"));
     let adapter =
         NativeViewAdapter::with_raw_rows(Arc::clone(&raw) as Arc<dyn RawRowSource>, view).unwrap();
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(handle.clone())).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();

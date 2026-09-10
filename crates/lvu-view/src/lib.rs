@@ -33,7 +33,6 @@ use lvu::{
     terminal::QueryDispatcher,
 };
 use lvu_core::SourceId;
-use lvu_shared::AnySourceHandle;
 use lvu_live::{IndexState, LiveRowProvider, SourceViewStatus};
 use lvu_query::{
     BatchQuery, BatchValidity, CompiledEnrichment, CompilerHost, CompilerHostConfig, DerivedState,
@@ -42,6 +41,7 @@ use lvu_query::{
     compile_enrichment_chain, exact_key_flags, execute_batch_with_exact_constraint, non_null_flags,
     parse_regex_enrichment, records_to_batch_with_context_and_exact_field, scalar_projection,
 };
+use lvu_shared::AnySourceHandle;
 use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},

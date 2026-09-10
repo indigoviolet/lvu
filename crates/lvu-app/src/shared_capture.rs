@@ -42,10 +42,13 @@
 //! forever, plus the guarantee that automatic saves after a conflict keep
 //! failing loudly rather than overwriting the peer.
 //!
-//! Flush needs no failure memory here, unlike the local worker thread: local
-//! saves are fire-and-forget (failures surface later via poll, so flush must
-//! remember them), while every remote save answers synchronously — every
-//! failure is already in the caller's hands before flush runs.
+//! Flush honesty lives in the worker thread, not here: direct
+//! `SharedStore` calls answer synchronously (every failure is already in
+//! the caller's hands), but the `SharedMemory` shim submits
+//! fire-and-forget exactly like the local worker — so the shared worker
+//! thread tracks per-view failures and the recipe failure, clearing on
+//! matching success, and `Flush` consults them before acknowledging
+//! durability. A failed shutdown can never report clean.
 //!
 //! Status: spawn/attach/control/save/drain transport is complete. Session
 //! consumption (`StartedSource` abstraction, controller cutover) waits for
@@ -59,13 +62,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lvu::{RecipeRequestMeta, app::RecipeOutcome};
-use lvu_core::{SourceDefinition, SourceId, ViewId};
+use lvu_core::{Acquisition, SourceDefinition, SourceId, ViewId};
 use lvu_shared::{
     SaveBases, StartOutcome, StoreEvent, StoreMethod, SuggestionContextShape,
     SuggestionOutcomeShape, WorkerClient,
 };
 
 use crate::memory::{Event as MemoryEvent, SaveRequest, SuggestionContext};
+
+/// Routing predicate for acquisition: a definition goes through the
+/// worker exactly when a shared session exists and the acquisition is
+/// not stdin. Stdin pipes belong to the launching window (no chunk
+/// driving exists), so they always stay local; everything else follows
+/// the session. Pure and unit-tested: every start/stop/restart call site
+/// branches on this, never on inline matches that could drift apart.
+pub fn worker_route(session_present: bool, definition: &SourceDefinition) -> bool {
+    session_present && !matches!(definition.acquisition, Acquisition::Stdin)
+}
 
 /// A worker-owned capture, ready for adapter input: the identity the worker
 /// enforces plus the journal path it derived (windows never hardcode the
@@ -846,6 +859,42 @@ mod tests {
             view_id: view,
             state: lvu::PersistentViewState::default(),
         }
+    }
+
+    /// The routing predicate is the single branch every start/stop/restart
+    /// call site shares: no session means local, stdin always stays local
+    /// (no chunk-driving client exists), everything else follows the
+    /// session. Command stands in for the non-file remote-capable kinds.
+    #[test]
+    fn worker_route_without_session_is_always_local() {
+        let dir = std::env::temp_dir();
+        let file = test_definition(1, &dir.join("route-file.log"));
+        let mut stdin = file.clone();
+        stdin.acquisition = lvu_core::Acquisition::Stdin;
+        assert!(!worker_route(false, &file));
+        assert!(!worker_route(false, &stdin));
+    }
+
+    #[test]
+    fn worker_route_with_session_excludes_only_stdin() {
+        let dir = std::env::temp_dir();
+        let file = test_definition(2, &dir.join("route-file.log"));
+        let mut stdin = file.clone();
+        stdin.acquisition = lvu_core::Acquisition::Stdin;
+        let mut command = file.clone();
+        command.acquisition = lvu_core::Acquisition::Command {
+            command: lvu_core::CommandDefinition {
+                program: lvu_core::CommandProgram::Shell {
+                    text: "tail -F route.log".to_owned(),
+                },
+                cwd: None,
+                environment: Default::default(),
+                restart: Default::default(),
+            },
+        };
+        assert!(worker_route(true, &file));
+        assert!(worker_route(true, &command));
+        assert!(!worker_route(true, &stdin));
     }
 
     /// One serving worker plus its socket: windows attach with distinct

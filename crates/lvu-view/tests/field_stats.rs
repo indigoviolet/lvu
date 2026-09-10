@@ -84,7 +84,9 @@ async fn harness(filter: Option<&str>) -> Harness {
     let view = ViewConfig::new(root.path().join("view-index"));
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(handle.clone())).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -362,7 +364,9 @@ async fn measure_whole_view_statistics_latency() {
         view.maximum_index_bytes = 256 * 1024 * 1024;
         let raw = Arc::new(LiveRowProvider::new(live).unwrap());
         let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-        adapter.register_source(lvu_shared::AnySourceHandle::Local(handle.clone())).unwrap();
+        adapter
+            .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+            .unwrap();
         adapter
             .register_view("view", vec![handle.source_id()])
             .unwrap();

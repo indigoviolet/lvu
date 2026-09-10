@@ -110,7 +110,9 @@ async fn a_statistics_pass_reads_one_field_not_every_column() {
     view.maximum_index_bytes = 128 * 1024 * 1024;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(Arc::clone(&raw), view).unwrap();
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(handle.clone())).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();

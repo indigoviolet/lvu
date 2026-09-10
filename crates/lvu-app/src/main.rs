@@ -646,6 +646,24 @@ struct SourceControlJob {
     worker: tokio::task::JoinHandle<()>,
 }
 
+/// Outcome of one shared-capture control operation, settled like a local
+/// control job: restarts carry the fresh remote handle for adapter
+/// registration, stops carry nothing. Failures carry the worker's reason
+/// (or an honest unknown-outcome report when the transport retired
+/// underneath).
+enum SharedControlOutcome {
+    Restarted { handle: lvu_shared::AnySourceHandle },
+    Stopped,
+}
+
+/// In-flight shared control operation, mirroring `SourceControlJob`.
+/// Exactly one of the two maps owns an id at a time (see intake).
+struct SharedControlJob {
+    restart: bool,
+    result: tokio::sync::oneshot::Receiver<Result<SharedControlOutcome, String>>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
 async fn control_source(
     manager: Arc<SourceManager>,
     definition: SourceDefinition,
@@ -714,6 +732,11 @@ struct Composition {
     manager: Arc<SourceManager>,
     raw: Arc<LiveRowProvider>,
     runtime: tokio::runtime::Handle,
+    /// Shared-capture session when this window shares its worker (`None`
+    /// in tests and any flow that must stay process-local). `Some` in
+    /// every ordinary launch: file/command acquisition, control, and the
+    /// store all go through it; stdin stays manager-local.
+    shared: Option<Arc<shared_capture::SharedStore>>,
     starts_tx: mpsc::Sender<StartResult>,
     starts_rx: mpsc::Receiver<StartResult>,
     sources: HashMap<SourceId, String>,
@@ -725,6 +748,11 @@ struct Composition {
     /// same acquisition cannot slip in beside it.
     pending_definitions: HashMap<SourceId, SourceDefinition>,
     source_controls: HashMap<SourceId, SourceControlJob>,
+    /// In-flight shared-capture control operations (worker restarts and
+    /// stops), mirroring `source_controls` shape and limits. Local and
+    /// shared jobs never share an id: routing decides once at intake by
+    /// session ownership, so the two maps cannot double-drive one source.
+    shared_controls: HashMap<SourceId, SharedControlJob>,
     cwd: PathBuf,
     scans_tx: mpsc::Sender<ScanResult>,
     scans_rx: mpsc::Receiver<ScanResult>,
@@ -3241,6 +3269,75 @@ impl Composition {
                 Err(error) => format!("{name}: {error}"),
             });
         }
+        // Shared control settlement mirrors local settlement above: poll
+        // completed jobs, register fresh remote handles, surface notices.
+        // A remotely restarted capture that fails registration is stopped
+        // through the worker (never left running unnamed), mirroring the
+        // local cleanup path.
+        let mut shared_completed = Vec::new();
+        for (id, job) in &mut self.shared_controls {
+            if job.restart
+                && app.views().iter().any(|view| {
+                    view.source_id == id.0.to_string() && app.view_has_pending_query(&view.id)
+                })
+            {
+                continue;
+            }
+            let result = match job.result.try_recv() {
+                Ok(result) => result,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => continue,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    Err("shared control worker disconnected".into())
+                }
+            };
+            shared_completed.push((*id, result));
+        }
+        for (id, result) in shared_completed {
+            changed = true;
+            self.shared_controls.remove(&id);
+            let name = self
+                .definitions
+                .get(&id)
+                .map_or_else(|| id.0.to_string(), |definition| definition.name.clone());
+            app.action_notice = Some(match result {
+                Ok(SharedControlOutcome::Restarted { handle }) => {
+                    match adapter.register_source(handle) {
+                        Ok(()) => {
+                            format!("{name}: capture restarted; existing views retained")
+                        }
+                        Err(error) => {
+                            let message = format!("register restarted source: {error}");
+                            if let Some(shared) = self.shared.clone() {
+                                let (sender, result) = tokio::sync::oneshot::channel();
+                                let worker = self.runtime.spawn(async move {
+                                    let stopped = shared.stop_source(id).await;
+                                    let diagnostic = match stopped {
+                                        Ok(()) => message,
+                                        other => {
+                                            format!("{message}; cleanup incomplete: {other:?}")
+                                        }
+                                    };
+                                    let _ = sender.send(Err(diagnostic));
+                                });
+                                self.shared_controls.insert(
+                                    id,
+                                    SharedControlJob {
+                                        restart: false,
+                                        result,
+                                        worker,
+                                    },
+                                );
+                            }
+                            format!("{name}: restart registration failed; stopping capture")
+                        }
+                    }
+                }
+                Ok(SharedControlOutcome::Stopped) => {
+                    format!("{name}: capture stopped; journal and views retained")
+                }
+                Err(error) => format!("{name}: {error}"),
+            });
+        }
         for request in app.take_source_controls() {
             changed = true;
             let id = match Uuid::parse_str(&request.source_id) {
@@ -3250,11 +3347,14 @@ impl Composition {
                     continue;
                 }
             };
-            if self.source_controls.contains_key(&id) || self.pending_starts.contains(&id) {
+            if self.source_controls.contains_key(&id)
+                || self.shared_controls.contains_key(&id)
+                || self.pending_starts.contains(&id)
+            {
                 app.action_notice = Some("source operation already pending".into());
                 continue;
             }
-            if self.source_controls.len() >= 8 {
+            if self.source_controls.len() + self.shared_controls.len() >= 8 {
                 app.action_notice =
                     Some("source control limit reached; wait for pending operations".into());
                 continue;
@@ -3264,6 +3364,47 @@ impl Composition {
                 continue;
             };
             let name = definition.name.clone();
+            // Worker-owned captures route to shared control; everything
+            // else (including stdin, which the worker refuses) stays on
+            // the local manager path below. Routing decides once here by
+            // session ownership, so the two job maps never double-drive.
+            if let Some(shared) = self.shared.clone().filter(|shared| shared.owns_source(id)) {
+                let (sender, result) = tokio::sync::oneshot::channel();
+                let restart = request.restart;
+                let worker = self.runtime.spawn(async move {
+                    let outcome = if restart {
+                        match shared.restart_source(&definition).await {
+                            Ok(started) => Ok(SharedControlOutcome::Restarted {
+                                handle: lvu_shared::AnySourceHandle::Remote(started.handle),
+                            }),
+                            Err(error) => Err(format!("restart capture: {error}")),
+                        }
+                    } else {
+                        match shared.stop_source(id).await {
+                            Ok(()) => Ok(SharedControlOutcome::Stopped),
+                            Err(error) => Err(format!("stop capture: {error}")),
+                        }
+                    };
+                    let _ = sender.send(outcome);
+                });
+                self.shared_controls.insert(
+                    id,
+                    SharedControlJob {
+                        restart,
+                        result,
+                        worker,
+                    },
+                );
+                app.action_notice = Some(format!(
+                    "{name}: {} capture…",
+                    if request.restart {
+                        "restarting"
+                    } else {
+                        "stopping"
+                    }
+                ));
+                continue;
+            }
             let manager = self.manager.clone();
             let (sender, result) = tokio::sync::oneshot::channel();
             let restart = request.restart;
@@ -4998,22 +5139,42 @@ impl Composition {
         self.pending_definitions
             .insert(definition.id, definition.clone());
         let manager = Arc::clone(&self.manager);
+        let shared = self.shared.clone();
         let sender = self.starts_tx.clone();
         self.runtime.spawn(async move {
             let source_id = definition.id;
             let view_id = view_id(source_id);
-            let result = match manager.start(definition.clone()).await {
-                Ok(handle) => Ok(StartedSource {
-                    definition,
-                    view_id,
-                    handle: lvu_shared::AnySourceHandle::Local(handle),
-                    origin: Some(origin.clone()),
-                }),
-                Err(error) => Err(StartFailure {
-                    source_id,
-                    origin,
-                    message: format!("start {}: {error}", definition.name),
-                }),
+            // Worker route first (see `worker_route`): at most one
+            // acquisition per definition across all windows, with the
+            // feeder started alongside. Local manager start otherwise.
+            let worker = shared.filter(|_| shared_capture::worker_route(true, &definition));
+            let result = match worker {
+                Some(session) => match session.start_source(&definition).await {
+                    Ok(started) => Ok(StartedSource {
+                        definition,
+                        view_id,
+                        handle: lvu_shared::AnySourceHandle::Remote(started.handle),
+                        origin: Some(origin.clone()),
+                    }),
+                    Err(error) => Err(StartFailure {
+                        source_id,
+                        origin,
+                        message: format!("start {}: {error}", definition.name),
+                    }),
+                },
+                None => match manager.start(definition.clone()).await {
+                    Ok(handle) => Ok(StartedSource {
+                        definition,
+                        view_id,
+                        handle: lvu_shared::AnySourceHandle::Local(handle),
+                        origin: Some(origin.clone()),
+                    }),
+                    Err(error) => Err(StartFailure {
+                        source_id,
+                        origin,
+                        message: format!("start {}: {error}", definition.name),
+                    }),
+                },
             };
             let _ = sender.send(result).await;
         });
@@ -7488,6 +7649,16 @@ async fn run() -> Result<(), String> {
         // stays the single owner of capture and durable state.
         return run_shared_capture(capture_dir).await;
     }
+    // Automatic shared session, before any acquisition or store work: every
+    // ordinary launch attaches first (spawning the worker when elected), so
+    // concurrent windows converge on one capture worker and one store.
+    // Attach failure is loud — never a silent local fork. A spawned worker
+    // left unused by a later startup failure drains on its own grace.
+    let executable = env::current_exe().map_err(|error| format!("current executable: {error}"))?;
+    let window_id = lvu_shared::default_window_id();
+    let shared_session = Arc::new(
+        shared_capture::SharedStore::startup(&executable, &capture_dir, &window_id).await?,
+    );
     let record_error = choice
         .record
         .as_ref()
@@ -7648,9 +7819,19 @@ async fn run() -> Result<(), String> {
         let outcome = if plan.requested && plan.stdin {
             start_stdin_definition(&manager, plan.definition.clone()).await
         } else if plan.requested {
-            start_definition(&manager, plan.definition.clone()).await
+            start_definition(
+                &manager,
+                Some(Arc::clone(&shared_session)),
+                plan.definition.clone(),
+            )
+            .await
         } else {
-            resume_definition(&manager, plan.definition.clone()).await
+            resume_definition(
+                &manager,
+                Some(Arc::clone(&shared_session)),
+                plan.definition.clone(),
+            )
+            .await
         };
         let started = match outcome {
             Ok(started) => started,
@@ -7703,18 +7884,11 @@ async fn run() -> Result<(), String> {
     let (scans_tx, scans_rx) = mpsc::channel(2);
     let (completions_tx, completions_rx) = mpsc::channel(2);
     let memory: memory::Memory = {
-        // Automatic shared store: attach the background worker first so
-        // it becomes the single workspace writer; the local worker never
-        // starts on this path, so durable state cannot split-brain.
-        // Attach failure is loud (never a silent local fallback that
-        // would fork the workspace behind the user's back, and no hidden
-        // bypass around the single-writer invariant).
-        let executable =
-            env::current_exe().map_err(|error| format!("current executable: {error}"))?;
-        let window_id = lvu_shared::default_window_id();
-        let shared =
-            shared_capture::SharedStore::startup(&executable, &capture_dir, &window_id).await?;
-        memory::Memory::Shared(memory::SharedMemory::wrap(std::sync::Arc::new(shared)))
+        // Automatic shared store built on the session attached above: the
+        // worker becomes the single workspace writer; the local worker
+        // never starts on this path, so durable state cannot split-brain.
+        // Attach already failed loudly above if sharing was impossible.
+        memory::Memory::Shared(memory::SharedMemory::wrap(Arc::clone(&shared_session)))
     };
     let command_presentation = command_rows::CommandPresentation::default();
     let command_controller = command_controller::CommandController::new(
@@ -7744,6 +7918,8 @@ async fn run() -> Result<(), String> {
         pending_starts: HashSet::new(),
         pending_definitions: HashMap::new(),
         source_controls: HashMap::new(),
+        shared_controls: HashMap::new(),
+        shared: Some(Arc::clone(&shared_session)),
         cwd,
         scans_tx,
         scans_rx,
@@ -7925,6 +8101,12 @@ async fn run() -> Result<(), String> {
         job.worker.abort();
         let _ = job.worker.await;
     }
+    // Shared control tasks hold the worker client; abort them before the
+    // session drains so no defeated restart/stop races the goodbye.
+    for (_, job) in composition.shared_controls.drain() {
+        job.worker.abort();
+        let _ = job.worker.await;
+    }
     timing.mark("source-controls");
     timing.report();
     report_capture_cost(&composition);
@@ -8035,10 +8217,28 @@ fn prepend_notice(app: &mut App, notice: Option<String>) {
 /// the recorded program, working directory and environment of its definition.
 async fn resume_definition(
     manager: &Arc<SourceManager>,
+    shared: Option<Arc<shared_capture::SharedStore>>,
     definition: SourceDefinition,
 ) -> Result<StartedSource, String> {
     let view_id = view_id(definition.id);
     let name = definition.name.clone();
+    if shared_capture::worker_route(shared.is_some(), &definition) {
+        // Worker-owned resume: the worker dedups against live captures
+        // (Present), so resume-after-crash and second-window attach take
+        // the same path and cannot double-acquire. Stdin never routes
+        // here (see `worker_route`).
+        let shared = shared.expect("worker route needs a session");
+        let started = shared
+            .start_source(&definition)
+            .await
+            .map_err(|error| format!("resume {name} on shared worker: {error}"))?;
+        return Ok(StartedSource {
+            definition,
+            view_id,
+            handle: lvu_shared::AnySourceHandle::Remote(started.handle),
+            origin: None,
+        });
+    }
     let handle = control_source(Arc::clone(manager), definition.clone(), true)
         .await?
         .ok_or_else(|| format!("resume {name}: capture did not start"))?;
@@ -8052,9 +8252,23 @@ async fn resume_definition(
 
 async fn start_definition(
     manager: &SourceManager,
+    shared: Option<Arc<shared_capture::SharedStore>>,
     definition: SourceDefinition,
 ) -> Result<StartedSource, String> {
     let view_id = view_id(definition.id);
+    if shared_capture::worker_route(shared.is_some(), &definition) {
+        let shared = shared.expect("worker route needs a session");
+        let started = shared
+            .start_source(&definition)
+            .await
+            .map_err(|error| format!("start {} on shared worker: {}", definition.name, error))?;
+        return Ok(StartedSource {
+            definition,
+            view_id,
+            handle: lvu_shared::AnySourceHandle::Remote(started.handle),
+            origin: None,
+        });
+    }
     let handle = manager
         .start(definition.clone())
         .await
@@ -9800,6 +10014,8 @@ mod tests {
             pending_starts: HashSet::new(),
             pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),
+            shared_controls: HashMap::new(),
+            shared: None,
             cwd: directory.path().to_path_buf(),
             scans_tx,
             scans_rx,
@@ -11464,6 +11680,8 @@ for line in sys.stdin:
             pending_starts: HashSet::new(),
             pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),
+            shared_controls: HashMap::new(),
+            shared: None,
             cwd: directory.path().to_path_buf(),
             scans_tx,
             scans_rx,
@@ -11594,6 +11812,8 @@ for line in sys.stdin:
             pending_starts: HashSet::new(),
             pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),
+            shared_controls: HashMap::new(),
+            shared: None,
             cwd: directory.path().to_path_buf(),
             scans_tx,
             scans_rx,

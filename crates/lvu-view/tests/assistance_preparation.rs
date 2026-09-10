@@ -106,7 +106,9 @@ async fn setup_with_compiler(
     });
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(handle.clone())).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
@@ -283,7 +285,9 @@ async fn ordinal_sampling_stays_balanced_across_reserved_sequence_gap() {
     view.compiler = None;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(restarted.clone())).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(restarted.clone()))
+        .unwrap();
     adapter.register_view("view", vec![source_id]).unwrap();
 
     let prepared = adapter

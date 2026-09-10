@@ -251,8 +251,12 @@ async fn setup() -> (
     let (live, view) = configs(&root);
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(api.clone())).unwrap();
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(worker.clone())).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(api.clone()))
+        .unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(worker.clone()))
+        .unwrap();
     adapter
         .register_view("view-a", vec![api.source_id()])
         .unwrap();
@@ -309,8 +313,12 @@ async fn setup_raw_bytes_with_budget(
     view.maximum_index_bytes = maximum_index_bytes;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let adapter = NativeViewAdapter::new(raw, view).unwrap();
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(api.clone())).unwrap();
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(worker.clone())).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(api.clone()))
+        .unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(worker.clone()))
+        .unwrap();
     adapter
         .register_view("raw-a", vec![api.source_id()])
         .unwrap();
@@ -850,7 +858,9 @@ async fn union_rejects_input_source_set_drift_and_preserves_last_good() {
         .await
         .unwrap();
     wait_runtime(&third, 1).await;
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(third.clone())).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(third.clone()))
+        .unwrap();
     let constraints = QueryConstraints {
         text: Some(TextConstraint {
             literal: "ts".into(),

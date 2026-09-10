@@ -5,11 +5,11 @@ pub use assistance::*;
 
 use super::{CommandColumns, Membership, NativeViewAdapter, Published, ViewError};
 use lvu_core::{InvestigationId, RawRecord, SourceId};
-use lvu_shared::AnySourceHandle;
 use lvu_query::{
     AtomicParquetPartWriter, BatchQuery, BatchValidity, DerivedState, EnrichmentStage,
     ParquetWriteBudget, SchemaContext, execute_batch, records_to_batch_with_context,
 };
+use lvu_shared::AnySourceHandle;
 use polars::prelude::{
     AnyValue, BooleanChunked, DataFrame, IntoColumn, NamedFrom, NewChunkedArray, Series,
 };

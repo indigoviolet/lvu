@@ -169,7 +169,9 @@ async fn setup(
     let (live_config, view_config) = configs(root);
     let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
     let adapter = NativeViewAdapter::new(raw, view_config).unwrap();
-    adapter.register_source(lvu_shared::AnySourceHandle::Local(handle.clone())).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+        .unwrap();
     adapter
         .register_view("view", vec![handle.source_id()])
         .unwrap();
