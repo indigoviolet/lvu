@@ -412,8 +412,9 @@ freezes the selected record identity and permits raw-context inspection.
 
 ### Live unions and shared enrichment keys
 
-The working tree integrates live union views and shared-key filtering; UI and
-release acceptance are still pending. `components/union_dialog.rs` provides one
+The working tree integrates live union views and shared-key filtering. Focused
+terminal workflows pass, including live append and restart; combined release
+acceptance remains pending. `components/union_dialog.rs` provides one
 checklist for selecting existing views. `lvu-app/union_controller.rs` and the
 composition root submit revision-fenced work to `lvu-view/union_worker.rs`.
 Inputs share their existing captures. Native query execution combines accepted
@@ -435,6 +436,11 @@ linearizes with raw source publication. Rejected candidates retain the accepted
 view. Transient failures retry with bounded backoff; terminal source-set drift
 remains rejected until the dependency changes. Stored union validation precedes
 restore mutation; role selections and ordinary grouping survive round trips.
+A restored union may encounter raw input types before its enrichments publish.
+The first failed attempt retains its dependencies and retries when an input
+publishes new membership. Input publication revision identifies retry attempts;
+it does not replace accepted definition/generation fences. Unchanged failures
+retain their existing backoff or terminal-rejection behavior.
 
 ### Legacy field correlation compatibility
 
