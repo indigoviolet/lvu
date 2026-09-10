@@ -5,7 +5,7 @@ The retired Correlation mapper let each raw source choose a different field.
 The supported flow makes that choice explicit as accepted enrichment, then
 opens the existing Union chooser from Fields. This story preserves the old
 user outcome while proving cancellation, stable identities/no recapture,
-native membership, input order and restart persistence.
+native membership, input order, creation-only key pinning and restart persistence.
 """
 
 import pathlib
@@ -50,6 +50,37 @@ def open_shared_key_chooser(app):
     choose_both_views(app)
 
 
+def pin_marker(field, checked):
+    return f"[{'x' if checked else ' '}] {field}"
+
+
+def assert_pins(app, expected):
+    app.send(b"i")
+    app.wait_for("Fields · record")
+    screen = app.wait_until(
+        lambda text: all(
+            pin_marker(field, checked) in text
+            for field, checked in expected.items()
+        ),
+        f"pin markers match {expected!r}",
+    )
+    for field, checked in expected.items():
+        assert pin_marker(field, checked) in screen, screen
+    app.send(b"\x1b")
+    wait_closed(app, "┌ Fields", "pin inspection closed")
+
+
+def toggle_pin(app, field, checked):
+    select_field(app, field)
+    app.send(b" ")
+    app.wait_until(
+        lambda text: pin_marker(field, checked) in text,
+        f"{field} pin becomes {checked}",
+    )
+    app.send(b"\x1b")
+    wait_closed(app, "┌ Fields", f"{field} pin edit closed")
+
+
 def run(binary):
     with tempfile.TemporaryDirectory(prefix="lvu-correlation-pty-") as directory:
         root = pathlib.Path(directory)
@@ -83,8 +114,10 @@ def run(binary):
             )
 
             # A fully selected chooser can still be cancelled. It registers no
-            # union and leaves the accepted origin view and all its rows intact.
+            # union and leaves both the accepted origin rows and pins intact.
             switch_to_enriched(app, "api accepted")
+            toggle_pin(app, "service", True)
+            assert_pins(app, {"service": True, "request_id": False})
             open_shared_key_chooser(app)
             app.send(b"\x1b")
             wait_closed(app, "┌ Union views", "shared-key chooser cancelled")
@@ -93,6 +126,7 @@ def run(binary):
                 "cancelled chooser preserved its origin view",
             )
             assert "› Union of" not in cancelled, cancelled
+            assert_pins(app, {"service": True, "request_id": False})
 
             # Repeat the explicit choice and accept it. Timestamp ordering is
             # native union behavior; only req-7 survives the exact key.
@@ -113,6 +147,16 @@ def run(binary):
             # The API source was captured first and retains its record order.
             assert merged.index("api accepted") < merged.index("api responded"), merged
             assert merged.index("api responded") < merged.index("worker queued"), merged
+
+            # Creation initializes only the exact key pin. It neither copies
+            # the origin's unrelated pin nor marks another union field.
+            assert_pins(app, {"request_id": True, "service": False, "ts": False})
+
+            # Later pin edits are ordinary persistent view state. An explicit
+            # key unpin must not be undone by restore-time auto-pinning.
+            toggle_pin(app, "ts", True)
+            toggle_pin(app, "request_id", False)
+            assert_pins(app, {"request_id": False, "ts": True})
 
             # The union points at original captured identities rather than
             # copying or recapturing either source's selected record.
@@ -136,6 +180,7 @@ def run(binary):
             )
             assert "api unrelated" not in restored, restored
             assert "worker unrelated" not in restored, restored
+            assert_pins(app, {"request_id": False, "ts": True})
             assert union_stable_id(
                 app, "api accepted", ("api accepted", "worker queued", "api responded")
             ) == api_id
@@ -154,7 +199,7 @@ def run(binary):
 
     print(
         "Correlation replacement PTY passed: explicit derived-key mapping, cancellation, "
-        "native ordered membership, stable original IDs and restart persistence"
+        "native ordered membership, stable original IDs, creation-only key pinning and restart"
     )
 
 
