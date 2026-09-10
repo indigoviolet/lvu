@@ -18,12 +18,10 @@ CARGO_TARGET_DIR = "{{ env.CARGO_TARGET_DIR | default(value='/mnt/HC_Volume_1067
 # cargo reads as "no wrapper".
 RUSTC_WRAPPER = "{{ env.RUSTC_WRAPPER | default(value=config_root ~ '/scripts/sccache.sh') }}"
 SCCACHE_DIR = "{{ env.SCCACHE_DIR | default(value='/mnt/HC_Volume_106796581/lvu-build/sccache') }}"
-# Eleven worktree targets at 2.3 GB each leave room for a cache twice this old
-# size, and an LRU pinned at 100% of its cap — which 10G was — evicts entries it
-# wants again within the hour and turns every write into an eviction. The
-# running server keeps the cap it started with, so this takes effect at the next
-# `sccache --stop-server`.
-SCCACHE_CACHE_SIZE = "20G"
+# Leave space for a fresh release target alongside active worktrees and
+# preserved evidence. The running server keeps its startup cap; restart it
+# under the validation lock after changing this value.
+SCCACHE_CACHE_SIZE = "15G"
 # Two jobs bounds compilation on this disk-constrained development host. A
 # release runner is neither shared nor disk-constrained and would otherwise
 # spend most of an hour building Polars one job at a time.
