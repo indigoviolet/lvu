@@ -1,17 +1,15 @@
-//! Acceptance for Correlate across sources as a component
-//! (docs/component-model.md §6.3 step 14, the last conversion).
+//! Compatibility acceptance for the legacy Correlation component.
 //!
-//! The layer owns the request queue, the completion fences, the pending
-//! lookup and the per-source mapping. The shell keeps forwarders for
-//! `lvu-app`'s completions and nothing else: no `Focus::Correlation`, no
-//! `Ctx::correlating`, no correlation state on `App`.
+//! New Fields correlation uses the shared-key Union chooser. Restored legacy
+//! mappings still use this layer's request queue, completion fences, pending
+//! lookup and per-source mapping, so those invariants remain covered here.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
     Action, App, CorrelationRequest, CorrelationSourceChoice, Focus,
     command_palette::CommandId,
     component::{Component, LayerId, Open, RawEvent},
-    components::correlation::{CorrelationControl, CorrelationHit},
+    components::correlation::{CorrelationControl, CorrelationHit, CorrelationOpen},
     fixture::FixtureProvider,
     theme::Theme,
     ui,
@@ -63,11 +61,22 @@ fn click(app: &mut App, provider: &FixtureProvider, point: (u16, u16)) {
     );
 }
 
-/// Open Fields on the selected record and press `r`: the Fields layer is
-/// replaced by Correlation, which queues the lookup. Returns its fence.
-fn start(app: &mut App, provider: &FixtureProvider) -> (u64, String) {
+/// Open the legacy compatibility layer explicitly and return its fence.
+/// Fields no longer routes new actions here; that replacement is pinned by
+/// `fields_correlate_routes_to_the_shared_key_union` below.
+fn start_legacy(app: &mut App, provider: &FixtureProvider) -> (u64, String) {
     app.handle(Action::Open(Open::Fields), provider);
-    key(app, provider, KeyCode::Char('r'));
+    let row = lvu::components::fields::anchored_row(&app.views, provider)
+        .expect("the fixture exposes its selected record")
+        .id;
+    key(app, provider, KeyCode::Esc);
+    app.handle(
+        Action::Open(Open::Correlation(CorrelationOpen {
+            row,
+            field: "service".into(),
+        })),
+        provider,
+    );
     assert_eq!(app.layers.top(), Some(LayerId::Correlation));
     let generation = app.layers.correlation.generation();
     let origin = app.layers.correlation.origin_view_id().to_owned();
@@ -96,7 +105,7 @@ fn choices() -> Vec<CorrelationSourceChoice> {
 
 /// Start a lookup and answer it with the two-source mapping.
 fn mapping(app: &mut App, provider: &FixtureProvider) -> (u64, String) {
-    let (generation, origin) = start(app, provider);
+    let (generation, origin) = start_legacy(app, provider);
     app.take_correlation_requests();
     assert!(app.open_correlation_dialog(
         generation,
@@ -119,16 +128,60 @@ fn accept_reason(app: &App) -> Option<&'static str> {
 }
 
 #[test]
-fn the_lookup_names_the_frozen_record_and_a_stale_completion_is_dropped() {
+fn fields_correlate_routes_to_the_shared_key_union() {
     let (provider, mut app) = demo();
+    let origin = app.active_view_id().unwrap().to_owned();
     app.handle(Action::Open(Open::Fields), &provider);
     let frozen = lvu::components::fields::anchored_row(&app.views, &provider)
         .unwrap()
         .id;
+
+    key(&mut app, &provider, KeyCode::Char('r'));
+
+    assert!(!app.layers.fields.is_open(), "Fields is replaced");
+    assert_eq!(app.layers.top(), Some(LayerId::Union));
+    assert!(
+        app.take_correlation_requests().is_empty(),
+        "new actions never enter the legacy raw-field mapping flow"
+    );
+    let chooser = screen(&draw(&provider, &mut app, 100, 30));
+    assert!(chooser.contains("Union views"), "{chooser}");
+
+    // The origin is preselected. Add the other fixture view and create so the
+    // request proves the frozen identity and field passed to the app's native
+    // accepted-derived authority check; no raw scalar is resolved in lvu.
+    key(&mut app, &provider, KeyCode::Down);
+    key(&mut app, &provider, KeyCode::Char(' '));
+    let ready = screen(&draw(&provider, &mut app, 100, 30));
+    assert!(
+        ready.contains("filtered by the selected enriched key"),
+        "{ready}"
+    );
+    key(&mut app, &provider, KeyCode::Enter);
+    let requests = app.layers.union.take_requests();
+    let [lvu::UnionDialogRequest::Create { inputs, shared_key }] = requests.as_slice() else {
+        panic!("unexpected union requests: {requests:?}");
+    };
+    assert_eq!(inputs.len(), 2);
+    let shared_key = shared_key.as_ref().expect("shared-key evidence");
+    assert_eq!(shared_key.origin_view_id, origin);
+    assert_eq!(shared_key.row_id, frozen);
+    assert_eq!(shared_key.field, "service");
+}
+
+#[test]
+fn the_lookup_names_the_frozen_record_and_a_stale_completion_is_dropped() {
+    let (provider, mut app) = demo();
     let before = app
         .persistent_view_state(app.active_view_id().unwrap())
         .unwrap();
-    let (generation, origin) = start(&mut app, &provider);
+    let (generation, origin) = start_legacy(&mut app, &provider);
+    let frozen = app
+        .view_state()
+        .unwrap()
+        .field_picker_row
+        .clone()
+        .expect("Fields froze the selected record");
     assert!(
         !app.layers.fields.is_open(),
         "Fields is replaced, not stacked"
@@ -190,7 +243,7 @@ fn the_lookup_names_the_frozen_record_and_a_stale_completion_is_dropped() {
 #[test]
 fn a_failed_lookup_stays_on_the_layer_as_its_error_state() {
     let (provider, mut app) = demo();
-    let (generation, origin) = start(&mut app, &provider);
+    let (generation, origin) = start_legacy(&mut app, &provider);
     app.take_correlation_requests();
     assert!(app.finish_correlation(generation, &origin, Err("journal closed".into())));
     assert_eq!(app.layers.top(), Some(LayerId::Correlation));
@@ -215,7 +268,7 @@ fn a_failed_lookup_stays_on_the_layer_as_its_error_state() {
 #[test]
 fn leaving_the_origin_view_cancels_the_lookup_and_fences_its_completion() {
     let (provider, mut app) = demo();
-    let (generation, origin) = start(&mut app, &provider);
+    let (generation, origin) = start_legacy(&mut app, &provider);
     app.take_correlation_requests();
     let other = app
         .views()
@@ -242,7 +295,7 @@ fn leaving_the_origin_view_cancels_the_lookup_and_fences_its_completion() {
 fn escape_withdraws_an_undrained_lookup_and_cancels_a_delivered_one() {
     let (provider, mut app) = demo();
     // Not yet handed to the adapter: the Resolve is simply withdrawn.
-    let (generation, origin) = start(&mut app, &provider);
+    let (generation, origin) = start_legacy(&mut app, &provider);
     key(&mut app, &provider, KeyCode::Esc);
     assert!(app.take_correlation_requests().is_empty());
     assert!(app.layers.stack.is_empty());
@@ -251,7 +304,7 @@ fn escape_withdraws_an_undrained_lookup_and_cancels_a_delivered_one() {
     // Delivered: a Cancel follows, and the generation stays counted until the
     // adapter answers, at which point the stale answer only releases it.
     for _ in 0..9 {
-        let (generation, origin) = start(&mut app, &provider);
+        let (generation, origin) = start_legacy(&mut app, &provider);
         assert!(matches!(
             app.take_correlation_requests().as_slice(),
             [CorrelationRequest::Resolve { .. }]
@@ -275,7 +328,7 @@ fn escape_withdraws_an_undrained_lookup_and_cancels_a_delivered_one() {
 fn capacity_is_bounded_and_a_full_queue_is_said_on_the_layer() {
     let (provider, mut app) = demo();
     for _ in 0..8 {
-        start(&mut app, &provider);
+        start_legacy(&mut app, &provider);
         assert!(matches!(
             app.take_correlation_requests().as_slice(),
             [CorrelationRequest::Resolve { .. }]
@@ -284,13 +337,10 @@ fn capacity_is_bounded_and_a_full_queue_is_said_on_the_layer() {
         // Cancelled but never answered: the adapter still holds it.
         app.take_correlation_requests();
     }
-    app.handle(Action::Open(Open::Fields), &provider);
-    let frozen = app.view_state().unwrap().field_picker_row.clone();
-    key(&mut app, &provider, KeyCode::Char('r'));
+    start_legacy(&mut app, &provider);
     assert_eq!(app.layers.top(), Some(LayerId::Correlation));
     assert!(app.take_correlation_requests().is_empty());
     assert!(!app.field_correlation_pending());
-    assert_eq!(app.view_state().unwrap().field_picker_row, frozen);
     let full = screen(&draw(&provider, &mut app, 100, 30));
     assert!(
         full.contains("correlation request queue is full; try again shortly"),
@@ -303,7 +353,7 @@ fn capacity_is_bounded_and_a_full_queue_is_said_on_the_layer() {
 #[test]
 fn the_reserved_rows_keep_the_frame_where_it_was_when_the_lookup_answers() {
     let (provider, mut app) = demo();
-    let (generation, origin) = start(&mut app, &provider);
+    let (generation, origin) = start_legacy(&mut app, &provider);
     app.take_correlation_requests();
     let pending_screen = screen(&draw(&provider, &mut app, 100, 30));
     let pending = app.layers.correlation.surface();
@@ -519,7 +569,7 @@ fn enter_runs_the_default_except_where_a_control_consumes_it() {
     let (provider, mut app) = demo();
     // While the lookup runs there is no mapping: Enter reaches the default,
     // which has nothing to accept, and nothing is queued.
-    start(&mut app, &provider);
+    start_legacy(&mut app, &provider);
     app.take_correlation_requests();
     key(&mut app, &provider, KeyCode::Enter);
     assert!(app.take_correlation_requests().is_empty());

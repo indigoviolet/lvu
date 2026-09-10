@@ -6255,11 +6255,18 @@ fn field_picker_scrolls_clipped_rows_and_stays_on_opened_event() {
             name: "source".into(),
             health: "ready".into(),
         }],
-        vec![ViewItem {
-            id: "view".into(),
-            source_id: "source".into(),
-            name: "view".into(),
-        }],
+        vec![
+            ViewItem {
+                id: "view".into(),
+                source_id: "source".into(),
+                name: "view".into(),
+            },
+            ViewItem {
+                id: "other".into(),
+                source_id: "source".into(),
+                name: "other view".into(),
+            },
+        ],
         false,
     );
     app.sync_provider(&provider, 8);
@@ -6323,14 +6330,26 @@ fn field_picker_scrolls_clipped_rows_and_stays_on_opened_event() {
         app.view_state().unwrap().field_picker_selected,
         first_visible.1
     );
+    let selected_field = lvu::components::fields::anchored_row(&app.views, &provider)
+        .unwrap()
+        .fields[first_visible.1]
+        .0
+        .clone();
 
     app.handle(raw_key(KeyCode::Char('r')), &provider);
-    assert!(matches!(
-        app.take_correlation_requests().as_slice(),
-        [lvu::app::CorrelationRequest::Resolve { row_id, .. }] if row_id.sequence == 1
-    ));
+    assert_eq!(app.layers.top(), Some(LayerId::Union));
+    assert!(app.take_correlation_requests().is_empty());
+    app.handle(raw_key(KeyCode::Down), &provider);
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    let requests = app.layers.union.take_requests();
+    let [lvu::UnionDialogRequest::Create { shared_key, .. }] = requests.as_slice() else {
+        panic!("unexpected union requests: {requests:?}");
+    };
+    let shared_key = shared_key.as_ref().expect("shared-key origin");
+    assert_eq!(shared_key.row_id.sequence, 1);
+    assert_eq!(shared_key.field, selected_field);
     app.handle(raw_key(KeyCode::Esc), &provider);
-    app.take_correlation_requests();
 
     app.handle(Action::MoveLine(1), &provider);
     app.handle(Action::Open(Open::Fields), &provider);

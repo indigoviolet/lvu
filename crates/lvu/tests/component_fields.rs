@@ -4,7 +4,7 @@
 //! Fields' seam is the provider and the active view: it reads a frozen record
 //! identity through `ctx.provider` and writes `ViewState.pinned_columns` /
 //! `color_field`, with no outbox of its own. Correlate replaces it with the
-//! Correlation layer; Raw context is a jump the shell performs.
+//! shared-key Union chooser; Raw context is a jump the shell performs.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
@@ -279,31 +279,36 @@ fn raw_context_closes_the_layer_and_jumps_and_the_raw_stream_gives_it_back() {
 }
 
 #[test]
-fn correlate_replaces_fields_with_the_correlation_layer_carrying_the_frozen_record() {
+fn correlate_replaces_fields_with_the_shared_key_union_carrying_the_frozen_record() {
     let (provider, mut app) = opened();
     draw(&provider, &mut app, 100, 30);
     let anchor = lvu::components::fields::anchor_id(&app.views)
         .cloned()
         .unwrap();
     key(&mut app, &provider, KeyCode::Char('r'));
-    // §6.5: Correlation is a `Replace`, not a child. Fields is gone and the
-    // lookup's pending state is shown where its answer will land.
+    // Shared-key Union is a `Replace`, not a child. Fields is gone and the
+    // origin stays preselected while the app waits for a second input choice.
     assert!(!app.layers.fields.is_open());
-    assert_eq!(app.layers.top(), Some(LayerId::Correlation));
-    assert!(app.field_correlation_pending());
-    let requests = app.take_correlation_requests();
-    assert_eq!(requests.len(), 1);
-    assert!(
-        format!("{requests:?}").contains(&anchor.sequence.to_string()),
-        "the request names the record Fields froze: {requests:?}"
-    );
+    assert_eq!(app.layers.top(), Some(LayerId::Union));
+    assert!(app.take_correlation_requests().is_empty());
     let pending = screen(&draw(&provider, &mut app, 100, 30));
-    assert!(pending.contains("Correlate across sources"), "{pending}");
-    assert!(pending.contains("finding records that share this value"));
+    assert!(pending.contains("Union views"), "{pending}");
 
-    // Escape abandons both the lookup and the layer.
+    key(&mut app, &provider, KeyCode::Down);
+    key(&mut app, &provider, KeyCode::Char(' '));
+    let ready = screen(&draw(&provider, &mut app, 100, 30));
+    assert!(ready.contains("filtered by the selected enriched key"));
+    key(&mut app, &provider, KeyCode::Enter);
+    let requests = app.layers.union.take_requests();
+    let [lvu::UnionDialogRequest::Create { shared_key, .. }] = requests.as_slice() else {
+        panic!("unexpected union requests: {requests:?}");
+    };
+    let shared_key = shared_key.as_ref().expect("shared-key origin");
+    assert_eq!(shared_key.row_id, anchor);
+    assert_eq!(shared_key.field, "service");
+
+    // Escape abandons the submitted chooser without entering legacy mapping.
     key(&mut app, &provider, KeyCode::Esc);
-    assert!(!app.field_correlation_pending());
     assert!(app.layers.stack.is_empty());
     assert_eq!(app.focus, Focus::Logs);
 }

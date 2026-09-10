@@ -1,69 +1,53 @@
 #!/usr/bin/env python3
-"""Follow one identity across sources that name its field differently.
+"""Normalize differently named keys into a cancellable shared-key union.
 
-Two sources carry the same request under different keys (`request_id` and
-`req`). Correlating from Fields must produce a view holding every record with
-that value from both sources, in explicit source order, with the correlating
-fields pinned; it must survive a restart; and a mapping that is never made must
-leave the origin view exactly as it was.
+The retired Correlation mapper let each raw source choose a different field.
+The supported flow makes that choice explicit as accepted enrichment, then
+opens the existing Union chooser from Fields. This story preserves the old
+user outcome while proving cancellation, stable identities/no recapture,
+native membership, input order and restart persistence.
 """
+
 import pathlib
 import sys
 import tempfile
-from test_lvu_pty import PtyApp
+
 from test_enrichment_chain_pty import stop
+from test_lvu_pty import PtyApp
+from test_shared_key_union_pty import (
+    add_enrichment,
+    choose_both_views,
+    select_field,
+    switch_to,
+    switch_to_enriched,
+    switch_to_union,
+    union_stable_id,
+)
+from test_union_pty import wait_closed
 
 
 API = "\n".join(
     [
-        '{"request_id":"req-7","service":"api","msg":"api accepted"}',
-        '{"request_id":"req-8","service":"api","msg":"api unrelated"}',
-        '{"request_id":"req-7","service":"api","msg":"api responded"}',
+        '{"ts":"2026-03-04T05:06:00Z","request_id":"req-7","service":"api","msg":"api accepted"}',
+        '{"ts":"2026-03-04T05:06:02Z","request_id":"req-8","service":"api","msg":"api unrelated"}',
+        '{"ts":"2026-03-04T05:06:04Z","request_id":"req-7","service":"api","msg":"api responded"}',
     ]
 ) + "\n"
 
 WORKER = "\n".join(
     [
-        '{"req":"req-7","stage":"worker queued"}',
-        '{"req":"req-9","stage":"worker unrelated"}',
+        '{"ts":"2026-03-04T05:06:01Z","req":"req-7","stage":"worker queued"}',
+        '{"ts":"2026-03-04T05:06:03Z","req":"req-9","stage":"worker unrelated"}',
     ]
 ) + "\n"
 
 
-def open_fields_on_first_record(app):
-    app.send(b"i")
-    app.wait_for("Fields · record")
-
-
-def correlate(app):
-    """Select `request_id` in Fields and start the lookup.
-
-    Correlation replaces Fields (component-model.md §6.5): the layer that
-    shows the pending lookup is the one the mapping lands in, with the same
-    frame and the same `[ Correlate ]` default.
-    """
-    app.wait_until(lambda text: "request_id" in text, "request_id offered in Fields")
-    # §8.11: rows follow the record's own order, and request_id is its first
-    # key, so the selection is already on it.
-    app.wait_until(lambda text: "> [ ] request_id" in text or "› [ ] request_id" in text,
-                   "request_id selected")
+def open_shared_key_chooser(app):
+    select_field(app, "request_id")
     app.send(b"r")
-    app.wait_for("Correlate across sources")
-    text = app.text()
-    assert "Fields · record" not in text, ("Fields is replaced, not stacked", text)
-    assert "[ Correlate ]" in text and "[ Cancel ]" in text, text
-
-
-def choose_worker_field(app):
-    """Map the worker source to its own key name, explicitly."""
-    app.wait_for("Not correlated")
-    app.send(b"\x1b[B")            # select the worker row
-    app.send(b"\r")                # open its field options
-    app.wait_until(lambda text: "req" in text, "worker field options")
-    app.send(b"\x1b[B")            # move off `Not correlated` onto `req`
-    app.send(b"\r")                # commit
-    app.wait_until(lambda text: "Not correlated" not in text
-                   or text.count("Not correlated") < 2, "worker mapped")
+    app.wait_for("┌ Union views")
+    assert "Correlate across sources" not in app.text(), app.text()
+    choose_both_views(app)
 
 
 def run(binary):
@@ -78,77 +62,99 @@ def run(binary):
             "XDG_CACHE_HOME": str(root / "cache"),
         }
         args = [str(api), str(worker), "--capture-dir", str(root / "capture")]
-        app = PtyApp(binary, args, width=150, height=32, cwd=root, environment=env)
+        app = PtyApp(binary, args, width=160, height=36, cwd=root, environment=env)
         try:
             app.wait_for("api accepted")
 
-            # --- A mapping that is never accepted changes nothing. ---------
-            open_fields_on_first_record(app)
-            correlate(app)
-            app.send(b"\x1b")
-            app.wait_until(lambda text: "Correlate across sources" not in text,
-                           "correlation cancelled")
-            text = app.text()
-            assert "Fields · record" not in text, ("Escape returned to Fields", text)
-            assert "api accepted" in text and "api unrelated" in text, (
-                "a cancelled correlation changed the origin view", text)
-
-            # --- The accepted mapping produces the cross-source view. ------
-            open_fields_on_first_record(app)
-            correlate(app)
-            choose_worker_field(app)
-            app.send(b"\t")                     # focus [ Correlate ]
-            app.send(b"\r")
-            app.wait_until(
-                lambda text: "Correlate across sources" not in text
-                and "worker queued" in text
-                and "api responded" in text
-                and "matched " in text,
-                "correlated view scanned both sources",
-                timeout=10,
+            # Each differently named raw key becomes the same structural,
+            # accepted output. Raw names are never handed to a legacy mapper.
+            switch_to(app, "api accepted")
+            add_enrichment(app, "request_id = pl.col('request_id')")
+            switch_to_enriched(app, "api accepted")
+            api_id = union_stable_id(
+                app, "api accepted", ("api accepted", "api unrelated", "api responded")
             )
-            text = app.text()
-            assert "api accepted" in text and "api responded" in text, text
-            assert "worker queued" in text, text
-            # Only req-7. The other requests, in either source, are excluded.
-            assert "api unrelated" not in text, text
-            assert "worker unrelated" not in text, text
-            # Explicit source order: every api record before the worker record.
-            assert text.index("api responded") < text.index("worker queued"), text
-            # The correlating fields are pinned, so the value stays visible.
-            assert "req-7" in text, text
 
-            # --- It survives a restart. ------------------------------------
+            switch_to(app, "worker queued")
+            add_enrichment(app, "request_id = pl.col('req')")
+            switch_to_enriched(app, "worker queued")
+            worker_id = union_stable_id(
+                app, "worker queued", ("worker queued", "worker unrelated")
+            )
+
+            # A fully selected chooser can still be cancelled. It registers no
+            # union and leaves the accepted origin view and all its rows intact.
+            switch_to_enriched(app, "api accepted")
+            open_shared_key_chooser(app)
+            app.send(b"\x1b")
+            wait_closed(app, "┌ Union views", "shared-key chooser cancelled")
+            cancelled = app.wait_until(
+                lambda text: "api accepted" in text and "api unrelated" in text,
+                "cancelled chooser preserved its origin view",
+            )
+            assert "› Union of" not in cancelled, cancelled
+
+            # Repeat the explicit choice and accept it. Timestamp ordering is
+            # native union behavior; only req-7 survives the exact key.
+            open_shared_key_chooser(app)
+            app.send(b"\r")
+            wait_closed(app, "┌ Union views", "shared-key union created", timeout=25)
+            merged = app.wait_until(
+                lambda text: "› Union of" in text
+                and "api accepted" in text
+                and "worker queued" in text
+                and "api responded" in text,
+                "normalized shared-key union published",
+                timeout=25,
+            )
+            assert "api unrelated" not in merged, merged
+            assert "worker unrelated" not in merged, merged
+            # No timestamp role was selected, so capture time is authoritative.
+            # The API source was captured first and retains its record order.
+            assert merged.index("api accepted") < merged.index("api responded"), merged
+            assert merged.index("api responded") < merged.index("worker queued"), merged
+
+            # The union points at original captured identities rather than
+            # copying or recapturing either source's selected record.
+            assert union_stable_id(
+                app, "api accepted", ("api accepted", "worker queued", "api responded")
+            ) == api_id
+            assert union_stable_id(
+                app, "worker queued", ("api accepted", "worker queued", "api responded")
+            ) == worker_id
+
             stop(app)
-            app = PtyApp(binary, args, width=150, height=32, cwd=root, environment=env)
-            app.wait_for("api accepted")
-            found = False
-            for _ in range(6):
-                text = app.text()
-                if "worker queued" in text and "api responded" in text:
-                    found = True
-                    break
-                app.send(b"]")
-                app.wait_until(lambda t: "api" in t or "worker" in t, "view switch")
-                app.assert_remains("Log", "impossible sentinel", .15)
-            assert found, ("the correlated view did not restore", app.text())
-            text = app.text()
-            assert "api unrelated" not in text and "worker unrelated" not in text, text
-            assert text.index("api responded") < text.index("worker queued"), text
+            app = PtyApp(binary, args, width=160, height=36, cwd=root, environment=env)
+            switch_to_union(app, "worker queued")
+            restored = app.wait_until(
+                lambda text: "› Union of" in text
+                and "api accepted" in text
+                and "worker queued" in text
+                and "api responded" in text,
+                "normalized shared-key union restored",
+                timeout=25,
+            )
+            assert "api unrelated" not in restored, restored
+            assert "worker unrelated" not in restored, restored
+            assert union_stable_id(
+                app, "api accepted", ("api accepted", "worker queued", "api responded")
+            ) == api_id
+            assert union_stable_id(
+                app, "worker queued", ("api accepted", "worker queued", "api responded")
+            ) == worker_id
             stop(app)
         finally:
             if app.process.poll() is None:
-                app.send(b"\x03")
-                try:
-                    app.wait_exit(5)
-                except Exception:
+                if sys.exc_info()[0] is None:
+                    stop(app)
+                else:
                     app.process.kill()
-                    app.process.wait()
-                app.close()
+                    app.process.wait(timeout=5)
+                    app.close()
+
     print(
-        "Correlation PTY passed: differing key names mapped explicitly, records from both "
-        "sources in explicit order, pinned correlating fields, restart restoration and a "
-        "cancelled mapping leaving the origin view intact"
+        "Correlation replacement PTY passed: explicit derived-key mapping, cancellation, "
+        "native ordered membership, stable original IDs and restart persistence"
     )
 
 
