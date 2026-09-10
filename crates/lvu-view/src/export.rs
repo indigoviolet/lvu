@@ -126,9 +126,34 @@ pub struct FrozenInput {
     _lease: JobLease,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FrozenSourceAuthority {
+    Local,
+    Remote { worker_session: String },
+}
+
 impl FrozenInput {
     pub fn summary(&self) -> &FrozenInputSummary {
         &self.summary
+    }
+
+    /// Capture ownership of the exact handles this frozen replay will read.
+    /// A later registry replacement must never authorize bytes read through
+    /// an older remote worker session.
+    pub(crate) fn source_authorities(&self) -> Vec<(SourceId, FrozenSourceAuthority)> {
+        self.frozen
+            .sources
+            .iter()
+            .map(|source| {
+                let authority = source.handle.remote_worker_session().map_or(
+                    FrozenSourceAuthority::Local,
+                    |worker_session| FrozenSourceAuthority::Remote {
+                        worker_session: worker_session.to_owned(),
+                    },
+                );
+                (source.id, authority)
+            })
+            .collect()
     }
 
     /// Replays the accepted view on the calling thread and visits bounded batches.

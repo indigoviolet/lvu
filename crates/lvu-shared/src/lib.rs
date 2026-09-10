@@ -26,6 +26,7 @@ pub mod remote;
 pub mod session;
 pub mod spawn;
 pub mod tail;
+pub mod union_commit;
 pub mod worker;
 
 pub use child::{ChildArgs, parse_child_args, run_child, run_child_blocking};

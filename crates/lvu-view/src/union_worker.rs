@@ -26,14 +26,14 @@
 //!   visited batches, and every visit honors bounded `FrozenInputLimits`
 //!   derived from the remaining [`UnionLimits`](super::union::UnionLimits).
 //! * After all inputs decode, the worker merges through
-//!   [`union_frozen_inputs`](super::union::union_frozen_inputs), then
-//!   publishes under ONE `shared` lock: input revisions/generations are
-//!   re-verified against the adopted (frozen) fence atomically with
-//!   publication, so an input that advanced mid-job aborts as stale instead
-//!   of publishing a mixed revision. Submit-time skew from a live tail is
-//!   adopted at freeze time, never failed: only movement during the job's
-//!   own visit/merge window aborts. Any failure preserves the prior
-//!   published union.
+//!   [`union_frozen_inputs`](super::union::union_frozen_inputs). Local raw
+//!   inputs retain their progress guards through the final `shared`-locked
+//!   check/install. Raw inputs from one remote worker instead use that
+//!   worker's linearized commit receipt, then repeat every window-owned
+//!   revision/kind/source-set/filtered-membership fence under the final
+//!   install lock; no window lock or source guard crosses the RPC. Movement
+//!   after a remote commit installs that exact candidate and marks a pending
+//!   refresh. Any failure preserves the prior published union.
 //! * Publication is an ordinary `Membership`: per-source surviving sequences
 //!   (ascending, for raw resolution through the existing provider),
 //!   `NO_BASIS_TIME` where the basis had no value, and `merge_keys` set to
@@ -46,7 +46,7 @@
 //!   while paging, folding, export, raw context and time bounds read the same
 //!   ordinary `Membership` downstream.
 
-use super::export::{FrozenInput, FrozenInputError, FrozenInputLimits};
+use super::export::{FrozenInput, FrozenInputError, FrozenInputLimits, FrozenSourceAuthority};
 use super::union::{
     INPUT_COLUMN, StoredUnionInput, UnionCandidateSpec, UnionCompletion, UnionFilterSpec,
     UnionFrozenInput, UnionFrozenRow, UnionLimits, detect_union_cycle, lossy_utf8_len,
@@ -65,14 +65,20 @@ use lvu_query::{
     BatchQuery, BatchValidity, CompiledDefinition, KeyFlag, TextSearch, exact_column_expr,
     exact_key_flags, execute_batch_with_native_predicate, non_null_flags, scalar_projection,
 };
+use lvu_shared::union_commit::{
+    CommitDigest, CommitOutcome, CommitReceipt, CommitRequest, UnionSourceFence, refresh_needed,
+    sort_fences, verify_raw_fence,
+};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use super::remote_union_commit::CandidateDigest;
 
 /// How many freeze requests the tick driver serves per `drain_updates` call.
 ///
@@ -88,6 +94,7 @@ const UNION_RETRY_INITIAL: Duration = Duration::from_millis(25);
 const UNION_RETRY_MAXIMUM: Duration = Duration::from_secs(1);
 const SOURCE_SET_MOVED: &str =
     "a union input source set moved; refresh requires a new union definition";
+static NEXT_REMOTE_COMMIT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 /// Worker thread to tick-thread driver: freeze one input for the running job.
 pub(crate) struct DriverCmd {
@@ -132,6 +139,9 @@ pub struct UnionPhaseTestProbe {
     pub polars_builds: Arc<AtomicUsize>,
     pub grouping_indexed_rows: Arc<AtomicUsize>,
     pub grouping_lookups: Arc<AtomicUsize>,
+    /// Total shared union budget after the job's owned candidate has dropped.
+    /// A successful publication intentionally retains its membership charge.
+    pub completed_budget_bytes: Arc<AtomicU64>,
 }
 
 /// Runtime state of one union view. Registration (`inputs`) is the accepted
@@ -152,6 +162,7 @@ pub(crate) struct UnionViewState {
     test_barrier: Option<UnionTestBarrier>,
     publish_test_barrier: Option<UnionPublishTestBarrier>,
     phase_test_probe: Option<UnionPhaseTestProbe>,
+    remote_commit_test_timeout: Option<Duration>,
     transient_test_failure: Option<String>,
     completed: VecDeque<UnionCompletion>,
     /// Compiled/parsed predicates become reusable only with the publication
@@ -173,6 +184,16 @@ pub(crate) struct UnionViewState {
     retry_delay: Duration,
     published_filter: UnionFilterSpec,
     published_color_rules: Vec<lvu::ColorRule>,
+    pending_remote_commit: Option<RemoteCommitIdentity>,
+    published_remote_commit: Option<RemoteCommitIdentity>,
+    remote_refresh_pending: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteCommitIdentity {
+    generation: u64,
+    nonce: String,
+    digest: CommitDigest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,6 +226,7 @@ impl UnionViewState {
             test_barrier: None,
             publish_test_barrier: None,
             phase_test_probe: None,
+            remote_commit_test_timeout: None,
             transient_test_failure: None,
             completed: VecDeque::new(),
             prepared_filter: None,
@@ -215,6 +237,9 @@ impl UnionViewState {
             retry_delay: UNION_RETRY_INITIAL,
             published_filter: UnionFilterSpec::default(),
             published_color_rules: Vec::new(),
+            pending_remote_commit: None,
+            published_remote_commit: None,
+            remote_refresh_pending: false,
         }
     }
 }
@@ -445,8 +470,9 @@ impl super::NativeViewAdapter {
         if state.published_revision == 0 && attempted.is_none() {
             return Some(false);
         }
-        let mut needs_refresh =
-            state.published_revision == 0 || inputs.len() != state.published_source_fences.len();
+        let mut needs_refresh = state.remote_refresh_pending
+            || state.published_revision == 0
+            || inputs.len() != state.published_source_fences.len();
         for input in inputs {
             let Some(view) = shared.views.get(&input.view_id) else {
                 return Some(true);
@@ -550,18 +576,25 @@ impl super::NativeViewAdapter {
                 state.retry_not_before = None;
                 state.retry_delay = UNION_RETRY_INITIAL;
             }
+            let next_generation = state
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| "union worker generation exhausted".to_owned())?;
             state.cancel.store(true, Ordering::Release);
             state.cancel = Arc::new(AtomicBool::new(false));
             state.pending = Some(candidate.clone());
             state.cmd_rx = Some(cmd_rx);
             state.frozen_tx = Some(frozen_tx);
             state.pending_delivery = None;
-            state.generation = state.generation.saturating_add(1);
+            state.generation = next_generation;
+            state.pending_remote_commit = None;
+            state.remote_refresh_pending = false;
             let generation = state.generation;
             let cancel = Arc::clone(&state.cancel);
             let test_barrier = state.test_barrier.take();
             let publish_test_barrier = state.publish_test_barrier.take();
             let phase_test_probe = state.phase_test_probe.take();
+            let remote_commit_timeout = state.remote_commit_test_timeout.take();
             let transient_test_failure = state.transient_test_failure.take();
             let ctx = UnionJobCtx {
                 spec: candidate.clone(),
@@ -581,8 +614,10 @@ impl super::NativeViewAdapter {
                 test_barrier,
                 publish_test_barrier,
                 phase_test_probe,
+                remote_commit_timeout,
                 transient_test_failure,
                 dependency_attempt,
+                remote_union_commit: self.remote_union_commit.clone(),
             };
             let handle = thread::Builder::new()
                 .name("lvu-view-union".into())
@@ -648,6 +683,25 @@ impl super::NativeViewAdapter {
             return Err("unknown union view".into());
         };
         state.phase_test_probe = Some(probe);
+        Ok(())
+    }
+
+    /// Override the total remote-commit wait for the next job only. This is
+    /// deterministic test instrumentation; production always uses the shared
+    /// control round-trip bound.
+    pub fn arm_union_remote_commit_test_timeout(
+        &self,
+        union_view_id: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if timeout.is_zero() {
+            return Err("remote union commit timeout must be positive".into());
+        }
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        let Some(state) = shared.union_views.get_mut(union_view_id) else {
+            return Err("unknown union view".into());
+        };
+        state.remote_commit_test_timeout = Some(timeout);
         Ok(())
     }
 
@@ -782,13 +836,28 @@ struct UnionJobCtx {
     test_barrier: Option<UnionTestBarrier>,
     publish_test_barrier: Option<UnionPublishTestBarrier>,
     phase_test_probe: Option<UnionPhaseTestProbe>,
+    remote_commit_timeout: Option<Duration>,
     transient_test_failure: Option<String>,
     dependency_attempt: Option<UnionDependencyAttempt>,
+    remote_union_commit: Option<super::remote_union_commit::RemoteUnionCommitRegistration>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrozenPublicationKind {
+    Raw,
+    Filtered,
 }
 
 /// Per-input frozen metadata for the atomic publication fence. Small scalar
 /// data only — rows travel separately by move, never cloned.
 struct FrozenUnionMeta {
+    view_id: String,
+    applied_revision: u64,
+    applied_generation: u64,
+    kind: FrozenPublicationKind,
+    registered_sources: Vec<SourceId>,
+    source_authorities: Vec<(SourceId, FrozenSourceAuthority)>,
+    selected_records: Option<u64>,
     basis: lvu::TimeBasis,
     source_meta: Vec<(SourceId, u64, Option<u64>)>,
     scanned_records: u64,
@@ -800,6 +869,9 @@ struct FrozenUnionWork {
     view_id: String,
     summary_revision: u64,
     summary_generation: u64,
+    kind: FrozenPublicationKind,
+    source_authorities: Vec<(SourceId, FrozenSourceAuthority)>,
+    selected_records: Option<u64>,
     basis: lvu::TimeBasis,
     /// Union-source identity, generation and high-watermark per source the
     /// frozen input covers, straight from its summary.
@@ -819,6 +891,11 @@ struct FrozenUnionWork {
 /// would misroute completions whenever the two differ.
 fn union_job_loop(ctx: UnionJobCtx) {
     let error = run_union_job(&ctx).err();
+    if let Some(probe) = &ctx.phase_test_probe {
+        probe
+            .completed_budget_bytes
+            .store(ctx.budget.used.load(Ordering::Acquire), Ordering::Release);
+    }
     let completion = UnionCompletion {
         union_view_id: ctx.spec.union_view_id.clone(),
         union_revision: ctx.spec.union_revision,
@@ -843,6 +920,7 @@ fn union_job_loop(ctx: UnionJobCtx) {
         .union_views
         .get_mut(&ctx.spec.union_view_id)
         .expect("checked above");
+    state.pending_remote_commit = None;
     if failed.is_some() {
         state.pending = None;
         if failed.as_deref().is_some_and(terminal_dependency_failure) {
@@ -945,6 +1023,13 @@ fn run_union_job(ctx: &UnionJobCtx) -> Result<(), String> {
     let mut decoded_inputs = Vec::with_capacity(frozen_inputs.len());
     for work in frozen_inputs {
         metas.push(FrozenUnionMeta {
+            view_id: work.view_id.clone(),
+            applied_revision: work.summary_revision,
+            applied_generation: work.summary_generation,
+            kind: work.kind,
+            registered_sources: work.source_meta.iter().map(|(id, _, _)| *id).collect(),
+            source_authorities: work.source_authorities,
+            selected_records: work.selected_records,
             basis: work.basis,
             source_meta: work.source_meta.clone(),
             scanned_records: work.scanned_records,
@@ -1277,6 +1362,12 @@ fn visit_union_input(
     carrier_bytes: &mut u64,
 ) -> Result<FrozenUnionWork, String> {
     let summary = frozen.summary().clone();
+    let source_authorities = frozen.source_authorities();
+    let kind = if summary.selected_records.is_some() {
+        FrozenPublicationKind::Filtered
+    } else {
+        FrozenPublicationKind::Raw
+    };
     if summary.applied_revision != input.accepted_revision
         || summary.applied_generation != input.applied_generation
     {
@@ -1417,6 +1508,9 @@ fn visit_union_input(
         view_id: input.view_id.clone(),
         summary_revision: summary.applied_revision,
         summary_generation: summary.applied_generation,
+        kind,
+        source_authorities,
+        selected_records: summary.selected_records,
         basis,
         source_meta: summary
             .sources
@@ -2066,6 +2160,706 @@ fn union_groups(
     Ok((groups, charged, lookups))
 }
 
+fn next_remote_commit_nonce(ctx: &UnionJobCtx) -> Result<String, String> {
+    let sequence = NEXT_REMOTE_COMMIT_NONCE
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| "remote union commit nonce exhausted".to_owned())?;
+    Ok(format!(
+        "{}-{}-{sequence}",
+        std::process::id(),
+        ctx.generation
+    ))
+}
+
+fn hash_stream(hash: &mut CandidateDigest, stream: lvu_core::StreamKind) {
+    hash.tag(match stream {
+        lvu_core::StreamKind::Stdout => 0,
+        lvu_core::StreamKind::Stderr => 1,
+        lvu_core::StreamKind::File => 2,
+        lvu_core::StreamKind::Http => 3,
+        lvu_core::StreamKind::Stdin => 4,
+    });
+}
+
+fn hash_chunk(hash: &mut CandidateDigest, chunk: lvu_core::ChunkPosition) {
+    hash.tag(match chunk {
+        lvu_core::ChunkPosition::Complete => 0,
+        lvu_core::ChunkPosition::Start => 1,
+        lvu_core::ChunkPosition::Continue => 2,
+        lvu_core::ChunkPosition::End => 3,
+    });
+}
+
+fn hash_basis(hash: &mut CandidateDigest, basis: lvu::TimeBasis) {
+    hash.tag(match basis {
+        lvu::TimeBasis::Capture => 0,
+        lvu::TimeBasis::Event => 1,
+        lvu::TimeBasis::Extracted => 2,
+        lvu::TimeBasis::Selected => 3,
+    });
+}
+
+fn hash_optional_string(hash: &mut CandidateDigest, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash.tag(1);
+            hash.string(value);
+        }
+        None => hash.tag(0),
+    }
+}
+
+fn hash_exact_scalar(hash: &mut CandidateDigest, value: &lvu_core::ExactScalar) {
+    match value {
+        lvu_core::ExactScalar::Null => hash.tag(0),
+        lvu_core::ExactScalar::Bool(value) => {
+            hash.tag(1);
+            hash.bool(*value);
+        }
+        lvu_core::ExactScalar::SignedInteger(value) => {
+            hash.tag(2);
+            hash.i64(*value);
+        }
+        lvu_core::ExactScalar::UnsignedInteger(value) => {
+            hash.tag(3);
+            hash.u64(*value);
+        }
+        lvu_core::ExactScalar::FloatBits(value) => {
+            hash.tag(4);
+            hash.u64(*value);
+        }
+        lvu_core::ExactScalar::String(value) => {
+            hash.tag(5);
+            hash.string(value);
+        }
+    }
+}
+
+fn hash_color_rules(hash: &mut CandidateDigest, rules: &[lvu::ColorRule]) {
+    hash.u64(rules.len() as u64);
+    for rule in rules {
+        hash.string(&rule.predicate);
+        hash.string(rule.color.label());
+        hash_optional_string(hash, rule.column.as_deref());
+        hash_optional_string(hash, rule.value.as_deref());
+    }
+}
+
+fn hash_union_filter(hash: &mut CandidateDigest, spec: &UnionCandidateSpec) {
+    hash.string(&spec.filter.search);
+    hash_optional_string(hash, spec.filter.advanced_polars.as_deref());
+    match &spec.filter.exact_key {
+        Some(exact) => {
+            hash.tag(1);
+            hash.string(exact.field());
+            hash_exact_scalar(hash, exact.value());
+        }
+        None => hash.tag(0),
+    }
+    hash_optional_string(hash, spec.filter.grouping.as_deref());
+    hash_color_rules(hash, &spec.color_rules);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hash_union_membership_extras(
+    hash: &mut CandidateDigest,
+    derived: &HashMap<(String, u64, String), Option<String>>,
+    derived_errors: &HashSet<(String, u64, String)>,
+    frozen_derived: Option<&FrozenDerived>,
+    color_rules: &[lvu::ColorRule],
+    advanced_present: bool,
+    enrichment_count: usize,
+    evaluation_batch_count: usize,
+) -> Result<(), String> {
+    let mut derived = derived.iter().collect::<Vec<_>>();
+    derived.sort_by(|left, right| left.0.cmp(right.0));
+    hash.u64(derived.len() as u64);
+    for ((source, sequence, field), value) in derived {
+        hash.string(source);
+        hash.u64(*sequence);
+        hash.string(field);
+        hash_optional_string(hash, value.as_deref());
+    }
+
+    let mut errors = derived_errors.iter().collect::<Vec<_>>();
+    errors.sort();
+    hash.u64(errors.len() as u64);
+    for (source, sequence, field) in errors {
+        hash.string(source);
+        hash.u64(*sequence);
+        hash.string(field);
+    }
+
+    match frozen_derived {
+        None => hash.tag(0),
+        Some(values) => {
+            hash.tag(1);
+            let mut precise = values.iter().collect::<Vec<_>>();
+            precise.sort_by(|left, right| left.0.cmp(right.0));
+            hash.u64(precise.len() as u64);
+            for ((source, sequence, field), (value, dtype)) in precise {
+                hash.string(source);
+                hash.u64(*sequence);
+                hash.string(field);
+                hash.json(value);
+                hash.string(dtype);
+            }
+        }
+    }
+
+    // These are the exact installed display values and rules. Hashing them
+    // binds candidate identity; it does not make display text predicate
+    // authority or re-evaluate any expression.
+    hash_color_rules(hash, color_rules);
+
+    // A union membership is canonical by construction: native filtering and
+    // enrichment were already materialized into the fields above. Reject a
+    // future constructor that tries to smuggle unevaluated engine state into
+    // the remote publication until that state gains a stable commitment.
+    if advanced_present {
+        return Err("remote union membership unexpectedly retains an advanced definition".into());
+    }
+    hash.tag(0);
+    if enrichment_count != 0 {
+        return Err("remote union membership unexpectedly retains enrichment stages".into());
+    }
+    hash.u64(0);
+    if evaluation_batch_count != 0 {
+        return Err("remote union membership unexpectedly retains evaluation batches".into());
+    }
+    hash.u64(0);
+    Ok(())
+}
+
+/// Hash the exact retained candidate after all native evaluation and memory
+/// reservation. Ordered inputs, rows and membership vectors stay ordered;
+/// only maps/sets are sorted. Raw bytes and typed cells are authoritative —
+/// lossy display strings, pointers and allocation capacities never enter.
+fn union_candidate_digest(
+    ctx: &UnionJobCtx,
+    nonce: &str,
+    raw_fences: &[UnionSourceFence],
+    fence: &[StoredUnionInput],
+    frozen_inputs: &[FrozenUnionMeta],
+    decoded_inputs: &[UnionFrozenInput],
+    membership: &Membership,
+) -> Result<CommitDigest, String> {
+    let mut hash = CandidateDigest::new();
+    hash.string(&ctx.spec.union_view_id);
+    hash.u64(ctx.spec.union_revision);
+    hash.u64(ctx.spec.generation);
+    hash.u64(ctx.generation);
+    hash.string(nonce);
+    hash.u64(raw_fences.len() as u64);
+    for source in raw_fences {
+        hash.string(&source.source_id);
+        hash.u64(source.generation);
+        hash.optional_u64(source.high_watermark);
+    }
+    hash.u64(fence.len() as u64);
+    for (submitted, frozen) in fence.iter().zip(frozen_inputs) {
+        hash.string(&submitted.view_id);
+        hash.u64(submitted.accepted_revision);
+        hash.u64(submitted.applied_generation);
+        hash.string(&frozen.view_id);
+        hash.u64(frozen.applied_revision);
+        hash.u64(frozen.applied_generation);
+        hash.tag(match frozen.kind {
+            FrozenPublicationKind::Raw => 0,
+            FrozenPublicationKind::Filtered => 1,
+        });
+        hash.optional_u64(frozen.selected_records);
+        hash.u64(frozen.registered_sources.len() as u64);
+        for source in &frozen.registered_sources {
+            hash.bytes(source.0.as_bytes());
+        }
+        hash.u64(frozen.source_authorities.len() as u64);
+        for (source, authority) in &frozen.source_authorities {
+            hash.bytes(source.0.as_bytes());
+            match authority {
+                FrozenSourceAuthority::Local => hash.tag(0),
+                FrozenSourceAuthority::Remote { worker_session } => {
+                    hash.tag(1);
+                    hash.string(worker_session);
+                }
+            }
+        }
+        hash.u64(frozen.source_meta.len() as u64);
+        for (source, generation, high_watermark) in &frozen.source_meta {
+            hash.bytes(source.0.as_bytes());
+            hash.u64(*generation);
+            hash.optional_u64(*high_watermark);
+        }
+        let mut outputs = frozen.accepted_enrichment_outputs.clone();
+        outputs.sort();
+        outputs.dedup();
+        hash.u64(outputs.len() as u64);
+        for output in outputs {
+            hash.string(&output);
+        }
+        hash_basis(&mut hash, frozen.basis);
+        hash.u64(frozen.scanned_records);
+    }
+    hash_union_filter(&mut hash, &ctx.spec);
+    hash.u64(decoded_inputs.len() as u64);
+    for input in decoded_inputs {
+        hash.string(&input.view_id);
+        hash.u64(input.applied_revision);
+        hash.u64(input.applied_generation);
+        hash.string(&input.timestamp_column);
+        hash.u64(input.rows.len() as u64);
+        for row in &input.rows {
+            hash.bytes(row.record_id.source_id.0.as_bytes());
+            hash.u64(row.record_id.sequence);
+            hash.optional_i64(row.timestamp_nanos);
+            hash.u64(row.fields.len() as u64);
+            for (field, value) in &row.fields {
+                hash.string(field);
+                hash.json(value);
+            }
+            hash.u64(row.field_types.len() as u64);
+            for (field, dtype) in &row.field_types {
+                hash.string(field);
+                hash.string(dtype);
+            }
+            hash.bytes(&row.raw_bytes);
+            hash.i64(row.captured_at_unix_nanos);
+            hash_stream(&mut hash, row.stream);
+            hash.bytes(&row.acquisition_id);
+            hash_chunk(&mut hash, row.chunk);
+        }
+    }
+
+    hash.u64(membership.count);
+    hash.u64(membership.bytes);
+    hash.u64(membership.sources.len() as u64);
+    for source in &membership.sources {
+        hash.string(&source.source_id);
+        hash.u64(source.generation);
+        hash.optional_u64(source.high_watermark);
+        hash.u64(source.sequences.len() as u64);
+        for value in source.sequences.iter() {
+            hash.u64(*value);
+        }
+        hash.u64(source.times.len() as u64);
+        for value in source.times.iter() {
+            hash.i64(*value);
+        }
+        hash.u64(source.merge_keys.len() as u64);
+        for value in source.merge_keys.iter() {
+            hash.i64(*value);
+        }
+        hash.bool(source.ascending);
+        hash.optional_i64(source.bounds.first);
+        hash.optional_i64(source.bounds.last);
+        hash.u64(source.bounds.count as u64);
+        hash.u64(source.bounds.missing as u64);
+        hash.u64(source.groups.len() as u64);
+        for group in source.groups.iter() {
+            hash.u64(group.start as u64);
+            hash.u64(group.len as u64);
+            hash.u64(group.logical_lines as u64);
+            hash.u64(group.payload_bytes as u64);
+            hash_stream(&mut hash, group.stream);
+            for value in [
+                group.orphan,
+                group.split,
+                group.oversized,
+                group.pending,
+                group.configured,
+                group.key_refused,
+                group.auto_open,
+                group.auto_structured,
+                group.partial_open,
+                group.partial_truncated,
+                group.structure_truncated,
+            ] {
+                hash.bool(value);
+            }
+            hash.u64(group.auto_structure_depth.into());
+            match group.run_key.as_deref() {
+                Some(value) => {
+                    hash.tag(1);
+                    hash.bytes(value);
+                }
+                None => hash.tag(0),
+            }
+            hash.bytes(&group.partial_prefix);
+            hash.bytes(&group.structure_prefix);
+            hash.bytes(&group.acquisition_id);
+            hash_chunk(&mut hash, group.last_chunk);
+            hash.i64(group.first_capture_nanos);
+            hash.i64(group.last_capture_nanos);
+        }
+    }
+    hash.u64(membership.enrichment_names.len() as u64);
+    for name in &membership.enrichment_names {
+        hash.string(name);
+    }
+    hash_union_membership_extras(
+        &mut hash,
+        &membership.derived,
+        &membership.derived_errors,
+        membership.frozen_derived.as_ref(),
+        &membership.color_rules,
+        membership.advanced.is_some(),
+        membership.enrichment.len(),
+        membership.evaluation_batches.len(),
+    )?;
+    let mut colors = membership.color_matches.iter().collect::<Vec<_>>();
+    colors.sort_by(|left, right| left.0.cmp(right.0));
+    hash.u64(colors.len() as u64);
+    for ((source, sequence), rule) in colors {
+        hash.string(source);
+        hash.u64(*sequence);
+        hash.u64((*rule).into());
+    }
+    hash_basis(&mut hash, membership.basis);
+    hash.bool(membership.grouped);
+    hash.u64(membership.order.len() as u64);
+    for (source, unit) in membership.order.iter() {
+        hash.u64((*source).into());
+        hash.u64((*unit).into());
+    }
+    hash.u64(membership.ranks.len() as u64);
+    for ranks in membership.ranks.iter() {
+        hash.u64(ranks.len() as u64);
+        for rank in ranks.iter() {
+            hash.u64((*rank).into());
+        }
+    }
+    hash.i64(membership.max_key);
+    hash.u64(membership.event_time_missing as u64);
+    hash.u64(membership.event_time_invalid as u64);
+    hash.u64(membership.evaluation_page_bytes as u64);
+    Ok(hash.finish())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RawPublicationAuthority {
+    Local,
+    Remote { worker_session: String },
+}
+
+fn raw_publication_authority(
+    frozen_inputs: &[FrozenUnionMeta],
+) -> Result<RawPublicationAuthority, String> {
+    let mut authority: Option<RawPublicationAuthority> = None;
+    for input in frozen_inputs
+        .iter()
+        .filter(|input| input.kind == FrozenPublicationKind::Raw)
+    {
+        if input.source_authorities.len() != input.registered_sources.len()
+            || input
+                .registered_sources
+                .iter()
+                .any(|source| !input.source_authorities.iter().any(|(id, _)| id == source))
+        {
+            return Err(format!(
+                "union input '{}' changed capture ownership during freeze",
+                input.view_id
+            ));
+        }
+        for (_, source_authority) in &input.source_authorities {
+            let next = match source_authority {
+                FrozenSourceAuthority::Local => RawPublicationAuthority::Local,
+                FrozenSourceAuthority::Remote { worker_session } => {
+                    RawPublicationAuthority::Remote {
+                        worker_session: worker_session.clone(),
+                    }
+                }
+            };
+            match &authority {
+                None => authority = Some(next),
+                Some(existing) if existing == &next => {}
+                Some(_) => {
+                    return Err(
+                        "a union cannot mix raw capture authorities or worker sessions".into(),
+                    );
+                }
+            }
+        }
+    }
+    // No raw inputs means an all-filtered union. It stays on the existing
+    // in-process atomic transaction and never sends a remote commit.
+    Ok(authority.unwrap_or(RawPublicationAuthority::Local))
+}
+
+fn remote_raw_fences(frozen_inputs: &[FrozenUnionMeta]) -> Result<Vec<UnionSourceFence>, String> {
+    let mut by_source = BTreeMap::<String, UnionSourceFence>::new();
+    for input in frozen_inputs
+        .iter()
+        .filter(|input| input.kind == FrozenPublicationKind::Raw)
+    {
+        for (source, generation, high_watermark) in &input.source_meta {
+            let fence = UnionSourceFence {
+                source_id: source.0.to_string(),
+                generation: *generation,
+                high_watermark: *high_watermark,
+            };
+            if let Some(existing) = by_source.insert(fence.source_id.clone(), fence.clone())
+                && existing != fence
+            {
+                return Err(format!(
+                    "raw source {} has conflicting frozen fences",
+                    fence.source_id
+                ));
+            }
+        }
+    }
+    let mut fences = by_source.into_values().collect::<Vec<_>>();
+    sort_fences(&mut fences);
+    Ok(fences)
+}
+
+fn frozen_view_fences(input: &FrozenUnionMeta) -> Vec<UnionSourceFence> {
+    input
+        .source_meta
+        .iter()
+        .map(|(source, generation, high_watermark)| UnionSourceFence {
+            source_id: source.0.to_string(),
+            generation: *generation,
+            high_watermark: *high_watermark,
+        })
+        .collect()
+}
+
+/// Recheck every window-side authority that cannot be attested by the raw
+/// worker receipt. Raw progress may advance after the worker's linearization,
+/// but its handle session, view kind and source set may not change. Filtered
+/// memberships remain entirely window-owned and must match their frozen fence.
+fn verify_remote_window_fences(
+    shared: &Shared,
+    ctx: &UnionJobCtx,
+    fence: &[StoredUnionInput],
+    frozen_inputs: &[FrozenUnionMeta],
+    worker_session: &str,
+) -> Result<Vec<UnionSourceFence>, String> {
+    let state = shared
+        .union_views
+        .get(&ctx.spec.union_view_id)
+        .ok_or_else(|| "unknown union view".to_owned())?;
+    if state.generation != ctx.generation || ctx.cancel.load(Ordering::Acquire) {
+        return Err("union superseded".into());
+    }
+    if fence.len() != frozen_inputs.len() {
+        return Err("union input set moved during the merge".into());
+    }
+    let mut observed = BTreeMap::<String, UnionSourceFence>::new();
+    for (submitted, frozen) in fence.iter().zip(frozen_inputs) {
+        if submitted.view_id != frozen.view_id {
+            return Err("union input order moved during the merge".into());
+        }
+        let view = shared
+            .views
+            .get(&submitted.view_id)
+            .ok_or_else(|| format!("union input view '{}' is unknown", submitted.view_id))?;
+        if view.applied_revision != frozen.applied_revision
+            || view.applied_generation != frozen.applied_generation
+        {
+            return Err(format!(
+                "union input '{}' moved during the merge",
+                submitted.view_id
+            ));
+        }
+        if view.registration.sources != frozen.registered_sources {
+            return Err(SOURCE_SET_MOVED.into());
+        }
+        let current_kind = if matches!(view.published, Published::Raw) {
+            FrozenPublicationKind::Raw
+        } else {
+            FrozenPublicationKind::Filtered
+        };
+        if current_kind != frozen.kind {
+            return Err(format!(
+                "union input '{}' changed publication kind during the merge",
+                submitted.view_id
+            ));
+        }
+        match frozen.kind {
+            FrozenPublicationKind::Filtered => {
+                super::union::verify_source_fence(
+                    &submitted.view_id,
+                    &frozen_view_fences(frozen),
+                    &current_source_fence(shared, view),
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            FrozenPublicationKind::Raw => {
+                for source_id in &view.registration.sources {
+                    let handle = &shared
+                        .sources
+                        .get(source_id)
+                        .ok_or_else(|| "union input source is no longer open".to_owned())?
+                        .handle;
+                    if handle.remote_worker_session() != Some(worker_session) {
+                        return Err(format!(
+                            "union raw source '{}' changed worker session during the merge",
+                            source_id.0
+                        ));
+                    }
+                    let progress = handle.progress();
+                    let current = UnionSourceFence {
+                        source_id: source_id.0.to_string(),
+                        generation: progress.generation,
+                        high_watermark: progress.high_watermark.map(|record| record.sequence),
+                    };
+                    if let Some(existing) =
+                        observed.insert(current.source_id.clone(), current.clone())
+                        && existing != current
+                    {
+                        return Err(format!(
+                            "raw source {} has conflicting current fences",
+                            current.source_id
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let mut observed = observed.into_values().collect::<Vec<_>>();
+    sort_fences(&mut observed);
+    Ok(observed)
+}
+
+/// Best-effort raw progress observation after an already-atomic install.
+/// Any missing/replaced/session-moved source is itself refresh-worthy; this
+/// function therefore returns `None` instead of turning a completed install
+/// into a failed completion after the fact.
+fn observe_remote_raw_fences(
+    shared: &Shared,
+    frozen_inputs: &[FrozenUnionMeta],
+    worker_session: &str,
+) -> Option<Vec<UnionSourceFence>> {
+    let mut observed = BTreeMap::<String, UnionSourceFence>::new();
+    for input in frozen_inputs
+        .iter()
+        .filter(|input| input.kind == FrozenPublicationKind::Raw)
+    {
+        let view = shared.views.get(&input.view_id)?;
+        if !matches!(view.published, Published::Raw)
+            || view.registration.sources != input.registered_sources
+        {
+            return None;
+        }
+        for source_id in &view.registration.sources {
+            let handle = &shared.sources.get(source_id)?.handle;
+            if handle.remote_worker_session() != Some(worker_session) {
+                return None;
+            }
+            let progress = handle.progress();
+            let current = UnionSourceFence {
+                source_id: source_id.0.to_string(),
+                generation: progress.generation,
+                high_watermark: progress.high_watermark.map(|record| record.sequence),
+            };
+            if let Some(existing) = observed.insert(current.source_id.clone(), current.clone())
+                && existing != current
+            {
+                return None;
+            }
+        }
+    }
+    let mut observed = observed.into_values().collect::<Vec<_>>();
+    sort_fences(&mut observed);
+    Some(observed)
+}
+
+fn verify_commit_receipt(
+    request: &CommitRequest,
+    expected_worker_session: &str,
+    receipt: &CommitReceipt,
+) -> Result<Vec<UnionSourceFence>, String> {
+    if receipt.worker_session != expected_worker_session
+        || receipt.window_id != request.window_id
+        || receipt.union_view_id != request.union_view_id
+        || receipt.candidate_generation != request.candidate_generation
+        || receipt.nonce != request.nonce
+        || receipt.digest != request.digest
+    {
+        return Err("remote union commit receipt does not match the pending candidate".into());
+    }
+    match &receipt.outcome {
+        CommitOutcome::Committed { current } => {
+            verify_raw_fence(&request.frozen, current).map_err(|detail| {
+                format!("remote union commit returned an invalid fence: {detail}")
+            })?;
+            Ok(current.clone())
+        }
+        CommitOutcome::Pending => Err("remote union commit returned a non-terminal receipt".into()),
+        CommitOutcome::Stale { detail } => Err(format!("remote union input is stale: {detail}")),
+        CommitOutcome::Refused { reason } => Err(format!("remote union commit refused: {reason}")),
+        CommitOutcome::Superseded => Err("remote union commit was superseded".into()),
+        CommitOutcome::NonceConflict => Err("remote union commit nonce conflicted".into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_union_locked(
+    shared: &mut Shared,
+    ctx: &UnionJobCtx,
+    fence: &[StoredUnionInput],
+    frozen_inputs: &[FrozenUnionMeta],
+    membership: Membership,
+    high_watermarks: Vec<(SourceId, Option<u64>)>,
+    prepared_filter: PreparedUnionFilter,
+    remote_identity: Option<RemoteCommitIdentity>,
+    remote_refresh_pending: bool,
+) {
+    let count = membership.count;
+    let bytes = membership.bytes;
+    let view = shared
+        .views
+        .get_mut(&ctx.spec.union_view_id)
+        .expect("publication fences checked union view");
+    view.pending_request = None;
+    view.resubmit_pending = false;
+    view.published = Published::Filtered {
+        membership: Arc::new(membership),
+    };
+    view.applied_revision = ctx.spec.union_revision;
+    view.applied_generation = ctx.spec.generation;
+    view.applied_constraints = lvu::QueryConstraints::default();
+    view.last_request = None;
+    view.refreshing = false;
+    view.provider_revision = view.provider_revision.saturating_add(1);
+    view.status = ViewQueryStatus {
+        view_id: ctx.spec.union_view_id.clone(),
+        revision: ctx.spec.union_revision,
+        state: ScanState::Ready,
+        scanned_records: frozen_inputs.iter().map(|work| work.scanned_records).sum(),
+        high_watermarks,
+        matched_records: count,
+        index_bytes: bytes,
+        diagnostic: None,
+    };
+    let state = shared
+        .union_views
+        .get_mut(&ctx.spec.union_view_id)
+        .expect("publication fences checked union state");
+    state.inputs = fence.to_vec();
+    state.pending = None;
+    state.published_revision = ctx.spec.union_revision;
+    state.published_generation = ctx.spec.generation;
+    state.prepared_filter = Some(prepared_filter);
+    state.published_filter = ctx.spec.filter.clone();
+    state.published_color_rules = ctx.spec.color_rules.clone();
+    state.rejected_attempt = None;
+    state.retry_attempt = None;
+    state.retry_not_before = None;
+    state.retry_delay = UNION_RETRY_INITIAL;
+    state.published_source_fences = fence
+        .iter()
+        .zip(frozen_inputs.iter())
+        .map(|(input, frozen)| (input.view_id.clone(), frozen_view_fences(frozen)))
+        .collect();
+    state.pending_remote_commit = None;
+    state.published_remote_commit = remote_identity;
+    state.remote_refresh_pending = remote_refresh_pending;
+}
+
 /// Merge result publication: fence re-verification and membership install
 /// happen atomically under one lock, so no input can advance between the
 /// check and the install. Any failure leaves the prior union untouched.
@@ -2355,26 +3149,45 @@ fn publish_union(
         ranks: result_ranks,
         max_key,
     };
+    match raw_publication_authority(&frozen_inputs)? {
+        RawPublicationAuthority::Local => publish_local_union(
+            ctx,
+            fence,
+            &frozen_inputs,
+            membership,
+            high_watermarks,
+            prepared_filter,
+        ),
+        RawPublicationAuthority::Remote { worker_session } => publish_remote_union(
+            ctx,
+            fence,
+            &frozen_inputs,
+            &decoded_inputs,
+            membership,
+            high_watermarks,
+            prepared_filter,
+            &worker_session,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_local_union(
+    ctx: &UnionJobCtx,
+    fence: &[StoredUnionInput],
+    frozen_inputs: &[FrozenUnionMeta],
+    membership: Membership,
+    high_watermarks: Vec<(SourceId, Option<u64>)>,
+    prepared_filter: PreparedUnionFilter,
+) -> Result<(), String> {
     let frozen_fences = fence
         .iter()
-        .zip(frozen_inputs.iter())
-        .map(|(input, work)| {
-            (
-                input.view_id.clone(),
-                work.source_meta
-                    .iter()
-                    .map(|(id, generation, high)| super::union::UnionSourceFence {
-                        source_id: id.0.to_string(),
-                        generation: *generation,
-                        high_watermark: *high,
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
+        .zip(frozen_inputs)
+        .map(|(input, work)| (input.view_id.clone(), frozen_view_fences(work)))
         .collect::<Vec<_>>();
-    // Pin only raw source progress publications during the short final fence
-    // check and install. All allocations above completed before these guards;
-    // filtered input publications use `shared` itself.
+    // Existing local transaction: pin raw progress through the final shared
+    // check and install. All-filtered unions acquire no raw guards and stay
+    // on this same path.
     let mut raw_handles = {
         let shared = ctx.shared.lock().expect("view state poisoned");
         let mut handles = Vec::new();
@@ -2391,15 +3204,9 @@ fn publish_union(
                             .ok_or_else(|| "union input source is no longer open".to_owned())?
                             .handle
                             .clone();
-                        // Temporary fail-closed scaffolding: union
-                        // publication needs generation-fenced local inputs,
-                        // and no remote guard may pose as worker publication
-                        // authority. Remote inputs are refused with an
-                        // actionable error until attested cross-process
-                        // fencing exists.
                         let Some(handle) = handle.as_local().cloned() else {
                             return Err(format!(
-                                "union input source '{}' is a shared capture: union over shared captures needs the cross-process fence (not yet implemented)",
+                                "union input source '{}' changed capture authority during the merge",
                                 source_id.0
                             ));
                         };
@@ -2464,66 +3271,139 @@ fn publish_union(
         super::union::verify_source_fence(&input.view_id, frozen, &current)
             .map_err(|error| error.to_string())?;
     }
-    let view = shared
-        .views
-        .get_mut(&ctx.spec.union_view_id)
-        .expect("checked");
-    view.pending_request = None;
-    view.resubmit_pending = false;
-    view.published = Published::Filtered {
-        membership: Arc::new(membership),
-    };
-    view.applied_revision = ctx.spec.union_revision;
-    view.applied_generation = ctx.spec.generation;
-    view.applied_constraints = lvu::QueryConstraints::default();
-    view.last_request = None;
-    view.refreshing = false;
-    view.provider_revision = view.provider_revision.saturating_add(1);
-    view.status = ViewQueryStatus {
-        view_id: ctx.spec.union_view_id.clone(),
-        revision: ctx.spec.union_revision,
-        state: ScanState::Ready,
-        scanned_records: frozen_inputs.iter().map(|work| work.scanned_records).sum(),
+    install_union_locked(
+        &mut shared,
+        ctx,
+        fence,
+        frozen_inputs,
+        membership,
         high_watermarks,
-        matched_records: count,
-        index_bytes: bytes,
-        diagnostic: None,
+        prepared_filter,
+        None,
+        false,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_remote_union(
+    ctx: &UnionJobCtx,
+    fence: &[StoredUnionInput],
+    frozen_inputs: &[FrozenUnionMeta],
+    decoded_inputs: &[UnionFrozenInput],
+    membership: Membership,
+    high_watermarks: Vec<(SourceId, Option<u64>)>,
+    prepared_filter: PreparedUnionFilter,
+    worker_session: &str,
+) -> Result<(), String> {
+    let registration = ctx
+        .remote_union_commit
+        .as_ref()
+        .ok_or_else(|| "union over shared captures needs a remote commit transport".to_owned())?;
+    let nonce = next_remote_commit_nonce(ctx)?;
+    let raw_fences = remote_raw_fences(frozen_inputs)?;
+    let digest = union_candidate_digest(
+        ctx,
+        &nonce,
+        &raw_fences,
+        fence,
+        frozen_inputs,
+        decoded_inputs,
+        &membership,
+    )?;
+    let identity = RemoteCommitIdentity {
+        generation: ctx.generation,
+        nonce: nonce.clone(),
+        digest,
     };
+    let request = CommitRequest {
+        window_id: registration.window_id.clone(),
+        union_view_id: ctx.spec.union_view_id.clone(),
+        candidate_generation: ctx.generation,
+        nonce,
+        digest,
+        frozen: raw_fences,
+    };
+
+    // Materialization, reservation and hashing are complete before this
+    // short window lock. The retained Membership stays worker-owned while
+    // the transport resolves; no shared lock or source guard crosses RPC.
+    {
+        let mut shared = ctx.shared.lock().expect("view state poisoned");
+        let _ = verify_remote_window_fences(&shared, ctx, fence, frozen_inputs, worker_session)?;
+        let state = shared
+            .union_views
+            .get_mut(&ctx.spec.union_view_id)
+            .expect("checked");
+        state.pending_remote_commit = Some(identity.clone());
+    }
+    let timeout = ctx
+        .remote_commit_timeout
+        .unwrap_or(lvu_shared::CONTROL_ROUNDTRIP_TIMEOUT);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "remote union commit deadline overflow".to_owned())?;
+    let receipt_rx = registration
+        .transport
+        .submit(worker_session, request.clone(), deadline)?;
+    let receipt = loop {
+        check_cancelled(&ctx.cancel, &ctx.shared)?;
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("remote union commit timed out before a terminal receipt".into());
+        }
+        let wait = FREEZE_WAIT.min(deadline.saturating_duration_since(now));
+        match receipt_rx.recv_timeout(wait) {
+            Ok(Ok(receipt)) => break receipt,
+            Ok(Err(error)) => return Err(format!("remote union commit failed: {error}")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    return Err("remote union commit timed out before a terminal receipt".into());
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("remote union commit transport disconnected".into());
+            }
+        }
+    };
+    let committed = verify_commit_receipt(&request, worker_session, &receipt)?;
+
+    let mut shared = ctx.shared.lock().expect("view state poisoned");
+    let observed_before_apply =
+        verify_remote_window_fences(&shared, ctx, fence, frozen_inputs, worker_session)?;
     let state = shared
         .union_views
-        .get_mut(&ctx.spec.union_view_id)
+        .get(&ctx.spec.union_view_id)
         .expect("checked");
-    state.inputs = fence.to_vec();
-    state.pending = None;
-    state.published_revision = ctx.spec.union_revision;
-    state.published_generation = ctx.spec.generation;
-    state.prepared_filter = Some(prepared_filter);
-    state.published_filter = ctx.spec.filter.clone();
-    state.published_color_rules = ctx.spec.color_rules.clone();
-    state.rejected_attempt = None;
-    state.retry_attempt = None;
-    state.retry_not_before = None;
-    state.retry_delay = UNION_RETRY_INITIAL;
-    state.published_source_fences = fence
-        .iter()
-        .zip(frozen_inputs.iter())
-        .map(|(input, frozen)| {
-            (
-                input.view_id.clone(),
-                frozen
-                    .source_meta
-                    .iter()
-                    .map(
-                        |(id, generation, high_watermark)| super::union::UnionSourceFence {
-                            source_id: id.0.to_string(),
-                            generation: *generation,
-                            high_watermark: *high_watermark,
-                        },
-                    )
-                    .collect(),
-            )
-        })
-        .collect();
+    if state.pending_remote_commit.as_ref() != Some(&identity) {
+        return Err("remote union commit no longer matches the pending candidate".into());
+    }
+    let refresh_before_apply = refresh_needed(&committed, &observed_before_apply);
+    install_union_locked(
+        &mut shared,
+        ctx,
+        fence,
+        frozen_inputs,
+        membership,
+        high_watermarks,
+        prepared_filter,
+        Some(identity.clone()),
+        refresh_before_apply,
+    );
+    drop(shared);
+
+    // A raw append can race immediately after installation. Observe once
+    // more and generation-scope the refresh mark to this exact digest so an
+    // older job can never dirty a replacement publication.
+    let mut shared = ctx.shared.lock().expect("view state poisoned");
+    let refresh_after_apply = observe_remote_raw_fences(&shared, frozen_inputs, worker_session)
+        .is_none_or(|observed| refresh_needed(&committed, &observed));
+    if refresh_after_apply
+        && let Some(state) = shared.union_views.get_mut(&ctx.spec.union_view_id)
+        && state.published_remote_commit.as_ref() == Some(&identity)
+    {
+        state.remote_refresh_pending = true;
+    }
     Ok(())
 }
 
@@ -2536,6 +3416,132 @@ mod tests {
     use lvu_live::{LiveConfig, LiveRowProvider};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    fn authority_meta(
+        view_id: &str,
+        source: SourceId,
+        authority: FrozenSourceAuthority,
+    ) -> FrozenUnionMeta {
+        FrozenUnionMeta {
+            view_id: view_id.into(),
+            applied_revision: 0,
+            applied_generation: 0,
+            kind: FrozenPublicationKind::Raw,
+            registered_sources: vec![source],
+            source_authorities: vec![(source, authority)],
+            selected_records: None,
+            basis: lvu::TimeBasis::Capture,
+            source_meta: vec![(source, 1, Some(0))],
+            scanned_records: 1,
+            accepted_enrichment_outputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn raw_publication_refuses_mixed_and_cross_session_authority() {
+        let first = SourceId::new();
+        let second = SourceId::new();
+        let local = authority_meta("local", first, FrozenSourceAuthority::Local);
+        let remote_a = authority_meta(
+            "remote-a",
+            second,
+            FrozenSourceAuthority::Remote {
+                worker_session: "a".into(),
+            },
+        );
+        assert!(raw_publication_authority(&[local, remote_a]).is_err());
+
+        let remote_a = authority_meta(
+            "remote-a",
+            first,
+            FrozenSourceAuthority::Remote {
+                worker_session: "a".into(),
+            },
+        );
+        let remote_b = authority_meta(
+            "remote-b",
+            second,
+            FrozenSourceAuthority::Remote {
+                worker_session: "b".into(),
+            },
+        );
+        assert!(raw_publication_authority(&[remote_a, remote_b]).is_err());
+    }
+
+    #[test]
+    fn commitment_covers_installed_union_extras_and_rejects_engine_state() {
+        fn digest(
+            derived: &HashMap<(String, u64, String), Option<String>>,
+            errors: &HashSet<(String, u64, String)>,
+            frozen: Option<&FrozenDerived>,
+            colors: &[lvu::ColorRule],
+            advanced: bool,
+            enrichments: usize,
+            batches: usize,
+        ) -> Result<CommitDigest, String> {
+            let mut hash = CandidateDigest::new();
+            hash_union_membership_extras(
+                &mut hash,
+                derived,
+                errors,
+                frozen,
+                colors,
+                advanced,
+                enrichments,
+                batches,
+            )?;
+            Ok(hash.finish())
+        }
+
+        let empty_derived = HashMap::new();
+        let empty_errors = HashSet::new();
+        let empty_frozen = FrozenDerived::new();
+        let baseline = digest(&empty_derived, &empty_errors, None, &[], false, 0, 0).unwrap();
+
+        let mut derived = HashMap::new();
+        derived.insert(
+            ("source".into(), 7, "key".into()),
+            Some("full value".into()),
+        );
+        assert_ne!(
+            baseline,
+            digest(&derived, &empty_errors, None, &[], false, 0, 0).unwrap()
+        );
+        let mut errors = HashSet::new();
+        errors.insert(("source".into(), 7, "key".into()));
+        assert_ne!(
+            baseline,
+            digest(&empty_derived, &errors, None, &[], false, 0, 0).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                &empty_derived,
+                &empty_errors,
+                Some(&empty_frozen),
+                &[],
+                false,
+                0,
+                0,
+            )
+            .unwrap(),
+            "None and Some(empty) are different installed option states"
+        );
+        let colors = [lvu::ColorRule {
+            predicate: "severity == 'error'".into(),
+            color: lvu::RuleColor::Magenta,
+            column: Some("severity".into()),
+            value: Some("error".into()),
+        }];
+        assert_ne!(
+            baseline,
+            digest(&empty_derived, &empty_errors, None, &colors, false, 0, 0,).unwrap()
+        );
+
+        assert!(digest(&empty_derived, &empty_errors, None, &[], true, 0, 0).is_err());
+        assert!(digest(&empty_derived, &empty_errors, None, &[], false, 1, 0).is_err());
+        assert!(digest(&empty_derived, &empty_errors, None, &[], false, 0, 1).is_err());
+    }
 
     /// Byte accounting charges the replay's serialized output — fields plus
     /// dtype evidence — never the raw record bytes alone. A field-heavy input
@@ -2616,8 +3622,10 @@ mod tests {
             test_barrier: None,
             publish_test_barrier: None,
             phase_test_probe: None,
+            remote_commit_timeout: None,
             transient_test_failure: None,
             dependency_attempt: None,
+            remote_union_commit: None,
         };
         let mut remaining_rows = 1_000_000u64;
         let mut remaining_bytes = 1_000_000u64;

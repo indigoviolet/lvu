@@ -16,20 +16,100 @@ use lvu_ingest::{RuntimeConfig, RuntimeState, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
 use lvu_query::CompilerHostConfig;
 use lvu_view::{
-    FrozenInputLimits, NativeViewAdapter, StoredUnionInput, UnionCandidateSpec, UnionFilterSpec,
-    UnionPhaseTestProbe, UnionPublishTestBarrier, UnionTestBarrier, ViewConfig,
+    FrozenInputLimits, NativeViewAdapter, RemoteUnionCommitTransport, StoredUnionInput,
+    UnionCandidateSpec, UnionFilterSpec, UnionPhaseTestProbe, UnionPublishTestBarrier,
+    UnionTestBarrier, ViewConfig,
 };
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize},
+        mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
     },
     time::Duration,
 };
 use tempfile::TempDir;
+
+#[derive(Clone, Copy)]
+enum TestCommitVerdict {
+    Commit,
+    WrongDigest,
+}
+
+struct TestCommitTransport {
+    requests: Mutex<Vec<(String, lvu_shared::union_commit::CommitRequest)>>,
+    verdict: TestCommitVerdict,
+    before_reply: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl TestCommitTransport {
+    fn committing() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            verdict: TestCommitVerdict::Commit,
+            before_reply: None,
+        }
+    }
+}
+
+impl RemoteUnionCommitTransport for TestCommitTransport {
+    fn submit(
+        &self,
+        expected_worker_session: &str,
+        request: lvu_shared::union_commit::CommitRequest,
+        _deadline: std::time::Instant,
+    ) -> Result<Receiver<Result<lvu_shared::union_commit::CommitReceipt, String>>, String> {
+        self.requests
+            .lock()
+            .expect("requests poisoned")
+            .push((expected_worker_session.to_owned(), request.clone()));
+        let (tx, rx) = channel();
+        if let Some(before_reply) = &self.before_reply {
+            before_reply();
+        }
+        let outcome = lvu_shared::union_commit::CommitOutcome::Committed {
+            current: request.frozen.clone(),
+        };
+        let mut receipt = lvu_shared::union_commit::CommitReceipt::answer(
+            expected_worker_session,
+            &request,
+            outcome,
+        );
+        if matches!(self.verdict, TestCommitVerdict::WrongDigest) {
+            receipt.digest[0] ^= 0xff;
+        }
+        tx.send(Ok(receipt)).expect("test receiver alive");
+        Ok(rx)
+    }
+}
+
+type CommitCall = (
+    String,
+    lvu_shared::union_commit::CommitRequest,
+    Sender<Result<lvu_shared::union_commit::CommitReceipt, String>>,
+);
+
+struct RendezvousCommitTransport {
+    calls: SyncSender<CommitCall>,
+}
+
+impl RemoteUnionCommitTransport for RendezvousCommitTransport {
+    fn submit(
+        &self,
+        expected_worker_session: &str,
+        request: lvu_shared::union_commit::CommitRequest,
+        _deadline: std::time::Instant,
+    ) -> Result<Receiver<Result<lvu_shared::union_commit::CommitReceipt, String>>, String> {
+        let (reply, result) = channel();
+        self.calls
+            .try_send((expected_worker_session.to_owned(), request, reply))
+            .map_err(|_| "test commit rendezvous is full".to_owned())?;
+        Ok(result)
+    }
+}
 
 fn source(id: SourceId, path: &std::path::Path, follow: bool) -> SourceDefinition {
     SourceDefinition {
@@ -328,6 +408,76 @@ async fn setup_raw_bytes_with_budget(
     (root, manager, api, worker, adapter)
 }
 
+async fn setup_remote_raw() -> (
+    TempDir,
+    SourceManager,
+    lvu_shared::RemoteSourceHandle,
+    NativeViewAdapter,
+) {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("remote.log");
+    fs::write(&path, b"remote-one\nremote-two\n").unwrap();
+    let capture_root = root.path().join("capture");
+    let manager = SourceManager::new(&capture_root, runtime_config()).unwrap();
+    let source_id = SourceId::new();
+    let local = manager
+        .start(source(source_id, &path, false))
+        .await
+        .unwrap();
+    wait_runtime(&local, 2).await;
+    let progress = local.progress();
+    assert_eq!(progress.records, 2, "remote fixture captured both rows");
+    let journal = capture_root
+        .join(source_id.0.to_string())
+        .join("capture.journal");
+    let remote = lvu_shared::RemoteSourceHandle::new(
+        source_id,
+        &journal,
+        "worker-session-a".into(),
+        progress,
+        lvu_shared::RemoteConfig::default(),
+    )
+    .expect("bind remote source");
+    let (live, view) = configs(&root);
+    let raw = Arc::new(LiveRowProvider::new(live).unwrap());
+    let adapter = NativeViewAdapter::new(raw, view).unwrap();
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Remote(remote.clone()))
+        .unwrap();
+    adapter
+        .register_view("remote-raw-a", vec![source_id])
+        .unwrap();
+    adapter
+        .register_view("remote-raw-b", vec![source_id])
+        .unwrap();
+    adapter
+        .register_union_view("union", vec![source_id])
+        .unwrap();
+    (root, manager, remote, adapter)
+}
+
+fn remote_raw_candidate(revision: u64) -> UnionCandidateSpec {
+    UnionCandidateSpec {
+        union_view_id: "union".into(),
+        union_revision: revision,
+        generation: revision,
+        inputs: vec![
+            StoredUnionInput {
+                view_id: "remote-raw-a".into(),
+                accepted_revision: 0,
+                applied_generation: 0,
+            },
+            StoredUnionInput {
+                view_id: "remote-raw-b".into(),
+                accepted_revision: 0,
+                applied_generation: 0,
+            },
+        ],
+        filter: UnionFilterSpec::default(),
+        color_rules: Vec::new(),
+    }
+}
+
 /// Pump the tick until the union job for `revision` completes, then return
 /// its error (if any). Freeze traffic rides `drain_updates`; the worker
 /// thread does the replay and merge.
@@ -345,6 +495,21 @@ fn wait_union(adapter: &mut NativeViewAdapter, revision: u64) -> Option<lvu_view
         assert!(
             started.elapsed() < Duration::from_secs(60),
             "union revision {revision} did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_commit_call(adapter: &mut NativeViewAdapter, calls: &Receiver<CommitCall>) -> CommitCall {
+    let started = std::time::Instant::now();
+    loop {
+        adapter.drain_updates(64);
+        if let Ok(call) = calls.try_recv() {
+            return call;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "remote union did not submit its commit request"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -491,9 +656,373 @@ fn phase_probe() -> (UnionPhaseTestProbe, [Arc<AtomicUsize>; 4]) {
             polars_builds: Arc::clone(&counters[1]),
             grouping_indexed_rows: Arc::clone(&counters[2]),
             grouping_lookups: Arc::clone(&counters[3]),
+            completed_budget_bytes: Arc::new(AtomicU64::new(u64::MAX)),
         },
         counters,
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_raw_union_installs_only_the_exact_receipted_candidate() {
+    let (_root, manager, remote, mut adapter) = setup_remote_raw().await;
+    let committed = Arc::new(TestCommitTransport::committing());
+    adapter
+        .set_remote_union_commit_transport("window-test".into(), committed.clone())
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(1), &|_| None)
+        .unwrap();
+    let completion = wait_union(&mut adapter, 1).expect("remote completion");
+    assert_eq!(completion.error, None);
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+    {
+        let requests = committed.requests.lock().expect("requests poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "worker-session-a");
+        assert_eq!(requests[0].1.window_id, "window-test");
+        assert_eq!(requests[0].1.frozen.len(), 1);
+        assert_eq!(
+            requests[0].1.frozen[0].source_id,
+            remote.source_id().0.to_string()
+        );
+    }
+
+    let rejected = Arc::new(TestCommitTransport {
+        requests: Mutex::new(Vec::new()),
+        verdict: TestCommitVerdict::WrongDigest,
+        before_reply: None,
+    });
+    adapter
+        .set_remote_union_commit_transport("window-test".into(), rejected)
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(2), &|_| None)
+        .unwrap();
+    let completion = wait_union(&mut adapter, 2).expect("rejected completion");
+    assert!(
+        completion
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("does not match the pending candidate")),
+        "unexpected receipt verdict: {:?}",
+        completion.error
+    );
+    assert_eq!(
+        union_texts(&mut adapter),
+        ["remote-one", "remote-two"],
+        "a mismatched receipt preserves the last-good membership"
+    );
+    let mut after_install = remote.progress();
+    after_install.records = after_install.records.saturating_add(1);
+    after_install.high_watermark = Some(lvu_core::RecordId {
+        source_id: remote.source_id(),
+        sequence: 2,
+    });
+    assert!(remote.update_progress("worker-session-a", after_install));
+    assert_eq!(adapter.union_needs_refresh("union"), Some(true));
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_progress_before_receipt_installs_then_requests_refresh() {
+    let (_root, manager, remote, mut adapter) = setup_remote_raw().await;
+    let mut advanced = remote.progress();
+    advanced.records = advanced.records.saturating_add(1);
+    advanced.high_watermark = Some(lvu_core::RecordId {
+        source_id: remote.source_id(),
+        sequence: 2,
+    });
+    let remote_for_reply = remote.clone();
+    let transport = Arc::new(TestCommitTransport {
+        requests: Mutex::new(Vec::new()),
+        verdict: TestCommitVerdict::Commit,
+        before_reply: Some(Arc::new(move || {
+            assert!(remote_for_reply.update_progress("worker-session-a", advanced.clone()));
+        })),
+    });
+    adapter
+        .set_remote_union_commit_transport("window-test".into(), transport)
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(1), &|_| None)
+        .unwrap();
+    let completion = wait_union(&mut adapter, 1).expect("remote completion");
+    assert_eq!(completion.error, None);
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+    assert_eq!(
+        adapter.union_needs_refresh("union"),
+        Some(true),
+        "progress observed after worker linearization is a pending refresh, not a rejection"
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn superseded_remote_waiter_cannot_clear_the_new_candidate() {
+    let (_root, manager, _remote, mut adapter) = setup_remote_raw().await;
+    let (calls_tx, calls_rx) = sync_channel(4);
+    adapter
+        .set_remote_union_commit_transport(
+            "window-test".into(),
+            Arc::new(RendezvousCommitTransport { calls: calls_tx }),
+        )
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(1), &|_| None)
+        .unwrap();
+    let (_session_one, request_one, reply_one) = wait_commit_call(&mut adapter, &calls_rx);
+
+    adapter
+        .submit_union_candidate(remote_raw_candidate(2), &|_| None)
+        .unwrap();
+    let (session_two, request_two, reply_two) = wait_commit_call(&mut adapter, &calls_rx);
+    let receipt_two = lvu_shared::union_commit::CommitReceipt::answer(
+        &session_two,
+        &request_two,
+        lvu_shared::union_commit::CommitOutcome::Committed {
+            current: request_two.frozen.clone(),
+        },
+    );
+    reply_two.send(Ok(receipt_two)).expect("new waiter alive");
+    let completion = wait_union(&mut adapter, 2).expect("new completion");
+    assert_eq!(completion.error, None);
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+
+    // The old waiter is generation-scoped. Whether it has already observed
+    // cancellation or observes it on this wake, it cannot clear or replace
+    // the generation-2 publication.
+    let receipt_one = lvu_shared::union_commit::CommitReceipt::answer(
+        "worker-session-a",
+        &request_one,
+        lvu_shared::union_commit::CommitOutcome::Committed {
+            current: request_one.frozen.clone(),
+        },
+    );
+    let _ = reply_one.send(Ok(receipt_one));
+    std::thread::sleep(Duration::from_millis(150));
+    adapter.drain_updates(64);
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+    assert_eq!(
+        adapter.union_inputs("union"),
+        Some(remote_raw_candidate(2).inputs)
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_commit_total_deadline_drops_candidate_and_ignores_late_receipt() {
+    let (_root, manager, _remote, mut adapter) = setup_remote_raw().await;
+    let baseline_budget = Arc::new(AtomicU64::new(u64::MAX));
+    adapter
+        .arm_union_phase_test_probe(
+            "union",
+            UnionPhaseTestProbe {
+                retained_rows: Arc::new(AtomicUsize::new(0)),
+                polars_builds: Arc::new(AtomicUsize::new(0)),
+                grouping_indexed_rows: Arc::new(AtomicUsize::new(0)),
+                grouping_lookups: Arc::new(AtomicUsize::new(0)),
+                completed_budget_bytes: Arc::clone(&baseline_budget),
+            },
+        )
+        .unwrap();
+    adapter
+        .set_remote_union_commit_transport(
+            "window-test".into(),
+            Arc::new(TestCommitTransport::committing()),
+        )
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(1), &|_| None)
+        .unwrap();
+    assert_eq!(wait_union(&mut adapter, 1).unwrap().error, None);
+    let baseline_budget = baseline_budget.load(std::sync::atomic::Ordering::Acquire);
+    assert!(baseline_budget > 0, "published membership owns its budget");
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+
+    let (calls_tx, calls_rx) = sync_channel(2);
+    adapter
+        .set_remote_union_commit_transport(
+            "window-test".into(),
+            Arc::new(RendezvousCommitTransport { calls: calls_tx }),
+        )
+        .unwrap();
+    let completed_budget = Arc::new(AtomicU64::new(u64::MAX));
+    adapter
+        .arm_union_phase_test_probe(
+            "union",
+            UnionPhaseTestProbe {
+                retained_rows: Arc::new(AtomicUsize::new(0)),
+                polars_builds: Arc::new(AtomicUsize::new(0)),
+                grouping_indexed_rows: Arc::new(AtomicUsize::new(0)),
+                grouping_lookups: Arc::new(AtomicUsize::new(0)),
+                completed_budget_bytes: Arc::clone(&completed_budget),
+            },
+        )
+        .unwrap();
+    adapter
+        .arm_union_remote_commit_test_timeout("union", Duration::from_millis(50))
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(2), &|_| None)
+        .unwrap();
+    let (session, request, late_reply) = wait_commit_call(&mut adapter, &calls_rx);
+    let completion = wait_union(&mut adapter, 2).expect("deadline completion");
+    assert!(
+        completion
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out before a terminal receipt")),
+        "unexpected deadline result: {:?}",
+        completion.error
+    );
+    assert_eq!(adapter.status("union").unwrap().revision, 1);
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+    assert_eq!(
+        completed_budget.load(std::sync::atomic::Ordering::Acquire),
+        baseline_budget,
+        "timed-out candidate charge must be released while last-good stays retained"
+    );
+
+    let late_receipt = lvu_shared::union_commit::CommitReceipt::answer(
+        &session,
+        &request,
+        lvu_shared::union_commit::CommitOutcome::Committed {
+            current: request.frozen.clone(),
+        },
+    );
+    assert!(
+        late_reply.send(Ok(late_receipt)).is_err(),
+        "the deadline must drop the receipt channel"
+    );
+    adapter.drain_updates(64);
+    assert_eq!(adapter.status("union").unwrap().revision, 1);
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+
+    adapter
+        .set_remote_union_commit_transport(
+            "window-test".into(),
+            Arc::new(TestCommitTransport::committing()),
+        )
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(3), &|_| None)
+        .unwrap();
+    let retry = wait_union(&mut adapter, 3).expect("retry completion");
+    assert_eq!(retry.error, None);
+    assert_eq!(union_texts(&mut adapter), ["remote-one", "remote-two"]);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_receipt_cannot_cross_a_filtered_input_publication() {
+    let (_root, manager, _remote, mut adapter) = setup_remote_raw().await;
+    let (calls_tx, calls_rx) = sync_channel(2);
+    adapter
+        .set_remote_union_commit_transport(
+            "window-test".into(),
+            Arc::new(RendezvousCommitTransport { calls: calls_tx }),
+        )
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(1), &|_| None)
+        .unwrap();
+    let (session, request, reply) = wait_commit_call(&mut adapter, &calls_rx);
+
+    let constraints = QueryConstraints {
+        text: Some(TextConstraint {
+            literal: "remote".into(),
+            case_insensitive: true,
+        }),
+        ..QueryConstraints::default()
+    };
+    adapter
+        .submit(QueryRequest {
+            view_id: "remote-raw-a".into(),
+            generation: 1,
+            revision: 1,
+            base_revision: 0,
+            base_constraints: QueryConstraints::default(),
+            purpose: QueryPurpose::Search,
+            constraints,
+        })
+        .unwrap();
+    wait_applied(&mut adapter, 1).await;
+    let receipt = lvu_shared::union_commit::CommitReceipt::answer(
+        &session,
+        &request,
+        lvu_shared::union_commit::CommitOutcome::Committed {
+            current: request.frozen.clone(),
+        },
+    );
+    reply.send(Ok(receipt)).expect("union waiter alive");
+    let completion = wait_union(&mut adapter, 1).expect("union completion");
+    assert!(
+        completion
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("moved during the merge")),
+        "unexpected final-fence verdict: {:?}",
+        completion.error
+    );
+    assert_eq!(adapter.union_inputs("union"), Some(Vec::new()));
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_receipt_cannot_cross_a_worker_session_replacement() {
+    let (root, manager, remote, mut adapter) = setup_remote_raw().await;
+    let (calls_tx, calls_rx) = sync_channel(2);
+    adapter
+        .set_remote_union_commit_transport(
+            "window-test".into(),
+            Arc::new(RendezvousCommitTransport { calls: calls_tx }),
+        )
+        .unwrap();
+    adapter
+        .submit_union_candidate(remote_raw_candidate(1), &|_| None)
+        .unwrap();
+    let (session, request, reply) = wait_commit_call(&mut adapter, &calls_rx);
+
+    let replacement = lvu_shared::RemoteSourceHandle::new(
+        remote.source_id(),
+        &root
+            .path()
+            .join("capture")
+            .join(remote.source_id().0.to_string())
+            .join("capture.journal"),
+        "worker-session-b".into(),
+        remote.progress(),
+        lvu_shared::RemoteConfig::default(),
+    )
+    .expect("bind replacement session");
+    adapter
+        .register_source(lvu_shared::AnySourceHandle::Remote(replacement))
+        .unwrap();
+    let receipt = lvu_shared::union_commit::CommitReceipt::answer(
+        &session,
+        &request,
+        lvu_shared::union_commit::CommitOutcome::Committed {
+            current: request.frozen.clone(),
+        },
+    );
+    reply.send(Ok(receipt)).expect("union waiter alive");
+    let completion = wait_union(&mut adapter, 1).expect("union completion");
+    assert!(
+        completion
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("changed worker session")),
+        "unexpected session-fence verdict: {:?}",
+        completion.error
+    );
+    assert_eq!(adapter.union_inputs("union"), Some(Vec::new()));
+    adapter.shutdown();
+    manager.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

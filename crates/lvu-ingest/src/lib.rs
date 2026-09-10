@@ -4,6 +4,8 @@ mod catalog;
 mod cursor;
 pub mod history;
 mod manager;
+#[cfg(feature = "test-support")]
+pub mod publish_probe;
 mod writer;
 
 pub use history::{SourceHistory, read_history};
