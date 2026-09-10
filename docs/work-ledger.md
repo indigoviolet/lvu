@@ -2427,3 +2427,21 @@ Producer SHA256 remains
 Review: `sol-runtime-review-scratch/v016-installer-66394e0-delta-review.md`,
 SHA256 `1b2ceb3753964698d108b9e49f8bca7d4ed030dbc9942f8f8833a27200ce84f6`.
 These are tooling pins, not an acceptance record or release GO.
+
+
+## 2026-09-10 — combined union colour source prepared, acceptance blocked
+
+Integrated `77c3c06` and `449a00a` as `48602f1` and `2d0aa98` on the complete
+ordinary-colour baseline. The merge preserves both input publication revisions
+and colour rules in dependency-attempt identity. Before first publication it
+uses the retained attempted colour rules, alongside the retained input/filter,
+so rejection/backoff comparisons do not accidentally compare against empty
+published rules. This merge hunk still needs integrated validation.
+
+The engine, export and colour-dialog files match `449a00a` exactly. An earlier
+owner test branch lacked the ordinary-colour dependency and is preserved but
+excluded from validation. The combined source is not accepted: independent
+review found that an unauthorized raw String namesake can conflict with an
+accepted UInt64 column before concatenation. The owner is repairing that
+pre-concatenation projection; the colour allocation finding is cleared.
+No combined build, PTY, matrix or release result is claimed here.

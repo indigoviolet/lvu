@@ -472,14 +472,7 @@ impl super::NativeViewAdapter {
         if !needs_refresh {
             return Some(false);
         }
-        let current = dependency_attempt(
-            &shared,
-            union_view_id,
-            inputs,
-            filter,
-            color_rules,
-            true,
-        );
+        let current = dependency_attempt(&shared, union_view_id, inputs, filter, color_rules, true);
         if current.as_ref() == state.rejected_attempt.as_ref() {
             return Some(false);
         }
