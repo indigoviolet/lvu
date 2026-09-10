@@ -241,7 +241,10 @@ pub async fn run_child(args: ChildArgs) -> i32 {
             Err(reason) => log_line(&paths, &format!("capture {} left stopped: {reason}", id.0)),
         }
     }
-    log_line(&paths, "serving");
+    log_line(
+        &paths,
+        &format!("serving session {}", service.worker_session()),
+    );
     service.serve(listener).await;
     // Drained (last detach past grace): stop captures, report, unlink the
     // socket while still holding the election so no window can connect to

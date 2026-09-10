@@ -202,6 +202,11 @@ pub struct WorkerService {
     session: Mutex<Vec<SourceDefinition>>,
     definitions: Mutex<HashMap<SourceId, SourceDefinition>>,
     shutdown_flag: std::sync::atomic::AtomicBool,
+    /// Worker lifetime nonce, minted once per `open` and published in
+    /// `Welcome` and every progress answer. Windows key remote epoch on
+    /// `(worker_session, generation)` so a replacement worker never reads
+    /// as continuity.
+    worker_session: String,
 }
 
 impl WorkerService {
@@ -236,9 +241,15 @@ impl WorkerService {
                 session: Mutex::new(session),
                 definitions: Mutex::new(HashMap::new()),
                 shutdown_flag: std::sync::atomic::AtomicBool::new(false),
+                worker_session: uuid::Uuid::new_v4().to_string(),
             }),
             session_warning,
         ))
+    }
+
+    /// This worker's lifetime nonce (see the field docs).
+    pub fn worker_session(&self) -> &str {
+        &self.worker_session
     }
 
     /// Resume the persisted session set with exactly startup-resume rules:
@@ -375,6 +386,26 @@ impl WorkerService {
             .collect();
         summaries.sort_by(|first, second| first.name.cmp(&second.name));
         summaries
+    }
+
+    /// Sample one live source's canonical progress for the poll RPC. The
+    /// value travels verbatim — never projected, never zero-filled — so
+    /// adapter scans and app diagnostics read the same truth the local
+    /// watch would show. Stopped handles report their terminal snapshot
+    /// (that is how windows read final counts and `last_error` after a
+    /// capture ends); only truly unknown ids are refused. Notably this
+    /// offers NO publication fencing: it is a point sample, not a
+    /// `lock_progress` equivalent, and must never be presented as one
+    /// (remote unions stay refused until the cross-process fence exists).
+    fn poll_source_progress(&self, source_id: &str) -> Result<lvu_ingest::SourceProgress, String> {
+        let id = uuid::Uuid::parse_str(source_id)
+            .map(SourceId)
+            .map_err(|_| "invalid source id".to_owned())?;
+        let handle = self
+            .manager
+            .source(id)
+            .ok_or_else(|| "source is not live on this worker".to_owned())?;
+        Ok(handle.progress())
     }
 
     /// Admit one explicit acquisition request: the hook decides, the manager
@@ -1649,6 +1680,21 @@ impl WorkerService {
                     sources: self.presence_snapshot().await,
                 }])
             }
+            WorkerRequest::RequestProgress {
+                request_id,
+                source_id,
+            } => {
+                // Pure in-memory read (manager lookup + watch borrow), so no
+                // timeout wrapper: there is nothing here that can wedge.
+                match self.poll_source_progress(&source_id) {
+                    Ok(progress) => Reply(vec![WorkerEvent::SourceProgress {
+                        request_id,
+                        worker_session: self.worker_session.clone(),
+                        progress,
+                    }]),
+                    Err(reason) => Reply(vec![WorkerEvent::Refused { request_id, reason }]),
+                }
+            }
             WorkerRequest::StdinChunk {
                 request_id,
                 source_id,
@@ -1746,6 +1792,7 @@ impl WorkerService {
                     request_id,
                     worker_pid: std::process::id(),
                     protocol: PROTOCOL_VERSION,
+                    worker_session: self.worker_session.clone(),
                     sources: self.presence_snapshot().await,
                 }])
             }
@@ -1777,6 +1824,7 @@ fn request_id_of(request: &WorkerRequest) -> String {
         | WorkerRequest::RequestRestart { request_id, .. }
         | WorkerRequest::StatusSubscribe { request_id }
         | WorkerRequest::StdinChunk { request_id, .. }
+        | WorkerRequest::RequestProgress { request_id, .. }
         | WorkerRequest::StdinClose { request_id, .. } => request_id.clone(),
     }
 }
@@ -2652,6 +2700,107 @@ mod tests {
                 assert_eq!(found.version, 1);
             }
             other => panic!("expected loaded views, got {other:?}"),
+        }
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn worker_sessions_are_unique_per_open() {
+        let first_root = tempfile::tempdir().unwrap();
+        let second_root = tempfile::tempdir().unwrap();
+        let (first, _) =
+            WorkerService::open(test_config(first_root.path()), Arc::new(AdmitAll)).unwrap();
+        let (second, _) =
+            WorkerService::open(test_config(second_root.path()), Arc::new(AdmitAll)).unwrap();
+        assert!(!first.worker_session().is_empty());
+        assert_ne!(first.worker_session(), second.worker_session());
+        // A UUIDv4, so windows can key remote epoch on it without parsing
+        // surprises.
+        let parsed =
+            uuid::Uuid::parse_str(first.worker_session()).expect("session is a UUID string");
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+    }
+
+    #[tokio::test]
+    async fn progress_poll_serves_canonical_snapshot_and_refuses_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("v.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let config = test_config(root.path());
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let session = service.worker_session().to_owned();
+        let definition = file_definition(95, &log);
+        service
+            .request_start(definition.clone())
+            .await
+            .expect("start");
+        let (mut client, mut decoder) = attach(&service, 503).await;
+        // A live source answers with the canonical progress verbatim,
+        // bound to this worker's session.
+        let poll = serde_json::to_value(crate::protocol::WorkerRequest::RequestProgress {
+            request_id: "p1".into(),
+            source_id: definition.id.0.to_string(),
+        })
+        .unwrap();
+        match rpc(&mut client, &mut decoder, poll).await.as_slice() {
+            [
+                WorkerEvent::SourceProgress {
+                    worker_session,
+                    progress,
+                    ..
+                },
+            ] => {
+                assert_eq!(worker_session, &session);
+                assert_eq!(progress.source_id, definition.id);
+                // The generation value itself is manager-assigned; what the
+                // transport guarantees is verbatim stability across polls.
+                let again = serde_json::to_value(crate::protocol::WorkerRequest::RequestProgress {
+                    request_id: "p1b".into(),
+                    source_id: definition.id.0.to_string(),
+                })
+                .unwrap();
+                match rpc(&mut client, &mut decoder, again).await.as_slice() {
+                    [
+                        WorkerEvent::SourceProgress {
+                            worker_session: session_again,
+                            progress: progress_again,
+                            ..
+                        },
+                    ] => {
+                        assert_eq!(session_again, &session);
+                        assert_eq!(progress_again.generation, progress.generation);
+                    }
+                    other => panic!("expected progress snapshot, got {other:?}"),
+                }
+            }
+            other => panic!("expected progress snapshot, got {other:?}"),
+        }
+        // Unknown ids are refused, never zero-filled.
+        let unknown = serde_json::to_value(crate::protocol::WorkerRequest::RequestProgress {
+            request_id: "p2".into(),
+            source_id: uuid::Uuid::nil().to_string(),
+        })
+        .unwrap();
+        match rpc(&mut client, &mut decoder, unknown).await.as_slice() {
+            [WorkerEvent::Refused { .. }] => {}
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        // A stopped source reports its terminal snapshot (final counts
+        // and last_error stay readable after the capture ends); only a
+        // never-known id is refused.
+        service.request_stop(definition.id).await.expect("stop");
+        let ended = serde_json::to_value(crate::protocol::WorkerRequest::RequestProgress {
+            request_id: "p3".into(),
+            source_id: definition.id.0.to_string(),
+        })
+        .unwrap();
+        match rpc(&mut client, &mut decoder, ended).await.as_slice() {
+            [WorkerEvent::SourceProgress { progress, .. }] => {
+                assert_eq!(progress.source_id, definition.id);
+                assert!(progress.state.is_terminal());
+            }
+            other => panic!("expected terminal snapshot, got {other:?}"),
         }
         service.request_shutdown();
         service.shutdown().await;

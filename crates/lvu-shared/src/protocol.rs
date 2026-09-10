@@ -69,6 +69,16 @@ pub enum WorkerRequest {
         request_id: String,
         source_id: String,
     },
+    /// Poll one source's canonical progress. Answered by exactly one
+    /// `SourceProgress` event, preserving the strict sequential
+    /// request/reply discipline: progress is polled on demand, never
+    /// pushed, so no connection ever carries an unsolicited frame
+    /// mid-request. Stopped sources answer with their terminal snapshot;
+    /// never-known ids are refused explicitly.
+    RequestProgress {
+        request_id: String,
+        source_id: String,
+    },
 }
 
 /// Lifecycle and acquisition traffic: worker to window (replies and events).
@@ -82,6 +92,11 @@ pub enum WorkerEvent {
         request_id: String,
         worker_pid: u32,
         protocol: u32,
+        /// Worker lifetime nonce (UUIDv4 per `WorkerService::open`).
+        /// Windows key remote epoch on `(worker_session, generation)`:
+        /// a new session forces re-registration instead of aliasing a
+        /// different capture under a reused generation or pid.
+        worker_session: String,
         sources: Vec<SourceSummary>,
     },
     Started {
@@ -117,6 +132,15 @@ pub enum WorkerEvent {
     /// traffic shares the framed connection; each reply still correlates
     /// by the inner event's own `request_id`.
     Store(StoreEvent),
+    /// Answer to `RequestProgress`: the canonical `SourceProgress`
+    /// verbatim (never a projection, never zero-filled), bound to one
+    /// worker lifetime by `worker_session`. Callers validate both the
+    /// source identity and the session before caching latest-wins.
+    SourceProgress {
+        request_id: String,
+        worker_session: String,
+        progress: lvu_ingest::SourceProgress,
+    },
     /// Accept a forwarded stdin stream: binds `{source_id}` to this
     /// connection. A replacement worker never inherits these bindings: after
     /// a crash the pipe is gone, and a new attachment needs a fresh source

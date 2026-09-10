@@ -194,6 +194,7 @@ pub struct WorkerClient {
     decoder: FrameDecoder,
     window_id: String,
     worker_pid: u32,
+    worker_session: String,
     next_request: u64,
     read_buf: Vec<u8>,
     _viewer: ViewerGuard,
@@ -301,6 +302,7 @@ impl WorkerClient {
             decoder: FrameDecoder::new(),
             window_id: window_id.to_owned(),
             worker_pid: 0,
+            worker_session: String::new(),
             next_request: 0,
             read_buf: vec![0u8; crate::READ_CHUNK_BYTES],
             _viewer: viewer,
@@ -322,12 +324,14 @@ impl WorkerClient {
             [
                 WorkerEvent::Welcome {
                     worker_pid,
+                    worker_session,
                     protocol,
                     sources,
                     ..
                 },
             ] if *protocol == PROTOCOL_VERSION => {
                 client.worker_pid = *worker_pid;
+                client.worker_session = worker_session.clone();
                 Ok((client, sources.clone()))
             }
             [WorkerEvent::Welcome { protocol, .. }] => Err(Refused(format!(
@@ -344,6 +348,12 @@ impl WorkerClient {
     /// diagnostics (and for proving a replacement worker took over).
     pub fn worker_pid(&self) -> u32 {
         self.worker_pid
+    }
+
+    /// The worker lifetime nonce from the handshake welcome. Progress
+    /// answers are checked against it (see `poll_progress`).
+    pub fn worker_session(&self) -> &str {
+        &self.worker_session
     }
 
     fn take_request_id(&mut self) -> String {
@@ -516,6 +526,55 @@ impl WorkerClient {
             }),
             Some(WorkerEvent::Refused { reason, .. }) => Err(reason.clone()),
             other => Err(format!("unexpected restart reply: {other:?}")),
+        }
+    }
+
+    /// Poll one source's canonical progress: one request, one reply, same
+    /// strict sequential discipline as every other call (progress is never
+    /// pushed, so no unsolicited frame can arrive mid-request). The answer
+    /// is validated before it is returned: the source identity must match
+    /// the requested source, and the worker session must match the handshake
+    /// session — a mismatch means a confused peer or a replaced worker, and
+    /// reads as a violation rather than an update. Unknown or not-live
+    /// sources come back as worker refusals. Feeders poll per their own
+    /// cadence (bounded staleness is the poller's policy); every answer is
+    /// sampled live, so staleness never exceeds the poll interval.
+    pub async fn poll_progress(
+        &mut self,
+        source_id: SourceId,
+    ) -> Result<lvu_ingest::SourceProgress, String> {
+        let request_id = self.take_request_id();
+        let events = self
+            .roundtrip(
+                WorkerRequest::RequestProgress {
+                    request_id,
+                    source_id: source_id.0.to_string(),
+                },
+                crate::WORKER_HANDSHAKE_TIMEOUT,
+            )
+            .await?;
+        match events.first() {
+            Some(WorkerEvent::SourceProgress {
+                worker_session,
+                progress,
+                ..
+            }) => {
+                if progress.source_id != source_id {
+                    return Err(format!(
+                        "worker answered progress for another source: {}",
+                        progress.source_id.0
+                    ));
+                }
+                if worker_session != &self.worker_session {
+                    return Err(
+                        "worker session changed mid-connection: re-attach instead of caching"
+                            .into(),
+                    );
+                }
+                Ok(progress.clone())
+            }
+            Some(WorkerEvent::Refused { reason, .. }) => Err(reason.clone()),
+            other => Err(format!("unexpected progress reply: {other:?}")),
         }
     }
 
@@ -770,5 +829,120 @@ mod tests {
             set_store_window(method, "mine");
             assert_eq!(method.window_id(), "mine");
         }
+    }
+
+    /// A scripted peer speaking just enough worker to drive handshake and
+    /// progress polls: Welcome once, then one `SourceProgress` per request
+    /// from the script. Lets the validation rules fail deterministically
+    /// without a worker.
+    async fn scripted_peer(listener: tokio::net::UnixListener, replies: Vec<WorkerEvent>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (stream, _) = listener.accept().await.expect("peer accepts");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut decoder = FrameDecoder::new();
+        let mut buffer = vec![0u8; crate::READ_CHUNK_BYTES];
+        let mut replies = replies.into_iter();
+        loop {
+            let count = reader.read(&mut buffer).await.expect("peer reads");
+            if count == 0 {
+                return;
+            }
+            let values = decoder.push_bytes(&buffer[..count]).expect("peer decodes");
+            for _value in values {
+                let Some(reply) = replies.next() else {
+                    return;
+                };
+                let wire =
+                    crate::encode_frame(&serde_json::to_value(&reply).expect("peer encodes"))
+                        .expect("peer frames");
+                writer.write_all(&wire).await.expect("peer writes");
+            }
+        }
+    }
+
+    fn peer_progress(source_id: SourceId, generation: u64) -> lvu_ingest::SourceProgress {
+        lvu_ingest::SourceProgress {
+            source_id,
+            generation,
+            state: lvu_ingest::RuntimeState::Running,
+            records: 9,
+            high_watermark: None,
+            journal_bytes: 0,
+            synced_records: 0,
+            syncs: 0,
+            handovers: 0,
+            writer_cpu_nanos: 0,
+            reader_cpu_nanos: 0,
+            boundaries: 0,
+            exit_code: None,
+            discarded_bytes: 0,
+            discarded_bytes_known: true,
+            last_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_progress_validates_identity_and_session() {
+        let root = tempfile::tempdir().unwrap();
+        crate::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let wanted = SourceId(uuid::Uuid::from_u128(701));
+        let other = SourceId(uuid::Uuid::from_u128(702));
+        let welcome = WorkerEvent::Welcome {
+            request_id: "h".into(),
+            worker_pid: 1,
+            protocol: crate::protocol::PROTOCOL_VERSION,
+            worker_session: "session-test".into(),
+            sources: Vec::new(),
+        };
+        // Wrong source, then wrong session, then correct: the client must
+        // refuse the first two as violations and accept the third.
+        let script = vec![
+            welcome,
+            WorkerEvent::SourceProgress {
+                request_id: "p1".into(),
+                worker_session: "session-test".into(),
+                progress: peer_progress(other, 3),
+            },
+            WorkerEvent::SourceProgress {
+                request_id: "p2".into(),
+                worker_session: "session-other".into(),
+                progress: peer_progress(wanted, 3),
+            },
+            WorkerEvent::SourceProgress {
+                request_id: "p3".into(),
+                worker_session: "session-test".into(),
+                progress: peer_progress(wanted, 3),
+            },
+        ];
+        tokio::spawn(scripted_peer(listener, script));
+        let (mut client, _) = WorkerClient::connect(root.path(), &socket, "window-t", 5001)
+            .await
+            .expect("connect");
+        assert_eq!(client.worker_session(), "session-test");
+        let error = client
+            .poll_progress(wanted)
+            .await
+            .expect_err("foreign source must be refused");
+        assert!(
+            error.contains("another source"),
+            "identity violation must name itself: {error}"
+        );
+        let error = client
+            .poll_progress(wanted)
+            .await
+            .expect_err("foreign session must be refused");
+        assert!(
+            error.contains("session changed"),
+            "epoch violation must name itself: {error}"
+        );
+        let progress = client.poll_progress(wanted).await.expect("valid poll");
+        assert_eq!(progress.source_id, wanted);
+        assert_eq!(progress.generation, 3);
+        assert_eq!(progress.records, 9);
     }
 }
