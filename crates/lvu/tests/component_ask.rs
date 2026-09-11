@@ -855,3 +855,285 @@ fn every_row_ask_can_draw_marks_each_letter_once_and_the_letter_presses_it() {
         "an accelerator fires a verb; it does not move focus"
     );
 }
+
+fn propose(app: &mut App, provider: &FixtureProvider, prompt: &str) -> (String, u64) {
+    let view_id = app.active_view_id().unwrap().to_owned();
+    open(app, provider, AskOpen::Generic);
+    app.handle(Action::Raw(RawEvent::Paste(prompt.into())), provider);
+    submit(app, provider);
+    let lvu::AskAiRequest::Start { generation, .. } =
+        app.take_ask_ai_requests().pop().expect("start request")
+    else {
+        panic!("start request")
+    };
+    (view_id, generation)
+}
+
+fn finish_proposal(app: &mut App, view_id: &str, generation: u64, expression: &str) {
+    let revision = app
+        .layers
+        .ask
+        .state()
+        .map(|dialog| dialog.definition_revision)
+        .unwrap_or_default();
+    assert!(app.finish_ask_ai(
+        generation,
+        view_id,
+        revision,
+        Ok((expression.into(), "keeps the matching records".into())),
+    ));
+}
+
+/// The responsive frame and sticky tail do not move across the dialog's
+/// states: input, waiting, proposal, error and the wider re-run share one
+/// popup, one interior and one primary-action origin at both normal sizes.
+#[test]
+fn responsive_frame_and_tail_are_stable_across_request_states() {
+    use lvu::app::{AskSample, AskSampleTier};
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        // Input.
+        let (provider, mut input) = demo();
+        open(&mut input, &provider, AskOpen::Generic);
+        input.handle(
+            Action::Raw(RawEvent::Paste("why do these fail".into())),
+            &provider,
+        );
+        draw(&provider, &mut input, width, height);
+        let first = input.layers.ask.surface();
+        assert!(!first.popup.is_empty(), "no frame at {width}x{height}");
+        let primary = first_action_origin(&input);
+
+        // Waiting on the remote turn: cancellable, not re-submittable.
+        let (provider, mut waiting) = demo();
+        let (_, generation) = propose(&mut waiting, &provider, "why do these fail");
+        let _ = generation;
+        draw(&provider, &mut waiting, width, height);
+
+        // Proposal with a thin standard sample, offering the wider re-run.
+        let (provider, mut proposal) = demo();
+        let (view_id, generation) = propose(&mut proposal, &provider, "why do these fail");
+        let thin = AskSample {
+            used: 128,
+            available: 4_201_993,
+            sources: 3,
+            tier: AskSampleTier::Standard,
+        };
+        assert!(proposal.record_ask_sample(generation, thin));
+        assert!(
+            proposal.finish_ask_ai(
+                generation,
+                &view_id,
+                proposal
+                    .layers
+                    .ask
+                    .state()
+                    .map(|dialog| dialog.definition_revision)
+                    .unwrap_or_default(),
+                Ok(("pl.col('level') == 'ERROR'".into(), "keeps errors".into())),
+            )
+        );
+        draw(&provider, &mut proposal, width, height);
+
+        // Error keeps the layer and the prompt.
+        let (provider, mut failed) = demo();
+        open(&mut failed, &provider, AskOpen::Generic);
+        submit(&mut failed, &provider);
+        draw(&provider, &mut failed, width, height);
+        assert_eq!(
+            failed.layers.ask.state().map(|dialog| dialog.stage),
+            Some(AskAiStage::Error)
+        );
+
+        for (name, app) in [
+            ("input", &input),
+            ("waiting", &waiting),
+            ("proposal", &proposal),
+            ("failed", &failed),
+        ] {
+            let surface = app.layers.ask.surface();
+            assert_eq!(
+                surface.popup, first.popup,
+                "{name} frame moved at {width}x{height}"
+            );
+            assert_eq!(
+                surface.interior, first.interior,
+                "{name} interior moved at {width}x{height}"
+            );
+            assert_eq!(
+                first_action_origin(app),
+                primary,
+                "{name} tail moved at {width}x{height}"
+            );
+        }
+        let screen = draw(&provider, &mut input, width, height);
+        assert!(screen.contains("Ask"), "{screen}");
+    }
+}
+
+fn first_action_origin(app: &App) -> Option<(u16, u16)> {
+    find_action(app).map(|(rect, _)| (rect.x, rect.y))
+}
+
+fn find_action(app: &App) -> Option<(ratatui::layout::Rect, AskControl)> {
+    let surface = app.layers.ask.surface();
+    let mut found = None;
+    for y in surface.popup.y..surface.popup.bottom() {
+        for x in surface.popup.x..surface.popup.right() {
+            if let Some(AskHit::Control(control)) = app.layers.ask.hit((x, y))
+                && matches!(
+                    control,
+                    AskControl::Submit | AskControl::Apply | AskControl::Cancel
+                )
+            {
+                found.get_or_insert((ratatui::layout::Rect::new(x, y, 1, 1), control));
+            }
+        }
+    }
+    found
+}
+
+/// At 54x16 the Kind choice, the Request field, the scrolling panes and the
+/// actions are all reachable: the dropdown opens from its field and answers
+/// its own hit test, typing lands in the request, the wheel scrolls an
+/// overflowing proposal, and Submit fires by mouse.
+#[test]
+fn compact_form_panes_and_actions_stay_reachable() {
+    let (provider, mut app) = demo();
+    open(&mut app, &provider, AskOpen::Generic);
+    draw(&provider, &mut app, 54, 16);
+    // The Kind field opens its anchored list and the rows answer hits.
+    let (kx, ky) = layer_rect(&app, AskControl::Kind);
+    app.handle(Action::Raw(RawEvent::Mouse(mouse_down(kx, ky))), &provider);
+    assert!(app.layers.ask.state().unwrap().kind_dropdown);
+    draw(&provider, &mut app, 54, 16);
+    let surface = app.layers.ask.surface();
+    let mut choice = None;
+    for y in surface.popup.y..surface.popup.bottom() {
+        for x in surface.popup.x..surface.popup.right() {
+            if let Some(AskHit::KindChoice(index)) = app.layers.ask.hit((x, y)) {
+                choice.get_or_insert(((x, y), index));
+            }
+        }
+    }
+    let ((cx, cy), _) = choice.expect("kind rows must paint at 54x16");
+    app.handle(Action::Raw(RawEvent::Mouse(mouse_down(cx, cy))), &provider);
+    assert!(!app.layers.ask.state().unwrap().kind_dropdown);
+    // Typing still lands in the request after the dropdown closes.
+    let (px, py) = layer_rect(&app, AskControl::Prompt);
+    app.handle(Action::Raw(RawEvent::Mouse(mouse_down(px, py))), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("show only errors".into())),
+        &provider,
+    );
+    assert_eq!(app.layers.ask.state().unwrap().prompt, "show only errors");
+    // A long proposal overflows the panes and scrolls under the fixed form,
+    // then Submit fires by mouse on a fresh dialog.
+    let (provider, mut scrolling) = demo();
+    let (view_id, generation) = propose(&mut scrolling, &provider, "why do these fail");
+    finish_proposal(
+        &mut scrolling,
+        &view_id,
+        generation,
+        &format!("pl.col('level') == 'ERROR' and {}", "very ".repeat(30)),
+    );
+    draw(&provider, &mut scrolling, 54, 16);
+    let before = scrolling
+        .layers
+        .ask
+        .state()
+        .map(|dialog| dialog.review_scroll)
+        .unwrap_or_default();
+    let surface = scrolling.layers.ask.surface();
+    let mut body_cell = None;
+    for y in surface.popup.y..surface.popup.bottom() {
+        for x in surface.popup.x..surface.popup.right() {
+            if scrolling.layers.ask.hit((x, y)) == Some(AskHit::Body) {
+                body_cell.get_or_insert((x, y));
+            }
+        }
+    }
+    if let Some((x, y)) = body_cell {
+        scrolling.handle(
+            Action::Raw(RawEvent::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            })),
+            &provider,
+        );
+    }
+    let after = scrolling
+        .layers
+        .ask
+        .state()
+        .map(|dialog| dialog.review_scroll)
+        .unwrap_or_default();
+    let limit = scrolling
+        .layers
+        .ask
+        .state()
+        .map(|dialog| dialog.review_scroll_limit)
+        .unwrap_or_default();
+    assert!(limit > 0, "the long proposal must overflow at 54x16");
+    assert_eq!(after, before.saturating_add(1).min(limit));
+
+    let (provider, mut app) = demo();
+    open(&mut app, &provider, AskOpen::Generic);
+    app.handle(
+        Action::Raw(RawEvent::Paste("show only errors".into())),
+        &provider,
+    );
+    draw(&provider, &mut app, 54, 16);
+    let (sx, sy) = layer_rect(&app, AskControl::Submit);
+    app.handle(Action::Raw(RawEvent::Mouse(mouse_down(sx, sy))), &provider);
+    assert!(
+        matches!(
+            app.take_ask_ai_requests().pop(),
+            Some(AskAiRequest::Start { .. })
+        ),
+        "Submit fires by mouse at 54x16"
+    );
+}
+
+/// Below the floor the tiny fallback owns the frame with no stale hitboxes.
+#[test]
+fn below_floor_uses_the_tiny_fallback() {
+    let (provider, mut app) = demo();
+    open(&mut app, &provider, AskOpen::Generic);
+    let screen = draw(&provider, &mut app, 19, 5);
+    assert!(screen.contains("terminal too small"), "{screen}");
+    assert_eq!(app.layers.ask.hit((10, 2)), None);
+}
+
+/// Wide and combining characters clip by display width without splitting a
+/// glyph: every painted control answers its own hit test inside the popup,
+/// and the unicode prompt echoes back intact.
+#[test]
+fn long_unicode_clips_with_exact_hitboxes() {
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        let (provider, mut app) = demo();
+        let (view_id, generation) = propose(&mut app, &provider, "café 日本語 éxpansion 漢字 mix");
+        finish_proposal(
+            &mut app,
+            &view_id,
+            generation,
+            "pl.col('café-日本語') == '👩‍💻-é'",
+        );
+        draw(&provider, &mut app, width, height);
+        let surface = app.layers.ask.surface();
+        assert!(!surface.popup.is_empty());
+        let mut controls = 0;
+        for y in surface.popup.y..surface.popup.bottom() {
+            for x in surface.popup.x..surface.popup.right() {
+                if app.layers.ask.hit((x, y)).is_some() {
+                    controls += 1;
+                }
+            }
+        }
+        assert!(controls > 0, "controls must paint at {width}x{height}");
+        assert_eq!(app.layers.ask.hit((0, 0)), None);
+        let screen = draw(&provider, &mut app, width, height);
+        assert!(screen.contains("café"), "{screen}");
+    }
+}
