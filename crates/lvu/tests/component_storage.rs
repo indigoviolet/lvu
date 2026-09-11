@@ -602,6 +602,181 @@ fn tiny_pressure_keeps_selection_diagnostics_and_actions_reachable() {
     draw(&provider, &mut empty, 54, 16);
 }
 
+/// Floor coverage for the generic overflow: at exactly 20x6 the shared band
+/// collapses to Refresh + same-layer More, and the hidden Cleanup/Confirm
+/// path stays reachable by keyboard (mnemonic, still two-step) and by mouse
+/// (More menu carrying the original action index), keeping Refresh default,
+/// destructive Confirm styling, Escape order and exact menu hitboxes.
+#[test]
+fn floor_overflow_menu_activates_hidden_cleanup_by_keyboard_and_mouse() {
+    let theme = Theme::LOVE_LIGHT;
+
+    // Keyboard path: mnemonics reach the hidden actions; arming and submitting
+    // stay same-layer with Refresh the filled default throughout.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Storage), &provider);
+    complete_with(&provider, &mut app, snapshot(6, 8192));
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    assert!(
+        app.layers
+            .storage
+            .action_rects()
+            .iter()
+            .any(|(s, _)| *s == 0),
+        "default Refresh slot must survive the floor"
+    );
+    assert!(
+        !app.layers
+            .storage
+            .action_rects()
+            .iter()
+            .any(|(s, _)| *s == 1),
+        "Cleanup hides behind the shared overflow at 20x6"
+    );
+    let more = app
+        .layers
+        .storage
+        .more_rect()
+        .expect("More must paint at 20x6");
+    assert_eq!(
+        app.layers.storage.hit((more.x, more.y)),
+        Some(StorageHit::More)
+    );
+    key(&mut app, &provider, KeyCode::Char('c'));
+    assert!(
+        app.layers.storage.confirm_clear(),
+        "first keyboard step arms same-layer"
+    );
+    assert_eq!(app.layers.top(), Some(LayerId::Storage));
+    key(&mut app, &provider, KeyCode::Char('c'));
+    let requests = app.layers.storage.outbox.take();
+    assert!(
+        matches!(
+            requests.first().map(|request| request.kind),
+            Some(StorageRequestKind::ClearUnusedDerived)
+        ),
+        "second keyboard step submits: {requests:?}"
+    );
+    assert_eq!(app.layers.top(), Some(LayerId::Storage));
+
+    // Destructive Confirm styling with Refresh default, where both fit.
+    let (provider, mut styled) = demo();
+    styled.handle(Action::Open(Open::Storage), &provider);
+    complete_with(&provider, &mut styled, snapshot(6, 8192));
+    key(&mut styled, &provider, KeyCode::Char('c'));
+    let buffer = draw_themed(&provider, &mut styled, 54, 16, theme);
+    let confirm_cell = (0..buffer.area.height)
+        .find_map(|y| {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            line.find("Confirm cleanup").map(|byte| {
+                use unicode_width::UnicodeWidthStr;
+                let column = UnicodeWidthStr::width(&line[..byte]) as u16;
+                buffer[(column, y)].style()
+            })
+        })
+        .expect("Confirm cleanup must be painted at 54x16");
+    assert_role(
+        confirm_cell,
+        role_style(theme, ButtonRole::Destructive, false),
+    );
+    let refresh_rect = styled
+        .layers
+        .storage
+        .action_rects()
+        .iter()
+        .find(|(slot, _)| *slot == 0)
+        .map(|(_, r)| *r)
+        .expect("Refresh must stay painted beside Confirm");
+    assert_role(
+        buffer[(refresh_rect.x, refresh_rect.y)].style(),
+        role_style(theme, ButtonRole::Default, false),
+    );
+
+    // Mouse path on a fresh dialog: More menu carries the original index.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Storage), &provider);
+    complete_with(&provider, &mut app, snapshot(6, 8192));
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    let more = app.layers.storage.more_rect().expect("More must paint");
+    click(&mut app, &provider, (more.x, more.y));
+    let buffer = draw_themed(&provider, &mut app, 20, 6, theme);
+    let _ = buffer;
+    let menu = app.layers.storage.menu_rects().to_vec();
+    assert_eq!(menu.len(), 1, "overflow menu holds the hidden Cleanup");
+    let surface = app.layers.storage.surface();
+    for (rect, index) in &menu {
+        assert_eq!(*index, 1, "menu must carry the original Cleanup index");
+        assert!(
+            contains_rect(surface.popup, rect),
+            "menu row escapes the published popup"
+        );
+        assert_eq!(
+            app.layers.storage.hit((rect.x, rect.y)),
+            Some(StorageHit::Menu(1)),
+            "menu paint/hit disagree"
+        );
+        let line: String = {
+            let buffer = draw_themed(&provider, &mut app, 20, 6, theme);
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect()
+        };
+        assert!(
+            line.contains("Preview cleanup") && !line.contains('&'),
+            "menu shows the stripped verb: {line:?}"
+        );
+    }
+    // First mouse step arms without submitting.
+    let (rect, _) = menu[0];
+    click(&mut app, &provider, (rect.x, rect.y));
+    assert!(app.layers.storage.confirm_clear());
+    assert!(app.layers.storage.outbox.take().is_empty());
+    assert_eq!(app.layers.top(), Some(LayerId::Storage));
+    // Second mouse step submits through the Confirm row.
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    let more = app.layers.storage.more_rect().expect("More must paint");
+    click(&mut app, &provider, (more.x, more.y));
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    let menu = app.layers.storage.menu_rects().to_vec();
+    assert_eq!(menu.len(), 1);
+    let line: String = {
+        let buffer = draw_themed(&provider, &mut app, 20, 6, theme);
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, menu[0].0.y)].symbol())
+            .collect()
+    };
+    assert!(line.contains("Confirm cleanup"), "{line:?}");
+    click(&mut app, &provider, (menu[0].0.x, menu[0].0.y));
+    let requests = app.layers.storage.outbox.take();
+    assert!(
+        matches!(
+            requests.first().map(|request| request.kind),
+            Some(StorageRequestKind::ClearUnusedDerived)
+        ),
+        "menu Confirm submits: {requests:?}"
+    );
+    assert_eq!(app.layers.top(), Some(LayerId::Storage));
+
+    // Escape order: menu first, then the layer — never both at once.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Storage), &provider);
+    complete_with(&provider, &mut app, snapshot(6, 8192));
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    let more = app.layers.storage.more_rect().expect("More must paint");
+    click(&mut app, &provider, (more.x, more.y));
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    assert!(!app.layers.storage.menu_rects().is_empty());
+    key(&mut app, &provider, KeyCode::Esc);
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    assert!(app.layers.storage.menu_rects().is_empty());
+    assert!(app.layers.storage.is_open());
+    key(&mut app, &provider, KeyCode::Esc);
+    assert!(!app.layers.storage.is_open());
+    assert_eq!(app.focus, lvu::Focus::Logs);
+}
+
 fn draw_themed<P: RowProvider>(
     provider: &P,
     app: &mut App,

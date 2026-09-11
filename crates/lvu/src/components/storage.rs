@@ -168,6 +168,12 @@ impl StorageDialog {
         &self.geometry.menu
     }
 
+    /// The generic overflow `More` button itself, when the shared action band
+    /// collapsed (20x6 floor only). `hit()` answers it as `StorageHit::More`.
+    pub fn more_rect(&self) -> Option<Rect> {
+        self.geometry.more.first().map(|(rect, _)| *rect)
+    }
+
     pub fn scroll(&self) -> usize {
         self.scroll
     }
@@ -1052,7 +1058,9 @@ impl Component for StorageDialog {
             let longest = hidden
                 .iter()
                 .filter_map(|idx| action_labels.get(*idx))
-                .map(|label| UnicodeWidthStr::width(*label))
+                .map(|label| {
+                    UnicodeWidthStr::width(crate::dialog_controls::mnemonic(label).text.as_str())
+                })
                 .max()
                 .unwrap_or(8);
             let preferred = u16::try_from(longest.saturating_add(4))
@@ -1087,12 +1095,18 @@ impl Component for StorageDialog {
                     pop.viewport.width.saturating_sub(bar_w),
                     1,
                 );
+                // The confirming row is destructive (like its action-band
+                // twin) while the default stays Refresh; selection wins.
+                let confirming = orig == 1 && self.confirm_clear;
                 let style = if idx == selected {
                     styles.selection
+                } else if confirming {
+                    styles.error
                 } else {
                     crate::dialog_controls::button_style(theme, false, false)
                 };
-                frame.render_widget(Paragraph::new((*label).to_owned()).style(style), row);
+                let text = crate::dialog_controls::mnemonic(label).text;
+                frame.render_widget(Paragraph::new(text).style(style), row);
                 // Store the original action index so choosing runs Refresh (0)
                 // or Cleanup/Confirm (1) directly, same-layer.
                 menu_hit.push((row, orig));
