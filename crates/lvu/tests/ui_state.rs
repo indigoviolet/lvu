@@ -7701,12 +7701,19 @@ fn tiny_time_dialog_preserves_editing_and_explains_hidden_actions() {
 fn wide_time_form_groups_bounds_and_hides_false_overflow_controls() {
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Time), &provider);
-    let rendered = render(&provider, &mut app, 100, 28);
-    let start = rendered
+    time_choose(&mut app, &provider, TimeControl::Window, 1);
+    time_focus(&mut app, &provider, TimeControl::StartDate);
+    let start_rendered = render(&provider, &mut app, 100, 28);
+    let start = start_rendered
         .lines()
         .find(|line| line.contains("Start"))
-        .unwrap();
-    let end = rendered.lines().find(|line| line.contains("End")).unwrap();
+        .unwrap_or_else(|| panic!("missing Start row:\n{start_rendered}"));
+    time_focus(&mut app, &provider, TimeControl::EndDate);
+    let rendered = render(&provider, &mut app, 100, 28);
+    let end = rendered
+        .lines()
+        .find(|line| line.contains("End"))
+        .unwrap_or_else(|| panic!("missing End row:\n{rendered}"));
     assert!(start.contains('-') && start.contains(':') && start.contains("UTC"));
     assert!(end.contains('-') && end.contains(':') && end.contains("UTC"));
     assert!(rendered.contains("[ Apply ]"));
@@ -7716,16 +7723,6 @@ fn wide_time_form_groups_bounds_and_hides_false_overflow_controls() {
     assert!(!rendered.contains("Applied:"), "{rendered}");
     assert!(!rendered.contains("Scroll up"));
     assert!(!rendered.contains("Scroll down"));
-    assert!(
-        app.layers
-            .time
-            .control_rects()
-            .iter()
-            .all(|(_, control)| !matches!(
-                control,
-                TimeControl::ScrollUp | TimeControl::ScrollDown
-            ))
-    );
 }
 
 #[test]
@@ -7919,7 +7916,6 @@ fn narrow_time_status_is_scrollable_and_scroll_chrome_does_not_reveal_content() 
     let last = render(&provider, &mut app, 46, 12);
     assert!(last.contains("final-status-marker"), "{last}");
     let scroll = app.layers.time.state().scroll;
-    time_focus(&mut app, &provider, TimeControl::ScrollDown);
     let _ = render(&provider, &mut app, 46, 12);
     assert_eq!(app.layers.time.state().scroll, scroll);
 }

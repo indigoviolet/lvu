@@ -12,8 +12,7 @@ use crate::component::Component;
 use crate::{
     App,
     app::Focus,
-    dialog_controls::{ActionRow, ButtonRole, DialogStyles, button_width, render_role_button},
-    dialog_layout::MIN_BODY_ROWS,
+    dialog_controls::DialogStyles,
     json_spans::{JsonSpan, classify},
     provider::RowProvider,
     theme::{Theme, ensure_contrast},
@@ -1950,58 +1949,6 @@ pub(crate) fn render_placeholder(frame: &mut Frame<'_>, field: Rect, text: &str,
     );
 }
 
-// The enrichment work landed private copies of these while dialog_layout.rs did
-// not exist yet. They are now thin adapters over the shared primitives so there
-// is one implementation of the spec, and its call sites did not have to move.
-pub(crate) fn dialog_compact(area: Rect) -> bool {
-    crate::dialog_layout::is_compact(area)
-}
-
-pub(crate) fn class_l_width(area: Rect) -> u16 {
-    crate::dialog_layout::DialogClass::L.width(area)
-}
-
-pub(crate) type DialogRegions = crate::dialog_layout::DialogRegions;
-
-pub(crate) fn class_l_content(
-    body_rows: u16,
-    message: u16,
-    help: u16,
-    actions: u16,
-) -> crate::dialog_layout::DialogContent {
-    crate::dialog_layout::DialogContent {
-        header: 0,
-        body: body_rows,
-        message,
-        help,
-        actions,
-    }
-}
-
-pub(crate) fn class_l_popup(
-    area: Rect,
-    body_rows: u16,
-    message: u16,
-    help: u16,
-    actions: u16,
-) -> Rect {
-    crate::dialog_layout::dialog_rect(
-        area,
-        crate::dialog_layout::DialogClass::L,
-        &class_l_content(body_rows, message, help, actions),
-    )
-}
-
-pub(crate) fn dialog_regions(popup: Rect, message: u16, help: u16, actions: u16) -> DialogRegions {
-    // These callers size their own popup first and then take whatever the body
-    // has left, so the body they "want" is only the floor that decides whether
-    // the layout is squeezed enough to shed help and padding.
-    crate::dialog_layout::regions(
-        popup,
-        &class_l_content(MIN_BODY_ROWS, message, help, actions),
-    )
-}
-
 /// §6.3/§7.4 message row: glyph, padded state word, one sentence. The
 /// vocabulary is closed by the spec; `Scanned` and `Unrun` belong to Storage
 /// and External command, which are not on the anatomy yet.
@@ -2248,146 +2195,6 @@ pub(crate) fn truncated(text: &str, width: usize) -> String {
 
 pub(crate) fn step_summary(source: &str, width: usize) -> String {
     truncated(&source.replace('\n', " ⏎ "), width)
-}
-
-/// Packs button labels the way `button_layout` does, returning the row count.
-pub(crate) fn packed_button_rows(width: u16, labels: &[&str]) -> u16 {
-    if width == 0 || labels.is_empty() {
-        return 0;
-    }
-    let mut rows = 1u16;
-    let mut x = 0u16;
-    for label in labels {
-        let label_width = button_width(label).min(width);
-        if x != 0 && x.saturating_add(label_width) > width {
-            rows = rows.saturating_add(1);
-            x = 0;
-        }
-        x = x.saturating_add(label_width).saturating_add(ACTION_GUTTER);
-    }
-    rows
-}
-
-pub(crate) fn render_dialog_frame(
-    frame: &mut Frame<'_>,
-    popup: Rect,
-    title: String,
-    active: bool,
-    theme: Theme,
-) {
-    let colour = if active {
-        theme.active_border
-    } else {
-        theme.border
-    };
-    frame.render_widget(
-        Block::default()
-            .title(Span::styled(
-                title,
-                Style::default().fg(colour).add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(colour)),
-        popup,
-    );
-}
-
-/// One button of a `button_layout` row (the focus-revealing layout the two
-/// enrichment layers use), styled by its §8.9 role: `default` is the one
-/// Enter executes, and it is filled.
-pub(crate) fn render_enrichment_button(
-    frame: &mut Frame<'_>,
-    rect: Rect,
-    label: &str,
-    focused: bool,
-    default: bool,
-    theme: Theme,
-) {
-    let role = if default {
-        ButtonRole::Default
-    } else {
-        ButtonRole::Normal
-    };
-    render_role_button(frame, rect, label, role, focused, theme);
-}
-
-/// The completion popup, drawn from state its owner holds. Returns the popup
-/// rect and the row rects it painted, so the owner records exactly what was
-/// drawn: the two layers that offer completion — Advanced and the enrichment
-/// step editor — each keep them in their own geometry (§5.1).
-///
-/// Legacy centered variant retained for the enrichment step editor until its
-/// owner migrates to the anchored form below. New callers must use
-/// [`draw_editor_completion_anchored`], which places the popup from the actual
-/// field rect through shared [`crate::dialog_layout::anchored_geometry`].
-pub(crate) fn draw_editor_completion(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    completion: &crate::app::EditorCompletionState,
-    theme: Theme,
-) -> (Rect, Vec<(Rect, usize)>) {
-    let popup = centered(area, 76, 12);
-    clear_themed(frame, popup, theme);
-    let mut rows: Vec<(Rect, usize)> = Vec::new();
-    let styles = DialogStyles::new(theme);
-    let inner = Block::default()
-        .title(match completion.kind {
-            crate::app::EditorCompletionKind::Field => " Complete field ",
-            crate::app::EditorCompletionKind::SampledValue => " Static sampled string literals ",
-        })
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent));
-    let content = dialog_body(popup);
-    frame.render_widget(inner, popup);
-    if content.height == 0 {
-        return (popup, rows);
-    }
-    let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(content);
-    let list_area = sections[0];
-    let visible = usize::from(list_area.height).max(1);
-    let top = completion
-        .top
-        .min(completion.items.len().saturating_sub(visible));
-    let mut lines = Vec::new();
-    for (offset, (index, item)) in completion
-        .items
-        .iter()
-        .enumerate()
-        .skip(top)
-        .take(visible)
-        .enumerate()
-    {
-        let selected = index == completion.selected;
-        lines.push(Line::styled(
-            format!(
-                "{} {}",
-                if selected { ">" } else { " " },
-                clipped_width(&item.label, usize::from(content.width.saturating_sub(3)))
-            ),
-            if selected {
-                styles.selection
-            } else {
-                styles.description
-            },
-        ));
-        rows.push((
-            Rect::new(list_area.x, list_area.y + offset as u16, list_area.width, 1),
-            index,
-        ));
-    }
-    if completion.items.is_empty() {
-        lines.push(Line::styled("(no sampled completions)", styles.unavailable));
-    }
-    frame.render_widget(Paragraph::new(lines), list_area);
-    frame.render_widget(
-        Paragraph::new(clipped_width(
-            &completion.status,
-            usize::from(sections[1].width),
-        ))
-        .style(styles.description),
-        sections[1],
-    );
-    (popup, rows)
 }
 
 /// Anchored completion popup for the contextual editors.
@@ -2700,70 +2507,6 @@ pub(crate) const ACTION_GUTTER: u16 = crate::dialog_controls::BUTTON_GUTTER;
 /// §4.1 `gutter` between the label column and the field column.
 pub(crate) const FIELD_GUTTER: u16 = 2;
 
-/// §8.2 button row with the first button as the default (§8.9). The shape
-/// every dialog whose default *is* its first button uses; a dialog whose
-/// default moves with state names it through `render_actions`.
-pub(crate) fn render_action_row(
-    frame: &mut Frame<'_>,
-    rect: Rect,
-    labels: &[&str],
-    focused: Option<usize>,
-    destructive: &[usize],
-    theme: Theme,
-) -> Vec<(usize, Rect)> {
-    render_actions(
-        frame,
-        rect,
-        ActionRow {
-            labels,
-            default: Some(0),
-            destructive,
-            focused,
-        },
-        theme,
-    )
-}
-
-/// §8.2 / §8.9 button row: buttons in the declared order, each styled by its
-/// role through `dialog_controls::role_style`, the focused one in the
-/// selection style. Returns the hitboxes actually drawn, which are the same
-/// rects the mouse handler is given.
-pub(crate) fn render_actions(
-    frame: &mut Frame<'_>,
-    rect: Rect,
-    row: ActionRow<'_>,
-    theme: Theme,
-) -> Vec<(usize, Rect)> {
-    if rect.height == 0 || rect.width == 0 {
-        return Vec::new();
-    }
-    let mut placed = Vec::new();
-    let mut x = rect.x;
-    let mut y = rect.y;
-    for (index, label) in row.labels.iter().enumerate() {
-        let width = button_width(label).min(rect.width);
-        if x > rect.x && x.saturating_add(width) > rect.right() {
-            x = rect.x;
-            y = y.saturating_add(1);
-        }
-        if y >= rect.bottom() {
-            break;
-        }
-        let button = Rect::new(x, y, width, 1);
-        render_role_button(
-            frame,
-            button,
-            label,
-            row.role(index),
-            row.focused == Some(index),
-            theme,
-        );
-        placed.push((index, button));
-        x = x.saturating_add(width).saturating_add(ACTION_GUTTER);
-    }
-    placed
-}
-
 /// §8.6 segmented mode control: `␣A␣│␣B␣│␣C␣` starting at `content.x`. The
 /// active segment carries the selection style; separators use the border role.
 /// A label may mark its §8.10 mnemonic with `&`, which underlines that letter
@@ -2954,35 +2697,6 @@ pub(crate) fn render_form_field(
     (field, caret)
 }
 
-/// §3: draw the border and title and return the region rects. Every dialog
-/// starts here, so rendering, hit-testing, scrolling and selection agree: a
-/// component records the interior in its own `Surface` and the shell copies
-/// it into `selection_modal`.
-pub(crate) fn dialog_frame_regions(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    class: crate::dialog_layout::DialogClass,
-    title: &str,
-    content: &crate::dialog_layout::DialogContent,
-    theme: Theme,
-) -> crate::dialog_layout::DialogRegions {
-    let popup = crate::dialog_layout::dialog_rect(area, class, content);
-    clear_themed(frame, popup, theme);
-    frame.render_widget(
-        Block::default()
-            .title(Span::styled(
-                format!(" {title} "),
-                Style::default()
-                    .fg(theme.active_border)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.active_border)),
-        popup,
-    );
-    crate::dialog_layout::regions(popup, content)
-}
-
 /// Phase A responsive frame renderer (foundation only, no component switched).
 ///
 /// Draws `geometry.frame` with the shared padded [`Block`] so geometry and
@@ -3024,26 +2738,6 @@ pub(crate) fn responsive_truncate(text: &str, max_width: usize) -> String {
     crate::dialog_layout::truncate_cell(text, max_width)
 }
 
-fn dialog_body(popup: Rect) -> Rect {
-    dialog_body_with_footer(popup, 1)
-}
-
-fn dialog_body_with_footer(popup: Rect, footer_height: u16) -> Rect {
-    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
-    if inner.width == 0 || inner.height <= 1 {
-        return Rect::new(inner.x, inner.y, inner.width, 0);
-    }
-    let horizontal_padding = u16::from(inner.width > 2);
-    Rect::new(
-        inner.x.saturating_add(horizontal_padding),
-        inner.y,
-        inner
-            .width
-            .saturating_sub(horizontal_padding.saturating_mul(2)),
-        inner.height.saturating_sub(footer_height),
-    )
-}
-
 pub(crate) struct InputSurface {
     pub(crate) style: Style,
 }
@@ -3070,22 +2764,6 @@ pub(crate) fn clear_themed(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
         Block::default().style(Style::default().fg(theme.base_fg).bg(theme.dialog_bg)),
         area,
     );
-}
-
-fn centered(area: Rect, percent_width: u16, height: u16) -> Rect {
-    let width = area
-        .width
-        .saturating_mul(percent_width)
-        .saturating_div(100)
-        .max(1)
-        .min(area.width);
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 pub fn clipped_width(text: &str, maximum: usize) -> String {

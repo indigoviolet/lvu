@@ -3177,3 +3177,12 @@ All planned dialog groups are now integrated. The Source-control `Stopped:`
 expectation, Fields data-arrival waits, merged-view first-key timing and the
 immediate `/proc` command-reap assertion are retained for the single combined
 candidate run; none is pre-declared waived. No publication claim is made here.
+
+The first exact `0.1.8` candidate at `325befc` stopped during workspace-test
+compilation: `ui_state.rs` still named the retired Time `ScrollUp`/`ScrollDown`
+controls. Production code compiled; PTYs had not started. The narrow repair
+removes those obsolete assertions, makes the wide Time test reveal Start and
+End through the real focused body viewport, and deletes the compatibility UI
+render helpers left unused after the final migrations. The focused Time test
+and all-target `lvu` Clippy with warnings denied pass. Failed evidence remains
+under `lvu-v018-325befc-acceptance/`; the successor receives a new exact run.
