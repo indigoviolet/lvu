@@ -3129,6 +3129,91 @@ mod tests {
         (client, decoder)
     }
 
+    /// A >120-byte capture root (the reported failure shape) serves,
+    /// handshakes, and cleans up through actual `run_child` wiring: bind,
+    /// serve, handshake, drain, and the wiring-owned socket unlink all
+    /// run over the derived short socket, while locks and log stay under
+    /// the original root. Driving the wiring (not a hand-bound listener
+    /// plus service shutdown, which never owned the unlink) proves the
+    /// real owner boundary end to end. A forged socket argv is refused
+    /// before binding anything.
+    #[tokio::test]
+    async fn long_capture_root_child_serves_handshake_and_cleans_up() {
+        use crate::child::{ChildArgs, parse_child_args, run_child};
+        use crate::spawn::{SpawnSpec, exit};
+        use std::ffi::OsString;
+
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("c".repeat(120));
+        std::fs::create_dir_all(&capture).unwrap();
+        let paths = crate::election::WorkerPaths::new(&capture);
+        let socket = paths.socket_path();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(
+                socket.as_os_str().as_bytes().len() <= crate::election::MAX_DIRECT_SOCKET_BYTES,
+                "long root must indirect to a short socket: {}",
+                socket.display()
+            );
+        }
+        // The spawner passes exactly the derived socket; the child parses
+        // the same argv back to identical args (positive argv validation).
+        let argv = SpawnSpec::new(Path::new("/usr/bin/lvu"), &capture, &socket).argv();
+        let tail: Vec<OsString> = argv.into_iter().skip(1).collect();
+        let args = parse_child_args(&tail)
+            .expect("argv parses")
+            .expect("child invocation recognized");
+        assert_eq!(
+            args,
+            ChildArgs {
+                capture_root: capture.clone(),
+                socket_path: socket.clone(),
+            }
+        );
+        let worker = tokio::spawn(async move { run_child(args).await });
+        // Scaffolding first so the handshake's viewer lock never races
+        // the child's own ensure (idempotent either way); then wait for
+        // the child's bind — connect itself never retries.
+        paths.ensure_directories().unwrap();
+        let bound = std::time::Instant::now() + Duration::from_secs(10);
+        while !socket.exists() {
+            if std::time::Instant::now() >= bound {
+                panic!("child never bound {}", socket.display());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (client, _) =
+            crate::client::WorkerClient::connect(&capture, &socket, "window-long", 9101)
+                .await
+                .expect("handshake over the short socket");
+        assert!(
+            !client.worker_session().is_empty(),
+            "handshake must publish the worker session"
+        );
+        drop(client);
+        let code = tokio::time::timeout(Duration::from_secs(30), worker)
+            .await
+            .expect("wiring drains and exits")
+            .expect("child task joins");
+        assert_eq!(code, exit::CLEAN, "drain must end clean");
+        assert!(
+            !socket.exists(),
+            "wiring must unlink its socket on clean shutdown"
+        );
+
+        // Forged socket argv: refused before binding, serving, or touching
+        // the election — the wrong path never becomes a worker.
+        let forged = paths.directory().join("foreign.sock");
+        let bad = ChildArgs {
+            capture_root: capture.clone(),
+            socket_path: forged.clone(),
+        };
+        let code = run_child(bad).await;
+        assert_eq!(code, exit::STARTUP, "foreign socket must be refused");
+        assert!(!forged.exists(), "refused child must bind nothing");
+    }
+
     #[tokio::test]
     async fn two_windows_share_one_capture_over_sockets() {
         let root = tempfile::tempdir().unwrap();

@@ -7,7 +7,10 @@
 //!   worker. The kernel releases it on crash, so a killed worker strands no
 //!   election state and a replacement can always be elected.
 //! - `<root>/shared-worker/control.sock` — the worker's Unix socket, valid
-//!   only while the owner lock is held by a live worker.
+//!   only while the owner lock is held by a live worker. When the direct
+//!   path would exceed portable `sockaddr_un` byte limits the socket is
+//!   deterministically indirected under a per-user runtime directory
+//!   (same election, same locks, log and capture state).
 //! - `<root>/shared-worker/viewers/<pid>.lock` — one record-locked file per
 //!   attached window, including the spawner's. A dead window's lock releases
 //!   in-kernel, so detach needs no heartbeat and leaves no stale PIDs.
@@ -31,17 +34,43 @@ pub const SOCKET_NAME: &str = "control.sock";
 pub const VIEWERS_DIR_NAME: &str = "viewers";
 pub const WORKER_LOG_NAME: &str = "worker.log";
 
-/// All shared-worker paths for one capture root. Construct once per pass;
-/// cheap and total (no I/O).
+/// Longest socket path used directly under the capture root, in bytes.
+/// Linux allows 107 and macOS 103 bytes of `sockaddr_un` path; 100 keeps a
+/// conservative portable margin. Longer capture roots use deterministic
+/// indirection (see `socket_path`) instead of failing at bind.
+pub const MAX_DIRECT_SOCKET_BYTES: usize = 100;
+
+/// Domain separator for the indirect-socket key: UUIDv5 over the canonical
+/// identity root (lexical fallback before existence). A dedicated
+/// namespace (not a reused one) so no other key in the tree can alias a
+/// socket name.
+#[cfg(unix)]
+const SOCKET_KEY_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes(*b"lvu-wsock-key\x00\x00\x00");
+
+/// Resolved socket site: the single direct/indirect decision that
+/// `socket_path` and `ensure_directories` share, so the path choice and
+/// the setup choice can never disagree with each other.
+#[cfg(unix)]
+enum SocketSite {
+    Direct(PathBuf),
+    Indirect(PathBuf),
+}
+
+/// All shared-worker paths for one capture root. Construction is cheap
+/// and total (no I/O); `socket_path` derivation may probe the filesystem
+/// (canonicalization when the root exists, lexical fallback before it),
+/// so it is deterministic but not free — construct once per pass.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerPaths {
     directory: PathBuf,
+    capture_root: PathBuf,
 }
 
 impl WorkerPaths {
     pub fn new(capture_root: &Path) -> Self {
         Self {
             directory: capture_root.join(WORKER_DIR_NAME),
+            capture_root: capture_root.to_path_buf(),
         }
     }
 
@@ -53,8 +82,47 @@ impl WorkerPaths {
         self.directory.join(OWNER_LOCK_NAME)
     }
 
+    /// The control socket, derived from ONE canonical identity root so a
+    /// short symlink spelling and a long spelling of one capture can
+    /// never choose different sockets while sharing one owner lock:
+    /// the direct layout while the canonical direct path fits the
+    /// portable byte limit, otherwise a stable short path under a
+    /// per-user runtime directory keyed by the same root. Owner/viewer
+    /// locks, the worker log and all capture state stay under the
+    /// original capture root either way — only the socket is indirected,
+    /// and deterministically: every window derives the identical string
+    /// from the identical capture, independent of TMPDIR/XDG. No abstract
+    /// sockets (Linux-only).
     pub fn socket_path(&self) -> PathBuf {
-        self.directory.join(SOCKET_NAME)
+        #[cfg(unix)]
+        {
+            match self.socket_site() {
+                SocketSite::Direct(path) | SocketSite::Indirect(path) => path,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.directory.join(SOCKET_NAME)
+        }
+    }
+
+    /// The single direct/indirect decision point, shared by `socket_path`
+    /// and directory setup so they can never disagree: a short symlink
+    /// spelling resolves to the same canonical direct path (not to the
+    /// runtime dir), and only a canonical direct path beyond the byte
+    /// limit indirects. Both arms derive from the canonical identity
+    /// root, never the raw spelling.
+    #[cfg(unix)]
+    fn socket_site(&self) -> SocketSite {
+        let root = canonical_identity(&self.capture_root);
+        let direct = root.join(WORKER_DIR_NAME).join(SOCKET_NAME);
+        if socket_byte_len(&direct) <= MAX_DIRECT_SOCKET_BYTES {
+            SocketSite::Direct(direct)
+        } else {
+            SocketSite::Indirect(
+                socket_runtime_dir().join(format!("lvu-{}.sock", socket_key(&root))),
+            )
+        }
     }
 
     pub fn viewers_dir(&self) -> PathBuf {
@@ -70,10 +138,165 @@ impl WorkerPaths {
     }
 
     /// Create the directory scaffolding (idempotent). Lock/socket files
-    /// themselves are created by their owners, never here.
+    /// themselves are created by their owners, never here. The runtime
+    /// directory is prepared exactly when the socket is indirected (same
+    /// decision as `socket_path`), so a bad runtime entry can never block
+    /// an unrelated direct capture, and bind never meets a missing
+    /// parent.
     pub fn ensure_directories(&self) -> io::Result<()> {
-        fs::create_dir_all(self.viewers_dir())
+        fs::create_dir_all(self.viewers_dir())?;
+        #[cfg(unix)]
+        if matches!(self.socket_site(), SocketSite::Indirect(_)) {
+            ensure_socket_runtime()?;
+        }
+        Ok(())
     }
+}
+
+/// Byte length of a socket path as the OS sees it (Unix paths are
+/// bytes; the `sockaddr_un` limit counts bytes, not chars).
+#[cfg(unix)]
+fn socket_byte_len(path: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(not(unix))]
+fn socket_byte_len(path: &Path) -> usize {
+    path.as_os_str().to_string_lossy().len()
+}
+
+/// Canonical identity root for socket derivation: canonicalized when
+/// the path exists so symlink aliases converge on one key, lexical
+/// fallback before existence (deterministic per spelling). The
+/// directories may not exist yet when the first window derives the
+/// path; every real flow creates scaffolding before deriving, so all
+/// live spellings converge once it does.
+#[cfg(unix)]
+fn canonical_identity(capture_root: &Path) -> PathBuf {
+    fs::canonicalize(capture_root).unwrap_or_else(|_| {
+        use std::path::Component;
+        let mut normalized = PathBuf::new();
+        for component in capture_root.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        normalized
+    })
+}
+
+/// Short key for a canonical identity root: UUIDv5, pure derivation
+/// with no filesystem probing (the caller canonicalized already).
+#[cfg(unix)]
+fn socket_key(canonical: &Path) -> String {
+    let name: &[u8] = {
+        use std::os::unix::ffi::OsStrExt;
+        canonical.as_os_str().as_bytes()
+    };
+    uuid::Uuid::new_v5(&SOCKET_KEY_NAMESPACE, name)
+        .simple()
+        .to_string()
+}
+
+/// Fixed per-user runtime directory for indirected sockets, keyed by
+/// EFFECTIVE uid throughout (name and ownership check agree even under
+/// setuid): `/tmp/lvu-worker-<euid>`, deliberately independent of
+/// TMPDIR and XDG so differing window environments cannot split one
+/// capture. macOS `/tmp` being a symlink is irrelevant: both ends
+/// derive the identical string, never a canonicalized one.
+#[cfg(unix)]
+fn socket_runtime_dir() -> PathBuf {
+    PathBuf::from(format!("/tmp/lvu-worker-{}", unsafe { libc::geteuid() }))
+}
+
+/// Create the runtime directory atomically owner-only and verify it.
+/// `mkdir` never follows a trailing symlink (EEXIST instead), so a
+/// raced plant in world-writable /tmp cannot redirect creation; the
+/// post-create re-check (never following: `symlink_metadata`) refuses
+/// symlinks, non-directories, and foreign-owned directories loudly
+/// instead of traversing or repairing them. Only a real directory this
+/// user owns is brought to 0700 — and re-verified after, since umask
+/// may have stripped bits at creation. A hostile or stale entry fails
+/// the attach with a clear error, never a hijacked socket. (A swap
+/// between the re-check and the chmod remains theoretically possible;
+/// same accepted window as XDG_RUNTIME_DIR handling everywhere.)
+#[cfg(unix)]
+fn ensure_socket_runtime() -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = socket_runtime_dir();
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    verify_socket_runtime_dir(&dir)
+}
+
+/// Verify a runtime directory never following it: symlinks,
+/// non-directories, and foreign-owned directories are refused loudly;
+/// only a real directory this user owns is brought to 0700, then
+/// re-lstat-revalidated (type, owner, mode) without following
+/// anything. Split from creation so tests can plant collisions in
+/// scratch space instead of the shared runtime dir.
+#[cfg(unix)]
+fn verify_socket_runtime_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "socket runtime {} is not a real directory; refusing to traverse",
+                dir.display()
+            ),
+        ));
+    }
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("socket runtime {} is owned by another user", dir.display()),
+        ));
+    }
+    let mut permissions = meta.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(dir, permissions)?;
+    // Re-lstat, never follow: confirm the tighten landed on the same
+    // real directory this user owns, not on something swapped in.
+    let rechecked = fs::symlink_metadata(dir)?;
+    if rechecked.file_type().is_symlink() || !rechecked.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "socket runtime {} changed under verification; refusing",
+                dir.display()
+            ),
+        ));
+    }
+    if rechecked.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "socket runtime {} changed owner under verification",
+                dir.display()
+            ),
+        ));
+    }
+    let mode = rechecked.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "socket runtime {} is 0o{mode:o}, not owner-only 0700",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// A held owner lock: exactly one worker process holds one at a time.
@@ -415,6 +638,146 @@ mod tests {
             paths.viewer_lock(42),
             PathBuf::from("/data/cap/shared-worker/viewers/42.lock")
         );
+    }
+
+    /// A >120-byte capture root (the reported failure shape) derives one
+    /// short socket shared by every spelling: the direct string would
+    /// exceed `sockaddr_un`, so both the plain and trailing-slash
+    /// spellings converge on the identical indirect path within the
+    /// portable byte limit, while locks and log stay under the original
+    /// root. Different roots must never alias one socket.
+    #[cfg(unix)]
+    #[test]
+    fn long_capture_root_derives_one_short_shared_socket() {
+        let base = tempfile::tempdir().unwrap();
+        let long = base.path().join("x".repeat(120));
+        std::fs::create_dir_all(&long).unwrap();
+        let spelled = PathBuf::from(format!("{}/", long.display()));
+        let first = WorkerPaths::new(&long);
+        let second = WorkerPaths::new(&spelled);
+        let socket = first.socket_path();
+        assert_eq!(
+            socket,
+            second.socket_path(),
+            "two spellings of one capture must share one socket"
+        );
+        assert!(
+            socket_byte_len(&socket) <= MAX_DIRECT_SOCKET_BYTES,
+            "indirect socket must fit the portable limit: {}",
+            socket.display()
+        );
+        let runtime = PathBuf::from(format!("/tmp/lvu-worker-{}", unsafe { libc::geteuid() }));
+        assert_eq!(
+            socket.parent().expect("socket parent"),
+            runtime.as_path(),
+            "indirect socket lives in the fixed per-user runtime dir, never TMPDIR"
+        );
+        assert!(
+            first.owner_lock().starts_with(&long),
+            "owner lock stays under the original root"
+        );
+        assert!(
+            first.worker_log().starts_with(&long),
+            "worker log stays under the original root"
+        );
+        assert!(
+            first.viewers_dir().starts_with(&long),
+            "viewer locks stay under the original root"
+        );
+        first.ensure_directories().unwrap();
+        assert!(socket.parent().expect("runtime dir").is_dir());
+        let other = base.path().join("y".repeat(120));
+        std::fs::create_dir_all(&other).unwrap();
+        assert_ne!(
+            WorkerPaths::new(&other).socket_path(),
+            socket,
+            "different captures must not share a socket"
+        );
+    }
+
+    /// A short symlink spelling resolves to the same canonical direct
+    /// socket — never to the runtime dir — so alias and real spellings
+    /// share one election socket instead of splitting it.
+    #[cfg(unix)]
+    #[test]
+    fn short_symlink_alias_shares_canonical_direct_socket() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = base.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let direct = WorkerPaths::new(&real).socket_path();
+        assert_eq!(
+            direct,
+            WorkerPaths::new(&alias).socket_path(),
+            "alias and real spellings must share one direct socket"
+        );
+        assert!(
+            direct.starts_with(&real),
+            "short captures keep the direct layout: {}",
+            direct.display()
+        );
+    }
+
+    /// Long real directory plus long symlink alias: both exceed the
+    /// direct limit textually, yet canonical convergence yields one
+    /// identical short socket instead of two sockets contending on one
+    /// owner lock.
+    #[cfg(unix)]
+    #[test]
+    fn long_alias_and_real_share_one_indirect_socket() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("z".repeat(120));
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = base.path().join("w".repeat(120));
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let first = WorkerPaths::new(&real).socket_path();
+        let second = WorkerPaths::new(&alias).socket_path();
+        assert_eq!(
+            first, second,
+            "long alias and real dir must share one indirect socket"
+        );
+        assert!(
+            socket_byte_len(&first) <= MAX_DIRECT_SOCKET_BYTES,
+            "shared socket must fit the portable limit: {}",
+            first.display()
+        );
+    }
+
+    /// Collision plants in scratch space (never the real per-user runtime
+    /// dir): symlinks and non-directories are refused without traversal,
+    /// and a lax-but-owned directory is tightened to 0700 and passes.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_verify_refuses_collisions_and_tightens_owned_dirs() {
+        let base = tempfile::tempdir().unwrap();
+        let link = base.path().join("runtime-link");
+        std::os::unix::fs::symlink(base.path(), &link).unwrap();
+        let refused = verify_socket_runtime_dir(&link).expect_err("symlink must be refused");
+        assert!(
+            refused.to_string().contains("refusing to traverse"),
+            "symlink refusal must name itself: {refused}"
+        );
+        let file = base.path().join("runtime-file");
+        std::fs::write(&file, b"nope").unwrap();
+        assert!(
+            verify_socket_runtime_dir(&file).is_err(),
+            "non-directory must be refused"
+        );
+        let lax = base.path().join("runtime-lax");
+        std::fs::create_dir_all(&lax).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&lax).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&lax, permissions).unwrap();
+        }
+        verify_socket_runtime_dir(&lax).expect("owned dir tightens to 0700");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&lax).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "lax dir must be tightened");
+        }
     }
 
     #[test]

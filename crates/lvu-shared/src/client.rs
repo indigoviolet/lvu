@@ -110,6 +110,16 @@ pub enum StartOutcome {
 /// and callers confirm liveness with a handshake, never the path alone.
 /// Bounded by [`crate::WORKER_HANDSHAKE_TIMEOUT`]; races between two
 /// spawners resolve through the election (the loser attaches).
+///
+/// Spawn budget: at most one child per invocation. A child that exits
+/// without binding (bad socket, doomed election) leaves the election
+/// empty again, but re-spawning it every 25ms only minted zombies at
+/// machine-gun rate while proving nothing new — the deadline error below
+/// already reports that outcome loudly with the worker log as evidence.
+/// Retries across invocations (the attach loop re-ensures) each bring a
+/// fresh budget, so a transiently failing child still gets relaunched,
+/// just never in a hot loop. The spawn handoff itself is capped by the
+/// same absolute handshake deadline: no nested longer clock.
 pub async fn ensure_worker(executable: &Path, capture_root: &Path) -> Result<PathBuf, String> {
     let paths = WorkerPaths::new(capture_root);
     paths
@@ -117,13 +127,20 @@ pub async fn ensure_worker(executable: &Path, capture_root: &Path) -> Result<Pat
         .map_err(|error| format!("worker directories: {error}"))?;
     let socket_path = paths.socket_path();
     let deadline = Instant::now() + crate::WORKER_HANDSHAKE_TIMEOUT;
+    let mut spawned = false;
     loop {
         match try_take_owner(&paths) {
             Ok(Some(_guard)) => {
                 // Won: drop immediately (the child takes the election
-                // itself; holding it here would force an INCUMBENT exit)
-                // and spawn.
-                spawn_child(executable, capture_root, &paths)?;
+                // itself; holding it here would force an INCUMBENT exit).
+                // One spawn per invocation: if this child dies without
+                // binding, the loop below waits out the deadline and
+                // reports, instead of spawning its replacement at 25ms
+                // intervals until the deadline fills the process table.
+                if !spawned {
+                    spawn_child(executable, capture_root, &paths, deadline)?;
+                    spawned = true;
+                }
             }
             Ok(None) => {}
             Err(error) => return Err(format!("worker election I/O: {error}")),
@@ -156,8 +173,51 @@ pub async fn ensure_worker(executable: &Path, capture_root: &Path) -> Result<Pat
 /// neither block on nor signal the worker through stdio. Stderr appends to
 /// the bounded worker log so startup failures leave a trace. The argv tail
 /// is exactly [`SpawnSpec::argv`] minus the executable.
+///
+/// Reaping starts BEFORE the child exists: a dedicated thread performs the
+/// spawn and then parks in `wait`, reporting spawn success/error back over
+/// a handoff bounded by the caller's absolute deadline — never a nested
+/// longer clock. A thread-start failure therefore creates no child, and
+/// every created child already has its waiter: no path leaks a zombie,
+/// even a child that fails fast while `ensure_worker` waits out its
+/// deadline. If the caller already gave up (deadline passed, receiver
+/// gone) by the time the spawn succeeds, the reaper kills and reaps the
+/// late child itself, so no unowned worker can appear behind the
+/// election's back. The thread exits with the child; the exit status
+/// itself stays observed through the socket handshake and the worker log,
+/// never through this handle. No polling, no blocking of the TUI or the
+/// worker lifetime.
+///
+/// `handoff_gate` is a test-only rendezvous: when `Some`, the reaper
+/// waits on it (bounded) between a successful spawn and its success
+/// report, letting a test hold the handoff deterministically while the
+/// caller's deadline expires. Production always passes `None`. A plain
+/// parameter — never global state — so no concurrent test can steal
+/// another's gate.
 #[cfg(unix)]
-fn spawn_child(executable: &Path, capture_root: &Path, paths: &WorkerPaths) -> Result<(), String> {
+fn spawn_child(
+    executable: &Path,
+    capture_root: &Path,
+    paths: &WorkerPaths,
+    deadline: Instant,
+) -> Result<(), String> {
+    spawn_child_inner(executable, capture_root, paths, deadline, None, None)
+}
+
+/// Spawn implementation with explicit test hooks (see `spawn_child`).
+/// `handoff_gate` parks the reaper between a successful spawn and its
+/// success report; `completion` is signalled after `child.wait()`
+/// returns, proving the reaper reaped on every Unix target (where
+/// `/proc` absence checks cannot run). Production passes `None` twice.
+#[cfg(unix)]
+fn spawn_child_inner(
+    executable: &Path,
+    capture_root: &Path,
+    paths: &WorkerPaths,
+    deadline: Instant,
+    handoff_gate: Option<std::sync::mpsc::Receiver<()>>,
+    completion: Option<std::sync::mpsc::SyncSender<()>>,
+) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let spec = SpawnSpec::new(executable, capture_root, &paths.socket_path());
     let mut argv = spec.argv();
@@ -180,15 +240,58 @@ fn spawn_child(executable: &Path, capture_root: &Path, paths: &WorkerPaths) -> R
     unsafe {
         command.pre_exec(|| pre_exec_detach());
     }
-    command
-        .spawn()
-        .map_err(|error| format!("spawn worker child: {error}"))?;
-    Ok(())
+    let (report_tx, report_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("lvu-worker-reaper".into())
+        .spawn(move || {
+            let mut command = command;
+            match command.spawn() {
+                Err(error) => {
+                    let _ = report_tx.send(Err(format!("spawn worker child: {error}")));
+                }
+                Ok(mut child) => {
+                    if let Some(gate) = handoff_gate {
+                        // Bounded: a test that dies mid-handoff wedges
+                        // neither the reaper nor the suite; expiry proceeds
+                        // to the report below like an opened gate.
+                        let _ = gate.recv_timeout(std::time::Duration::from_secs(60));
+                    }
+                    if report_tx.send(Ok(())).is_err() {
+                        // The caller stopped waiting (deadline): a late
+                        // success must not become an unowned worker, so
+                        // kill best-effort and reap either way.
+                        let _ = child.kill();
+                    }
+                    let _ = child.wait();
+                    // Reaped: signal completion so tests can prove the
+                    // wait ran on every Unix target, with or without
+                    // `/proc`.
+                    if let Some(done) = completion {
+                        let _ = done.try_send(());
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("reap worker child: {error}"))?;
+    // Capped by the same absolute handshake deadline the caller holds:
+    // the handoff can never outlive the election wait around it.
+    let wait = deadline.saturating_duration_since(Instant::now());
+    match report_rx.recv_timeout(wait) {
+        Ok(result) => result,
+        Err(error) => Err(format!(
+            "worker spawn handoff timed out after {wait:?}: {error:?}"
+        )),
+    }
 }
 
 #[cfg(not(unix))]
-fn spawn_child(executable: &Path, capture_root: &Path, paths: &WorkerPaths) -> Result<(), String> {
-    let _ = (executable, capture_root, paths);
+fn spawn_child(
+    executable: &Path,
+    capture_root: &Path,
+    paths: &WorkerPaths,
+    deadline: Instant,
+) -> Result<(), String> {
+    let _ = (executable, capture_root, paths, deadline);
     Err("shared capture spawning needs a Unix detach port".into())
 }
 
@@ -1326,6 +1429,202 @@ mod tests {
                 Path::new("/data/cap/shared-worker/control.sock")
             )
         );
+    }
+
+    /// A child that always fails fast (doomed bind, exit code 4 like the
+    /// real SOCKET_BIND path) is spawned exactly once per ensure
+    /// invocation — never every 25ms — and leaves no zombies: the reaper
+    /// thread owns every wait. The bounded deadline error is unchanged,
+    /// with the child's own log line as evidence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failing_child_spawns_once_and_leaves_no_zombies() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("capture");
+        std::fs::create_dir_all(&capture).unwrap();
+        let count_file = root.path().join("spawns.log");
+        let pid_file = root.path().join("spawn.pid");
+        let script = root.path().join("fail-child.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo $$ > \"{}\"\n\
+                 echo spawn-attempt >> \"{}\"\n\
+                 root=\"\"\nprev=\"\"\n\
+                 for arg in \"$@\"; do\n\
+                 if [ \"$prev\" = \"--capture-dir\" ]; then root=\"$arg\"; fi\n\
+                 prev=\"$arg\"\n\
+                 done\n\
+                 echo \"simulated child bind failure\" >> \"$root/shared-worker/worker.log\"\n\
+                 exit 4\n",
+                pid_file.display(),
+                count_file.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        }
+        let error = ensure_worker(&script, &capture)
+            .await
+            .expect_err("doomed child must fail the attach");
+        assert!(
+            error.contains("no worker elected") && error.contains("within 5s"),
+            "original bounded error must survive: {error}"
+        );
+        let spawns = std::fs::read_to_string(&count_file).unwrap();
+        assert_eq!(
+            spawns.lines().count(),
+            1,
+            "one spawn per ensure invocation, never a 25ms storm: {spawns:?}"
+        );
+        let log = capture.join("shared-worker/worker.log");
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("simulated child bind failure"),
+            "child diagnostics must reach the worker log"
+        );
+        // The one child is gone — not lingering as a zombie: its own PID
+        // was recorded at spawn, so this binds the proof to this child
+        // instead of scanning every child of the parallel test process.
+        // Linux-only (`/proc`); other platforms keep the spawn-count
+        // proof above.
+        #[cfg(target_os = "linux")]
+        {
+            let pid: u32 = std::fs::read_to_string(&pid_file)
+                .expect("spawn pid recorded")
+                .trim()
+                .parse()
+                .expect("spawn pid parses");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    Err(_) => break,
+                    Ok(stat) => {
+                        if std::time::Instant::now() >= deadline {
+                            panic!("spawned child {pid} never reaped: {stat:?}");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A spawn that outlives its handoff deadline cannot become an
+    /// unowned worker: the reaper detects the dropped success report,
+    /// kills the late child, and reaps it. The test gate holds the
+    /// reaper after a real fork/exec while a short (nonzero) deadline
+    /// expires — deterministic ordering no sleep can buy — then releases
+    /// it into the kill path. The caller gets the bounded handoff error;
+    /// no process (live or zombie) with the script's marker remains.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn late_spawn_success_is_killed_not_orphaned() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("capture");
+        std::fs::create_dir_all(&capture).unwrap();
+        // Single-PID slow child: `exec` replaces the shell in place, so
+        // the recorded PID names the actual late child through kill and
+        // reap — no `sleep` grandchild can be orphaned out from under
+        // the proof.
+        let pid_file = root.path().join("slow-child.pid");
+        let script = root.path().join("slow-child.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        }
+        let paths = WorkerPaths::new(&capture);
+        paths.ensure_directories().unwrap();
+        // Own gate straight into this spawn only: no global state, so no
+        // concurrent test can park (or release) our reaper. The
+        // completion hook proves the reaper's wait ran, on every Unix
+        // target.
+        let (gate_tx, gate_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        let spawned = {
+            let script = script.clone();
+            let capture = capture.clone();
+            let paths = paths.clone();
+            tokio::task::spawn_blocking(move || {
+                spawn_child_inner(
+                    &script,
+                    &capture,
+                    &paths,
+                    deadline,
+                    Some(gate_rx),
+                    Some(done_tx),
+                )
+            })
+            .await
+            .expect("spawn join")
+        };
+        let error = spawned.expect_err("expired deadline must fail the handoff");
+        assert!(
+            error.contains("handoff timed out"),
+            "late handoff must name itself: {error}"
+        );
+        // The child is provably alive while the gate is held: its own
+        // PID file exists (written before `exec`), so the release below
+        // lands the kill on a live process rather than racing an
+        // already-dead one.
+        let pid: u32 = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = text.trim().parse()
+                {
+                    break pid;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("slow child never recorded its PID");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        // Release the parked reaper into the kill path (dropping works
+        // too, via disconnect; send here for explicitness).
+        let _ = gate_tx.try_send(());
+        // Portable reap proof first: the reaper signals only after its
+        // `wait` returns, so this fires iff the late child was reaped —
+        // on every Unix target, with or without `/proc`.
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("reaper must complete the late child's wait");
+        // That exact PID must vanish (live or zombie: zombies keep their
+        // `/proc` entry): bounded poll, loud survivor report. Linux-only;
+        // other platforms keep the handoff-timeout proof above.
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    Err(_) => break,
+                    Ok(stat) => {
+                        if std::time::Instant::now() >= deadline {
+                            panic!("late child {pid} was neither killed nor reaped: {stat:?}");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
     }
 
     #[test]
