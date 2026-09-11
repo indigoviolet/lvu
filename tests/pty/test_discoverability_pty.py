@@ -68,16 +68,18 @@ def run(binary: pathlib.Path) -> None:
             app.send(b"\x1b")
             app.wait_until(lambda text: "[ External command" not in text, "enrichment closed")
 
-            # The mnemonic presses the button: Alt-C clones in View.
+            # The mnemonic selects the tab: Alt-C clones in View (§8.6).
             app.send(b"v")
             app.wait_for("[ Apply ]")
-            assert underlined_letters(app, "[ Clone ]") == "C", app.text()
+            assert underlined_letters(app, "Clone") == "C", app.text()
+            viewed = app.text()
+            assert "[ Clone ]" not in viewed, viewed
             app.send(b"\x1bb")
             app.wait_for("New view")
             app.send(b"\x1bc")
             app.wait_for("Copy of")
             app.send(b"\x1b")
-            app.wait_until(lambda text: "[ New blank ]" not in text, "view closed")
+            app.wait_until(lambda text: "[ Apply ]" not in text, "view closed")
 
             # The palette prints the chord that works, in either base pane.
             app.send(b"\x10")

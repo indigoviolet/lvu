@@ -3942,9 +3942,12 @@ fn named_view_dialog_emits_blank_clone_and_rename_requests() {
     app.handle(Action::Open(Open::View), &provider);
     assert_eq!(app.focus, Focus::Layer);
     // dialog-system.md §11 retires ALL-CAPS mode banners: the active mode is
-    // shown by the selected mode button instead.
+    // shown by the selected header segment instead (§8.6); Apply is the only
+    // button.
     let opened = render(&provider, &mut app, 90, 24);
-    assert!(opened.contains("[ Clone ]"), "{opened}");
+    assert!(opened.contains("Clone"), "{opened}");
+    assert!(!opened.contains("[ Clone ]"), "{opened}");
+    assert!(opened.contains("[ Apply ]"), "{opened}");
     assert_eq!(app.layers.view.mode(), lvu::ViewDialogMode::Clone);
     app.handle(raw_alt(KeyCode::Char('b')), &provider);
     for _ in 0.."New view".len() {

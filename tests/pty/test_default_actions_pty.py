@@ -114,13 +114,18 @@ def run(binary: pathlib.Path) -> None:
             # --- 80x24 ------------------------------------------------------
             enrichment_checks(app, "1")
 
-            # View: the verb is filled, not the first mode button, and the
-            # fifth button is actually on screen at 80 columns.
+            # View: the modes are header tabs (§8.6), never action buttons.
+            # Apply is the only button and carries the fill.
             app.send(b"v")
             app.wait_for("[ Apply ]")
-            assert_only_default(app, "[ Apply ]", ("[ New blank ]", "[ Clone ]", "[ Sources ]"))
+            viewed = app.text()
+            for tab in ("New blank", "Clone", "Rename", "Sources"):
+                assert tab in viewed, f"missing header tab {tab}\n{viewed}"
+            for button in ("[ New blank ]", "[ Clone ]", "[ Rename ]", "[ Sources ]"):
+                assert button not in viewed, f"{button} must not render as a button\n{viewed}"
+            assert_only_default(app, "[ Apply ]", ("New blank", "Clone", "Sources"))
             app.send(b"\x1b")
-            app.wait_until(lambda text: "[ New blank ]" not in text, "view closes")
+            app.wait_until(lambda text: "[ Apply ]" not in text, "view closes")
 
             # Time: the initial focus is a dropdown, which keeps Enter; past
             # the three dropdowns (basis, window, gap) the start-date segment
@@ -182,9 +187,14 @@ def run(binary: pathlib.Path) -> None:
             enrichment_checks(app, "2")
             app.send(b"v")
             app.wait_for("[ Apply ]")
-            assert_only_default(app, "[ Apply ]", ("[ New blank ]", "[ Clone ]"))
+            viewed = app.text()
+            for tab in ("New blank", "Clone"):
+                assert tab in viewed, f"missing header tab {tab}\n{viewed}"
+            for button in ("[ New blank ]", "[ Clone ]"):
+                assert button not in viewed, f"{button} must not render as a button\n{viewed}"
+            assert_only_default(app, "[ Apply ]", ("New blank", "Clone"))
             app.send(b"\x1b")
-            app.wait_until(lambda text: "[ New blank ]" not in text, "view closes")
+            app.wait_until(lambda text: "[ Apply ]" not in text, "view closes")
             app.send(b"z")
             app.wait_for("Multiline grouping")
             assert_only_default(app, "[ Apply ]", ())

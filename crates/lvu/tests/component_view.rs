@@ -75,6 +75,16 @@ fn click(app: &mut App, provider: &FixtureProvider, point: (u16, u16)) {
     );
 }
 
+fn shift_tab(app: &mut App, provider: &FixtureProvider) {
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::SHIFT,
+        ))),
+        provider,
+    );
+}
+
 fn type_name(app: &mut App, provider: &FixtureProvider, name: &str) {
     for _ in 0..64 {
         key(app, provider, KeyCode::Backspace);
@@ -255,16 +265,16 @@ fn the_shell_contains_the_modal_and_a_button_click_acts_where_a_field_only_focus
     assert!(app.layers.view.is_open());
     assert_eq!(app.view_state().unwrap().selected, selected);
 
-    // A mode button acts on the click that focuses it; the field does not.
-    let sources_button = app
+    // A header segment acts on click; choosing a mode is not submitting.
+    let sources_tab = app
         .layers
         .view
-        .control_rects()
+        .tab_rects()
         .iter()
-        .find(|(_, control)| *control == ViewDialogControl::Mode(ViewDialogMode::Sources))
+        .find(|(_, mode)| *mode == ViewDialogMode::Sources)
         .map(|(rect, _)| (rect.x, rect.y))
-        .expect("the Sources mode button is drawn");
-    click(&mut app, &provider, sources_button);
+        .expect("the Sources segment is drawn");
+    click(&mut app, &provider, sources_tab);
     assert_eq!(app.layers.view.mode(), ViewDialogMode::Sources);
     assert_eq!(app.layers.view.control(), ViewDialogControl::Sources);
     assert!(
@@ -275,6 +285,154 @@ fn the_shell_contains_the_modal_and_a_button_click_acts_where_a_field_only_focus
     key(&mut app, &provider, KeyCode::Esc);
     assert!(!app.layers.view.is_open());
     assert_eq!(app.focus, Focus::Logs);
+}
+
+#[test]
+fn modes_render_as_a_segmented_header_with_apply_as_the_only_button() {
+    for (width, height) in [(90u16, 24u16), (80, 24), (54, 16)] {
+        let (provider, mut app) = demo();
+        app.handle(Action::Open(Open::View), &provider);
+        let rendered = screen(&draw(&provider, &mut app, width, height));
+        // The four modes are segments, never action buttons.
+        for bracketed in ["[ New blank ]", "[ Clone ]", "[ Rename ]", "[ Sources ]"] {
+            assert!(
+                !rendered.contains(bracketed),
+                "{width}x{height}: {bracketed} must not render as a button:\n{rendered}"
+            );
+        }
+        for segment in ["New blank", "Clone", "Rename", "Sources"] {
+            assert!(
+                rendered.contains(segment),
+                "{width}x{height}: missing header segment {segment}:\n{rendered}"
+            );
+        }
+        // Exactly one action button.
+        assert!(
+            rendered.contains("[ Apply ]"),
+            "{width}x{height}:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("[ Apply membership ]"),
+            "Clone mode applies a name, not membership:\n{rendered}"
+        );
+        // Geometry agrees: four header rects plus one action rect.
+        assert_eq!(app.layers.view.tab_rects().len(), 4, "{width}x{height}");
+        let controls = app.layers.view.control_rects();
+        assert_eq!(controls.len(), 1, "{width}x{height}: {controls:?}");
+        assert_eq!(controls[0].1, ViewDialogControl::Apply);
+        // Every drawn rect hit-tests to what it drew.
+        for (rect, mode) in app.layers.view.tab_rects().to_vec() {
+            assert_eq!(
+                app.layers.view.hit((rect.x, rect.y)),
+                Some(ViewHit::Tab(mode)),
+                "{width}x{height}"
+            );
+        }
+        for (rect, control) in app.layers.view.control_rects().to_vec() {
+            assert_eq!(
+                app.layers.view.hit((rect.x, rect.y)),
+                Some(ViewHit::Control(control)),
+                "{width}x{height}"
+            );
+        }
+    }
+
+    // Sources mode relabels the one action and keeps the same header.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::View), &provider);
+    alt(&mut app, &provider, KeyCode::Char('m'));
+    let rendered = screen(&draw(&provider, &mut app, 90, 24));
+    assert!(rendered.contains("[ Apply membership ]"), "{rendered}");
+    for bracketed in ["[ New blank ]", "[ Clone ]", "[ Rename ]", "[ Sources ]"] {
+        assert!(
+            !rendered.contains(bracketed),
+            "{bracketed} leaked:\n{rendered}"
+        );
+    }
+    assert_eq!(app.layers.view.tab_rects().len(), 4);
+    assert_eq!(app.layers.view.control_rects().len(), 1);
+}
+
+#[test]
+fn header_focus_moves_and_selects_modes_without_touching_drafts_or_membership() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::View), &provider);
+    draw(&provider, &mut app, 90, 24);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Input);
+
+    // Tab cycles header → body → action, never through four faux buttons.
+    key(&mut app, &provider, KeyCode::Tab);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Apply);
+    key(&mut app, &provider, KeyCode::Tab);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Tabs);
+    key(&mut app, &provider, KeyCode::Tab);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Input);
+    shift_tab(&mut app, &provider);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Tabs);
+    shift_tab(&mut app, &provider);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Apply);
+
+    // Left/Right on the header moves and selects immediately, keeping focus.
+    key(&mut app, &provider, KeyCode::Tab);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Tabs);
+    // Opened in Clone; Left reaches Blank, Right returns to Clone.
+    key(&mut app, &provider, KeyCode::Left);
+    assert_eq!(app.layers.view.mode(), ViewDialogMode::Blank);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Tabs);
+    assert_eq!(app.layers.view.draft(), "New view");
+    key(&mut app, &provider, KeyCode::Right);
+    assert_eq!(app.layers.view.mode(), ViewDialogMode::Clone);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Tabs);
+
+    // Enter and Space on the header only select; they never submit.
+    app.layers.view.outbox.take();
+    key(&mut app, &provider, KeyCode::Enter);
+    assert!(app.layers.view.outbox.take().is_empty());
+    key(&mut app, &provider, KeyCode::Char(' '));
+    assert!(app.layers.view.outbox.take().is_empty());
+    assert_eq!(app.layers.view.mode(), ViewDialogMode::Clone);
+
+    // A mode switch reseeds the name; typing then Alt reaches Sources, whose
+    // Space toggles membership rather than typing. An extra source makes the
+    // toggle observable: the owning source alone can never leave.
+    alt(&mut app, &provider, KeyCode::Char('b'));
+    assert_eq!(app.layers.view.mode(), ViewDialogMode::Blank);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Input);
+    key(&mut app, &provider, KeyCode::Char('!'));
+    assert_eq!(app.layers.view.draft(), "New view!");
+    app.sources.push(SourceItem {
+        id: "extra-0".into(),
+        name: "extra source 0".into(),
+        health: "open".into(),
+    });
+    alt(&mut app, &provider, KeyCode::Char('m'));
+    assert_eq!(app.layers.view.mode(), ViewDialogMode::Sources);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Sources);
+    // Select the extra source so Space has something to add.
+    draw(&provider, &mut app, 90, 24);
+    let extra = app
+        .layers
+        .view
+        .source_rects()
+        .iter()
+        .find(|(_, index)| app.sources[*index].id == "extra-0")
+        .map(|(rect, _)| (rect.x, rect.y))
+        .expect("the extra source is drawn");
+    click(&mut app, &provider, extra);
+    let before = app.layers.view.source_ids().to_vec();
+    // Header Space must not toggle; body Space must. From Sources, Tab runs
+    // Sources → Apply → Tabs.
+    key(&mut app, &provider, KeyCode::Tab);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Apply);
+    key(&mut app, &provider, KeyCode::Tab);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Tabs);
+    key(&mut app, &provider, KeyCode::Char(' '));
+    assert_eq!(app.layers.view.source_ids(), before);
+    key(&mut app, &provider, KeyCode::Tab);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Sources);
+    draw(&provider, &mut app, 90, 24);
+    key(&mut app, &provider, KeyCode::Char(' '));
+    assert_ne!(app.layers.view.source_ids(), before);
 }
 
 #[test]

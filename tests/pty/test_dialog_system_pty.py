@@ -215,17 +215,31 @@ def run(binary: pathlib.Path) -> None:
             app.send(b"\x1b")
             app.wait_until(lambda text: "Storage" not in text, "storage closes")
 
-            # --- wide: mouse hitboxes match the drawn buttons -------------
+            # --- wide: mouse hitboxes match what is drawn ------------------
+            # The modes are header tabs (§8.6); clicking a segment switches
+            # immediately while Apply stays the only button.
             app.send(b"v")
-            app.wait_for("[ Clone ]")
-            column, row = find_text(app, "[ Clone ]")
+            app.wait_for("Clone")
+            viewed = app.text()
+            for button in ("[ New blank ]", "[ Clone ]", "[ Rename ]", "[ Sources ]"):
+                assert button not in viewed, f"{button} must not render\n{viewed}"
+            assert "[ Apply ]" in viewed, viewed
+            # "Sources" also names the sidebar, so click the unambiguous
+            # segments: New blank switches the draft, Clone switches back.
+            column, row = find_text(app, "New blank")
             click(app, column + 2, row)
             app.wait_until(
-                lambda text: "[ New blank ]" in text,
-                "clicking the drawn button reaches the control under it",
+                lambda text: "New view" in text,
+                "clicking the drawn segment reaches the tab under it",
+            )
+            column, row = find_text(app, "Clone")
+            click(app, column + 2, row)
+            app.wait_until(
+                lambda text: "Copy of" in text and "[ Apply membership ]" not in text,
+                "clicking back reseeds the name mode",
             )
             app.send(b"\x1b")
-            app.wait_until(lambda text: "[ New blank ]" not in text, "view closes")
+            app.wait_until(lambda text: "[ Apply ]" not in text, "view closes")
 
             # --- narrow: degrade, do not clip or overprint ----------------
             app.resize(54, 16)
@@ -234,19 +248,22 @@ def run(binary: pathlib.Path) -> None:
                 "the workspace repaints at 54x16",
             )
             app.send(b"v")
-            view = app.wait_for("[ New blank ]")
+            view = app.wait_for("New blank")
+            assert "[ New blank ]" not in view, view
+            assert "[ Apply ]" in view, view
 
             # §5.5: the sidebar is not competing with the dialog.
             assert "Sources / views" not in view, view
 
-            # The regression this dialog is named for: at 54x16 the button row
-            # used to be painted into the wrapped help text.
+            # The regression this dialog is named for: at 54x16 the action row
+            # used to be painted into the wrapped help text. The tabs live in
+            # the sticky header; only Apply lives in the action row.
             lines = view.splitlines()
-            button_row = next(
-                row for row, line in enumerate(lines) if "[ New blank ]" in line
+            action_row = next(
+                row for row, line in enumerate(lines) if "[ Apply" in line
             )
-            assert "keep the capture" not in lines[button_row], lines[button_row]
-            assert "renaming" not in lines[button_row], lines[button_row]
+            assert "keep the capture" not in lines[action_row], lines[action_row]
+            assert "renaming" not in lines[action_row], lines[action_row]
 
             left, top, right, bottom = dialog_bounds(app, "View")
             assert right - left + 1 == 52, "§5.1 compact class M is the full frame"
@@ -257,8 +274,12 @@ def run(binary: pathlib.Path) -> None:
             assert left < column < right and top < row < bottom, (
                 "a control must be inside the surface that owns it"
             )
+            column, row = find_text(app, "Clone")
+            assert left < column < right and top < row < bottom, (
+                "a header tab must be inside the surface that owns it"
+            )
             app.send(b"\x1b")
-            app.wait_until(lambda text: "[ New blank ]" not in text, "view closes")
+            app.wait_until(lambda text: "[ Apply ]" not in text, "view closes")
 
             # --- narrow: every Settings field stays reachable -------------
             # §12.14: at 54x16 the form used to hide nine of its ten fields

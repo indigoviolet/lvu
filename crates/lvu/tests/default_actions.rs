@@ -822,19 +822,27 @@ fn view_fills_apply_rather_than_the_first_mode_button() {
         app.handle(Action::Open(Open::View), &provider);
         assert_eq!(app.layers.view.control(), ViewDialogControl::Input);
         let buffer = draw(&provider, &mut app, width, height, theme);
+        let rendered = screen(&buffer);
+        // The modes are header segments, never action buttons.
+        for bracketed in ["[ New blank ]", "[ Clone ]", "[ Rename ]", "[ Sources ]"] {
+            assert!(
+                !rendered.contains(bracketed),
+                "{width}x{height}: {bracketed} must not render:\n{rendered}"
+            );
+        }
+        // The header still names every mode and the action row holds Apply.
+        for segment in ["New blank", "Clone", "Rename", "Sources"] {
+            assert!(rendered.contains(segment), "{width}x{height}:\n{rendered}");
+        }
+        assert_eq!(app.layers.view.tab_rects().len(), 4, "{width}x{height}");
         let rects: Vec<(Rect, String)> = app
             .layers
             .view
             .control_rects()
             .iter()
-            .filter(|(_, control)| {
-                matches!(
-                    control,
-                    ViewDialogControl::Mode(_) | ViewDialogControl::Apply
-                )
-            })
             .map(|(rect, _)| (*rect, labelled(&buffer, *rect)))
             .collect();
+        assert_eq!(rects.len(), 1, "{width}x{height}: {rects:?}\n{rendered}");
         assert_eq!(
             filled_buttons(&buffer, &rects, theme),
             vec!["Apply".to_owned()],

@@ -347,7 +347,7 @@ the longest option is as live as the count.
 | Multiline grouping | `m` | S | One field plus a 3-row preview pane. |
 | Command palette | Ctrl-P | P | Transient, top-anchored, list-driven. |
 | Time window | `t` | M | Six fields in four rows, three actions. Today's 88% width is 30 columns wider than its longest row at 100x30. |
-| View | `v` | M | Name field, source membership list, three actions. |
+| View | `v` | M | Four-segment mode header, a name field or source-membership list, and one Apply action. |
 | Recipes | `r` | M | List + name field + actions. |
 | Bookmarks | `B` | M | List + actions. 100% width today for a 20-character row. |
 | Fields | `i` | L | The field tree and the Value pane side by side (§8.12) need the width; it was M before value exploration. |
@@ -548,7 +548,7 @@ Verb or verb phrase, sentence case: `Apply`, `Clear`, `Save`, `Open`, `Rescan`,
 `Submit`, `Start`, `Send`, `Add`, `Edit`, `Remove`, `Go to`, `Edit note`,
 `Raw context`, `Pin`, `Color rows by field`, `Refresh`, `Preview cleanup`,
 `Confirm cleanup`, `Request proposal`, `Start reviewed source`, `Review and run`,
-`New line`, `Clone`, `New blank view`, `History`, `Update`, `More ▾`,
+`New line`, `History`, `Update`, `More ▾`,
 `🧠 Recognize timestamp`. A trailing `…` marks a button that opens another
 dialog (`External command…`, whether as a child or a replacement, §10). No
 `Cancel`, `Close` or `OK` buttons as *dismissals* anywhere: Escape closes, and
@@ -584,9 +584,8 @@ gutter. Every button has one of three **roles** (`dialog_controls::ButtonRole`):
 `Default` (exactly one per dialog that has actions, filled per §6.3 and
 executed by Enter per §8.9), `Normal`, or `Destructive` (last in the row,
 styled error, never the default). The default is drawn first wherever the row
-is a row of verbs; a row whose verbs are ordered by another rule (View's
-`Apply · Clone · New blank view`) keeps that order and the fill, not the
-position, marks the default. A
+is a row of verbs; a row whose verbs are ordered by another rule keeps that
+order and the fill, not the position, marks the default. A
 button that would start a third row moves into `[ More ▾ ]`, which opens an
 **A**-class list of the remaining actions. Space never activates a button
 (reserved for text); Enter on a focused button presses that button. Mouse
@@ -1677,38 +1676,44 @@ border; at 54x16 the buttons overprint the help):
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-After, 100x30 (72 × 12). One dialog for the current view: rename by editing
-the name, change membership with the checkboxes, `Apply` commits both.
-`Clone` and `New blank view` create and switch:
+After. The four operations that choose what the dialog edits are one shared
+segmented control in the sticky header. They are modes, not verbs in the action
+row. `Apply` (or `Apply membership`) is the sole action and filled default.
+Click or Alt-B/C/R/S switches immediately; with the header focused, Left/Right
+switches modes while retaining header focus and Enter/Space never submits.
+Tab/Shift-Tab visits the header once, then the mode body, then Apply.
+
+Clone mode at 100x30:
 
 ```
 ┌ View · Raw events ───────────────────────────────────────────────────┐
 │                                                                      │
-│  Name         Raw events▁                                            │
+│  New blank │ Clone │ Rename │ Sources                                │
 │                                                                      │
-│  Sources                                                    1 of 1   │
-│    [x] events.log                   running · 64 records             │
+│  Name         Copy of Raw events▁                                    │
 │                                                                      │
-│  ○  Ready     renaming or changing sources keeps the capture         │
+│  ○  Ready     creating, cloning and renaming keep the capture        │
 │                                                                      │
-│  [ Apply ]  [ Clone ]  [ New blank view ]                            │
+│  [ Apply ]                                                          │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Alt-Up/Alt-Down reorder within the Sources list as today; the order note
+New blank, Clone and Rename seed their own name draft. Sources replaces the
+name field with the membership checklist; Apply membership commits its checked
+set. Alt-Up/Alt-Down reorder within that list as today, and the order note
 (`source position, then record sequence`) becomes the help row when there are
-two or more sources.
+two or more sources. A mode switch never submits or mutates accepted membership.
 
-After, 54x16 (52 × 7):
+Sources mode at 54x16:
 
 ```
 ┌ View · Raw events ──────────────────────────────┐
-│  Name      Raw events▁                          │
+│ New blank│Clone│Rename│Sources                  │
 │  Sources                                 1 of 1 │
 │    [x] events.log        running · 64 records   │
 │  ○  Ready     changes keep the capture          │
-│  [ Apply ]  [ Clone ]  [ New blank view ]       │
+│  [ Apply membership ]                           │
 └─────────────────────────────────────────────────┘
 ```
 

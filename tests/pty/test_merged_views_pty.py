@@ -25,7 +25,9 @@ def run(binary):
             app.send(b"\r"); app.wait_for("Applied   keep")
             app.send(b"\x1b"); app.wait_until(lambda text: " Search " not in text, "search closed")
             app.send(b"v"); app.wait_for("View · ")
-            app.send(b"\x1bm"); app.wait_for("Apply membership")
+            app.send(b"\x1bm"); membership = app.wait_for("Apply membership")
+            assert "[ Apply membership ]" in membership, membership
+            assert "[ Sources ]" not in membership, membership
             app.send(b"\x1b[B ")
             app.send(b"\x1b[1;3A")
             app.send(b"\r")

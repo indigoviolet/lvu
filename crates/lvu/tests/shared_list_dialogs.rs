@@ -179,9 +179,9 @@ fn view_membership_has_transactional_apply_button_and_clickable_modes() {
     let clone = app
         .layers
         .view
-        .control_rects()
+        .tab_rects()
         .iter()
-        .find(|(_, control)| *control == ViewDialogControl::Mode(ViewDialogMode::Clone))
+        .find(|(_, mode)| *mode == ViewDialogMode::Clone)
         .unwrap()
         .0;
     app.handle(raw_click(clone), &provider);

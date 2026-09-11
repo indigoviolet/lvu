@@ -28,12 +28,12 @@ use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface,
     ViewEvent, is_typed_char,
 };
-use crate::dialog_controls::{ActionRow, DialogStyles, button_line};
+use crate::dialog_controls::DialogStyles;
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit, reset_cursor_to_end};
 use crate::ui::{
     FIELD_GUTTER, MessageState, clipped_width, dialog_frame_regions, help_rows, message_rows,
-    packed_button_rows, place_input_cursor_at, render_actions, render_help_text, render_message,
-    render_scrollbar,
+    packed_button_rows, place_input_cursor_at, render_action_row, render_help_text, render_message,
+    render_scrollbar, render_segmented_control,
 };
 
 /// The dialog refuses a submission when the queue is full and says so in its
@@ -48,9 +48,13 @@ const VIEW_MAX_SOURCES: usize = 32;
 
 /// Which control inside the View dialog has focus. UI-only state, so it lives
 /// with the component rather than on `App` (§3).
+///
+/// `Tabs` is the one header focus stop for the four mode segments (§8.6, §8.8):
+/// Tab reaches the header once, not four times. The active mode itself lives
+/// on `ViewDialog::mode`, never in this enum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewDialogControl {
-    Mode(ViewDialogMode),
+    Tabs,
     Input,
     Sources,
     Apply,
@@ -59,17 +63,21 @@ pub enum ViewDialogControl {
 /// Everything View draws that can be clicked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewHit {
+    Tab(ViewDialogMode),
     Control(ViewDialogControl),
     Source(usize),
     Body,
 }
 
 /// Recorded by `render`, consumed by `hit()` (§5.1). Every rect here was
-/// painted this frame.
+/// painted this frame. Tab segment rects come from the same
+/// `render_segmented_control` call that painted the header, so rendering,
+/// hit-testing, focus and scrolling share them.
 #[derive(Clone, Debug, Default)]
 struct ViewGeometry {
     body: Rect,
     sources: Vec<(Rect, usize)>,
+    tabs: Vec<(Rect, ViewDialogMode)>,
     controls: Vec<(Rect, ViewDialogControl)>,
 }
 
@@ -147,6 +155,12 @@ impl ViewDialog {
         &self.geometry.controls
     }
 
+    /// The header segment rects, in `ViewDialogMode::ALL` order, from the same
+    /// `render_segmented_control` call that painted them.
+    pub fn tab_rects(&self) -> &[(Rect, ViewDialogMode)] {
+        &self.geometry.tabs
+    }
+
     /// A refusal from the worker. This is the component's `complete` (§2.4):
     /// the draft is kept so the user can correct it, exactly as the old
     /// `App::view_request_failed` kept `ViewDialogState`.
@@ -160,20 +174,18 @@ impl ViewDialog {
         self.mode != ViewDialogMode::Sources && self.control == ViewDialogControl::Input
     }
 
-    /// Tab order: the four mode buttons, then the field or the list, then Apply.
+    /// Tab order (§8.8): the one header stop, then the mode-specific body
+    /// (the name field or the membership list), then Apply.
     fn controls(&self) -> Vec<ViewDialogControl> {
-        let mut controls = ViewDialogMode::ALL
-            .iter()
-            .copied()
-            .map(ViewDialogControl::Mode)
-            .collect::<Vec<_>>();
-        controls.push(if self.mode == ViewDialogMode::Sources {
-            ViewDialogControl::Sources
-        } else {
-            ViewDialogControl::Input
-        });
-        controls.push(ViewDialogControl::Apply);
-        controls
+        vec![
+            ViewDialogControl::Tabs,
+            if self.mode == ViewDialogMode::Sources {
+                ViewDialogControl::Sources
+            } else {
+                ViewDialogControl::Input
+            },
+            ViewDialogControl::Apply,
+        ]
     }
 
     fn seed(&mut self, mode: ViewDialogMode, ctx: &Ctx<'_>) {
@@ -195,8 +207,24 @@ impl ViewDialog {
         reset_cursor_to_end(&self.draft, &mut self.cursor);
     }
 
+    /// A mode switch from a click, a mnemonic, the palette or a command.
+    /// The keys land in the arriving mode's body, as the Filter tabs do.
     fn select_mode(&mut self, mode: ViewDialogMode, ctx: &Ctx<'_>) {
         self.seed(mode, ctx);
+    }
+
+    /// Left/Right on the focused header: the switch is immediate and the
+    /// header keeps the keys so the user can keep moving, as the Filter tabs
+    /// do. `seed` puts focus in the body, so this restores the header stop.
+    fn move_tab(&mut self, delta: i32, ctx: &Ctx<'_>) {
+        let index = ViewDialogMode::ALL
+            .iter()
+            .position(|mode| *mode == self.mode)
+            .unwrap_or(0);
+        let next = ViewDialogMode::ALL
+            [(index as i32 + delta).rem_euclid(ViewDialogMode::ALL.len() as i32) as usize];
+        self.seed(next, ctx);
+        self.control = ViewDialogControl::Tabs;
     }
 
     fn move_source(&mut self, delta: i32, ctx: &Ctx<'_>) {
@@ -263,7 +291,9 @@ impl ViewDialog {
 
     fn activate(&mut self, ctx: &Ctx<'_>) {
         match self.control {
-            ViewDialogControl::Mode(mode) => self.select_mode(mode, ctx),
+            // §8.9: a segmented control consumes Enter to select the focused
+            // segment, which Left/Right already made the active one.
+            ViewDialogControl::Tabs => {}
             ViewDialogControl::Apply | ViewDialogControl::Sources | ViewDialogControl::Input => {
                 self.submit(ctx)
             }
@@ -317,8 +347,17 @@ impl ViewDialog {
                 self.reorder_source(1, ctx);
                 Outcome::Consumed
             }
-            // A focused name field owns the arrow keys; only a list or a
-            // button lets them reach the membership selection.
+            // The header owns Left/Right while it has focus (§8.6); a focused
+            // name field owns them otherwise. Only a list lets Up/Down reach
+            // the membership selection.
+            KeyCode::Left if self.control == ViewDialogControl::Tabs => {
+                self.move_tab(-1, ctx);
+                Outcome::Consumed
+            }
+            KeyCode::Right if self.control == ViewDialogControl::Tabs => {
+                self.move_tab(1, ctx);
+                Outcome::Consumed
+            }
             KeyCode::Left if self.text_editing() => self.text(EditCommand::MoveLeft),
             KeyCode::Right if self.text_editing() => self.text(EditCommand::MoveRight),
             KeyCode::Up if self.text_editing() => self.text(EditCommand::MoveUp),
@@ -331,7 +370,7 @@ impl ViewDialog {
                 self.move_source(1, ctx);
                 Outcome::Consumed
             }
-            // The buttons' own letters are §8.10 mnemonics, resolved by the
+            // The segments' own letters are §8.10 mnemonics, resolved by the
             // shell before the key arrives here. Alt-M and Alt-D are the two
             // chords that are *not* letters of their labels (§8.10), so they
             // stay here as the unlisted aliases they have always been.
@@ -355,13 +394,18 @@ impl ViewDialog {
                 self.control = move_control(self.control, &self.controls(), 1);
                 Outcome::Consumed
             }
+            // §8.9: Enter and Space on the header select the focused segment,
+            // which Left/Right already made the active one.
+            KeyCode::Enter if self.control == ViewDialogControl::Tabs => Outcome::Consumed,
+            KeyCode::Char(' ') if self.control == ViewDialogControl::Tabs => Outcome::Consumed,
             KeyCode::Enter => {
                 self.activate(ctx);
                 Outcome::Consumed
             }
             KeyCode::Backspace => self.text(EditCommand::Backspace),
-            // Space picks a source out of the list whichever control has
-            // focus, because in Sources mode there is no field to type into.
+            // Space picks a source out of the list wherever the keys are
+            // except on the header, because in Sources mode there is no field
+            // to type into.
             KeyCode::Char(' ') if self.mode == ViewDialogMode::Sources => {
                 self.toggle_source(ctx);
                 Outcome::Consumed
@@ -377,15 +421,18 @@ impl ViewDialog {
     fn mouse(&mut self, kind: MouseEventKind, hit: Option<ViewHit>, ctx: &mut Ctx<'_>) -> Outcome {
         match kind {
             MouseEventKind::Down(MouseButton::Left) => match hit {
+                // A segment click switches immediately and puts the keys in
+                // the arriving mode's body, as the Filter tabs do.
+                Some(ViewHit::Tab(mode)) => {
+                    self.select_mode(mode, ctx);
+                    Outcome::Consumed
+                }
                 Some(ViewHit::Control(control)) => {
                     if self.controls().contains(&control) {
                         self.control = control;
                     }
-                    // A field or a list only takes focus; a button acts.
-                    if !matches!(
-                        control,
-                        ViewDialogControl::Input | ViewDialogControl::Sources
-                    ) {
+                    // The body only takes focus; Apply acts.
+                    if control == ViewDialogControl::Apply {
                         self.activate(ctx);
                     }
                     Outcome::Consumed
@@ -413,30 +460,30 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
 }
 
-/// The action row, in the order it is drawn. The mode buttons double as the
-/// mode indicator, so rendering and Tab order share this list.
-pub(crate) fn view_dialog_button_controls(
-    mode: ViewDialogMode,
-) -> Vec<(ViewDialogControl, &'static str)> {
-    let mut controls = vec![
-        // §8.10 mnemonics: `b`, `c`, `r`, `s`. Alt-D (clone) and Alt-M
-        // (membership) predate the rule that the letter is one of the label's;
-        // they keep working unlisted, and Alt-only, because a bare `d` or `m`
-        // is not a letter this row underlines.
-        (ViewDialogControl::Mode(ViewDialogMode::Blank), "New &blank"),
-        (ViewDialogControl::Mode(ViewDialogMode::Clone), "&Clone"),
-        (ViewDialogControl::Mode(ViewDialogMode::Rename), "&Rename"),
-        (ViewDialogControl::Mode(ViewDialogMode::Sources), "&Sources"),
-    ];
-    controls.push((
-        ViewDialogControl::Apply,
-        if mode == ViewDialogMode::Sources {
-            "Apply membership"
-        } else {
-            "Apply"
-        },
-    ));
-    controls
+/// The four header segments in `ViewDialogMode::ALL` order (§8.6). They render
+/// through `render_segmented_control` and never in the action row (§2.5).
+/// §8.10 mnemonics: `b`, `c`, `r`, `s`. Alt-D (clone) and Alt-M (membership)
+/// predate the rule that the letter is one of the label's; they keep working
+/// unlisted, and Alt-only, because a bare `d` or `m` is not a letter the
+/// header underlines.
+const VIEW_TAB_LABELS: [&str; 4] = ["New &blank", "&Clone", "&Rename", "&Sources"];
+
+/// The one action-row verb (§8.9). It is the only button the dialog draws.
+fn view_apply_label(mode: ViewDialogMode) -> &'static str {
+    if mode == ViewDialogMode::Sources {
+        "Apply membership"
+    } else {
+        "Apply"
+    }
+}
+
+/// Everything the shell's §8.10 resolver may press, in `press_action` order:
+/// the one action first, then the four header segments (as the Filter dialog
+/// lists its buttons before its `Search │ Advanced` segments).
+fn view_mnemonic_targets(mode: ViewDialogMode) -> Vec<&'static str> {
+    let mut targets = vec![view_apply_label(mode)];
+    targets.extend(VIEW_TAB_LABELS);
+    targets
 }
 
 /// §4.3: the four mode choices the palette contributes for this layer. Their
@@ -572,21 +619,25 @@ impl Component for ViewDialog {
     }
 
     fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
-        view_dialog_button_controls(self.mode)
-            .into_iter()
-            .map(|(_, label)| label)
-            .collect()
+        view_mnemonic_targets(self.mode)
     }
 
+    /// Press the action or segment at `index` of `action_labels`, as a click
+    /// on it would; a tab switch puts the keys in the arriving tab's body.
     fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
-        let Some((control, _)) = view_dialog_button_controls(self.mode).get(index).copied() else {
-            return Outcome::Ignored;
-        };
-        match control {
-            ViewDialogControl::Mode(mode) => self.select_mode(mode, ctx),
-            _ => self.submit(ctx),
+        match index {
+            0 => {
+                self.submit(ctx);
+                Outcome::Consumed
+            }
+            _ => match ViewDialogMode::ALL.get(index.saturating_sub(1)) {
+                Some(mode) => {
+                    self.select_mode(*mode, ctx);
+                    Outcome::Consumed
+                }
+                None => Outcome::Ignored,
+            },
         }
-        Outcome::Consumed
     }
 
     fn surface(&self) -> Surface {
@@ -595,10 +646,13 @@ impl Component for ViewDialog {
 
     fn hit(&self, point: (u16, u16)) -> Option<ViewHit> {
         let g = &self.geometry;
-        g.controls
+        g.tabs
             .iter()
-            .find_map(|(rect, control)| {
-                contains(*rect, point).then_some(ViewHit::Control(*control))
+            .find_map(|(rect, mode)| contains(*rect, point).then_some(ViewHit::Tab(*mode)))
+            .or_else(|| {
+                g.controls.iter().find_map(|(rect, control)| {
+                    contains(*rect, point).then_some(ViewHit::Control(*control))
+                })
             })
             .or_else(|| {
                 g.sources.iter().find_map(|(rect, index)| {
@@ -619,8 +673,8 @@ impl Component for ViewDialog {
         let mut caret: Option<(u16, u16)> = None;
 
         let sources_mode = self.mode == ViewDialogMode::Sources;
-        let controls = view_dialog_button_controls(self.mode);
-        let labels: Vec<&str> = controls.iter().map(|(_, label)| *label).collect();
+        let apply_label = view_apply_label(self.mode);
+        let apply_labels = [apply_label];
         let width = content_width(area, DialogClass::M);
 
         let (state, sentence) = match self.error.as_deref() {
@@ -648,11 +702,11 @@ impl Component for ViewDialog {
             1
         };
         let content = DialogContent {
-            header: 0,
+            header: 1,
             body: body_rows,
             message: message_rows(&sentence, width),
             help: help_rows(help, width),
-            actions: packed_button_rows(width, &labels),
+            actions: packed_button_rows(width, &apply_labels),
         };
 
         let title = match ctx.views.active_item() {
@@ -667,10 +721,33 @@ impl Component for ViewDialog {
             scrollable: true,
             text_focus: self.text_editing(),
         };
+
+        // §8.6: the mode control is the sticky header. The active segment
+        // carries the selection style; the focus ring follows it when Tab
+        // reaches the header. The rects below are the same ones hit-testing
+        // reads, so rendering, mouse, focus and scrolling share them.
+        let active = ViewDialogMode::ALL
+            .iter()
+            .position(|mode| *mode == self.mode)
+            .unwrap_or(0);
+        let focused = (self.control == ViewDialogControl::Tabs).then_some(active);
+        let tabs: Vec<(Rect, ViewDialogMode)> = render_segmented_control(
+            frame,
+            regions.header,
+            &VIEW_TAB_LABELS,
+            active,
+            focused,
+            theme,
+        )
+        .into_iter()
+        .zip(ViewDialogMode::ALL)
+        .collect();
+
         // Recorded before the early return so a dialog too narrow to draw a
-        // body still hit-tests against nothing rather than against last frame.
+        // body still hit-tests its header rather than last frame's body.
         self.geometry = ViewGeometry {
             body: regions.body,
+            tabs: tabs.clone(),
             ..ViewGeometry::default()
         };
         self.surface = surface;
@@ -787,43 +864,21 @@ impl Component for ViewDialog {
         render_message(frame, regions.message, state, &sentence, theme, ascii);
         render_help_text(frame, regions.help, help, theme);
 
-        // §3: actions live in their own rect, so they can no longer be drawn into
-        // the help text the way the old fixed-offset button block was.
-        let focused = controls
-            .iter()
-            .position(|(control, _)| *control == self.control);
-        // §8.9: the default is `Apply`, which is what the name field and the
-        // membership list submit; the mode buttons before it are the mode
-        // indicator (§12.8 moves them into a header segment).
-        let default = controls
-            .iter()
-            .position(|(control, _)| *control == ViewDialogControl::Apply);
-        for (index, rect) in render_actions(
-            frame,
-            regions.actions,
-            ActionRow {
-                labels: &labels,
-                default,
-                destructive: &[],
-                focused,
-            },
-            theme,
-        ) {
-            let (control, label) = controls[index];
-            let selected = matches!(control, ViewDialogControl::Mode(value) if value == self.mode);
-            if selected && focused != Some(index) {
-                // The active mode reads as applied and bold; the underline is
-                // the mnemonic's (§8.10), so it is not borrowed for this.
-                let style = styles.applied.add_modifier(Modifier::BOLD);
-                frame.render_widget(Paragraph::new(button_line(label, style)).style(style), rect);
-            }
-            controls_hit.push((rect, control));
+        // §3: the action row holds exactly one verb (§8.9). It is the default
+        // the name field and the membership list submit; the modes live in the
+        // header above and never here.
+        let focused = (self.control == ViewDialogControl::Apply).then_some(0);
+        for (_, rect) in
+            render_action_row(frame, regions.actions, &apply_labels, focused, &[], theme)
+        {
+            controls_hit.push((rect, ViewDialogControl::Apply));
         }
 
         surface.caret = caret;
         self.geometry = ViewGeometry {
             body: regions.body,
             sources,
+            tabs,
             controls: controls_hit,
         };
         self.surface = surface;

@@ -40,8 +40,15 @@ def run(binary):
             app.send(b"v")
             app.wait_for("View · ")
             app.wait_for("New blank")
+            viewed = app.text()
+            for button in ("[ New blank ]", "[ Clone ]", "[ Rename ]", "[ Sources ]"):
+                assert button not in viewed, f"{button} must not render as a button\n{viewed}"
+            assert "[ Apply ]" in viewed, viewed
+            # The header tabs switch modes; Sources relabels the one action.
             app.send(b"\x1bm")
-            app.wait_for("Apply membership")
+            membership = app.wait_for("Apply membership")
+            assert "[ Apply membership ]" in membership, membership
+            assert "[ Sources ]" not in membership, membership
             app.send(b"\x1b")
             app.wait_until(lambda text: "Apply membership" not in text, "view closes")
 

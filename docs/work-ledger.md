@@ -2989,3 +2989,41 @@ primary-checkout validation remains pending; this is not a published release.
 A pre-existing unstaged mise tool-version update was preserved outside the
 merge commit. The independent union-colour restore scheduling defect on the
 release line still blocks publication and is assigned to the release owner.
+
+
+### Responsive-dialog audit and View segmented-header baseline — 2026-09-11
+
+Fresh Sol xhigh planning audited every current `LayerId`, the command palette,
+anchored popups, startup/tiny overlays, docked Details and Raw-context jump at
+clean `9f295f0509569eaad5cf511fc8f744925d51c12c`, tree
+`e57115b265d0f98715770520db27c5c091b1a40c`. The extracted plan is retained at
+`sol-dialog-audit/dialog-responsive-plan.md` on the build volume, SHA-256
+`9908c8f3ecc55cd4dde05ce640ab7110cfcb3a69ec8aa0b1260d5bd31c448378`;
+the primary scope review is beside it, SHA-256
+`37ec54728cebf302c742998f279cf03a44fcf60a33f4e9d71aa2ec1504727bc5`.
+Implementation is sequenced View baseline → shared geometry core → disjoint
+component migrations. Optional bookmark origin metadata is explicitly later
+schema/product work, not hidden in geometry.
+
+Muse delivered the View baseline as `32a1e11`, with test-only successors
+`f889868`, `4b0192c` and final `1b8c8ec`. New blank, Clone, Rename and Sources
+now use the existing segmented renderer and one header focus stop; Apply or
+Apply membership is the only action and default. Rendering and mouse hit tests
+consume the same segment/action rects. The final PTY navigation locates restored
+file and command raw views by their records under one absolute eight-second
+budget instead of assuming an unstable view ordinal.
+
+Fresh Terra xhigh review first held the stale `"[ Clone ]"` wait, then a
+per-hop deadline/transient-frame test defect. It cleared exact final commit
+`1b8c8ec72a0ccc49328dde64dac7cb6f38258663`, tree
+`565443646a80bccfbedd2c2a53faee329b24d3bb`, after one independent fresh
+named-view PTY passed against app SHA-256
+`723693bb3f772f81e8f1e4f0dbd068455dadc2fb0ecc1263be84a7eed8376efc`.
+Earlier review passed 7 component-view, 15 default-action, 6 shared-list and
+169 UI-state tests, targeted Clippy and five changed PTYs. Exact parent
+comparisons reproduced the ordinary merged-view append timeout and the full
+real-PTY command-reap failure, so neither is attributed to this UI delta; both
+remain combined-candidate risks. Review logs are under
+`terra-view-tabs-review/` on the build volume. The primary integrates the final
+tree with the authoritative View dialog documentation; no full matrix or
+release acceptance is claimed by this focused baseline.

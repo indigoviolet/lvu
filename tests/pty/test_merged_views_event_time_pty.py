@@ -69,7 +69,9 @@ def run(binary):
             app.send(b"v")
             app.wait_for("View · ")
             app.send(b"\x1bm")
-            app.wait_for("Apply membership")
+            membership = app.wait_for("Apply membership")
+            assert "[ Apply membership ]" in membership, membership
+            assert "[ Sources ]" not in membership, membership
             app.send(b"\x1b[B ")
             app.send(b"\r")
             app.wait_until(

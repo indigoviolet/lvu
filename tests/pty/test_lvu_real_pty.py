@@ -909,8 +909,14 @@ def run_named_views_story(binary: pathlib.Path) -> None:
             app.wait_for("error first")
 
             # Clone the selected raw view, then give the clone an independent filter.
+            # View modes are header segments (§8.6), not action buttons: the
+            # unbracketed `Clone` segment selects the mode while `[ Apply ]`
+            # stays the only button.
             app.send(b"v")
-            app.wait_for("[ Clone ]")
+            cloned = app.wait_for("Clone")
+            for button in ("[ New blank ]", "[ Clone ]", "[ Rename ]", "[ Sources ]"):
+                assert button not in cloned, cloned
+            assert "[ Apply ]" in cloned, cloned
             app.send(b"\x7f" * len("Copy of All events"))
             app.send(b"Errors\r")
             app.wait_for("Errors")
@@ -938,8 +944,9 @@ def run_named_views_story(binary: pathlib.Path) -> None:
 
             # A blank view starts without cloned constraints.
             app.send(b"v")
-            app.send(b"\x1bb")  # Alt-B: blank view.
-            app.wait_for("[ New blank ]")
+            app.send(b"\x1bb")  # Alt-B: blank tab.
+            blanked = app.wait_for("New view")
+            assert "[ New blank ]" not in blanked, blanked
             app.send(b"\x7f" * len("New view"))
             app.send(b"Info\r")
             info = app.wait_for("Info")
@@ -951,7 +958,8 @@ def run_named_views_story(binary: pathlib.Path) -> None:
 
             # Rename persists independently from its settings.
             app.send(b"v"); app.send(b"\x1br")
-            app.wait_for("[ Rename ]")
+            renamed = app.wait_for("Rename")
+            assert "[ Rename ]" not in renamed, renamed
             app.send(b"\x7f" * len("Info")); app.send(b"Information\r")
             app.wait_for("Information")
 
@@ -993,14 +1001,50 @@ def run_named_views_story(binary: pathlib.Path) -> None:
                 "restored Information constraint",
                 timeout=8.0,
             )
-            reopened.send(b"]")  # the unfiltered view of the same source
-            reopened.wait_until(
-                lambda text: "error first" in text and "info first" in text,
-                "restored All events",
-                timeout=8.0,
-            )
-            reopened.send(b"]")  # command raw view
-            reopened.wait_for("startup-marker", timeout=8.0)
+            # View order after a restart is not positional: stepping `]`
+            # past Information can land on the command source's raw view
+            # instead of the file source's (the exact 1d888a3 parent lands
+            # wrong the same way), so identify each raw view by its records
+            # rather than by ordinal. `]` wraps. One absolute deadline is
+            # shared by the whole cycle, so retries can never stretch past
+            # the pre-existing 8s bound, and the iteration ceiling is only a
+            # second bound: each wait gets just the time still remaining.
+            def classify_view(text: str) -> str | None:
+                if "startup-marker" in text:
+                    return "command"
+                if 'search:"error"' in text:
+                    return "error"
+                if 'search:"info"' in text:
+                    return "info"
+                if "error first" in text and "info first" in text:
+                    return "file"
+                return None
+
+            def cycle_to(want: str, current: str) -> str:
+                deadline = time.monotonic() + 8.0
+                for _ in range(8):
+                    reopened.send(b"]")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    # Wait only for a real view different from the one just
+                    # left: an unclassified starting/query-pending frame must
+                    # never advance the cycle, or the destination publishes
+                    # after we have already stepped past it.
+                    seen = reopened.wait_until(
+                        lambda text: classify_view(text) is not None
+                        and classify_view(text) != current,
+                        f"restored {want} raw view",
+                        timeout=remaining,
+                    )
+                    cls = classify_view(seen)
+                    if cls == want:
+                        return seen
+                    current = cls
+                raise AssertionError(f"{want} raw view not reached by cycling restored views")
+
+            cycle_to("file", "info")
+            cycle_to("command", "file")
             quit_cleanly(reopened)
         finally:
             if reopened.process.poll() is None: reopened.process.kill()
