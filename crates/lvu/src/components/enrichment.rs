@@ -26,13 +26,7 @@
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::Modifier,
-    text::Line,
-    widgets::{Paragraph, Wrap},
-};
+use ratatui::{Frame, layout::Rect, style::Modifier, text::Line, widgets::Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{EnrichmentControl as Control, Views};
@@ -40,12 +34,12 @@ use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Open, Outcome, RenderCtx, Surface,
 };
-use crate::dialog_controls::{DialogStyles, button_layout};
+use crate::dialog_controls::{ButtonRole, DialogStyles, render_role_button, stable_action_rows};
+use crate::dialog_layout::{DialogSpec, PresentationKind, plan_list, resolve_dialog};
 use crate::text_edit::TextTarget;
 use crate::ui::{
-    MessageState, class_l_popup, class_l_width, clear_themed, dialog_regions, message_rows,
-    packed_button_rows, render_dialog_frame, render_enrichment_button, render_message,
-    render_pane_heading, render_scrollbar, step_summary,
+    MessageState, render_help_text, render_message, render_responsive_frame, render_scrollbar,
+    step_summary,
 };
 
 /// Everything the list draws that can be clicked.
@@ -476,6 +470,17 @@ impl Component for EnrichmentDialog {
 /// Which way an enrichment chain change is being applied. Re-exported from
 /// `app` so the two enrichment layers name the same fence the shell does.
 pub(crate) use crate::app::PendingEnrichmentMutation as EnrichmentMutation;
+/// Stable LongContent budgets: outer size is policy-only, never the step count
+/// or pending state, so empty/populated/pending/error frames share one `frame`
+/// and sticky tail origins. The body owns the surplus via the shared list
+/// pane. Hand-rolled row counts here are presentation-only folding (AGENTS.md).
+fn enrichment_spec(area: Rect) -> DialogSpec {
+    let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let actions = stable_action_rows(estimate, &ACTION_LABELS).clamp(1, 2);
+    DialogSpec::new(PresentationKind::LongContent, 0, 3, 2, 2, actions)
+}
+
 /// Moved verbatim from `ui::render_enrichment_step_list`. The hit regions it
 /// wrote into `App` are the component's geometry now; `view_state`,
 /// `appearance.ascii` and the caret come from `ctx`. A free function taking
@@ -540,86 +545,95 @@ fn render_enrichment_list(
         sentence.push_str(" · unsaved draft kept");
     }
 
-    // §5.2: measure the natural body before choosing the popup height.
-    let probe_width = class_l_width(area).saturating_sub(4).max(1);
-    let action_rows = packed_button_rows(probe_width, &labels);
-    let message_rows = message_rows(&sentence, probe_width);
-    let steps_rows = 1 + stages.len().clamp(1, 10) as u16;
+    // §5.2: the frame is policy-only (stable across pending/empty/populated/
+    // error states); the step count sizes only the scroll extent.
     let help = "Later steps can use fields from earlier steps, command output as <name>.<field> · Alt-Up/Down reorder · commands run only when you confirm";
-    let help_rows = Paragraph::new(help)
-        .wrap(Wrap { trim: true })
-        .line_count(probe_width)
-        .clamp(1, 2) as u16;
-    let natural_body = steps_rows;
-    let popup = class_l_popup(area, natural_body, message_rows, help_rows, action_rows);
-    if popup.width < 20 || popup.height < 5 {
+    let active = ctx.active;
+    let default = EnrichmentDialog::default_control(ctx.views);
+    let default_index = controls.iter().position(|control| *control == default);
+    let spec = enrichment_spec(area);
+    let Ok(resolved) = resolve_dialog(
+        area,
+        &spec,
+        stages.len().max(1),
+        &labels,
+        default_index,
+        None,
+    ) else {
+        // Below the 20x6 floor the tiny fallback owns the frame; stay open
+        // with nothing drawn, as the palette does.
         return this.record(geometry, Surface::default());
-    }
-    clear_themed(frame, popup, theme);
+    };
+    render_responsive_frame(frame, &resolved, "Enrichment", active, theme);
+    let mut surface = Surface {
+        popup: resolved.frontmost,
+        interior: resolved.interior,
+        ..Surface::default()
+    };
     // §10: under a child this layer keeps its frame and title and drops to
     // `border` colour. `ctx.active` is what the legacy `active` argument was;
     // the shell knows which layer is on top and the parent decides what that
     // leaves it drawable (§6.5).
-    let active = ctx.active;
-    render_dialog_frame(frame, popup, " Enrichment ".to_owned(), active, theme);
-    let regions = dialog_regions(popup, message_rows, help_rows, action_rows);
-    let surface = Surface {
-        popup,
-        interior: regions.interior,
-        ..Surface::default()
-    };
     if !active {
         return this.record(geometry, surface);
     }
 
-    // Body: the steps list, expression and command steps in chain order.
-    let body = regions.body;
-    if body.height > 0 {
-        let list_area = Rect::new(
-            body.x,
-            body.y,
-            body.width,
-            body.height.min(steps_rows).max(1),
+    // Body: the steps list, expression and command steps in chain order. One
+    // authoritative shared plan drives heading, count, viewport, scrollbar,
+    // selection window, paint and mouse.
+    let count_text = if stages.is_empty() {
+        "0 of 0".to_owned()
+    } else {
+        format!("{} of {}", selected + 1, stages.len())
+    };
+    let count_width = u16::try_from(UnicodeWidthStr::width(count_text.as_str())).unwrap_or(0);
+    let list = plan_list(
+        resolved.body.viewport,
+        count_width,
+        stages.len(),
+        (!stages.is_empty()).then_some(selected),
+        0,
+    );
+    if list.heading.height > 0 {
+        frame.render_widget(
+            Paragraph::new("Steps").style(styles.label.add_modifier(Modifier::BOLD)),
+            list.heading,
         );
-        let count = (!stages.is_empty()).then(|| format!("{} of {}", selected + 1, stages.len()));
-        let pane =
-            render_pane_heading(frame, list_area, "Steps", count, stages.len().max(1), theme);
-        let visible = usize::from(pane.viewport.height).max(1);
-        let top = selected.saturating_sub(visible.saturating_sub(1));
-        let mut rows = Vec::new();
-        if stages.is_empty() {
-            rows.push(Line::styled(
-                "No steps yet · Add creates one",
-                styles.description,
-            ));
-        } else {
-            for (position, (index, stage)) in stages
-                .iter()
-                .enumerate()
-                .skip(top)
-                .take(visible)
-                .enumerate()
-            {
-                let hit = Rect::new(
-                    list_area.x,
-                    pane.viewport.y + position as u16,
-                    list_area.width,
-                    1,
-                );
-                geometry.rows.push((hit, index));
-                let marker = if index == selected {
-                    if ctx.ascii { "> " } else { "› " }
-                } else {
-                    "  "
-                };
-                let prefix = format!("{marker}{}  ", index + 1);
-                let width = usize::from(pane.viewport.width)
-                    .saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
-                let text = match &stage.command {
-                    Some(command) => command_row(stage, command, state, ctx.ascii, width),
-                    None => step_summary(&stage.source, width),
-                };
-                rows.push(Line::styled(
+        if list.count.width > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(count_text)).style(styles.description),
+                list.count,
+            );
+        }
+    }
+    if stages.is_empty() {
+        if list.viewport.height > 0 {
+            frame.render_widget(
+                Paragraph::new("No steps yet · Add creates one").style(styles.description),
+                Rect::new(list.viewport.x, list.viewport.y, list.viewport.width, 1),
+            );
+        }
+    } else {
+        for (offset, row) in list.row_rects.iter().enumerate() {
+            let index = list.first_row.saturating_add(offset);
+            let Some(stage) = stages.get(index) else {
+                continue;
+            };
+            geometry.rows.push((*row, index));
+            let marker = if index == selected {
+                if ctx.ascii { "> " } else { "› " }
+            } else {
+                "  "
+            };
+            let prefix = format!("{marker}{}  ", index + 1);
+            let width =
+                usize::from(row.width).saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+            let text = match &stage.command {
+                Some(command) => command_row(stage, command, state, ctx.ascii, width),
+                None => step_summary(&stage.source, width),
+            };
+            frame.render_widget(
+                Paragraph::new(Line::styled(
                     format!("{prefix}{text}"),
                     if index == selected && focused == Control::Steps {
                         styles.selection
@@ -628,57 +642,51 @@ fn render_enrichment_list(
                     } else {
                         styles.label
                     },
-                ));
-            }
-        }
-        frame.render_widget(Paragraph::new(rows), pane.viewport);
-        if let Some(bar) = pane.scrollbar {
-            render_scrollbar(
-                frame,
-                bar,
-                top,
-                stages.len().saturating_sub(visible),
-                theme,
-                ctx.ascii,
+                )),
+                *row,
             );
         }
     }
+    if let Some(bar) = list.scrollbar {
+        render_scrollbar(
+            frame,
+            bar,
+            list.first_row,
+            stages.len().saturating_sub(list.row_rects.len()),
+            theme,
+            ctx.ascii,
+        );
+    }
+    surface.scrollable = list.scrollbar.is_some();
 
-    // Message, help and actions.
+    // Message, help and actions: sticky tail bands from the shared geometry.
     render_message(
         frame,
-        regions.message,
+        resolved.message,
         message_state,
         &sentence,
         theme,
         ctx.ascii,
     );
-    if regions.help.height > 0 {
-        frame.render_widget(
-            Paragraph::new(help)
-                .wrap(Wrap { trim: true })
-                .style(styles.description),
-            regions.help,
-        );
-    }
-    if regions.actions.height > 0 {
+    render_help_text(frame, resolved.help, help, theme);
+    {
         let focused_index = controls.iter().position(|control| *control == focused);
-        // §8.9: the fill marks the button Enter would press from the list,
-        // which is `Add` on an empty chain and `Edit` once a step is selected.
-        let default = EnrichmentDialog::default_control(ctx.views);
-        for (index, hit) in button_layout(regions.actions, &labels, focused_index) {
-            geometry.controls.push((hit, controls[index]));
-            render_enrichment_button(
+        for (index, hit) in &resolved.actions.buttons {
+            geometry.controls.push((*hit, controls[*index]));
+            render_role_button(
                 frame,
-                hit,
-                labels[index],
-                controls[index] == focused,
-                controls[index] == default,
+                *hit,
+                labels[*index],
+                if resolved.actions.default == Some(*index) {
+                    ButtonRole::Default
+                } else {
+                    ButtonRole::Normal
+                },
+                focused_index == Some(*index),
                 theme,
             );
         }
     }
-    let _ = regions.content;
     this.record(geometry, surface)
 }
 
