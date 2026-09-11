@@ -733,6 +733,32 @@ impl WorkerClient {
         }
     }
 
+    /// Record a window-local source definition in the worker's session set
+    /// without acquiring anything there. A refusal (notably degraded
+    /// persistence) is an error here; the caller decides whether the
+    /// capture may proceed without the note.
+    pub async fn note_session_member(
+        &mut self,
+        definition: &serde_json::Value,
+    ) -> Result<(), String> {
+        let request_id = self.take_request_id();
+        let expected = request_id.clone();
+        let events = self
+            .roundtrip(
+                WorkerRequest::NoteSessionMember {
+                    request_id,
+                    definition: definition.clone(),
+                },
+                CONTROL_ROUNDTRIP_TIMEOUT,
+            )
+            .await?;
+        match primary(&events, &expected) {
+            Some(WorkerEvent::SessionNoted { .. }) => Ok(()),
+            Some(WorkerEvent::Refused { reason, .. }) => Err(reason.clone()),
+            other => Err(format!("unexpected session-note reply: {other:?}")),
+        }
+    }
+
     /// Submit one union commit attempt: one request, one receipt, under the
     /// caller's per-attempt bound (the transport partitions the window's
     /// absolute deadline across attempts; see the recovery loop that calls
@@ -1233,6 +1259,7 @@ fn request_request_id(request: &WorkerRequest) -> &str {
         | WorkerRequest::RequestStart { request_id, .. }
         | WorkerRequest::RequestStop { request_id, .. }
         | WorkerRequest::RequestRestart { request_id, .. }
+        | WorkerRequest::NoteSessionMember { request_id, .. }
         | WorkerRequest::StatusSubscribe { request_id, .. }
         | WorkerRequest::StdinChunk { request_id, .. }
         | WorkerRequest::RequestProgress { request_id, .. }
@@ -1277,6 +1304,7 @@ fn event_request_id(event: &WorkerEvent) -> Option<&str> {
         | WorkerEvent::Started { request_id, .. }
         | WorkerEvent::Refused { request_id, .. }
         | WorkerEvent::Stopped { request_id, .. }
+        | WorkerEvent::SessionNoted { request_id, .. }
         | WorkerEvent::StdinOpen { request_id, .. }
         | WorkerEvent::SourceProgress { request_id, .. } => Some(request_id),
         WorkerEvent::Store(inner) => store_event_request_id(inner),

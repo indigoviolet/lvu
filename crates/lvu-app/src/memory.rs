@@ -933,7 +933,7 @@ fn shared_worker(
                     } else if failed.is_empty() {
                         Ok(())
                     } else {
-                        Err(failed.values().next().expect("nonempty").clone())
+                        Err(flush_failure(&failed))
                     };
                     if done.send(result).is_err() {
                         break;
@@ -957,6 +957,21 @@ fn queue_error<T>(error: TrySendError<T>) -> String {
         TrySendError::Full(_) => "memory worker queue is full".into(),
         TrySendError::Disconnected(_) => "memory worker disconnected".into(),
     }
+}
+
+/// Flush-time failure choice, shared by the local and mediated workers so
+/// they agree: a non-refusal failure means real work may be lost, so it
+/// wins deterministically over HashMap order; a set of pure
+/// degraded-store refusals reports the refusal, which the shutdown path
+/// exempts when nothing is queued or in flight (see
+/// `degraded_flush_is_clean`).
+fn flush_failure(failed: &HashMap<ViewId, String>) -> String {
+    failed
+        .values()
+        .find(|error| !error.contains(lvu_shared::STORE_UNAVAILABLE_MARKER))
+        .or_else(|| failed.values().next())
+        .expect("nonempty")
+        .clone()
 }
 
 /// See `RECENT_LIMIT`: transitional test-only worker thread.
@@ -1484,7 +1499,7 @@ fn worker(
                 } else if failed.is_empty() {
                     Ok(())
                 } else {
-                    Err(failed.values().next().expect("nonempty").clone())
+                    Err(flush_failure(&failed))
                 };
                 let _ = done.send(result);
             }
@@ -3248,6 +3263,62 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(event, Event::Saved(..))),
             "flush drains the save acks first"
+        );
+        memory.stop().expect("clean stop joins");
+    }
+
+    #[test]
+    fn flush_failure_prefers_real_loss_over_acknowledged_refusal() {
+        use std::collections::HashMap;
+        let mut failed = HashMap::new();
+        failed.insert(
+            ViewId::new(),
+            format!(
+                "{} (unsupported database schema version 9999); capture continues",
+                lvu_shared::STORE_UNAVAILABLE_MARKER
+            ),
+        );
+        failed.insert(ViewId::new(), "memory worker disconnected".to_string());
+        assert_eq!(flush_failure(&failed), "memory worker disconnected");
+        failed.retain(|_, error| error.contains(lvu_shared::STORE_UNAVAILABLE_MARKER));
+        assert!(
+            flush_failure(&failed).contains(lvu_shared::STORE_UNAVAILABLE_MARKER),
+            "pure refusals still report the refusal"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_flush_reports_degraded_refusal_with_marker() {
+        let root = TempDir::new().unwrap();
+        // Same byte-crafted future-schema fixture the worker's own degraded
+        // test uses: a parseable header with a too-new user_version, no
+        // database dependency.
+        let workspace = root.path().join("captures").join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\x00");
+        header[60..64].copy_from_slice(&9999u32.to_be_bytes());
+        std::fs::write(workspace.join("workspace.sqlite3"), &header).unwrap();
+        let store = shared_fixture(root.path(), 6214).await;
+        let mut memory = SharedMemory::wrap(store);
+        // A save against the refused store records its refusal, exactly as
+        // a degraded session does; the flush then re-reports it rather
+        // than going clean.
+        let definition = definition();
+        let view = ViewId::new();
+        memory
+            .save(Box::new(request(1, definition, view, "seek")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        poll_until(&memory, deadline, |event| {
+            matches!(event, Event::SaveFailed(..))
+        })
+        .await;
+        let (_events, result) = memory.flush(Duration::from_secs(10));
+        let error = result.expect_err("degraded flush must refuse loudly");
+        assert!(
+            error.contains(lvu_shared::STORE_UNAVAILABLE_MARKER),
+            "refusal names the outage with the shared marker: {error}"
         );
         memory.stop().expect("clean stop joins");
     }

@@ -2,9 +2,11 @@
 """Resuming the previous session's sources on the next launch.
 
 The story is the one a user lives: open a file and a command, quit, come back.
-What comes back has to be the whole set, the file has to continue rather than
-re-read what is already captured, the command has to run again, and the status
-line has to say that this happened rather than leaving it to be discovered.
+What comes back has to be the whole set: the file continues rather than
+re-read what is already captured, the remembered command stays listed with
+its reason instead of starting on its own, an explicit restart through
+discovery runs it again, and the status line says all of this
+rather than leaving it to be discovered.
 """
 
 from __future__ import annotations
@@ -57,7 +59,10 @@ def run(binary):
         pids = root / "pids"
         command = looping_command(pids)
 
-        # A session with one file source and one command source.
+        # A session with one file source and one command source. Waiting for
+        # the command's own output proves its shell spawned before the quit,
+        # so the per-session launch count below is exact rather than a race
+        # between the worker spawn and the shutdown.
         app = launch(binary, [str(log), "--command", command], environment, capture)
         try:
             app.wait_for("file-first")
@@ -66,6 +71,13 @@ def run(binary):
                 "both sources in the sidebar",
             )
             app.wait_until(lambda text: text.count("Running:") >= 2, "both acquiring")
+            # The file view holds focus, so the command's own output is not
+            # on screen; its shell's first write proves the spawn instead.
+            app.wait_until(
+                lambda text: len(pids.read_text().splitlines()) == 1,
+                "the command shell spawned before the quit",
+                timeout=15,
+            )
             stop(app)
         finally:
             if app.process.poll() is None:
@@ -79,23 +91,55 @@ def run(binary):
         with log.open("a") as output:
             output.write("file-second\n")
 
-        # The whole point: no arguments at all.
+        # The whole point: no arguments at all. Files resume from the durable
+        # cursor on their own; a remembered command never starts
+        # automatically — it stays listed with its reason, and an explicit
+        # restart through discovery launches it exactly once more.
         app = launch(binary, [], environment, capture)
         try:
-            app.wait_for("resumed 2 of 2 sources from the last session")
-            app.wait_until(
-                lambda text: "shell command" in text and "sample.log" in text,
-                "both sources resumed into the sidebar",
+            app.wait_for(
+                "resumed 1 of 2 sources from the last session; "
+                "1 could not be re-acquired"
             )
             app.wait_until(
-                lambda text: text.count("Running:") >= 2,
-                "both resumed sources acquiring",
+                lambda text: "shell command" in text and "sample.log" in text,
+                "both sources back in the sidebar",
+            )
+            app.wait_until(
+                lambda text: "not acquiring" in text,
+                "the remembered command explains itself instead of starting",
             )
             app.wait_for("file-second")
             assert "file-first" in app.text(), "resumed file lost its history"
-            # The command source's own view carries its output.
-            app.send(b"]")
-            app.wait_for("command-ready")
+            # Explicit restart: the Add source dialog's discovery lists the
+            # remembered command; starting it there is the launch the resume
+            # deliberately withheld. The per-capture worker outlives a quit,
+            # so this adopts the still-live capture instead of spawning a
+            # duplicate — what matters is the capture running again with its
+            # output visible, not a new PID. (Same-session stop/restart
+            # spawning is covered by test_source_control_pty.py.)
+            app.send(b"\x10")
+            app.wait_for("Command palette", timeout=8)
+            app.send(b"Add source\r")
+            app.wait_for("Add source", timeout=8)
+            app.send(b"\x04")
+            app.wait_for("Candidates", timeout=10)
+            app.send(b"shell")
+            app.wait_until(
+                lambda text: "shell command" in text and "Remembered" in text,
+                "the remembered command is a discovery candidate",
+                timeout=10,
+            )
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: text.count("Running:") >= 2,
+                "the restarted command capture is running again",
+                timeout=15,
+            )
+            # The start lands on the command's own view, whose retained
+            # output is readable behind the still-open dialog.
+            app.wait_for("command-ready", timeout=15)
+            app.send(b"\x1b")
             stop(app)
         finally:
             if app.process.poll() is None:
@@ -105,18 +149,22 @@ def run(binary):
         captured = journal_bytes(capture)
         assert captured.count(b"file-first") == 1, "resume re-captured history"
         assert captured.count(b"file-second") == 1, "resume duplicated a new record"
-        assert len(pids.read_text().splitlines()) == 2, "one command launch per session"
 
         # Arguments add to the resumed set, and naming a source that is already
-        # in it does not produce a second copy of it.
+        # in it does not produce a second copy of it. The remembered command
+        # still waits for its explicit restart, so only the file and the
+        # added source acquire.
         extra = root / "extra.log"
         extra.write_text("extra-first\n")
         app = launch(binary, [str(extra), str(log)], environment, capture)
         try:
-            app.wait_for("resumed 2 of 2 sources from the last session")
+            app.wait_for(
+                "resumed 1 of 2 sources from the last session; "
+                "1 could not be re-acquired"
+            )
             app.wait_until(
-                lambda text: text.count("Running:") >= 3,
-                "resumed set plus the added source",
+                lambda text: text.count("Running:") >= 2,
+                "resumed file plus the added source",
             )
             assert app.text().count("sample.log") == 1, "named source was duplicated"
             stop(app)
@@ -193,7 +241,8 @@ def run(binary):
 
     print(
         "Resume PTY passed: session set restored with no arguments, file continued "
-        "without duplicates, command relaunched once, arguments added and deduplicated, "
+        "without duplicates, remembered command explained until its explicit "
+        "restart reactivated its capture, arguments added and deduplicated, "
         "--fresh acquired nothing and deleted nothing, stdin explained in the sidebar"
     )
 

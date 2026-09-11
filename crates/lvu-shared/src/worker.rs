@@ -60,6 +60,13 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// exist. Counts are sampled at event time; there is no per-record feed.
 pub const STATUS_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Stable prefix of the degraded-persistence refusal every mediated write
+/// returns when the workspace store failed to open. Windows match on this
+/// (never on the open-failure reason that follows it) to tell an
+/// already-explained refusal with nothing queued or in flight — a clean
+/// shutdown — from a real save loss.
+pub const STORE_UNAVAILABLE_MARKER: &str = "workspace store unavailable";
+
 /// Lifecycle work detached from a timed-out socket request is capped at the
 /// viewer cap. A connection dispatches one request at a time, and excess
 /// work is refused instead of growing a hidden task/queue without bound.
@@ -858,6 +865,32 @@ impl WorkerService {
         }
         let snapshot = session.clone();
         store_session_set(&self.config.workspace_root, &snapshot).err()
+    }
+
+    /// Record a window-local source (stdin today) in the session set
+    /// without acquiring anything here. The definition travels verbatim;
+    /// a later window restores it as a visible entry the resume path
+    /// refuses loudly (stdin cannot restart) instead of dropping it
+    /// silently. No capture starts, no byte replays, nothing is
+    /// fabricated. Degraded persistence refuses loudly instead (same rule
+    /// as `note_session_stopped`): the manifest note is a durable write,
+    /// and rewriting it while the workspace is incompatible is unsafe.
+    async fn note_session_member(
+        &self,
+        definition: lvu_core::SourceDefinition,
+    ) -> Result<(), String> {
+        if let Some(reason) = self.store_unavailable.as_deref() {
+            return Err(format!(
+                "workspace store unavailable ({reason}); session member not recorded, durable bytes unchanged"
+            ));
+        }
+        let mut session = self.session.lock().await;
+        if !session.iter().any(|value| value.id == definition.id) {
+            session.push(definition);
+        }
+        let snapshot = session.clone();
+        drop(session);
+        store_session_set(&self.config.workspace_root, &snapshot)
     }
 
     /// Drop one source from the in-memory session and persist the note.
@@ -2440,6 +2473,12 @@ impl WorkerService {
     /// store. Every mediated write funnels through here: one synchronous
     /// transaction per call, so concurrent windows serialize in SQLite and
     /// the row-version guard stays the sole conflict authority.
+    ///
+    /// The degraded refusal below is a stable diagnostic sentence shared
+    /// with windows (`STORE_UNAVAILABLE_MARKER`): a window that already
+    /// showed it in-session and has nothing queued or in flight at
+    /// shutdown reports success rather than failing the exit on the same
+    /// acknowledged refusal.
     async fn with_store<T, E, F>(&self, operation: F) -> Result<T, String>
     where
         T: Send + 'static,
@@ -2452,7 +2491,7 @@ impl WorkerService {
         // empty/success. No store lock is taken on this path.
         if let Some(reason) = self.store_unavailable.as_deref() {
             return Err(format!(
-                "workspace store unavailable ({reason}); capture continues, persistence refused"
+                "{STORE_UNAVAILABLE_MARKER} ({reason}); capture continues, persistence refused"
             ));
         }
         let Some(store) = self.store.as_ref() else {
@@ -2807,6 +2846,30 @@ impl WorkerService {
                     Ok(Err(reason)) => Reply(vec![WorkerEvent::Refused { request_id, reason }]),
                 }
             }
+            WorkerRequest::NoteSessionMember {
+                request_id,
+                definition,
+            } => {
+                let definition: lvu_core::SourceDefinition =
+                    match serde_json::from_value(definition) {
+                        Ok(definition) => definition,
+                        Err(_) => {
+                            return Reply(vec![WorkerEvent::Refused {
+                                request_id,
+                                reason: "invalid session definition".into(),
+                            }]);
+                        }
+                    };
+                let service = Arc::clone(self);
+                match tokio::time::timeout(timeout, service.note_session_member(definition)).await {
+                    Err(_) => Reply(vec![WorkerEvent::Refused {
+                        request_id,
+                        reason: "session note timed out".into(),
+                    }]),
+                    Ok(Ok(())) => Reply(vec![WorkerEvent::SessionNoted { request_id }]),
+                    Ok(Err(reason)) => Reply(vec![WorkerEvent::Refused { request_id, reason }]),
+                }
+            }
             WorkerRequest::StatusSubscribe { .. } => {
                 *subscribed = true;
                 Reply(vec![WorkerEvent::SourceStatus {
@@ -2963,6 +3026,7 @@ fn request_id_of(request: &WorkerRequest) -> String {
         | WorkerRequest::RequestStart { request_id, .. }
         | WorkerRequest::RequestStop { request_id, .. }
         | WorkerRequest::RequestRestart { request_id, .. }
+        | WorkerRequest::NoteSessionMember { request_id, .. }
         | WorkerRequest::StatusSubscribe { request_id }
         | WorkerRequest::StdinChunk { request_id, .. }
         | WorkerRequest::RequestProgress { request_id, .. }
@@ -4223,6 +4287,78 @@ mod tests {
         assert_eq!(
             load_session_set(&root.path().join("workspace")).unwrap(),
             vec![definition]
+        );
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    /// A window-local source joins the session set without starting a
+    /// capture: the note persists the definition verbatim, stays
+    /// idempotent across repeats, and never fabricates acquisition.
+    #[tokio::test]
+    async fn note_session_member_persists_without_starting_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, _) =
+            WorkerService::open(test_config(root.path()), Arc::new(AdmitAll)).unwrap();
+        let definition = SourceDefinition {
+            schema_version: 1,
+            id: SourceId(uuid::Uuid::from_u128(77)),
+            name: "standard input".into(),
+            acquisition: lvu_core::Acquisition::Stdin,
+            identity_hints: Default::default(),
+            retention: None,
+        };
+        service
+            .note_session_member(definition.clone())
+            .await
+            .expect("note");
+        // Idempotent: a repeated note is not a second member.
+        service
+            .note_session_member(definition.clone())
+            .await
+            .expect("re-note");
+        let members = load_session_set(&root.path().join("workspace")).unwrap();
+        assert_eq!(members, vec![definition]);
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    /// Degraded persistence refuses the note loudly instead of recording
+    /// nothing: the manifest note is a durable write, and rewriting it
+    /// while the workspace is incompatible is unsafe.
+    #[tokio::test]
+    async fn note_session_member_refuses_degraded_store() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let db = workspace.join("workspace.sqlite3");
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\x00");
+        header[60..64].copy_from_slice(&9999u32.to_be_bytes());
+        std::fs::write(&db, &header).expect("fixture database");
+        let mut config = test_config(root.path());
+        config.workspace_root = workspace.clone();
+        let (service, _) =
+            WorkerService::open(config, Arc::new(AdmitAll)).expect("degraded open still serves");
+        let definition = SourceDefinition {
+            schema_version: 1,
+            id: SourceId(uuid::Uuid::from_u128(78)),
+            name: "standard input".into(),
+            acquisition: lvu_core::Acquisition::Stdin,
+            identity_hints: Default::default(),
+            retention: None,
+        };
+        let error = service
+            .note_session_member(definition)
+            .await
+            .expect_err("degraded note must refuse loudly");
+        assert!(
+            error.contains("durable bytes unchanged"),
+            "refusal says what was preserved: {error}"
+        );
+        assert!(
+            !workspace.join("session.json").exists(),
+            "no manifest is fabricated on refusal"
         );
         service.request_shutdown();
         service.shutdown().await;

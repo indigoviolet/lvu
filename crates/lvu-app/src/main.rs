@@ -4878,13 +4878,26 @@ impl Composition {
             for event in events {
                 self.handle_memory_event(app, adapter, event);
             }
-            result.map_err(|error| {
-                format!(
+            if let Err(error) = result {
+                // An already-explained degraded-store refusal with nothing
+                // queued and nothing in flight loses nothing: the session
+                // ran degraded and said so on screen, so failing the exit
+                // on the same refusal would turn a deliberate quit into a
+                // failure. Anything actually pending or in flight, and any
+                // other flush failure, still fails loudly below.
+                if degraded_flush_is_clean(
+                    &error,
+                    self.memory_pending.len(),
+                    self.memory_inflight.len(),
+                ) {
+                    return Ok(());
+                }
+                return Err(format!(
                     "{error}; pending={}, inflight={}",
                     self.memory_pending.len(),
                     self.memory_inflight.len(),
-                )
-            })?;
+                ));
+            }
             self.queue_memory_saves(app, true);
             if self.memory_pending.is_empty() && self.memory_inflight.is_empty() {
                 return Ok(());
@@ -5312,6 +5325,54 @@ impl Composition {
 
 /// How a correlated value reads in the dialog and the view name. The predicate
 /// always uses the typed scalar; this is presentation.
+/// Shutdown-flush decision for a failed memory flush, shared with the
+/// shutdown path so the rule is stated once: an acknowledged
+/// degraded-store refusal with nothing queued and nothing in flight loses
+/// nothing, so the exit stays clean. Anything actually pending or in
+/// flight, and any other flush failure, still fails loudly — unsafe
+/// persistence keeps refusing and the bytes stay untouched either way.
+fn degraded_flush_is_clean(error: &str, pending: usize, inflight: usize) -> bool {
+    pending == 0 && inflight == 0 && error.contains(lvu_shared::STORE_UNAVAILABLE_MARKER)
+}
+
+#[cfg(test)]
+mod degraded_flush_tests {
+    use super::degraded_flush_is_clean;
+
+    #[test]
+    fn acknowledged_refusal_with_nothing_queued_is_clean() {
+        let error = format!(
+            "memory autosave: {} (unsupported database schema version 9999); \
+             capture continues, persistence refused",
+            lvu_shared::STORE_UNAVAILABLE_MARKER,
+        );
+        assert!(degraded_flush_is_clean(&error, 0, 0));
+    }
+
+    #[test]
+    fn queued_or_inflight_work_keeps_the_failure_loud() {
+        let error = format!(
+            "memory autosave: {} (unsupported database schema version 9999); \
+             capture continues, persistence refused",
+            lvu_shared::STORE_UNAVAILABLE_MARKER,
+        );
+        assert!(!degraded_flush_is_clean(&error, 1, 0));
+        assert!(!degraded_flush_is_clean(&error, 0, 1));
+        assert!(!degraded_flush_is_clean(&error, 2, 3));
+    }
+
+    #[test]
+    fn other_flush_failures_stay_loud_even_when_drained() {
+        assert!(!degraded_flush_is_clean("memory worker disconnected", 0, 0));
+        assert!(!degraded_flush_is_clean(
+            "memory autosave flush deadline exceeded (submitting final saves; \
+             pending=0, inflight=0, worker: running)",
+            0,
+            0
+        ));
+    }
+}
+
 fn correlation_value_label(value: &lvu_core::ExactScalar) -> String {
     match value {
         lvu_core::ExactScalar::Null => "null".into(),
@@ -7943,12 +8004,25 @@ async fn run() -> Result<(), String> {
     let mut source_ids = HashMap::new();
     let mut definitions = HashMap::new();
     let mut session_sources = Vec::new();
+    // Stdin definitions started window-locally, sent to the worker after
+    // every acquisition below so one refused note cannot disturb a start.
+    let mut pending_stdin_notes = Vec::new();
     // An argument lvu cannot read still fails startup, but the sources planned
     // before it are acquired first and then cleaned up, so a failing launch
     // reaps what it owned instead of leaving it running.
     for plan in planned {
         let outcome = if plan.requested && plan.stdin {
-            start_stdin_definition(&manager, plan.definition.clone()).await
+            let started = start_stdin_definition(&manager, plan.definition.clone()).await;
+            // Window-local stdin never runs on the worker, so record its
+            // definition in the worker's session set explicitly: a later
+            // window restores it as a visible entry the resume path
+            // refuses loudly (stdin cannot restart) instead of dropping
+            // it silently. No acquisition, no replay, no fabrication —
+            // and a refused note never fails the capture it describes.
+            if started.is_ok() {
+                pending_stdin_notes.push(plan.definition.clone());
+            }
+            started
         } else if plan.requested {
             start_definition(
                 &manager,
@@ -8009,6 +8083,15 @@ async fn run() -> Result<(), String> {
     }
     prepend_notice(&mut app, resume_notice(resume_total, resumed, unresumed));
     prepend_notice(&mut app, session_error);
+    // Session notes last: acquisition is settled, so a worker that cannot
+    // take the note (notably a pre-note-method worker still within its
+    // shutdown grace after an upgrade) only loses the note — the capture
+    // it describes is already running.
+    for definition in std::mem::take(&mut pending_stdin_notes) {
+        if let Err(error) = shared_session.note_local_source(&definition).await {
+            app.action_notice = Some(format!("stdin session will not restore: {error}"));
+        }
+    }
     if !app.views().is_empty() {
         app.close_source_layer();
     }
