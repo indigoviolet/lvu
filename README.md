@@ -12,6 +12,34 @@ can be saved as a recipe. Optional assistance can draft filters, enrichments
 and timestamp rules through a local coding-agent provider, but everything
 except that works offline.
 
+## Features
+
+- **Lossless durable capture.** Files, command output, and stdin land in a
+  local store with byte-exact records and stable identities; files resume
+  from a durable cursor, so a restart repeats nothing.
+- **Many sources, many views.** Open several sources at once; each keeps a
+  permanent unfiltered All events view, and views can be cloned or merged
+  over open sources.
+- **Live unions with shared keys.** Combine existing views into one live
+  union, matching inputs on an accepted enrichment column pinned at creation.
+- **Filtering that meets you halfway.** Literal words, `field: value`,
+  `/regex/`, and Polars expressions, with search and advanced constraints
+  combining.
+- **Native enrichment, reviewed commands.** Add derived columns from named
+  regex captures or Polars expressions evaluated by the Rust engine;
+  external commands run only after explicit review, with durable results.
+- **Presentation that never rewrites data.** Time windows over capture,
+  event, or extracted time shown in your configured zone; Run/Filter
+  grouping, folding, and ordered colour rules — all display-only, with
+  last-good rollback on invalid drafts.
+- **Bookmarks, recipes, snapshots.** Bookmark records with notes, save a
+  view's setup as a revisable recipe, and export fixed snapshots for
+  investigation.
+- **Assistance optional, offline core.** Plain-language filter, enrichment,
+  and timestamp drafting plus resumable snapshot investigations through
+  your own local agent CLI; everything else works offline (`uv` only for
+  Polars expressions, `node` only for the bridge).
+
 ## Install
 
 Homebrew:
