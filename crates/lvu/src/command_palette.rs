@@ -1548,10 +1548,16 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
         ),
         command(
             CommandId::Context,
-            "Raw context",
-            "Jump to the selected record in its source's All events view; o again returns",
+            "Inspect context",
+            "Temporarily show the selected record in All events; o returns to this view",
             "Views",
-            &["neighbors", "surrounding", "unfiltered", "all events"],
+            &[
+                "neighbors",
+                "surrounding",
+                "unfiltered",
+                "all events",
+                "raw context",
+            ],
             Action::RawContext {
                 anchor: None,
                 layer: None,
@@ -1570,10 +1576,10 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
         ),
         command(
             CommandId::ReturnFromRawContext,
-            "Back from raw context",
+            "Return from context",
             "Return to the view, record and dialog o was pressed in",
             "Views",
-            &["return", "back", "filtered view"],
+            &["return", "back", "filtered view", "raw context"],
             Action::ReturnFromRawContext,
             if context.raw_context_held && matches!(context.focus, Focus::Logs | Focus::Selector) {
                 None

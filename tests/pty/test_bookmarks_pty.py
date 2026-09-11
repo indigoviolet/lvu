@@ -35,7 +35,7 @@ def run(binary):
                     app.send(b"B"); app.wait_for("Café failure to inspect")
                     # Enter on the list goes to the record; raw context is its
                     # own control.
-                    app.send(b"\t"); app.wait_for("Raw context")
+                    app.send(b"\t"); app.wait_for("Inspect context")
                     # Raw context is a jump to All events with `o` back, which
                     # re-pushes this list (docs/raw-context-as-jump.md).
                     app.send(b"\r"); app.wait_for("first event")

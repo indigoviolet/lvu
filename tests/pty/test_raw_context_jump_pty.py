@@ -70,7 +70,7 @@ def round_trip(binary: pathlib.Path, root: pathlib.Path, source: pathlib.Path, w
         # Bookmarks: the button closes it, jumps, and the return re-opens it.
         app.send(b"b")
         app.send(b"B"); app.wait_for("Bookmarks · ")
-        app.send(b"\t"); app.wait_for("Raw context")
+        app.send(b"\t"); app.wait_for("Inspect context")
         app.send(b"\r")
         app.wait_until(lambda t: jumped(t) and "Bookmarks · " not in t, "Bookmarks closed on the jump", timeout=10)
         app.send(b"o")

@@ -113,12 +113,13 @@ seed.
 
 ## Composition with the dialog rules
 
-- **§8.9 default action.** Nothing changes: `Pin` stays Fields' default,
-  `Go to` stays Bookmarks'. `Raw context` is an ordinary button in both. The
+- **§8.9 default action.** `Pin` stays Fields' default and `Open in All events`
+  stays Bookmarks'. `Inspect context` is an ordinary button in both. The
   dialog's own §8.9 problem — `Back to anchor` unreachable by Enter —
   disappears with the dialog.
-- **§7.5 buttons.** The label stays `Raw context` with no trailing `…`: it
-  no longer opens a child dialog.
+- **§7.5 buttons.** The label is `Inspect context` with no trailing `…`: it
+  names a temporary jump, not a child dialog. Bookmarks' separate `Open in All
+  events` action names the permanent navigation.
 - **§8.10 discoverability.** The two operations live in the palette with
   their chord; the status segment prints `o back` under the "non-routine key
   with no button" allowance; no other hint appears anywhere.

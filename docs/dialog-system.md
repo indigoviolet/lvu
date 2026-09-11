@@ -1764,7 +1764,7 @@ After, 54x16 (52 × 8):
 └─────────────────────────────────────────────────┘
 ```
 
-### 12.10 Bookmarks `B` — class M
+### 12.10 Bookmarks `B` — LongContent
 
 Before: 100% × 22; `1 / 128 bookmarks ·`; one row; sixteen blank rows;
 buttons indented one column and `↑/↓ select` flush left beneath them.
@@ -1780,7 +1780,8 @@ After, 100x30 (72 × 11 with one bookmark):
 │                                                                      │
 │  ○  Ready     Enter jumps to the selected bookmark                   │
 │                                                                      │
-│  [ Go to ]  [ Edit note ]  [ Raw context ]  [ Remove ]               │
+│  [ Open in All events ]  [ Edit note ]  [ Inspect context ]          │
+│  [ Remove ]                                                           │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -1797,12 +1798,12 @@ After, 54x16 (52 × 7):
 │    › #19  02:13:14  fixture request 19 complet… │
 │           no note                               │
 │  ○  Ready     Enter jumps to the bookmark       │
-│  [ Go to ]  [ Edit note ]  [ Raw context ]      │
-│  [ Remove ]                                     │
+│  [ Open in All events ]  [ Edit note ]           │
+│  [ Inspect context ]  [ Remove ]                 │
 └─────────────────────────────────────────────────┘
 ```
 
-### 12.11 Fields `i` — class L
+### 12.11 Fields `i` — Contextual Inspector
 
 Before: 70% × 16; `> [ ] level = DEBUG` rows; key-list footer.
 
@@ -1879,15 +1880,15 @@ After, 54x16 (52 × 11):
 └─────────────────────────────────────────────────┘
 ```
 
-### 12.12 Raw context `o` — retired; now a jump
+### 12.12 Inspect context `o` — temporary jump
 
 The dialog this entry described — a class-XL, read-only window of the
 physical stream around the anchor with `[ Back to anchor ]` — is gone. `o`
 jumps to the selected record in its source's All events view, selected and
-centred, and `o` again returns to the view, the record and the dialog it was
+centred, and `o` again returns to the view, record and dialog it was
 pressed in; the raw view's status line says `raw of <view> · #<n> · o back`
 (`locating…` while the record is still being indexed). Fields and Bookmarks
-keep their `Raw context` button (§7.5): it closes them, jumps, and they are
+call this temporary action `Inspect context`: it closes them, jumps, and they are
 re-pushed on return from what the view remembers. The whole design, including
 what was lost against the dialog and the docked pane that could recover it,
 is `raw-context-as-jump.md`. Its original sketches are in

@@ -265,7 +265,7 @@ fn action_buttons(
     if fields.is_empty() {
         // Nothing to pin, but the record itself is still inspectable.
         return if has_anchor {
-            vec![("Raw c&ontext", C::Context)]
+            vec![("Inspect c&ontext", C::Context)]
         } else {
             Vec::new()
         };

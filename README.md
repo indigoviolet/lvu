@@ -104,7 +104,7 @@ In the viewer:
 | `t` | Time: an absolute or rolling window over capture time, event time or an extracted timestamp |
 | `i` | Fields: the record's structure with types and sample values; one key pins, filters, colours, folds or correlates a field |
 | `d` | Details: the selected record as a tree beside the log |
-| `b` / `B` | Bookmark the selected record / the bookmarks list with notes |
+| `b` / `B` | Bookmark the selected record / open bookmarks and notes; `Open in All events` stays there, while `Inspect context` returns with `o` |
 | `v` | Views: new, cloned and merged views over open sources |
 | `r` | Recipes: save, apply, export and review a view's setup |
 | `z` / `m` | Grouping: Run, Filter or Off using enrichment columns |

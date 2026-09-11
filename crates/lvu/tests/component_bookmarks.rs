@@ -342,7 +342,7 @@ fn responsive_frame_is_policy_stable_for_longcontent() {
             let buffer = draw(&provider, &mut app, width, height);
             let rendered = screen(&buffer);
             assert!(rendered.contains("Bookmarks"), "{rendered}");
-            assert!(rendered.contains("Go to"), "{rendered}");
+            assert!(rendered.contains("Open in All events"), "{rendered}");
             let surface = app.layers.bookmarks.surface();
             let (want_w, want_h) = policy_size(
                 ratatui::layout::Rect::new(0, 0, width, height),

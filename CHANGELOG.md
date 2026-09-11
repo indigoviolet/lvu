@@ -4,7 +4,7 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
-## Unreleased
+## v0.1.8 — 2026-09-11
 
 ### Features
 
@@ -13,6 +13,9 @@ validation evidence lives in the [work ledger](docs/work-ledger.md).
   indexes while record identities and durable cursors remain common.
 - Present New blank, Clone, Rename and Sources as modes in the View dialog's
   segmented header; Apply / Apply membership is the sole action and default.
+- Let self-contained dialogs use the available terminal while contextual
+  editors keep their referenced log row visible. Lists, forms, actions,
+  scrolling, cursors and mouse targets now share one responsive geometry.
 
 ### Fixes
 
@@ -27,6 +30,8 @@ validation evidence lives in the [work ledger](docs/work-ledger.md).
   digest under one absolute deadline. Foreign identities fail closed.
 - Preserve restored union definitions, enrichment-backed colours and last-good
   state while input restoration is pending or a retryable union attempt fails.
+- Distinguish a bookmark's permanent `Open in All events` navigation from
+  temporary `Inspect context`, which returns to the originating view with `o`.
 
 ### Breaking changes
 

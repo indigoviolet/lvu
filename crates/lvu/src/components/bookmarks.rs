@@ -640,12 +640,13 @@ impl BookmarksDialog {
 /// §8.9/§8.10: the row of bookmark actions, in drawn order. `Edit note` and
 /// `Remove` are the two that carry a mnemonic — they are the two that had an
 /// Alt chord and no underline to show it, which §8.10 calls the button gaining
-/// the mnemonic its label affords. `Go to` is the default and Enter runs it.
+/// the mnemonic its label affords. `Open in All events` is the default and
+/// Enter runs it.
 fn bookmark_actions() -> [(&'static str, BookmarkDialogControl); 4] {
     [
-        ("Go to", BookmarkDialogControl::Goto),
+        ("Open in All events", BookmarkDialogControl::Goto),
         ("&Edit note", BookmarkDialogControl::Edit),
-        ("Raw context", BookmarkDialogControl::Context),
+        ("Inspect c&ontext", BookmarkDialogControl::Context),
         ("&Remove", BookmarkDialogControl::Delete),
     ]
 }
@@ -655,7 +656,12 @@ fn bookmark_actions() -> [(&'static str, BookmarkDialogControl); 4] {
 /// stable maxima, actions from the stable 4-verb row so empty/populated share
 /// one frame and sticky tail.
 fn bookmarks_spec_for(area: Rect) -> DialogSpec {
-    let labels = ["Go to", "&Edit note", "Raw context", "&Remove"];
+    let labels = [
+        "Open in All events",
+        "&Edit note",
+        "Inspect c&ontext",
+        "&Remove",
+    ];
     let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
     let estimate = policy_w.saturating_sub(4).max(1);
     let action_rows = stable_action_rows(estimate, &labels).clamp(1, 2);
@@ -818,7 +824,12 @@ impl Component for BookmarksDialog {
         // semantics are unchanged. Go to/Raw context behavior stays as-is.
         if let Some(editing) = dialog.editing.clone() {
             let parent_spec = bookmarks_spec_for(area);
-            let parent_labels = ["Go to", "&Edit note", "Raw context", "&Remove"];
+            let parent_labels = [
+                "Open in All events",
+                "&Edit note",
+                "Inspect c&ontext",
+                "&Remove",
+            ];
             let Ok(parent_geometry) = crate::dialog_layout::resolve_dialog(
                 area,
                 &parent_spec,
@@ -965,8 +976,8 @@ impl Component for BookmarksDialog {
             "Press b on a record to bookmark it."
         } else {
             concat!(
-                "Go to selects the record in its source's All events view, where it ",
-                "is always present. Raw context shows its neighbours without leaving."
+                "Open in All events stays on the record in its source's complete view. ",
+                "Inspect context shows its neighbours temporarily; o returns."
             )
         };
         let (state, sentence) = if dialog.status.contains("limit") {
@@ -976,8 +987,8 @@ impl Component for BookmarksDialog {
         } else {
             (MessageState::Applied, dialog.status.clone())
         };
-        // §12.10 `[ Go to ]`, honest now that bookmarks are source-scoped: the
-        // record is always present in its source's All events view.
+        // §12.10 `[ Open in All events ]`, honest now that bookmarks are
+        // source-scoped: the record is always present in that complete view.
         let mut actions: Vec<(&'static str, C)> = Vec::new();
         if !bookmarks.is_empty() {
             actions.extend(bookmark_actions());

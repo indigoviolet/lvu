@@ -307,6 +307,10 @@ calculate those independently. Long and Unicode drafts must keep the cursor and
 selected list row visible without overlapping the shortcut footer. All surfaces
 use semantic roles from `theme.rs`. [Dialog presentation](dialog-design.md) defines
 the editable/help/status/results/actions hierarchy and narrow-layout requirements;
+[the responsive dialog geometry](dialog-system.md) gives self-contained workspaces
+most of the viewport and places contextual prompts/inspectors around their frozen
+log anchor. `DialogGeometry` is the single source for painting, scrolling, cursor,
+selection and mouse hitboxes, including compact fallbacks and anchored popups;
 [the dialog system](dialog-system.md) §8.9 gives every dialog one filled default
 action that Enter runs, audited per dialog in
 [dialog-default-actions.md](dialog-default-actions.md); §8.10 says where a user
@@ -490,16 +494,17 @@ rejected or cancelled candidate keeps the whole last-good chain.
 do not mutate hidden drafts. Movement does not dirty persistence. Time uses
 grouped Start/End controls, staged UTC/offset selection and custom-offset inputs.
 Enrichment and external-command forms expose actions as visible buttons.
-Enrichment is two nested layers built to `dialog-system.md`: `Enrichment`
-(class L) lists the ordered steps and the external-command summary with
+Enrichment is two nested responsive LongContent layers built to
+`dialog-system.md`: `Enrichment` lists the ordered steps and the
+external-command summary with
 Add/Edit/Remove actions, and `Enrichment › New step` / `› Edit step` (class L
 child) holds one expression field, the record it reads, the output the accepted
 chain produced, and Save/Remove. Save returns to the list only once the step is
 accepted; a rejected draft keeps its own layer and the whole accepted chain.
 Escape closes the completion popup, then the step editor, then the list. Both
-layers use the §3 region order, the §7.4 message row and §8.7 panes; the layout,
-scrim and pane helpers are private to `ui.rs` until the shared `dialog_layout`
-module exists.
+layers use the §3 region order, the §7.4 message row and §8.7 panes. Shared
+`dialog_layout` geometry keeps the child relationship, body scroll, completion
+anchor, cursor, selection and mouse targets aligned.
 
 Grouping consumes accepted enrichment outputs. Run joins consecutive equal
 non-null keys; Filter starts a group at each non-null value and appends the

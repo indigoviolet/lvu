@@ -3127,3 +3127,53 @@ one worker and clean socket removal. Combined binary SHA-256:
 Primary fast-forwarded to that exact reviewed merge. Earlier exact-`81f35db`
 and exact-`bc200f1` PTY failures remain preserved; this is cleared shared core,
 not component migration, full PTY-matrix or published-release acceptance.
+
+
+### Responsive dialog component integrations — 2026-09-11
+
+At the user's direction, the primary now performs the remaining review directly;
+no further independent reviewer sessions are being launched. Primary inspected
+the final owned diffs and integrated three disjoint component groups:
+
+- `8a95a29` merges final simple surfaces `5e9f7ee`: View, Folding, Union, View
+  summary and Help. The View header stays a four-mode segmented control with one
+  Apply action; Folding selection remains visible; Union reports real list
+  overflow; the summary's Fold row opens Folding. Owner evidence passed 33
+  direct component tests, 15 default-action tests, six shared-list tests and
+  representative Help/View-summary/Folding PTYs.
+- `0d0d360` merges final admin surfaces `f2430ae`: Recipes, Storage and Settings.
+  Settings reveals newly focused controls after a scrolled More pane; Storage
+  retains scrollable diagnostics; the 20x6 overflow action is reachable by
+  keyboard and mouse. Owner evidence passed 43 component tests, three shared
+  inspection tests, formatting/check/Clippy and the Settings PTY.
+- `bc49b01` merges final contextual editors `4e616f0`: Filter, Grouping, Time and
+  Colour. Shared anchors now come from the actually painted field/record and the
+  same responsive geometry drives rendering and interaction. Owner evidence
+  passed 78 direct tests, Clippy, and representative editor/time/colour PTYs.
+
+The ordinary merged-view first-key timeout and immediate `/proc` command-reap
+assertion remain retained as combined-candidate risks; neither was introduced
+by these disjoint UI diffs. At this checkpoint Fields/Correlation/Bookmarks,
+Source/Ask/Investigation and the Enrichment stack were still being completed.
+No full combined PTY or release claim was made there.
+
+Primary then directly reviewed and integrated the remaining disjoint groups:
+
+- `038d349` merges Fields/Correlation/Bookmarks through `49dc4a8`. The exact
+  six-file source stack was clean and passed 41 component tests, check and
+  Clippy; Correlation and Bookmarks PTYs passed. Primary's terminology follow-up
+  names the permanent bookmark jump `Open in All events` and the temporary,
+  returnable jump `Inspect context`; the three focused suites pass 51/51.
+- `567a050` merges Enrichment list/step/external command through `74ba412`.
+  The exact four-file stack was clean; responsive LongContent frames preserve
+  the list/child/Replace relationship and anchor completion to the painted
+  field. Direct component evidence passed before the merge.
+- `6168bf7` merges Source/Ask/Investigation through `4874b2f`. The exact
+  seven-file stack was clean and passed 56 owned tests, formatting, check and
+  Clippy; Ask and Investigation PTYs passed. Source's six-line PTY update reads
+  the new shared pane counter rather than the retired heading.
+
+All planned dialog groups are now integrated. The Source-control `Stopped:`
+expectation, Fields data-arrival waits, merged-view first-key timing and the
+immediate `/proc` command-reap assertion are retained for the single combined
+candidate run; none is pre-declared waived. No publication claim is made here.

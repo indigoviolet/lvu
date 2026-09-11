@@ -332,6 +332,16 @@ fn search_ranks_exact_prefix_alias_and_fuzzy_subsequence() {
 }
 
 #[test]
+fn context_wording_distinguishes_temporary_inspection() {
+    let mut palette = open_logs();
+    type_query(&mut palette, "inspect context");
+    let command = palette.selected_command().unwrap();
+    assert_eq!(command.id, CommandId::Context);
+    assert_eq!(command.name, "Inspect context");
+    assert!(command.description.contains("Temporarily"));
+}
+
+#[test]
 fn tab_completes_selected_name_and_enter_executes_enabled_action() {
     let mut palette = open_logs();
     type_query(&mut palette, "grep");

@@ -305,7 +305,7 @@ mise exec -- cargo update -p lvu-app --offline    # refresh Cargo.lock
 # Any build or `cargo check` refreshes it just as well. The point is only that
 # Cargo.lock must record the new version before you commit, or the release
 # build fails on --locked.
-git commit -am "lvu 0.1.7"
+git commit -am "lvu 0.1.8"
 git push
 ```
 

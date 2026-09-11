@@ -153,7 +153,7 @@ def run(binary):
             # Explicit raw-context inspection is still reachable on its own
             # control, and still anchors on the bookmarked record.
             app.send(b"\t")
-            app.wait_until(lambda text: "Raw context" in text, "raw context control")
+            app.wait_until(lambda text: "Inspect context" in text, "context control")
             app.send(b"\r")
             app.wait_until(
                 lambda text: "event 02 beta" in text and "event 01 alpha" in text,
