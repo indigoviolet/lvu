@@ -320,3 +320,140 @@ fn a_note_longer_than_the_cap_is_refused_and_says_so() {
     app.handle(Action::Raw(RawEvent::Paste("a\nb".into())), &provider);
     assert!(app.layers.bookmarks.state().draft.is_empty());
 }
+
+#[test]
+fn responsive_frame_is_policy_stable_for_longcontent() {
+    use lvu::dialog_layout::{PresentationKind, policy_size};
+
+    // 80x24 and 54x16 share one LongContent frame per size; 2 bookmarks and
+    // 12 bookmarks share it. The list scrolls behind its count via the shared
+    // plan; paint/mouse/scrollbar share its rects.
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        for extra in [0usize, 10] {
+            let (provider, mut app) = demo();
+            app.sync_provider(&provider, 30);
+            app.handle(Action::Top, &provider);
+            // 2 bookmarks short, 12 long; bookmark before opening.
+            for _ in 0..(2 + extra) {
+                app.handle(Action::ToggleBookmark, &provider);
+                app.handle(Action::MoveLine(1), &provider);
+            }
+            app.handle(Action::Open(Open::Bookmarks), &provider);
+            let buffer = draw(&provider, &mut app, width, height);
+            let rendered = screen(&buffer);
+            assert!(rendered.contains("Bookmarks"), "{rendered}");
+            assert!(rendered.contains("Go to"), "{rendered}");
+            let surface = app.layers.bookmarks.surface();
+            let (want_w, want_h) = policy_size(
+                ratatui::layout::Rect::new(0, 0, width, height),
+                PresentationKind::LongContent,
+            );
+            assert_eq!(
+                (surface.popup.width, surface.popup.height),
+                (want_w, want_h),
+                "{width}x{height} extra={extra} frame must be policy"
+            );
+        }
+    }
+
+    // Below the floor the tiny fallback owns the frame.
+    let (provider, mut app) = opened();
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+}
+
+#[test]
+fn list_scroll_reveals_with_matching_mouse() {
+    // Twelve bookmarks (24 logical rows) overflow the LongContent body at
+    // 80x24; Down scrolls the shared viewport and a click selects.
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 30);
+    app.handle(Action::Top, &provider);
+    for _ in 0..12 {
+        app.handle(Action::ToggleBookmark, &provider);
+        app.handle(Action::MoveLine(1), &provider);
+    }
+    app.handle(Action::Open(Open::Bookmarks), &provider);
+    let buffer = draw(&provider, &mut app, 80, 24);
+    assert!(screen(&buffer).contains("Bookmarks"));
+    for _ in 0..11 {
+        key(&mut app, &provider, KeyCode::Down);
+    }
+    let scrolled = draw(&provider, &mut app, 80, 24);
+    let scrolled_text = screen(&scrolled);
+    assert!(scrolled_text.contains("Bookmarks"), "{scrolled_text}");
+    // Windowed: the shared plan shows a subset with the selection in it.
+    let rows = app.layers.bookmarks.row_rects().to_vec();
+    assert!(!rows.is_empty());
+    let selected = app.layers.bookmarks.state().selected;
+    assert!(rows.iter().any(|(_, index)| *index == selected));
+    // Clicking a visible row selects it (same rects for paint and mouse).
+    let (rect, index) = rows[0];
+    click(&mut app, &provider, (rect.x, rect.y));
+    assert_eq!(app.layers.bookmarks.state().selected, index);
+
+    // Same at compact 54x16: frame is policy, list still scrolls.
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 30);
+    app.handle(Action::Top, &provider);
+    for _ in 0..12 {
+        app.handle(Action::ToggleBookmark, &provider);
+        app.handle(Action::MoveLine(1), &provider);
+    }
+    app.handle(Action::Open(Open::Bookmarks), &provider);
+    assert!(screen(&draw(&provider, &mut app, 54, 16)).contains("Bookmarks"));
+    for _ in 0..11 {
+        key(&mut app, &provider, KeyCode::Down);
+    }
+    draw(&provider, &mut app, 54, 16);
+    let rows = app.layers.bookmarks.row_rects().to_vec();
+    assert!(!rows.is_empty());
+}
+
+#[test]
+fn note_child_shows_parent_behind_and_escapes_back() {
+    // Noncompact: the parent list stays visible behind the child with a
+    // breadcrumb title; Escape returns child→Bookmarks→base with save
+    // semantics unchanged.
+    let (provider, mut app) = opened();
+    let view = app.active_view_id().unwrap().to_owned();
+    draw(&provider, &mut app, 100, 30);
+    alt(&mut app, &provider, KeyCode::Char('e'));
+    let editing = screen(&draw(&provider, &mut app, 100, 30));
+    assert!(editing.contains("Bookmarks › Note for"), "{editing}");
+    assert!(editing.contains("Save note"), "{editing}");
+    // Parent list behind the child: the second bookmark's row survives.
+    let second = app.bookmarks_for_view(&view)[1].id.sequence;
+    assert!(
+        editing.contains(&format!("#{second}")),
+        "parent must stay visible behind noncompact child: {editing}"
+    );
+    key(&mut app, &provider, KeyCode::Char('h'));
+    key(&mut app, &provider, KeyCode::Char('i'));
+    key(&mut app, &provider, KeyCode::Enter);
+    assert_eq!(app.bookmarks_for_view(&view)[0].note, "hi");
+    // Saved child returns to Bookmarks; Escape returns to base.
+    assert!(app.layers.bookmarks.is_open());
+    assert!(app.layers.bookmarks.state().editing.is_none());
+    key(&mut app, &provider, KeyCode::Esc);
+    assert!(!app.layers.bookmarks.is_open());
+    assert_eq!(app.focus, Focus::Logs);
+
+    // Compact: the child reuses the parent frame with a breadcrumb; the parent
+    // list is not drawn behind it.
+    let (provider, mut app) = opened();
+    draw(&provider, &mut app, 54, 16);
+    alt(&mut app, &provider, KeyCode::Char('e'));
+    let compact = screen(&draw(&provider, &mut app, 54, 16));
+    assert!(compact.contains("Bookmarks › Note for"), "{compact}");
+    assert!(compact.contains("Save note"), "{compact}");
+    assert!(
+        !compact.contains(&format!("#{second}")),
+        "compact child uses the parent frame, parent list hidden: {compact}"
+    );
+    key(&mut app, &provider, KeyCode::Esc);
+    assert!(app.layers.bookmarks.is_open());
+    assert!(app.layers.bookmarks.state().editing.is_none());
+    key(&mut app, &provider, KeyCode::Esc);
+    assert!(!app.layers.bookmarks.is_open());
+}
