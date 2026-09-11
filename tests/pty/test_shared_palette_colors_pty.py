@@ -137,7 +137,7 @@ def assert_palette_contrast(app: PtyApp, theme: str) -> None:
     assert contrast(input_fg, input_bg) >= 4.5, (theme, "input", input_fg, input_bg)
 
 
-def assert_aligned_shortcuts(screen: str) -> None:
+def aligned_shortcut_positions(screen: str) -> list[int]:
     positions = []
     for line in screen.splitlines():
         match = re.search(
@@ -147,8 +147,27 @@ def assert_aligned_shortcuts(screen: str) -> None:
         )
         if match:
             positions.append(match.start(1))
+    return positions
+
+
+def assert_aligned_shortcuts(positions: list[int], screen: str) -> None:
     assert len(positions) >= 3, ("too few visible shortcut-bearing rows", positions, screen)
     assert len(set(positions)) == 1, ("shortcut column is not aligned", positions, screen)
+
+
+def reason_columns(screen: str) -> list[int]:
+    """Start columns of the unavailable-row reasons painted in one viewport.
+
+    List rows carry both the command name and its reason; the detail band
+    below repeats the reason without the name, so only lines holding a
+    lowercase `recipe` name fragment count. Columns are computed per painted
+    viewport, so agreement is asserted per viewport, never across scrolls.
+    """
+    return [
+        line.index("open Recipes")
+        for line in screen.splitlines()
+        if "open Recipes" in line and "recipe" in line
+    ]
 
 
 def assert_mixed_recipe_columns(screen: str) -> None:
@@ -159,15 +178,11 @@ def assert_mixed_recipe_columns(screen: str) -> None:
     available = next(line for line in lines if line.count("Recipes") >= 2)
     heading = next(i for i, line in enumerate(lines) if "Not available now" in line)
     adapt = next(line for line in lines[heading:] if "Adapt suggested recipe" in line)
-    reject = next(line for line in lines[heading:] if "Reject selected recipe" in line)
     assert lines.index(available) < heading, ("the runnable row precedes the group", available)
     # A long name leaves the reason clipped at the popup edge; the detail
     # row carries it whole once the row is selected. The prefix is enough
     # to show which reason it is and where it starts.
-    for line in (adapt, reject):
-        assert "open Recipes" in line, ("the row carries the layer's reason", line)
-    reason_columns = [line.index("open Recipes") for line in (adapt, reject)]
-    assert len(set(reason_columns)) == 1, ("reasons start in one column", reason_columns, adapt, reject)
+    assert "open Recipes" in adapt, ("the row carries the layer's reason", adapt)
 
 
 def run_theme(binary: pathlib.Path, theme: str, evidence: pathlib.Path) -> None:
@@ -189,26 +204,60 @@ def run_theme(binary: pathlib.Path, theme: str, evidence: pathlib.Path) -> None:
         blank = app.wait_for("Command palette")
         assert "Confirm derived-data cleanup" not in blank
         assert "Unavailable:" not in blank
-        assert_aligned_shortcuts(blank)
+        positions = aligned_shortcut_positions(blank)
 
         # Walk the complete blank-query result set. Disabled commands must not
-        # leak in merely because selection scrolling reveals later rows.
+        # leak in merely because selection scrolling reveals later rows. The
+        # responsive list viewport shows a window, so shortcut alignment is
+        # collected across every viewport it paints.
         for _ in range(100):
             app.send(b"\x1b[B")
             app.drain()
             assert "Confirm derived-data cleanup" not in app.text()
+            positions += aligned_shortcut_positions(app.text())
+        assert_aligned_shortcuts(positions, app.text())
 
         # A searched result set deliberately mixes 33-column unavailable names
         # with the short actionable command. Names may clip, but they cannot
         # consume or shift the shared shortcut/category columns.
         app.send(b"\x01\x0brecipe")
-        recipes = app.wait_until(
+        # The retained numeric selection can leave the new result set's
+        # viewport at its bottom rows; walk selection back to the top so the
+        # first rows paint before waiting on them.
+        for _ in range(100):
+            if "Adapt suggested recipe" in app.text():
+                break
+            app.send(b"\x1b[A")
+            app.drain()
+        # The responsive list viewport holds fewer rows than the unavailable
+        # recipe group spans, so its first and last rows never share one
+        # viewport. Walk the whole result set: every viewport holding at
+        # least two reason rows must agree on the reason column, and the
+        # Reject row must carry its reason where it paints.
+        top_view = app.wait_until(
             lambda text: "Adapt suggested recipe" in text
-            and "Reject selected recipe" in text
             and text.count("Recipes") >= 2,
-            "mixed long and short recipe command rows",
+            "mixed long and short recipe command rows (top)",
         )
-        assert_mixed_recipe_columns(recipes)
+        assert_mixed_recipe_columns(top_view)
+        checked = 0
+        saw_reject = False
+        for _ in range(200):
+            text = app.text()
+            columns = reason_columns(text)
+            if len(columns) >= 2:
+                assert len(set(columns)) == 1, ("reasons start in one column", columns, text)
+                checked += 1
+            if any(
+                "Reject selected recipe" in line and "open Recipes" in line
+                for line in text.splitlines()
+            ):
+                saw_reject = True
+                break
+            app.send(b"\x1b[B")
+            app.drain()
+        assert saw_reject, "never scrolled to the Reject row"
+        assert checked >= 1, "no viewport held two reason rows"
 
         # Query replacement also proves that the palette input owns keyboard
         # focus after list scrolling. Match refresh deliberately retains the

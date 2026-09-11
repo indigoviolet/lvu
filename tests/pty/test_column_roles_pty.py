@@ -84,8 +84,13 @@ def configure_named_zone(app):
     app.send(b",")
     app.wait_for("[ Save ]", timeout=8.0)
     app.send(b"\t" * 4 + b"\r")
+    # The anchored zone popup shows at most eight rows, so the custom row is
+    # not visible on open. Wait for the popup to be ready, wrap Up to the
+    # custom row, and only then wait for it.
+    app.wait_for("UTC\u221212:00", timeout=8.0)
+    app.send(b"\x1b[A")  # UTC is first; Up wraps to the custom row.
     app.wait_for("Custom IANA zone", timeout=8.0)
-    app.send(b"\x1b[A\r")  # UTC is first; Up wraps to the custom row.
+    app.send(b"\r")
     app.send(b"Europe/Berlin")
     app.wait_for("Europe/Berlin", timeout=8.0)
 
