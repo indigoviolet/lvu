@@ -368,6 +368,72 @@ fn the_shared_completion_belongs_to_the_step_editor_and_absorbs_one_dismissal() 
 }
 
 #[test]
+fn below_floor_uses_the_tiny_fallback() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    accept_step(&mut app, &provider, "one = pl.lit(1)");
+
+    // Each of the three layers leaves the frame to the tiny fallback below
+    // the 20x6 floor, and the layers stay open underneath it.
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+    assert!(!tiny.contains(" Enrichment "), "{tiny}");
+
+    alt(&mut app, &provider, KeyCode::Char('e'));
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+    assert!(!tiny.contains("Edit step"), "{tiny}");
+    key(&mut app, &provider, KeyCode::Esc);
+
+    alt(&mut app, &provider, KeyCode::Char('c'));
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+    assert!(!tiny.contains("External command"), "{tiny}");
+    // Replace closes to the workspace, not to the list (§6.5).
+    key(&mut app, &provider, KeyCode::Esc);
+    assert_eq!(app.layers.top(), None);
+
+    // A roomy redraw restores the list on the same selection.
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    let roomy = screen(&draw(&provider, &mut app, 80, 24));
+    assert!(roomy.contains("Enrichment"), "{roomy}");
+    assert!(roomy.contains("one = pl.lit(1)"), "{roomy}");
+}
+
+#[test]
+fn clicking_a_completion_row_selects_it_through_the_shared_hitbox() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    alt(&mut app, &provider, KeyCode::Char('a'));
+    paste(&mut app, &provider, "copied = ");
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL,
+        ))),
+        &provider,
+    );
+    draw(&provider, &mut app, 80, 24);
+    let rows = app.layers.enrichment_step.completion_rects().to_vec();
+    assert!(rows.len() > 1, "completion paints selectable rows");
+    // The painted rows answer the hit test with their own index, so click
+    // and paint share one geometry.
+    for (rect, index) in &rows {
+        assert_eq!(
+            app.layers.enrichment_step.hit((rect.x, rect.y)),
+            Some(lvu::components::enrichment_step::StepHit::Completion(
+                *index
+            ))
+        );
+    }
+    click(&mut app, &provider, (rows[1].0.x, rows[1].0.y));
+    assert_eq!(
+        app.layers.enrichment_step.completion().unwrap().selected,
+        rows[1].1
+    );
+}
+
+#[test]
 fn removing_from_the_editor_returns_to_the_list_and_revalidates_the_chain() {
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Enrichment), &provider);

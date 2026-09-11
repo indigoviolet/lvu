@@ -28,7 +28,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Style,
     text::Line,
-    widgets::{Paragraph, Widget, Wrap},
+    widgets::{Paragraph, Widget},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -42,13 +42,12 @@ use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface, ViewEvent,
     is_typed_char,
 };
-use crate::dialog_controls::{DialogStyles, button_layout};
+use crate::dialog_controls::{ButtonRole, DialogStyles, render_role_button, stable_action_rows};
+use crate::dialog_layout::{DialogSpec, PresentationKind, is_compact, resolve_dialog};
 use crate::text_edit::{EditCommand, EditPolicy, TextTarget, edit};
 use crate::ui::{
-    DialogRegions, InputSurface, MessageState, class_l_popup, class_l_width, clear_themed,
-    dialog_compact, dialog_regions, draw_editor_completion, message_rows, packed_button_rows,
-    render_dialog_frame, render_enrichment_button, render_message, render_pane_heading,
-    render_scrollbar, truncated,
+    InputSurface, MessageState, draw_editor_completion_anchored, render_help_text, render_message,
+    render_pane_heading, render_responsive_frame, render_scrollbar, truncated,
 };
 
 /// §8.1 caps the expression field at three wrapped rows; §5.2.1 reserves all
@@ -763,9 +762,23 @@ impl Component for EnrichmentStepLayer {
 }
 
 /// Moved verbatim from `ui::render_enrichment_step`. The parent pass and the
-/// scrim it used to do itself are the shell's stack loop now (§5.3); the inset
-/// against the parent's frame stays, because only this layer knows how wide its
-/// own parent would be.
+/// scrim it used to do itself are the shell's stack loop now (§5.3).
+///
+/// Stable LongContent budgets: outer size is policy-only, never the draft or
+/// preview length, so every keystroke shares one `frame` and sticky tail
+/// origins. `body_content_rows` sizes only the scroll extent. Hand-rolled row
+/// assignment below is presentation-only folding, never query membership
+/// (AGENTS.md).
+fn step_spec(area: Rect) -> DialogSpec {
+    let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let actions = stable_action_rows(estimate, &STEP_MAX_LABELS).clamp(1, 2);
+    DialogSpec::new(PresentationKind::LongContent, 0, 3, 2, 1, actions)
+}
+
+/// The stable maximum action set, so the budget never moves between adding
+/// (Save alone) and editing (Save + Remove).
+const STEP_MAX_LABELS: [&str; 2] = ["Save", "Remove"];
 fn render_enrichment_step(
     this: &mut EnrichmentStepLayer,
     frame: &mut Frame<'_>,
@@ -804,12 +817,24 @@ fn render_enrichment_step(
     );
 
     // §10/§5.3: the shell drew the parent under one more scrim pass before it
-    // reached this layer, so all that is left here is the inset.
-    let compact = dialog_compact(area);
-    let title = if editing_index.is_some() {
-        " Enrichment › Edit step ".to_owned()
+    // reached this layer. In a compact terminal the child takes the parent's
+    // frame (the shell skips the parent; the breadcrumb keeps the context);
+    // otherwise it resolves against an inset viewport so the scrimmed parent
+    // frame stays visible behind it. No parent geometry is computed here.
+    let child_area = if is_compact(area) {
+        area
     } else {
-        " Enrichment › New step ".to_owned()
+        Rect::new(
+            area.x.saturating_add(3),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(6),
+            area.height.saturating_sub(2),
+        )
+    };
+    let title = if editing_index.is_some() {
+        "Enrichment › Edit step".to_owned()
+    } else {
+        "Enrichment › New step".to_owned()
     };
     let labels: Vec<&str> = if editing_index.is_some() {
         vec!["Save", "Remove"]
@@ -892,15 +917,15 @@ fn render_enrichment_step(
         }
     }
 
-    let probe_width = class_l_width(area).saturating_sub(4).max(1);
-    let action_rows = packed_button_rows(probe_width, &labels);
-    let message_rows = message_rows(&sentence, probe_width);
-    let side_by_side = probe_width >= 72;
+    let (policy_w, _) =
+        crate::dialog_layout::policy_size(child_area, PresentationKind::LongContent);
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let side_by_side = estimate >= 72;
     // The field grows with the wrapped draft up to its cap (§8.1); measure it
     // exactly the way the input renders it.
     let expression_rows = crate::text_edit::wrapped_text(
         &editor.draft,
-        usize::from(probe_width.saturating_sub(12).max(1)),
+        usize::from(estimate.saturating_sub(12).max(1)),
     )
     .lines
     .len()
@@ -920,50 +945,27 @@ fn render_enrichment_step(
         input_rows + output_rows
     };
     let help = "name = expression  or  /regex with (?P<name>…) groups/";
-    let help_rows = Paragraph::new(help)
-        .wrap(Wrap { trim: true })
-        .line_count(probe_width)
-        .clamp(1, 2) as u16;
-    // §5.2.1: the field itself grows with the wrapped draft (§8.1), which is
-    // typing-driven, so the body reserves rows for that growth and lets the
-    // field grow inside them; the preview below sits at the reserved offset
-    // either way. The reservation comes from the frame, so a compact terminal
-    // spends its rows on the preview panes instead of on room the draft may
-    // never use — and it is the same reservation on every keystroke.
-    let field_rows = 1 + crate::dialog_layout::live_rows(
-        area,
-        crate::dialog_layout::DialogClass::L,
-        &crate::ui::class_l_content(1 + 1 + preview_rows, message_rows, help_rows, action_rows),
-        EXPRESSION_ROW_CAP - 1,
-    );
-    let natural_body = field_rows + 1 + preview_rows;
-    let mut popup = class_l_popup(area, natural_body, message_rows, help_rows, action_rows);
-    if !compact {
-        // §10: a child never covers its parent's frame completely.
-        let parent = class_l_popup(area, 0, message_rows, help_rows, action_rows);
-        let width = popup.width.min(parent.width.saturating_sub(4)).max(20);
-        let height = popup.height.min(area.height.saturating_sub(2));
-        popup = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-    }
-    if popup.width < 20 || popup.height < 5 {
+    // §5.2.1: the field reserves its cap rows so the preview below sits at a
+    // reserved offset on every keystroke; a compact terminal still spends its
+    // rows on the preview panes first through the shared body viewport.
+    let field_rows: u16 = EXPRESSION_ROW_CAP + 1;
+    let content_rows = usize::from(field_rows + 1 + preview_rows);
+    let spec = step_spec(child_area);
+    let Ok(resolved) = resolve_dialog(child_area, &spec, content_rows, &labels, Some(0), None)
+    else {
+        // Below the 20x6 floor the tiny fallback owns the frame; stay open
+        // with nothing drawn, as the palette does.
         return this.record(geometry, Surface::default());
-    }
-    clear_themed(frame, popup, theme);
-    render_dialog_frame(frame, popup, title, true, theme);
-    let regions = dialog_regions(popup, message_rows, help_rows, action_rows);
+    };
+    render_responsive_frame(frame, &resolved, &title, true, theme);
     let mut surface = Surface {
-        popup,
-        interior: regions.interior,
-        scrollable: true,
+        popup: resolved.frame,
+        interior: resolved.interior,
+        scrollable: resolved.body.overflow() > 0,
         ..Surface::default()
     };
 
-    let body = regions.body;
+    let body = resolved.body.viewport;
     if body.height == 0 || body.width == 0 {
         return this.record(geometry, surface);
     }
@@ -1049,7 +1051,7 @@ fn render_enrichment_step(
             frame,
             &mut geometry,
             ctx,
-            &regions,
+            &resolved,
             message_state,
             sentence,
             &labels,
@@ -1142,6 +1144,7 @@ fn render_enrichment_step(
         let limit = output_lines.len().saturating_sub(visible);
         this.scroll_limit = limit;
         this.scroll = this.scroll.min(limit);
+        surface.scrollable = surface.scrollable || limit > 0;
         frame.render_widget(
             Paragraph::new(
                 output_lines
@@ -1166,7 +1169,7 @@ fn render_enrichment_step(
         frame,
         &mut geometry,
         ctx,
-        &regions,
+        &resolved,
         message_state,
         sentence,
         &labels,
@@ -1174,14 +1177,29 @@ fn render_enrichment_step(
         dialog.control,
         help,
     );
-    // §5.2: the popup is part of what this layer drew, so containment is
-    // against the union; while it is open it owns the text selection bound.
-    if let Some(completion) = &this.completion {
-        let (popup, rows) = draw_editor_completion(frame, area, completion, theme);
-        surface.popup = surface.popup.union(popup);
-        surface.interior = popup.inner(ratatui::layout::Margin::new(1, 1));
-        surface.caret = None;
-        geometry.completion = rows;
+    // Anchored class A: the completion popup is placed from the actual painted
+    // field rect through shared `anchored_geometry` (below preferred with a
+    // one-row gap, above when below cannot fit, edge-clamped, scrolling past
+    // eight rows with a status footer), bounded by the full render area so it
+    // may overhang its parent. One geometry drives its paint, row hitboxes
+    // and scrollbar; no centered fallback and no manual popup rect. While a
+    // popup is drawn it owns the text selection bound; when the field painted
+    // nothing no popup is drawn rather than anchoring to a stale rect.
+    if let Some(completion) = &this.completion
+        && !field_rect.is_empty()
+    {
+        let (popup, rows, overflows) =
+            draw_editor_completion_anchored(frame, area, field_rect, completion, theme, ctx.ascii);
+        // A refused placement (empty popup: the field's bands hold no
+        // gap-honoring popup) leaves frame, selection bound, caret and wheel
+        // interest exactly as the body render left them.
+        if !popup.is_empty() {
+            surface.popup = surface.popup.union(popup);
+            surface.interior = popup.inner(ratatui::layout::Margin::new(1, 1));
+            surface.caret = None;
+            surface.scrollable = surface.scrollable || overflows;
+            geometry.completion = rows;
+        }
     }
     this.record(geometry, surface)
 }
@@ -1199,7 +1217,7 @@ fn render_enrichment_step_tail(
     frame: &mut Frame<'_>,
     geometry: &mut StepGeometry,
     ctx: &RenderCtx<'_>,
-    regions: &DialogRegions,
+    resolved: &crate::dialog_layout::DialogGeometry,
     message_state: MessageState,
     sentence: String,
     labels: &[&str],
@@ -1208,35 +1226,32 @@ fn render_enrichment_step_tail(
     help: &str,
 ) {
     let theme = ctx.theme;
-    let styles = DialogStyles::new(theme);
     render_message(
         frame,
-        regions.message,
+        resolved.message,
         message_state,
         &sentence,
         theme,
         ctx.ascii,
     );
-    if regions.help.height > 0 {
-        frame.render_widget(
-            Paragraph::new(help.to_owned())
-                .wrap(Wrap { trim: true })
-                .style(styles.description),
-            regions.help,
+    render_help_text(frame, resolved.help, help, theme);
+    // One shared action geometry drives paint and hitboxes: the filled
+    // default (§8.9, always Save here) plus the drawn rects the mouse handler
+    // is given, so click and paint cannot disagree.
+    let focused_index = controls.iter().position(|control| *control == focused);
+    for (index, hit) in &resolved.actions.buttons {
+        geometry.controls.push((*hit, controls[*index]));
+        render_role_button(
+            frame,
+            *hit,
+            labels[*index],
+            if resolved.actions.default == Some(*index) {
+                ButtonRole::Default
+            } else {
+                ButtonRole::Normal
+            },
+            focused_index == Some(*index),
+            theme,
         );
-    }
-    if regions.actions.height > 0 {
-        let focused_index = controls.iter().position(|control| *control == focused);
-        for (index, hit) in button_layout(regions.actions, labels, focused_index) {
-            geometry.controls.push((hit, controls[index]));
-            render_enrichment_button(
-                frame,
-                hit,
-                labels[index],
-                controls[index] == focused,
-                index == 0,
-                theme,
-            );
-        }
     }
 }
