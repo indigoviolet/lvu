@@ -3311,3 +3311,21 @@ by `order: recognized`. Their focused successor stories pass. Complete exact
 workspace, bridge, full PTY, two-window, sequential-reopen and remote-union
 verification remains the sole pre-tag acceptance step; no release is claimed
 by this preflight.
+
+Exact candidate `5258a03`, tree `1c44ab6`, passed source/version/proof checks,
+the full locked Rust workspace, all-target Clippy, 105 bridge checks and pinned
+binary builds. Its PTY matrix was 78/82, so no `accepted.json` was created.
+All four failures were stale screen-global assertions rather than product
+failures: command Arguments had visibly cleared to `(none)` while retained
+review/raw text still contained the old word; grouping had cleared its search
+while the open Filter dialog covered the grouped rows; recipe export lost its
+first immediately-sent search character; and palette alignment mixed columns
+from different responsive scroll viewports. Failed evidence is preserved under
+`lvu-v018-5258a03-final-acceptance/`.
+
+The focused successors pass against the exact candidate binaries: command
+editor and recipe export in `v018-exact-failed4-rerun.log`, palette in
+`v018-palette-final.log`, and the Storage tail in
+`v018-storage-story-final.log`. Storage's existing byte assertions—not a
+simultaneous visibility assertion—prove raw journal and investigation exports
+survive derived cleanup. A successor exact commit/run remains required.

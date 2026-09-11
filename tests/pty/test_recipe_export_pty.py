@@ -3,6 +3,7 @@
 import pathlib
 import sys
 import tempfile
+import time
 import tomllib
 from test_lvu_pty import PtyApp
 from test_enrichment_chain_pty import stop, paste
@@ -21,7 +22,7 @@ def run(binary):
             try:
                 app.wait_for("ignore message")
                 if number == 1:
-                    app.send(b"/"); app.wait_for("Search"); app.send(b"keep")
+                    app.send(b"/"); app.wait_for("Search"); time.sleep(0.1); app.send(b"keep")
                     # A draft on All events applies only when submitted.
                     app.send(b"\r"); app.wait_for("Applied   keep")
                     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")

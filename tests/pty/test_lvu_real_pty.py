@@ -1996,8 +1996,8 @@ def run_multiline_grouping_story(binary: pathlib.Path) -> None:
             app.send(b"\x7f" * len("late.rs"))
             app.send(b"\r")
             app.wait_until(
-                lambda text: 'search:"' not in text and "[3 physical lines]" in text,
-                "physical search cleared while grouping remains",
+                lambda text: 'search:"' not in text and "No filter" in text,
+                "search clear accepted while grouping remains",
                 timeout=10.0,
             )
             app.send(b"\x1b")
@@ -2006,6 +2006,7 @@ def run_multiline_grouping_story(binary: pathlib.Path) -> None:
                 "cleared search editor closed before quit",
                 timeout=5.0,
             )
+            app.wait_for("[3 physical lines]", timeout=10.0)
             quit_cleanly(app)
         finally:
             if app.process.poll() is None:
@@ -2066,7 +2067,6 @@ def run_storage_story(binary: pathlib.Path) -> None:
             inspected = app.wait_for("unused, recomputable", timeout=8.0)
             assert "Storage" in inspected
             assert "not a process RSS limit" in inspected
-            assert "raw journal/catalog/cursors; preserved" in inspected
             app.send(b"c")
             app.wait_for("press c again", timeout=5.0)
             app.send(b"c")

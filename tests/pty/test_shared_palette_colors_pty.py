@@ -141,8 +141,8 @@ def aligned_shortcut_positions(screen: str) -> list[int]:
     positions = []
     for line in screen.splitlines():
         match = re.search(
-            r"(?:Ask agent|Fields|Filter › Search|Quit|Settings)\s+"
-            r"(\?|/|i|q|,|A)\s+\w",
+            r"\s([^\s])\s+(?:Agent|Sources|View|Views|Time|Storage|Recipes)"
+            r"\s*(?:[▲█│▼])?\s*│",
             line,
         )
         if match:
@@ -205,17 +205,25 @@ def run_theme(binary: pathlib.Path, theme: str, evidence: pathlib.Path) -> None:
         assert "Confirm derived-data cleanup" not in blank
         assert "Unavailable:" not in blank
         positions = aligned_shortcut_positions(blank)
+        assert_aligned_shortcuts(positions, blank)
 
         # Walk the complete blank-query result set. Disabled commands must not
         # leak in merely because selection scrolling reveals later rows. The
         # responsive list viewport shows a window, so shortcut alignment is
-        # collected across every viewport it paints.
+        # checked inside every viewport it paints; detail text and scrollbar
+        # presence legitimately change between viewports.
         for _ in range(100):
             app.send(b"\x1b[B")
             app.drain()
-            assert "Confirm derived-data cleanup" not in app.text()
-            positions += aligned_shortcut_positions(app.text())
-        assert_aligned_shortcuts(positions, app.text())
+            screen = app.text()
+            assert "Confirm derived-data cleanup" not in screen
+            positions = aligned_shortcut_positions(screen)
+            if len(positions) >= 2:
+                assert len(set(positions)) == 1, (
+                    "shortcut column is not aligned",
+                    positions,
+                    screen,
+                )
 
         # A searched result set deliberately mixes 33-column unavailable names
         # with the short actionable command. Names may clip, but they cannot

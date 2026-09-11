@@ -348,8 +348,16 @@ index_per_source_mib = 256
             reopened.send(b"\t")
             reopened.send(b"\x7f" * len(f"{helper}\n{marker}\nvalid"))
             # §12.6 paints the field's lines; an emptied field shows its
-            # placeholder, so the cleared content going away is the marker.
-            reopened.wait_until(lambda text: "valid" not in text, "arguments cleared")
+            # placeholder. Match that field row rather than a global substring:
+            # retained review text and uncovered raw rows may repeat an old
+            # argument without meaning the editor still contains it.
+            reopened.wait_until(
+                lambda text: any(
+                    "Arguments" in line and "(none)" in line
+                    for line in text.splitlines()
+                ),
+                "arguments cleared",
+            )
             paste(reopened, str(helper))
             reopened.send(ALT_N)
             paste(reopened, str(marker))
