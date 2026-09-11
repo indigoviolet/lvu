@@ -368,8 +368,12 @@ pub const MAX_ACTION_ROWS: u16 = 2;
 /// (0–2 rows). `buttons` holds the visible buttons with their original label
 /// indices in drawn order; `overflow` holds the hidden indices in original
 /// order for the anchored `More ▾` menu and `press_action`. `more` is the
-/// `More ▾` hitbox when `overflow` is non-empty. `default` is the filled
-/// default (§8.9), always in `buttons` when the band has room for one row.
+/// `More ▾` hitbox when `overflow` is reachable through it. `default` is the
+/// filled default (§8.9), always in `buttons` when the band has room for one
+/// row; a default naming a destructive index is refused (destructive is never
+/// the default, as in `ActionRow::role`). `focused` records the focus index
+/// the caller passed; when it names a hidden row the `More ▾` menu owns the
+/// focus ring (see [`ActionGeometry::more_is_focused`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionGeometry {
     pub band: Rect,
@@ -377,6 +381,8 @@ pub struct ActionGeometry {
     pub overflow: Vec<usize>,
     pub more: Option<Rect>,
     pub default: Option<usize>,
+    pub focused: Option<usize>,
+    pub destructive: Vec<usize>,
 }
 
 impl ActionGeometry {
@@ -388,6 +394,23 @@ impl ActionGeometry {
     /// Visible index set, in drawn order. Useful for asserting stable order.
     pub fn visible_indices(&self) -> Vec<usize> {
         self.buttons.iter().map(|(index, _)| *index).collect()
+    }
+
+    /// True when the recorded focus names a hidden row: the `More ▾` menu
+    /// owns the focus ring and Enter opens it rather than pressing a button.
+    pub fn more_is_focused(&self) -> bool {
+        match (self.focused, self.more) {
+            (Some(focused), Some(_)) => self.overflow.contains(&focused),
+            _ => false,
+        }
+    }
+
+    /// True when hidden rows exist but `More ▾` has no hitbox (a single narrow
+    /// row holding only the default). The hidden actions are unreachable by
+    /// mouse; callers treat this as the dialog fallback (`TooSmall`) and grow
+    /// the stable action budget to two rows rather than drawing a dead band.
+    pub fn unreachable_overflow(&self) -> bool {
+        !self.overflow.is_empty() && self.more.is_none()
     }
 }
 
@@ -465,8 +488,32 @@ pub fn plan_actions(
     default: Option<usize>,
     focused: Option<usize>,
 ) -> ActionGeometry {
-    let valid_default = default.filter(|index| *index < labels.len());
-    let _ = focused;
+    plan_actions_with_roles(band, labels, default, &[], focused)
+}
+
+/// Plan with explicit destructive roles (see [`ActionRow::role`]).
+///
+/// `destructive` indices are validated into range and stored; a `default`
+/// naming one is refused to `None` because a destructive action is never the
+/// default. Visibility is stable in labels/default/destructive only: `focused`
+/// never reshuffles the visible set, it maps onto `More ▾` when hidden (see
+/// [`ActionGeometry::more_is_focused`]).
+pub fn plan_actions_with_roles(
+    band: Rect,
+    labels: &[&str],
+    default: Option<usize>,
+    destructive: &[usize],
+    focused: Option<usize>,
+) -> ActionGeometry {
+    let destructive_set: Vec<usize> = destructive
+        .iter()
+        .copied()
+        .filter(|index| *index < labels.len())
+        .collect();
+    let valid_default = default
+        .filter(|index| *index < labels.len())
+        .filter(|index| !destructive_set.contains(index));
+    let valid_focused = focused.filter(|index| *index < labels.len());
     if band.is_empty() || labels.is_empty() {
         return ActionGeometry {
             band,
@@ -474,6 +521,8 @@ pub fn plan_actions(
             overflow: (0..labels.len()).collect(),
             more: None,
             default: valid_default,
+            focused: valid_focused,
+            destructive: destructive_set.clone(),
         };
     }
     let widths: Vec<u16> = labels
@@ -535,6 +584,8 @@ pub fn plan_actions(
                 overflow: Vec::new(),
                 more: None,
                 default: valid_default,
+                focused: valid_focused,
+                destructive: destructive_set.clone(),
             };
         }
     }
@@ -596,6 +647,8 @@ pub fn plan_actions(
                     overflow: (0..labels.len()).filter(|i| *i != d).collect(),
                     more: Some(both_placed[1]),
                     default: valid_default,
+                    focused: valid_focused,
+                    destructive: destructive_set.clone(),
                 };
             }
             let _ = more_row_widths;
@@ -605,6 +658,8 @@ pub fn plan_actions(
                 overflow: (0..labels.len()).filter(|i| *i != d).collect(),
                 more: None,
                 default: valid_default,
+                focused: valid_focused,
+                destructive: destructive_set.clone(),
             };
         }
         let visible = keep.min(labels.len());
@@ -630,6 +685,8 @@ pub fn plan_actions(
             overflow: (visible..labels.len()).collect(),
             more: Some(placed[visible]),
             default: valid_default,
+            focused: valid_focused,
+            destructive: destructive_set.clone(),
         };
     }
 
@@ -671,6 +728,8 @@ pub fn plan_actions(
             overflow,
             more: Some(more_rect),
             default: valid_default,
+            focused: valid_focused,
+            destructive: destructive_set.clone(),
         };
     }
     visible_end = visible_end.max(valid_default.map(|d| d + 1).unwrap_or(0).min(labels.len()));
@@ -708,5 +767,7 @@ pub fn plan_actions(
         overflow: (visible_end..labels.len()).collect(),
         more: Some(more_rect),
         default: valid_default,
+        focused: valid_focused,
+        destructive: destructive_set.clone(),
     }
 }
