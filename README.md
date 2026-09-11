@@ -1,3 +1,5 @@
+![lvu startup splash: animated terminal rendering of a red heart above "LOVE YOU LOG TIME" lettering](assets/startup/love-you-log-time/120x40-sharp/ansi-preview.gif)
+
 # lvu
 
 lvu is a terminal log viewer. It captures files, command output and stdin
