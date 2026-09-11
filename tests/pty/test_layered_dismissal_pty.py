@@ -4,7 +4,20 @@ import pathlib
 import sys
 import tempfile
 
+from wcwidth import wcswidth
+
 from test_lvu_pty import ADVANCED_TAB, FILTER_TITLE, PtyApp, open_advanced_filter
+
+
+def display_col(line: str, char_index: int) -> int:
+    """Display column of a character index in a `PtyApp.text()` line.
+
+    `text()` collapses each wide glyph (and its empty pyte stub cell) into one
+    character, so character indices equal display columns only on ASCII lines.
+    Mouse coordinates need display columns.
+    """
+    width = wcswidth(line[:char_index])
+    return char_index if width < 0 else width
 
 
 def drag_select(app, start, end):
@@ -48,9 +61,14 @@ try:
     app.wait_for("Fields · record")
     field_y, field_row = next(
         # §12.11 splits the field into a name column and a value column.
-        (y, row) for y, row in enumerate(app.screen.display) if "service" in row and "api" in row
+        # Read through text(), not screen.display: the latter raises
+        # IndexError on an empty wide-character stub cell, and its character
+        # indices are display columns only on ASCII lines.
+        (y, row)
+        for y, row in enumerate(app.text().splitlines())
+        if "service" in row and "api" in row
     )
-    field_x = field_row.index("service")
+    field_x = display_col(field_row, field_row.index("service"))
     drag_select(app, (field_x, field_y), (field_x + 5, field_y))
 
     app.send(b"q")

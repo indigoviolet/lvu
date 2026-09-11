@@ -113,15 +113,23 @@ def run(binary):
             app.wait_until(lambda text: "› login retry" in text, "the derived view is selected", timeout=20)
 
             app.send(b"i")
-            app.wait_for("Value · ")
+            app.wait_for("Fields · record")
             app.send(b"\x1b[B")  # module: rows follow the record's key order
-            app.wait_for("Value · module")
+            # The 80x24 dialog is too narrow for the side-by-side Value pane,
+            # so select by the tree row itself: the `›` gutter plus the
+            # unchecked box name the selected, pinnable field.
+            app.wait_until(
+                lambda text: "› [ ] module" in text,
+                "module row selected",
+            )
             app.send(b"\r")
             app.send(b"\x1b")
             # The pinned field becomes a log column: it appears in the header
             # row between the built-in level column and the event text.
-            app.wait_until(lambda text: "Value · " not in text and "level  module" in text,
-                           "the module column is pinned")
+            app.wait_until(
+                lambda text: "Fields · record" not in text and "level  module" in text,
+                "the module column is pinned",
+            )
 
             open_step_editor(app)
             paste(app, "run_key = pl.col('msg')")
