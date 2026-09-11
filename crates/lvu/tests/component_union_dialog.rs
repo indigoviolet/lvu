@@ -9,7 +9,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
     Action, App,
-    component::{LayerId, Open, RawEvent},
+    component::{Component, LayerId, Open, RawEvent},
     fixture::FixtureProvider,
     theme::Theme,
     ui,
@@ -179,4 +179,86 @@ fn short_dialog_scrolls_highlight_and_mouse_uses_visible_global_index() {
     let requests = app.layers.union.take_requests();
     let lvu::UnionDialogRequest::Create { inputs, .. } = &requests[0];
     assert!(inputs.contains(&"extra-7".to_owned()));
+}
+
+#[test]
+fn responsive_frame_is_policy_stable_for_short_and_long_lists() {
+    use lvu::dialog_layout::{PresentationKind, policy_size};
+
+    // Short (2 views) and long (14 views) share one LongContent frame per
+    // size; the shared pane heading/count/scrollbar and row rects drive
+    // selection, scrolling, paint and mouse from one authority.
+    for (width, height) in [(240u16, 80u16), (140, 40), (80, 24), (54, 16), (20, 6)] {
+        let mut frames = Vec::new();
+        for extra in [0usize, 12] {
+            let (provider, mut app) = demo();
+            let source_id = app.views()[0].source_id.clone();
+            for index in 0..extra {
+                app.add_view(lvu::ViewItem {
+                    id: format!("extra-{index}"),
+                    source_id: source_id.clone(),
+                    name: format!("Extra view {index}"),
+                });
+            }
+            app.handle(Action::Open(Open::Union(lvu::UnionOpen::Plain)), &provider);
+            let buffer = draw(&provider, &mut app, width, height);
+            let rendered = screen(&buffer);
+            let surface = app.layers.union.surface();
+            let (want_w, want_h) = policy_size(
+                ratatui::layout::Rect::new(0, 0, width, height),
+                PresentationKind::LongContent,
+            );
+            assert_eq!(
+                (surface.popup.width, surface.popup.height),
+                (want_w, want_h),
+                "{width}x{height} extra={extra} frame must be policy"
+            );
+            if (width, height) != (20, 6) {
+                assert!(
+                    surface.popup.width < width || surface.popup.height < height,
+                    "{width}x{height} became full frame"
+                );
+            }
+            // Shared pane heading and count; same rects for paint and mouse.
+            // At the 20x6 floor the 1-row body drops its heading to preserve
+            // the selection row, and long labels clip: frame/default survive.
+            assert!(rendered.contains("Union views"), "{rendered}");
+            if (width, height) != (20, 6) {
+                assert!(rendered.contains("Views"), "{rendered}");
+                assert!(
+                    rendered.contains("of ") && rendered.contains("views selected")
+                        || rendered.contains("1 of "),
+                    "{rendered}"
+                );
+                assert!(rendered.contains("Create union"), "{rendered}");
+                assert!(rendered.contains("Cancel"), "{rendered}");
+                assert!(!rendered.contains("More"), "{rendered}");
+            } else {
+                // Two-row stable band at the floor: both static buttons fit
+                // without any overflow menu.
+                assert!(rendered.contains("Create union"), "{rendered}");
+                assert!(rendered.contains("Cancel"), "{rendered}");
+                assert!(!rendered.contains("More"), "{rendered}");
+            }
+            frames.push(surface.popup);
+        }
+        assert_eq!(
+            frames[0], frames[1],
+            "{width}x{height} frame must not move with list length"
+        );
+    }
+
+    // Below the floor the tiny fallback owns the frame.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Union(lvu::UnionOpen::Plain)), &provider);
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+
+    // At the floor both static buttons fit with no overflow menu.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Union(lvu::UnionOpen::Plain)), &provider);
+    let floor = screen(&draw(&provider, &mut app, 20, 6));
+    assert!(floor.contains("Create union"), "{floor}");
+    assert!(floor.contains("Cancel"), "{floor}");
+    assert!(!floor.contains("More"), "{floor}");
 }
