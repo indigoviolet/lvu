@@ -36,12 +36,12 @@ use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface, is_typed_char,
 };
-use crate::dialog_controls::{ActionRow, DialogStyles};
+use crate::dialog_controls::{ActionRow, DialogStyles, render_role_button, stable_action_rows};
+use crate::dialog_layout::{DialogSpec, PANE_INDENT, PresentationKind, plan_list, resolve_dialog};
 use crate::text_edit::{EditCommand, EditPolicy, TextTarget, edit};
 use crate::ui::{
-    InputSurface, MessageState, dialog_frame_regions, help_rows, input_tail, message_rows,
-    packed_button_rows, place_input_cursor_at, render_actions, render_help_text, render_message,
-    render_scrollbar, truncated, wrap_sentence,
+    InputSurface, MessageState, input_tail, place_input_cursor_at, render_help_text,
+    render_message, render_responsive_frame, render_scrollbar, truncated, wrap_sentence,
 };
 
 /// The selected field's value, for the caret clamp.
@@ -1129,7 +1129,6 @@ fn render_command_enrichment(
     area: Rect,
     ctx: &RenderCtx<'_>,
 ) -> Surface {
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let theme = ctx.theme;
     let mut geometry = CommandGeometry::default();
     let styles = DialogStyles::new(theme);
@@ -1143,7 +1142,6 @@ fn render_command_enrichment(
         .target()
         .filter(|_| !this.scroll_focused)
         .and_then(|target| ctx.cursors.peek(&target, command_field(&dialog)));
-    let width = content_width(area, DialogClass::L);
     let busy = matches!(
         dialog.run_state,
         RunState::Saving | RunState::Preparing | RunState::Running | RunState::SavingResults
@@ -1282,9 +1280,14 @@ fn render_command_enrichment(
         "Results appear in Details and to later steps as {name}.<field>; {name}.status shows Ready or Pending.",
         name = dialog.name
     ));
-    let note_width = width
-        .saturating_sub(crate::dialog_layout::PANE_INDENT)
-        .max(1);
+    // Stable LongContent frame: policy-only outer size, never the note length
+    // or run state, so every state shares one `frame` and sticky tail
+    // origins. The form + notes length sizes only the scroll extent below.
+    // Wrapping is measured at the policy content estimate so loading/results/
+    // errors never resize the frame.
+    let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let note_width = estimate.saturating_sub(PANE_INDENT).max(1);
     let note_lines: Vec<String> = notes
         .iter()
         .flat_map(|note| wrap_sentence(note, usize::from(note_width), usize::MAX))
@@ -1322,29 +1325,41 @@ fn render_command_enrichment(
         .sum();
 
     let action_labels = ACTION_LABELS;
-    let content = DialogContent {
-        header: 0,
-        // The form, a blank row, the pane heading, its lines.
-        body: u16::try_from(form_rows + 2 + note_lines.len()).unwrap_or(u16::MAX),
-        message: message_rows(&sentence, width).max(1),
-        help: help_rows(help, width),
-        actions: packed_button_rows(width, &action_labels),
-    };
-    let regions = dialog_frame_regions(
-        frame,
+    // §8.9: `Save` is the default until a review is waiting, when the run it
+    // describes is. `Remove` is the destructive one and never the default.
+    let default = if this.review_pending() { 1 } else { 0 };
+    let actions = stable_action_rows(estimate, &action_labels).clamp(1, 2);
+    let spec = DialogSpec::new(PresentationKind::LongContent, 0, 3, 2, 1, actions);
+    // The form, a blank row, the pane heading, its lines: scroll extent only.
+    let body_content = form_rows + 2 + note_lines.len();
+    let Ok(resolved) = resolve_dialog(
         area,
-        DialogClass::L,
+        &spec,
+        body_content,
+        &action_labels,
+        Some(default),
+        None,
+    ) else {
+        // Below the 20x6 floor the tiny fallback owns the frame; stay open
+        // with nothing drawn, as the palette does.
+        this.geometry = geometry;
+        this.surface = Surface::default();
+        return this.surface;
+    };
+    render_responsive_frame(
+        frame,
+        &resolved,
         "Enrichment › External command",
-        &content,
+        true,
         theme,
     );
     let mut surface = Surface {
-        popup: regions.popup,
-        interior: regions.interior,
-        scrollable: true,
+        popup: resolved.frame,
+        interior: resolved.interior,
+        scrollable: resolved.body.overflow() > 0,
         ..Surface::default()
     };
-    let body = regions.body;
+    let body = resolved.body.viewport;
     if body.width == 0 || body.height == 0 {
         this.geometry = geometry;
         this.surface = surface;
@@ -1432,55 +1447,55 @@ fn render_command_enrichment(
         y = y.saturating_add(1);
     }
     let pane_area = Rect::new(body.x, y, body.width, body.bottom().saturating_sub(y));
-    let visible = usize::from(pane_area.height.saturating_sub(1));
-    let count = format!("{} of {}", visible.min(note_lines.len()), note_lines.len());
-    let rects = pane(
-        pane_area,
-        u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
-        note_lines.len(),
+    // One authoritative shared list plan for the review pane: heading, count,
+    // viewport, scrollbar, selection window and painted row rects. The same
+    // rects drive paint, scrollbar and mouse hit-testing.
+    let count_text = format!(
+        "{} of {}",
+        this.scroll
+            .saturating_add(usize::from(pane_area.height.saturating_sub(1)))
+            .min(note_lines.len()),
+        note_lines.len()
     );
-    if rects.heading.height > 0 {
+    let count_width = u16::try_from(UnicodeWidthStr::width(count_text.as_str())).unwrap_or(0);
+    let list = plan_list(pane_area, count_width, note_lines.len(), None, this.scroll);
+    if list.heading.height > 0 {
         frame.render_widget(
             Paragraph::new("Results and review").style(if this.scroll_focused {
                 styles.shortcut.add_modifier(Modifier::BOLD)
             } else {
                 styles.label.add_modifier(Modifier::BOLD)
             }),
-            rects.heading,
+            list.heading,
         );
-        if rects.count.width > 0 {
-            frame.render_widget(Paragraph::new(count).style(styles.description), rects.count);
+        if list.count.width > 0 {
+            frame.render_widget(
+                Paragraph::new(count_text).style(styles.description),
+                list.count,
+            );
         }
     }
-    let limit = note_lines
-        .len()
-        .saturating_sub(usize::from(rects.viewport.height));
+    let limit = note_lines.len().saturating_sub(list.row_rects.len());
     this.scroll_limit = limit;
-    this.scroll = this.scroll.min(limit);
+    this.scroll = list.first_row;
     let scroll = this.scroll;
-    for (offset, line) in note_lines
-        .iter()
-        .skip(scroll)
-        .take(usize::from(rects.viewport.height))
-        .enumerate()
-    {
+    for (offset, row) in list.row_rects.iter().enumerate() {
+        let Some(line) = note_lines.get(list.first_row.saturating_add(offset)) else {
+            continue;
+        };
         frame.render_widget(
-            Paragraph::new(line.clone()).style(styles.description),
-            Rect::new(
-                rects.viewport.x,
-                rects.viewport.y.saturating_add(offset as u16),
-                rects.viewport.width,
-                1,
-            ),
+            Paragraph::new(truncated(line, usize::from(row.width))).style(styles.description),
+            *row,
         );
     }
-    if let Some(bar) = rects.scrollbar {
+    if let Some(bar) = list.scrollbar {
         render_scrollbar(frame, bar, scroll, limit, theme, ascii);
     }
-    geometry.notes = (limit > 0).then_some(rects.viewport);
+    geometry.notes = list.scrollbar.is_some().then_some(list.viewport);
+    surface.scrollable = surface.scrollable || list.scrollbar.is_some();
 
-    render_message(frame, regions.message, state, &sentence, theme, ascii);
-    render_help_text(frame, regions.help, help, theme);
+    render_message(frame, resolved.message, state, &sentence, theme, ascii);
+    render_help_text(frame, resolved.help, help, theme);
     let controls = [
         Control::Save,
         Control::Review,
@@ -1490,21 +1505,25 @@ fn render_command_enrichment(
     let focused = controls
         .iter()
         .position(|control| *control == dialog.selected_control);
-    // §8.9: `Save` is the default until a review is waiting, when the run it
-    // describes is. `Remove` is the destructive one and never the default.
-    let default = if this.review_pending() { 1 } else { 0 };
-    for (index, rect) in render_actions(
-        frame,
-        regions.actions,
-        ActionRow {
-            labels: &action_labels,
-            default: Some(default),
-            destructive: &[2],
-            focused,
-        },
-        theme,
-    ) {
-        geometry.controls.push((rect, controls[index]));
+    // One shared action geometry drives paint and hitboxes, with the §8.9
+    // roles (default follows the pending review; Remove is destructive), so
+    // click and paint cannot disagree.
+    let row = ActionRow {
+        labels: &action_labels,
+        default: Some(default),
+        destructive: &[2],
+        focused,
+    };
+    for (index, rect) in &resolved.actions.buttons {
+        geometry.controls.push((*rect, controls[*index]));
+        render_role_button(
+            frame,
+            *rect,
+            action_labels[*index],
+            row.role(*index),
+            focused == Some(*index),
+            theme,
+        );
     }
     this.geometry = geometry;
     this.surface = surface;
