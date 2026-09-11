@@ -7,6 +7,7 @@ import argparse
 import os
 import pathlib
 import tempfile
+import time
 
 from wcwidth import wcswidth
 
@@ -102,11 +103,23 @@ def assert_form_contract(text: str, buttons: tuple[str, ...] = ()) -> None:
         assert f"[ {label} ]" in text, f"missing bounded button {label!r}\n{text}"
 
 
+def display_col(line: str, char_index: int) -> int:
+    """Display column of a character index in a `PtyApp.text()` line.
+
+    `text()` collapses each wide glyph (and its empty pyte stub cell) into one
+    character, so character indices equal display columns only on ASCII lines.
+    Mouse coordinates need display columns: a wide glyph before the index
+    shifts everything after it by one cell per glyph.
+    """
+    width = wcswidth(line[:char_index])
+    return char_index if width < 0 else width
+
+
 def locate(text: str, token: str) -> tuple[int, int]:
     for y, line in enumerate(text.splitlines()):
         x = line.find(token)
         if x >= 0:
-            return x, y
+            return display_col(line, x), y
     raise AssertionError(f"could not locate {token!r}\n{text}")
 
 
@@ -354,6 +367,15 @@ def exercise_theme(
                 "Time window",
                 ("Apply", "Clear", "🧠 Recognize timestamp"),
             )
+            # Opening the second source leaves a transient time update in
+            # flight ("Updating  the last applied window stays active"); let
+            # the message settle before asserting its wording.
+            time_form = wait_frame(
+                app,
+                lambda text: "Time window" in text and "Applied" in text,
+                "settled Time message",
+                len(app.transcript),
+            )
             # §7.4: one message row, one state word, no `Applied:` stutter.
             assert "Start" in time_form and "End" in time_form
             assert "Applied" in time_form and "Applied:" not in time_form
@@ -375,14 +397,21 @@ def exercise_theme(
             # §9 replaces the scroll pseudo-buttons with a scrollbar; the
             # narrow form reflows Start/End to one field per row instead.
             # One field per row is the reflow: the wide form labels the pair
-            # `Start`, the narrow one labels each segment. `Start date` on its
-            # own row is that, and it is what fits above the fold now that the
-            # Gap-jump row costs the tight form a line.
+            # `Start`, the narrow one labels each segment. The tight body
+            # opens at the top of the form, so walk focus — which the body
+            # follows — until the `Start date` row scrolls into view, paced
+            # to one redraw per step so the walk cannot skip the window.
+            for _ in range(21):
+                app.drain()
+                if "Start date" in app.text():
+                    break
+                app.send(b"\t")
+                time.sleep(0.05)
             narrow = wait_frame(
                 app,
                 lambda text: "Time window" in text and "Start date" in text,
                 "narrow Time reflow",
-                start,
+                len(app.transcript),
             )
             assert "Scroll down" not in narrow, narrow
             assert_form_contract(narrow)
