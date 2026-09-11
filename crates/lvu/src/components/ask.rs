@@ -460,6 +460,18 @@ impl AskDialog {
             dialog.progress = "recipe context exceeds the 128 KiB proposal limit".into();
             return Outcome::Consumed;
         }
+        // Bind this turn to the view definition as it stands at Submit, not
+        // the one the dialog opened on: background churn between open and
+        // submit must not doom the turn, and a Submit-again after a fence
+        // trip re-freezes so recovery is possible. Only the revision travels
+        // with the request; task identity, generation and the
+        // snapshot/sample fences are untouched, and a completion bound to an
+        // older revision is still refused by `complete`.
+        {
+            let view_id = dialog.view_id.clone();
+            dialog.definition_revision =
+                ctx.views.definition_revision(&view_id).unwrap_or_default();
+        }
         dialog.review_scroll = 0;
         dialog.review_scroll_limit = 0;
         if !wider {

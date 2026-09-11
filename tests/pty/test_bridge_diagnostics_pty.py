@@ -43,6 +43,15 @@ def environment(root: pathlib.Path, **overrides: str) -> dict[str, str]:
 
 def ask_and_read_message(app: PtyApp, needle: str, description: str) -> str:
     """Submit an Ask request and return the screen carrying its diagnostic."""
+    # The Ask revision fence binds at dialog-open; early-startup setup can
+    # still land inside the turn under load and invalidate it. Wait for the
+    # workspace to go quiescent (initial query settled, full membership
+    # painted) before opening it.
+    app.wait_until(
+        lambda text: "query pending" not in text and "probe 11" in text,
+        "workspace quiescent before Ask",
+        timeout=15.0,
+    )
     app.send(b"A")
     app.wait_for("Request")
     app.send(b"only errors")
@@ -62,14 +71,19 @@ def assert_workspace_still_works(app: PtyApp) -> None:
     app.send(b"/")
     app.wait_for("Search")
     app.send(b"ERROR\r")
+    # The responsive Filter dialog covers the filtered rows, so a rows-visible
+    # wait can pass before the query round-trips (a covered row reads as
+    # absent). Wait for the layer's Applied readiness first, then close it
+    # before asserting on the full rows.
+    app.wait_until(lambda text: "Applied" in text, "filter round-tripped", timeout=10.0)
+    app.send(b"\x1b")
+    app.wait_until(lambda text: "Search" not in text, "the search dialog closes")
     filtered = app.wait_until(
         lambda text: "probe 00" in text and "probe 01" not in text,
         "literal search still filters while the bridge is unavailable",
         timeout=10.0,
     )
     assert "probe 03" in filtered, filtered
-    app.send(b"\x1b")
-    app.wait_until(lambda text: "Search" not in text, "the search dialog closes")
 
 
 def quit_cleanly(app: PtyApp) -> None:
