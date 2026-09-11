@@ -344,12 +344,34 @@ fn action_buttons(
         (pin_label, C::Pin),
         ("&Filter", C::Filter),
         ("E&xclude", C::Exclude),
+        (fold_label, C::Fold),
         (color_label, C::Color),
         (severity_label, C::Severity),
         (timestamp_label, C::Timestamp),
-        (fold_label, C::Fold),
         ("Co&rrelate", C::Correlate),
     ]
+}
+
+/// Keep all eight actions visible in two rows at 54 columns. Wide terminals
+/// retain the descriptive labels; the compact verbs preserve the same
+/// mnemonics and action indices.
+fn action_label_for_width(
+    area: Rect,
+    label: &'static str,
+    control: FieldPickerControl,
+) -> &'static str {
+    if area.width > 54 {
+        return label;
+    }
+    use FieldPickerControl as C;
+    match control {
+        C::Color if label.starts_with("Stop") => "&Uncolor",
+        C::Severity if label.starts_with("Stop") => "No &sev",
+        C::Timestamp if label.starts_with("Stop") => "No &time",
+        C::Timestamp => "&Time",
+        C::Correlate => "&Relate",
+        _ => label,
+    }
 }
 
 /// Stable Contextual Inspector budgets: outer size is policy-only, never async
@@ -365,10 +387,10 @@ fn fields_spec_for(area: Rect) -> DialogSpec {
         "&Pin",
         "&Filter",
         "E&xclude",
+        "Fol&d",
         "&Color",
         "&Severity",
         "&Timestamp",
-        "Fol&d",
         "Co&rrelate",
     ];
     const FULL_HELP: &str =
@@ -493,10 +515,10 @@ impl FieldsDialog {
             FieldPickerControl::Pin,
             FieldPickerControl::Filter,
             FieldPickerControl::Exclude,
+            FieldPickerControl::Fold,
             FieldPickerControl::Color,
             FieldPickerControl::Severity,
             FieldPickerControl::Timestamp,
-            FieldPickerControl::Fold,
             FieldPickerControl::Correlate,
             FieldPickerControl::Context,
         ];
@@ -1314,7 +1336,10 @@ impl Component for FieldsDialog {
             .and_then(|state| state.color_field.clone());
         let selected_row = fields.get(selected).cloned();
         let actions = action_buttons(ctx.views, ctx.provider);
-        let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
+        let action_labels = actions
+            .iter()
+            .map(|(label, control)| action_label_for_width(area, label, *control))
+            .collect::<Vec<_>>();
 
         // Whole-view figures, when a pass has answered for exactly this field.
         let whole_view = match (ctx.views.active_id(), selected_row.as_ref()) {
@@ -1665,11 +1690,11 @@ impl Component for FieldsDialog {
         // §8.9: Pin is the default; it is first in the row. One shared plan
         // drives paint and mouse so the fill and the Enter arm cannot disagree.
         for (index, rect) in geometry.actions.buttons.iter() {
-            let (label, control_kind) = actions[*index];
+            let (_, control_kind) = actions[*index];
             crate::dialog_controls::render_role_button(
                 frame,
                 *rect,
-                label,
+                action_labels[*index],
                 if geometry.actions.default == Some(*index) {
                     ButtonRole::Default
                 } else {

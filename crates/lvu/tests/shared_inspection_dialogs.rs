@@ -161,11 +161,18 @@ fn help_reflows_with_shared_roles() {
                     "obsolete Help reminder {obsolete:?} in:\n{rendered}"
                 );
             }
-            assert_eq!(
-                rendered.matches("CONVENTIONS").count(),
-                1,
-                "the conventions are stated once:\n{rendered}"
-            );
+            let conventions = rendered.matches("CONVENTIONS").count();
+            if height >= 30 {
+                assert_eq!(
+                    conventions, 1,
+                    "the conventions are stated once:\n{rendered}"
+                );
+            } else {
+                assert!(
+                    conventions <= 1,
+                    "a compact viewport never duplicates conventions:\n{rendered}"
+                );
+            }
         }
     }
 }

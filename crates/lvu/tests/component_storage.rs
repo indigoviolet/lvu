@@ -602,13 +602,11 @@ fn tiny_pressure_keeps_selection_diagnostics_and_actions_reachable() {
     draw(&provider, &mut empty, 54, 16);
 }
 
-/// Floor coverage for the generic overflow: at exactly 20x6 the shared band
-/// collapses to Refresh + same-layer More, and the hidden Cleanup/Confirm
-/// path stays reachable by keyboard (mnemonic, still two-step) and by mouse
-/// (More menu carrying the original action index), keeping Refresh default,
-/// destructive Confirm styling, Escape order and exact menu hitboxes.
+/// At exactly 20x6 the two-row action band keeps Refresh and Cleanup directly
+/// reachable. Keyboard and mouse preserve the two-step confirmation, Refresh
+/// remains the default, and Confirm retains destructive styling.
 #[test]
-fn floor_overflow_menu_activates_hidden_cleanup_by_keyboard_and_mouse() {
+fn floor_actions_activate_cleanup_by_keyboard_and_mouse() {
     let theme = Theme::LOVE_LIGHT;
 
     // Keyboard path: mnemonics reach the hidden actions; arming and submitting
@@ -625,22 +623,17 @@ fn floor_overflow_menu_activates_hidden_cleanup_by_keyboard_and_mouse() {
             .any(|(s, _)| *s == 0),
         "default Refresh slot must survive the floor"
     );
-    assert!(
-        !app.layers
-            .storage
-            .action_rects()
-            .iter()
-            .any(|(s, _)| *s == 1),
-        "Cleanup hides behind the shared overflow at 20x6"
-    );
-    let more = app
+    let cleanup = app
         .layers
         .storage
-        .more_rect()
-        .expect("More must paint at 20x6");
+        .action_rects()
+        .iter()
+        .find(|(slot, _)| *slot == 1)
+        .map(|(_, rect)| *rect)
+        .expect("Cleanup must paint in the second action row at 20x6");
     assert_eq!(
-        app.layers.storage.hit((more.x, more.y)),
-        Some(StorageHit::More)
+        app.layers.storage.hit((cleanup.x, cleanup.y)),
+        Some(StorageHit::Cleanup)
     );
     key(&mut app, &provider, KeyCode::Char('c'));
     assert!(
@@ -694,84 +687,50 @@ fn floor_overflow_menu_activates_hidden_cleanup_by_keyboard_and_mouse() {
         role_style(theme, ButtonRole::Default, false),
     );
 
-    // Mouse path on a fresh dialog: More menu carries the original index.
+    // Mouse path on a fresh dialog: the second action row previews, then
+    // confirms, without an intermediate menu.
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Storage), &provider);
     complete_with(&provider, &mut app, snapshot(6, 8192));
     draw_themed(&provider, &mut app, 20, 6, theme);
-    let more = app.layers.storage.more_rect().expect("More must paint");
-    click(&mut app, &provider, (more.x, more.y));
-    let buffer = draw_themed(&provider, &mut app, 20, 6, theme);
-    let _ = buffer;
-    let menu = app.layers.storage.menu_rects().to_vec();
-    assert_eq!(menu.len(), 1, "overflow menu holds the hidden Cleanup");
-    let surface = app.layers.storage.surface();
-    for (rect, index) in &menu {
-        assert_eq!(*index, 1, "menu must carry the original Cleanup index");
-        assert!(
-            contains_rect(surface.popup, rect),
-            "menu row escapes the published popup"
-        );
-        assert_eq!(
-            app.layers.storage.hit((rect.x, rect.y)),
-            Some(StorageHit::Menu(1)),
-            "menu paint/hit disagree"
-        );
-        let line: String = {
-            let buffer = draw_themed(&provider, &mut app, 20, 6, theme);
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, rect.y)].symbol())
-                .collect()
-        };
-        assert!(
-            line.contains("Preview cleanup") && !line.contains('&'),
-            "menu shows the stripped verb: {line:?}"
-        );
-    }
-    // First mouse step arms without submitting.
-    let (rect, _) = menu[0];
-    click(&mut app, &provider, (rect.x, rect.y));
+    let cleanup = app
+        .layers
+        .storage
+        .action_rects()
+        .iter()
+        .find(|(slot, _)| *slot == 1)
+        .map(|(_, rect)| *rect)
+        .expect("Preview cleanup action must paint");
+    click(&mut app, &provider, (cleanup.x, cleanup.y));
     assert!(app.layers.storage.confirm_clear());
     assert!(app.layers.storage.outbox.take().is_empty());
     assert_eq!(app.layers.top(), Some(LayerId::Storage));
-    // Second mouse step submits through the Confirm row.
+    // Second mouse step submits through the relabelled direct action.
     draw_themed(&provider, &mut app, 20, 6, theme);
-    let more = app.layers.storage.more_rect().expect("More must paint");
-    click(&mut app, &provider, (more.x, more.y));
-    draw_themed(&provider, &mut app, 20, 6, theme);
-    let menu = app.layers.storage.menu_rects().to_vec();
-    assert_eq!(menu.len(), 1);
-    let line: String = {
-        let buffer = draw_themed(&provider, &mut app, 20, 6, theme);
-        (0..buffer.area.width)
-            .map(|x| buffer[(x, menu[0].0.y)].symbol())
-            .collect()
-    };
-    assert!(line.contains("Confirm cleanup"), "{line:?}");
-    click(&mut app, &provider, (menu[0].0.x, menu[0].0.y));
+    let confirm = app
+        .layers
+        .storage
+        .action_rects()
+        .iter()
+        .find(|(slot, _)| *slot == 1)
+        .map(|(_, rect)| *rect)
+        .expect("Confirm cleanup action must paint");
+    click(&mut app, &provider, (confirm.x, confirm.y));
     let requests = app.layers.storage.outbox.take();
     assert!(
         matches!(
             requests.first().map(|request| request.kind),
             Some(StorageRequestKind::ClearUnusedDerived)
         ),
-        "menu Confirm submits: {requests:?}"
+        "direct Confirm submits: {requests:?}"
     );
     assert_eq!(app.layers.top(), Some(LayerId::Storage));
 
-    // Escape order: menu first, then the layer — never both at once.
+    // With no intermediate menu, Escape closes the layer directly.
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Storage), &provider);
     complete_with(&provider, &mut app, snapshot(6, 8192));
     draw_themed(&provider, &mut app, 20, 6, theme);
-    let more = app.layers.storage.more_rect().expect("More must paint");
-    click(&mut app, &provider, (more.x, more.y));
-    draw_themed(&provider, &mut app, 20, 6, theme);
-    assert!(!app.layers.storage.menu_rects().is_empty());
-    key(&mut app, &provider, KeyCode::Esc);
-    draw_themed(&provider, &mut app, 20, 6, theme);
-    assert!(app.layers.storage.menu_rects().is_empty());
-    assert!(app.layers.storage.is_open());
     key(&mut app, &provider, KeyCode::Esc);
     assert!(!app.layers.storage.is_open());
     assert_eq!(app.focus, lvu::Focus::Logs);

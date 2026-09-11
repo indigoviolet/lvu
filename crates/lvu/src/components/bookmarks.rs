@@ -498,6 +498,7 @@ impl BookmarksDialog {
                 .selected
                 .min(bookmarks.len().saturating_sub(1))
                 .saturating_mul(2)
+                .saturating_add(1)
         });
         let list = plan_list(inner, count_w, total_rows, selected_logical, 0);
         if list.heading.height > 0 {
@@ -1043,6 +1044,7 @@ impl Component for BookmarksDialog {
                 .selected
                 .min(bookmarks.len().saturating_sub(1))
                 .saturating_mul(2)
+                .saturating_add(1)
         });
         let list = plan_list(inner, count_w, total_rows, selected_logical, 0);
         if list.heading.height > 0 {

@@ -1377,8 +1377,8 @@ place:
 │   › 1  /completed in (?P<ms>\d+)ms/                                                │
 │     2  level_lower = pl.col('level').str.to_lowercase()                            │
 │ ● Applied   2 steps active                                                         │
-│ Later steps can use fields from earlier steps, command output as <name>.<field> ·  │
-│ Alt-Up/Down reorder · commands run only when you confirm                           │
+│ Later steps can use fields from earlier steps and command output as <name>.<field>.│
+│ Reorder before downstream use; commands run only when you confirm.                 │
 │ [ Add ]  [ Edit ]  [ Remove ]  [ External command… ]                               │
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -1400,8 +1400,8 @@ Command steps (§8.14) are rows of the same list, in chain order, and the
 │    › 3  hot = pl.col('geo.tier') == 'hot'                                           │
 │                                                                                    │
 │  ◐  Pending   3 steps active · 1 unrun: geo                                        │
-│  Later steps can use fields from earlier steps, command output as <name>.<field>   │
-│  · Alt-Up/Down reorder · commands run only when you confirm                        │
+│  Later steps can use fields from earlier steps and command output as <name>.<field>│
+│  Reorder before downstream use; commands run only when you confirm.                │
 ```
 
 `⚙` (`$` in ASCII) marks a command row; the run state after the name is

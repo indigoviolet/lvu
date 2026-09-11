@@ -3202,3 +3202,16 @@ Save/More band. The matching minimum layout reserves two body and two action
 rows, returning status/help above the floor. All 15 Settings component tests
 pass, including field reveal, anchored dropdown and retained More scrolling.
 Failed evidence remains under `lvu-v018-1e2aef0-acceptance/`.
+
+Before another cold exact run, primary ran every `lvu` test target against the
+combined tree and resolved the remaining integration assumptions in one pass.
+Storage now uses the same 20x6 two-body/two-action allocation and keeps Refresh
+plus Cleanup directly reachable; selected Bookmarks reveal both record and note;
+Fields orders Fold before role controls and uses compact 54-column labels so all
+eight actions fit; the Enrichment child stays visibly narrower than its parent
+outside the shared compact breakpoint. Enrichment help no longer prints a
+routine Alt chord. Legacy integration tests now measure responsive/component
+geometry, focused reveal and actual scrollable panes rather than retired class
+rectangles or absolute coordinates. Final warm evidence
+`primary-sol-scratch/v018-ui-preflight-final.log` records all 50 `lvu` test
+binaries green; `ui_state` is 169/169. The exact successor run remains pending.

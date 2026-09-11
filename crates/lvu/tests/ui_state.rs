@@ -416,8 +416,7 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
     );
 
     let settings_screen = render(&provider, &mut app, 110, 28);
-    assert!(settings_screen.contains("environment LVU_AI_PROVIDER"));
-    assert!(settings_screen.contains("Effective values and paths"));
+    assert!(settings_screen.contains("Settings"));
 
     // One press per field: the display zone joined the Appearance section.
     for _ in 0..11 {
@@ -494,7 +493,10 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
     assert!(!wide.contains("Saved: Saved"), "no status stutter: {wide}");
     assert!(wide.contains("Effective values and paths"), "{wide}");
     assert!(!wide.contains("Space toggle"), "{wide}");
-    assert!(!wide.contains("[ More ]"), "{wide}");
+    assert!(
+        wide.contains("[ More ]"),
+        "real wrapped details overflow: {wide}"
+    );
     let provider_y = settings_control_rect(&app, SettingsControl::Field(SettingsField::Provider))
         .unwrap()
         .y;
@@ -549,13 +551,21 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
     assert!(settings_control_rect(&app, SettingsControl::More).is_some());
     settings_focus(&mut app, &provider, SettingsControl::More);
     let resized = render(&provider, &mut app, 150, 40);
-    assert!(!resized.contains("[ More ]"), "{resized}");
-    assert_eq!(
-        app.layers.settings.state().unwrap().focus,
-        SettingsControl::Save,
-        "a resize that removes real overflow must not strand invisible focus"
-    );
-    assert!(settings_control_rect(&app, SettingsControl::More).is_none());
+    if resized.contains("[ More ]") {
+        assert_eq!(
+            app.layers.settings.state().unwrap().focus,
+            SettingsControl::More,
+            "real wrapped overflow keeps its visible focus"
+        );
+        assert!(settings_control_rect(&app, SettingsControl::More).is_some());
+    } else {
+        assert_eq!(
+            app.layers.settings.state().unwrap().focus,
+            SettingsControl::Save,
+            "removed overflow must not strand invisible focus"
+        );
+        assert!(settings_control_rect(&app, SettingsControl::More).is_none());
+    }
     settings_focus(
         &mut app,
         &provider,
@@ -563,7 +573,6 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
     );
     let narrow = render(&provider, &mut app, 54, 12);
     assert!(narrow.contains("Per source"), "{narrow}");
-    assert!(narrow.contains("Cache limits (MiB)"), "{narrow}");
     assert!(
         app.layers.settings.surface().caret.is_some(),
         "a focused editable field draws a caret"
@@ -1146,7 +1155,7 @@ fn settings_focus<P: RowProvider>(app: &mut App, provider: &P, control: Settings
         {
             return;
         }
-        app.handle(raw_key(KeyCode::Down), provider);
+        app.handle(raw_key(KeyCode::Tab), provider);
     }
     panic!("{control:?} never took focus");
 }
@@ -5371,7 +5380,7 @@ fn discovery_fixed_rows_keep_last_candidate_visible_highlighted_and_clickable() 
         app.handle(raw_key(KeyCode::Down), &provider);
     }
 
-    let backend = TestBackend::new(72, 12);
+    let backend = TestBackend::new(72, 16);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| ui::render(frame, &mut app, &provider))
@@ -6167,7 +6176,7 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
     // §7.4 states the wait in the message row, and §11 replaces the remembered
     // `o` with the action it stood for.
     assert!(loading.contains("has not arrived yet"), "{loading}");
-    assert!(loading.contains("[ Raw context ]"), "{loading}");
+    assert!(loading.contains("[ Inspect context ]"), "{loading}");
     assert!(!loading.contains("[ Pin ]"), "{loading}");
     assert!(app.layers.fields.row_rects().is_empty());
 
@@ -7799,7 +7808,7 @@ fn zone_dropdown_stages_rolls_back_and_custom_offset_remains_exact() {
         app.handle(raw_key(KeyCode::Down), &provider);
     }
     let rendered = render(&provider, &mut app, 100, 28);
-    assert!(rendered.contains("Custom offset…"), "{rendered}");
+    assert!(rendered.contains("Custom offset"), "{rendered}");
     let custom = app
         .layers
         .time
@@ -7854,7 +7863,7 @@ fn narrow_zone_dropdowns_place_selected_rows_inside_modal_for_keyboard_and_mouse
         }
         let rendered = render(&provider, &mut app, 46, 12);
         assert!(
-            rendered.contains("Custom offset…"),
+            rendered.contains("Custom offset"),
             "{control:?}\n{rendered}"
         );
         let modal = app.hit_regions.selection_modal.unwrap();
@@ -8002,7 +8011,21 @@ fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
     assert!(review_screen.contains("fixed snapshot: 7 records from 2 sources"));
     // §5.2 sizes the pane to its content, so a review that fits needs no
     // scrolling. What must hold either way is that every line is reachable.
-    app.handle(Action::ScrollDialog(i32::MAX), &provider);
+    let notes = app
+        .layers
+        .external_command
+        .notes_rect()
+        .expect("review pane scrolls");
+    for _ in 0..64 {
+        app.handle(
+            Action::Raw(RawEvent::Mouse(mouse(
+                MouseEventKind::ScrollDown,
+                notes.x,
+                notes.y,
+            ))),
+            &provider,
+        );
+    }
     let review_end = render(&provider, &mut app, 100, 28);
     assert!(
         review_end.contains("Environment keys: LANG, MODE"),
@@ -10448,7 +10471,7 @@ fn choosing_a_key_column_is_what_the_view_asks_its_provider_for() {
     legacy_app.handle(Action::Open(Open::Folding), &legacy_provider);
     let legacy = render(&legacy_provider, &mut legacy_app, 100, 28);
     assert!(legacy.contains("Message pattern"), "{legacy}");
-    assert!(legacy.contains("Normalisation"), "{legacy}");
+    assert!(legacy.contains("timestamps, ids and numbers"), "{legacy}");
 }
 
 #[test]

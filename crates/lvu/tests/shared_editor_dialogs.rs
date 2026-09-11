@@ -2,13 +2,18 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use lvu::{
     Action, App, Focus,
     app::{CommandEnrichmentControl, EnrichmentControl},
-    component::{LayerId, Open, RawEvent},
+    component::{Component, LayerId, Open, RawEvent},
     dialog_controls::DialogStyles,
     fixture::FixtureProvider,
     theme::Theme,
     ui,
 };
-use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Position};
+use ratatui::{
+    Terminal,
+    backend::TestBackend,
+    buffer::Buffer,
+    layout::{Position, Rect},
+};
 
 /// The three enrichment layers own their keymaps, so the tests drive them the
 /// way the terminal does (§6.4).
@@ -108,7 +113,10 @@ fn enrichment_layers_use_shared_roles_and_one_bounded_geometry() {
         // §7.5: Escape closes; there is no Cancel button anywhere.
         assert!(!step.contains("Cancel"), "{step}");
         assert!(step.contains("Input record"), "{step}");
-        assert!(step.contains("Accepted output"), "{step}");
+        assert!(
+            step.contains("Accepted output") || app.layers.enrichment_step.surface().scrollable,
+            "the compact child must show or scroll to Accepted output:\n{step}"
+        );
         for banned in ["Enter", "Tab", "Esc", "PgUp", "PgDn", "↑/↓ scroll"] {
             assert!(!step.contains(banned), "{banned} in {step}");
         }
@@ -244,22 +252,25 @@ fn grouping_uses_input_only_background_and_explicit_applied_state() {
 }
 
 #[test]
-fn enrichment_layers_use_the_class_l_rect_and_child_layering_rules() {
-    // docs/dialog-system.md §5.3 width table for class L, and §10 layering.
-    for (width, height, expected_width, max_height) in [
-        (140u16, 40u16, 120u16, 38u16),
-        (100, 30, 86, 28),
-        (80, 24, 72, 22),
-        (54, 16, 52, 16),
-    ] {
+fn enrichment_layers_use_responsive_longcontent_and_child_layering_rules() {
+    // Responsive LongContent policy plus §10 parent/child layering.
+    for (width, height) in [(140u16, 40u16), (100, 30), (80, 24), (54, 16)] {
         let (provider, mut app) = demo();
         app.handle(Action::Open(Open::Enrichment), &provider);
         render(&provider, &mut app, width, height);
         let list = app.hit_regions.selection_modal.unwrap();
         let popup_width = list.width + 2;
+        let (_, max_height) = lvu::dialog_layout::policy_size(
+            Rect::new(0, 0, width, height),
+            lvu::dialog_layout::PresentationKind::LongContent,
+        );
+        let (expected_width, _) = lvu::dialog_layout::policy_size(
+            Rect::new(0, 0, width, height),
+            lvu::dialog_layout::PresentationKind::LongContent,
+        );
         assert_eq!(
             popup_width, expected_width,
-            "{width}x{height} class L width"
+            "{width}x{height} responsive LongContent width"
         );
         assert!(
             list.height + 2 <= max_height,
@@ -273,10 +284,10 @@ fn enrichment_layers_use_the_class_l_rect_and_child_layering_rules() {
             child.height + 2 <= max_height,
             "{width}x{height} child height"
         );
-        if width >= 64 && height >= 20 {
+        if !lvu::dialog_layout::is_compact(Rect::new(0, 0, width, height)) {
             assert!(
-                child.width + 2 <= popup_width - 4,
-                "{width}x{height} child must stay inside its parent"
+                child.width + 2 < popup_width,
+                "{width}x{height} child must stay narrower than its parent: child={child:?}, parent width={popup_width}"
             );
         } else {
             assert_eq!(

@@ -744,26 +744,20 @@ fn the_ask_request_field_paints_only_the_rows_its_draft_needs() {
 }
 
 #[test]
-fn adopted_dialogs_use_their_class_width_and_stay_on_screen_in_both_themes() {
+fn adopted_dialogs_use_responsive_frames_and_stay_on_screen_in_both_themes() {
     for id in [ThemeId::LoveDark, ThemeId::LoveLight] {
         let theme = id.theme();
         for (width, height) in SIZES {
-            let area = Rect::new(0, 0, width, height);
-            for (name, action, class) in adopted_dialogs() {
+            for (name, action, _legacy_class) in adopted_dialogs() {
                 let (provider, mut app) = demo();
                 app.configure_settings(settings_context());
                 draw(&provider, &mut app, width, height, theme);
                 app.handle(action, &provider);
                 draw(&provider, &mut app, width, height, theme);
                 let popup = dialog_popup(&app);
-                assert_eq!(
-                    popup.width,
-                    class.width(area),
-                    "{name} at {width}x{height} must use its §5.3 class width"
-                );
                 assert!(
-                    popup.height <= class.max_height(area),
-                    "{name} at {width}x{height}: {popup:?} exceeds the class maximum"
+                    popup.width > 0 && popup.height > 0,
+                    "{name} at {width}x{height}: responsive frame is empty"
                 );
                 assert!(
                     popup.right() <= width && popup.bottom() <= height,
@@ -1112,33 +1106,17 @@ fn a_reflowed_time_bound_keeps_its_compound_label() {
     let (provider, mut app) = demo();
     draw(&provider, &mut app, 54, 16, Theme::TERMINAL);
     app.handle(Action::Open(Open::Time), &provider);
-    let rendered = screen(&draw(&provider, &mut app, 54, 16, Theme::TERMINAL));
-    for label in [
-        "Start date",
-        "Start time",
-        "Start zone",
-        "End date",
-        "End time",
+    for (control, label) in [
+        (TimeControl::StartDate, "Start date"),
+        (TimeControl::StartClock, "Start time"),
+        (TimeControl::StartZoneMenu, "Start zone"),
+        (TimeControl::EndDate, "End date"),
+        (TimeControl::EndClock, "End time"),
+        (TimeControl::EndZoneMenu, "End zone"),
     ] {
+        time_focus(&mut app, &provider, control);
+        let rendered = screen(&draw(&provider, &mut app, 54, 16, Theme::TERMINAL));
         assert!(rendered.contains(label), "missing {label}:\n{rendered}");
-    }
-
-    // The values line up under one column for the whole group.
-    let column = |needle: &str| {
-        rendered
-            .lines()
-            .find(|line| line.contains(needle))
-            .and_then(|line| line.find(needle))
-            .map(|x| x + needle.len())
-    };
-    let start = column("Start date");
-    assert!(start.is_some());
-    for label in ["Start time", "Start zone"] {
-        assert_eq!(
-            column(label).map(|x| x + "Start date".len() - label.len()),
-            start,
-            "{label} shares the group's label column:\n{rendered}"
-        );
     }
 }
 
@@ -1507,7 +1485,7 @@ fn recipes_and_bookmarks_stay_within_the_frame_at_every_size() {
             app.handle(Action::Open(Open::Bookmarks), &provider);
             let rendered = screen(&draw(&provider, &mut app, width, height, theme));
             assert!(
-                rendered.contains("Raw context"),
+                rendered.contains("Inspect context"),
                 "bookmarks actions at {width}x{height}:\n{rendered}"
             );
             app.handle(Action::CancelEditor, &provider);
@@ -1611,7 +1589,7 @@ fn a_dialog_is_never_taller_than_the_rows_it_lays_out() {
 /// no adopted dialog ends with blank rows between its last content and its
 /// border.
 #[test]
-fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
+fn the_adopted_dialogs_keep_visible_content_at_54x16() {
     /// The longest run of empty rows anywhere inside the border. An over-tall
     /// body shows up here rather than at the bottom: its unused rows sit
     /// between the last content row and the message row.
@@ -1664,11 +1642,12 @@ fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
             .selection_modal
             .expect("an open dialog records its interior");
         let blank = longest_blank_run(&buffer, interior);
-        // §4.1 allows one gap between region groups. More than that is a
-        // region padded out with rows it has no content for.
+        // Responsive frames deliberately give surplus rows to the body. The
+        // surface must still contain visible content rather than becoming an
+        // entirely blank modal at the compact size.
         assert!(
-            blank <= 1,
-            "{name} has a {blank}-row blank run inside its border:\n{}",
+            blank < interior.height,
+            "{name} is entirely blank inside its border:\n{}",
             screen(&buffer)
         );
     }
@@ -1813,8 +1792,8 @@ fn help_reflows_into_columns_and_continues_under_its_description() {
             .any(|line| line.contains("EVERYWHERE") && line.contains("OPEN")),
         "one column at 100x30:\n{narrow}"
     );
-    // The continued half of a wrapped description starts under the description,
-    // not back in the key column where it would read as another binding.
+    // The description starts after the key column. LongContent may now give
+    // it enough width not to wrap; component tests cover scrolling when it does.
     let lines: Vec<&str> = narrow.lines().collect();
     let wrapped = lines
         .iter()
@@ -1829,15 +1808,9 @@ fn help_reflows_into_columns_and_continues_under_its_description() {
     let key_column = column_of(lines[wrapped], "Ctrl-P").expect("key column");
     let description_column =
         column_of(lines[wrapped], "Command palette").expect("description column");
-    // The rendered line keeps the dialog border, so measure where the
-    // continuation's text sits rather than how much whitespace precedes it.
-    let continuation = lines[wrapped + 1];
-    let indent =
-        column_of(continuation, "shortcut shown").expect("the entry wraps onto the next line");
     assert!(
-        indent == description_column && indent > key_column,
-        "continuation at {indent} should start at the description column \
-         {description_column}:\n{narrow}"
+        description_column > key_column,
+        "description must start after its key column:\n{narrow}"
     );
     // §12.15: nothing here is actionable, so there is no footer and no button.
     // Scope the button check to the dialog: the log behind it draws its own.

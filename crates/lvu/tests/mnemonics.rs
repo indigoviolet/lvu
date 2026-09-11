@@ -167,7 +167,7 @@ fn every_action_row_mnemonic_in_the_product_is_accounted_for() {
         // colour column.
         (
             "Fields",
-            vec!['p', 'f', 'x', 'c', 's', 't', 'd', 'r'],
+            vec!['p', 'f', 'x', 'd', 'c', 's', 't', 'r'],
             false,
         ),
         ("Storage", vec!['r', 'c'], false),

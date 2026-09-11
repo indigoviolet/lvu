@@ -547,7 +547,7 @@ fn render_enrichment_list(
 
     // §5.2: the frame is policy-only (stable across pending/empty/populated/
     // error states); the step count sizes only the scroll extent.
-    let help = "Later steps can use fields from earlier steps, command output as <name>.<field> · Alt-Up/Down reorder · commands run only when you confirm";
+    let help = "Later steps can use fields from earlier steps and command output as <name>.<field>. Reorder before downstream use; commands run only when you confirm.";
     let active = ctx.active;
     let default = EnrichmentDialog::default_control(ctx.views);
     let default_index = controls.iter().position(|control| *control == default);

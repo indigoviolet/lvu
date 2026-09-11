@@ -825,9 +825,9 @@ fn render_enrichment_step(
         area
     } else {
         Rect::new(
-            area.x.saturating_add(3),
+            area.x.saturating_add(6),
             area.y.saturating_add(1),
-            area.width.saturating_sub(6),
+            area.width.saturating_sub(12),
             area.height.saturating_sub(2),
         )
     };

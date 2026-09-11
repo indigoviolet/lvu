@@ -1,12 +1,11 @@
 use lvu::{
     Action, App, QueryCompletion, QueryFailure, QueryPurpose,
     component::{Open, RawEvent},
-    dialog_layout::{DialogClass, dialog_rect_for_class},
     fixture::FixtureProvider,
     theme::Theme,
     ui,
 };
-use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
+use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
 /// A converted layer owns its keymap, so its input arrives raw (§6.4).
 fn raw_key(code: crossterm::event::KeyCode) -> Action {
@@ -116,8 +115,7 @@ fn unicode_search_caret_uses_display_columns_and_completion_owns_it() {
         &provider,
     );
     let (_, cursor) = draw(&provider, &mut app, 88, 20);
-    let popup = dialog_rect_for_class(Rect::new(0, 0, 88, 20), DialogClass::S);
-    let input_left = popup.x + 2;
+    let input_left = app.layers.filter.field_rect().x;
     assert_eq!(
         cursor.x,
         input_left + 5,

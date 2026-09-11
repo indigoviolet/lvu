@@ -466,6 +466,12 @@ fn storage_spec_for(area: Rect, buttons: &[&str]) -> DialogSpec {
     let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
     let estimate = policy_w.saturating_sub(4).max(1);
     let action_rows = stable_action_rows(estimate, buttons).clamp(1, 2);
+    // At 20x6, reserve two rows for the list and two for Refresh/More. A
+    // message row would collapse the action band and make cleanup unreachable;
+    // diagnostics and status return above the terminal floor.
+    if area.height == 6 {
+        return DialogSpec::new(PresentationKind::LongContent, 0, 2, 0, 0, action_rows);
+    }
     DialogSpec::new(PresentationKind::LongContent, 0, 3, 2, 0, action_rows)
 }
 
