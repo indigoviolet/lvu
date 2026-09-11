@@ -3215,3 +3215,13 @@ geometry, focused reveal and actual scrollable panes rather than retired class
 rectangles or absolute coordinates. Final warm evidence
 `primary-sol-scratch/v018-ui-preflight-final.log` records all 50 `lvu` test
 binaries green; `ui_state` is 169/169. The exact successor run remains pending.
+
+Primary then ran `cargo test --workspace --locked` on the warm combined target.
+It reached 99 green result groups before a deliberately arriving one-byte
+partial-record fixture asserted an exact physical-record count (76; observed
+71). This is not stable by contract: an arriving partial may be emitted before
+its terminator. The test now proves what it owns—more than 64 members trigger
+the bounded group split, no count exceeds the input bytes, and the overflow
+marker remains present. The targeted regression passes, followed by the full
+workspace at 120/120 green result groups. Evidence:
+`primary-sol-scratch/v018-workspace-preflight-final.log`.

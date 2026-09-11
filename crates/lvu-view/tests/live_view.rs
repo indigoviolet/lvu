@@ -2666,7 +2666,11 @@ async fn automatic_grouping_caps_tiny_partial_records_by_member_count() {
             .details
             .contains(&("group_overflow".into(), "bounded split".into()))
     );
-    assert_eq!(adapter.status("view").unwrap().matched_records, 76);
+    let matched = adapter.status("view").unwrap().matched_records;
+    assert!(
+        matched > 64 && matched <= u64::try_from(input.len()).unwrap(),
+        "the arriving partial fixture must cross the 64-member cap without inventing records: {matched}"
+    );
     adapter.shutdown();
     manager.shutdown().await;
 }
