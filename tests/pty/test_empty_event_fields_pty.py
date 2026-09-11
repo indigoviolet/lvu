@@ -90,8 +90,8 @@ def run(binary: pathlib.Path) -> None:
             assert "Space pin" not in fields
             assert "[ Color ]" not in fields
             assert "r correlate" not in fields
-            # §11 replaced the remembered `o` with the action it stood for.
-            assert "[ Raw context ]" in fields
+            # The empty state offers the record itself under its new name.
+            assert "[ Inspect context ]" in fields
 
             # While the empty layer owns the keys, a base-screen key reaches
             # nothing: `d` must not open Details here. This pins the invariant

@@ -5,6 +5,7 @@ Value pane describes the selected field over a bounded sample, one key
 filters to a value, and the step editor's picker offers a nested path."""
 import json
 import pathlib
+import re
 import sys
 import tempfile
 
@@ -61,12 +62,32 @@ def run(binary: pathlib.Path) -> None:
 
             # Details: the JSON record is a tree; `http` is collapsed to its
             # summary until Enter opens it, and Left climbs back out.
+            # Details names the selected record in its always-visible stable-id
+            # line, so select a 503 record (sequence 0 or 30) explicitly and
+            # verify it instead of assuming where Home leaves the selection: a
+            # late arrival can re-tail a FOLLOW selection after `g`. (The
+            # `sequence:` line itself sits below the pane's fold.) Opening
+            # Details focuses it, where Up moves the tree cursor, so Tab twice
+            # back to the log first (Details, Selector, Logs): Up then moves
+            # the record selection, which the open Details follows live. Up
+            # from any row reaches 0 or 30 under either clamp or wrap.
             app.send(b"g")
             app.send(b"d")
-            details = app.wait_for("Selected event details")
-            assert "{3 keys}" in details, details
+            app.wait_for("Selected event details")
+            app.send(b"\t\t")
+            for _ in range(45):
+                if re.search(r"display id: [0-9a-f-]+:(30|0)\b", app.text()):
+                    break
+                app.send(b"\x1b[A")
+            details = app.wait_until(
+                lambda text: "{3 keys}" in text
+                and re.search(r"display id: [0-9a-f-]+:(30|0)\b", text) is not None,
+                "first 503 record tree",
+            )
             assert "status: 503" not in details, details
-            # Toggling the pane focuses it; the cursor starts on the first row.
+            # Tab back into Details for the tree cursor below; the cursor
+            # starts on the first row.
+            app.send(b"\t")
             app.send(b"\x1b[B\x1b[B")  # cursor to `http`
             app.send(b"\r")
             app.wait_for("status: 503")
