@@ -101,12 +101,24 @@ pub fn store(workspace_root: &Path, sources: &[SourceDefinition]) -> Result<(), 
     .map_err(|error| format!("write {}: {error}", path.display()))
 }
 
-/// Whether replacing the manifest is safe: true when it loads (including
-/// absent, which loads as empty). A present-but-unreadable manifest —
-/// newer schema, corruption, oversize — must keep its bytes and mtime:
-/// `store` writes only this build's shape and would silently discard what
-/// it cannot parse, so callers refuse loudly instead of storing.
+/// Whether replacing the manifest is safe: true when the workspace store
+/// is available to this build and the manifest loads (absent counts as
+/// loading empty). Either failure refuses loudly before any serialization:
+/// a present-but-unreadable manifest (newer schema, corruption, oversize)
+/// would suffer a lossy rewrite of bytes this build cannot parse, and a
+/// manifest beside a future/incompatible database belongs to a workspace
+/// generation this build must not append to — even when the manifest
+/// itself parses, its unknown additive fields would be silently dropped.
+/// Callers refuse instead of storing. Single-writer note: the shared
+/// worker owns remote start/stop persistence through the same rule; the
+/// app remains authoritative for the unresumed set it alone sees, and
+/// neither side writes while persistence is unavailable.
 pub fn recordable(workspace_root: &Path) -> Result<(), String> {
+    if let Err(error) = lvu_memory::workspace_store_compatible(workspace_root) {
+        return Err(format!(
+            "workspace persistence unavailable ({error}); leaving durable bytes unchanged"
+        ));
+    }
     match load(workspace_root) {
         Ok(_) => Ok(()),
         Err(error) => Err(format!(
@@ -197,6 +209,35 @@ mod tests {
         assert!(
             recordable(&workspace).is_err(),
             "corrupt manifest must refuse"
+        );
+    }
+
+    /// A readable schema-1 manifest beside a future database still refuses:
+    /// the manifest parses, but its workspace generation is not ours, so
+    /// storing would silently drop unknown additive fields.
+    #[test]
+    fn recordable_refuses_future_database_despite_readable_manifest() {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace directory");
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\x00");
+        header[60..64].copy_from_slice(&9999u32.to_be_bytes());
+        std::fs::write(workspace.join("workspace.sqlite3"), &header).expect("plant future db");
+        std::fs::write(
+            manifest_path(&workspace),
+            "{\"schema_version\":1,\"sources\":[],\"future_additive\":\"keep-me\"}\n",
+        )
+        .expect("plant forward manifest");
+        let refused = recordable(&workspace).expect_err("future database must refuse");
+        assert!(
+            refused.contains("workspace persistence unavailable"),
+            "refusal names the unavailable persistence: {refused}"
+        );
+        assert_eq!(
+            std::fs::read(manifest_path(&workspace)).expect("manifest bytes"),
+            "{\"schema_version\":1,\"sources\":[],\"future_additive\":\"keep-me\"}\n".as_bytes(),
+            "the gate itself reads only"
         );
     }
 }

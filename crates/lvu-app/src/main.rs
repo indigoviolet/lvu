@@ -12675,6 +12675,70 @@ root = \"/tmp/elsewhere\"\n",
         assert_eq!(stored.len(), 1, "a missing manifest still records normally");
         assert_eq!(stored[0].id, composition.session_sources[0].id);
     }
+
+    /// The skew the manifest-only gate missed: a future database beside a
+    /// readable schema-1 manifest with an unknown additive field. The
+    /// manifest parses, but the workspace generation is not ours — storing
+    /// would silently drop the unknown field — so recording refuses and
+    /// both files keep bytes and mtime.
+    #[tokio::test]
+    async fn record_session_refuses_future_database_despite_readable_manifest() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager: _manager,
+        } = batch_fixture();
+        let workspace = composition.capture_root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\x00");
+        header[60..64].copy_from_slice(&9999u32.to_be_bytes());
+        std::fs::write(workspace.join("workspace.sqlite3"), &header).expect("plant future db");
+        let manifest = workspace.join("session.json");
+        std::fs::write(
+            &manifest,
+            "{\"schema_version\":1,\"sources\":[],\"future_additive\":\"keep-me\"}\n",
+        )
+        .expect("plant forward manifest");
+        let before = std::fs::read(&manifest).expect("manifest bytes");
+        let mtime_before = std::fs::metadata(&manifest)
+            .expect("manifest metadata")
+            .modified()
+            .expect("manifest mtime");
+        composition.session_sources = vec![batch_definition(915, "fresh")];
+        composition.record_session(&mut app);
+        assert_eq!(
+            std::fs::read(&manifest).expect("manifest bytes after"),
+            before,
+            "readable manifest beside a future database must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::metadata(&manifest)
+                .expect("metadata after")
+                .modified()
+                .expect("mtime after"),
+            mtime_before,
+            "refused record must not touch the manifest"
+        );
+        assert_eq!(
+            std::fs::read(workspace.join("workspace.sqlite3")).expect("db bytes after"),
+            header,
+            "the future database itself is untouched"
+        );
+        let notice = app.action_notice.as_deref().unwrap_or("");
+        assert!(
+            notice.contains("session not recorded")
+                && notice.contains("workspace persistence unavailable"),
+            "refusal must name the unavailable persistence: {notice}"
+        );
+        assert!(
+            std::fs::read_to_string(&manifest)
+                .expect("read back")
+                .contains("future_additive"),
+            "unknown additive field survives the refused record"
+        );
+    }
 }
 
 #[cfg(test)]
