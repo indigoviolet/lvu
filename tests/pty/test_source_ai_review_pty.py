@@ -74,8 +74,8 @@ def preview_first_line(text: str) -> int | None:
     for the terminal the user actually looks at instead of racing it.
     """
     for row in text.splitlines():
-        if "Preview · lines " in row:
-            window = row.split("Preview · lines ", 1)[1].split(" ·", 1)[0]
+        if "lines " in row and " of " in row:
+            window = row.split("lines ", 1)[1].split(" of ", 1)[0]
             return int(window.split("–", 1)[0])
     return None
 
@@ -148,7 +148,7 @@ def run_case(binary: pathlib.Path, width: int, height: int) -> None:
             (
                 index
                 for index, row in enumerate(app.text().splitlines())
-                if "Preview · lines " in row
+                if "lines " in row and " of " in row
             ),
             None,
         )

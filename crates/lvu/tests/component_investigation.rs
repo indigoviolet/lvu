@@ -305,3 +305,196 @@ fn the_palette_rows_report_their_own_availability_and_act() {
         "nothing to resume while one is being resumed"
     );
 }
+
+fn conversation(app: &mut App, provider: &FixtureProvider, question: &str, replies: &[String]) {
+    open(app, provider);
+    ask(app, provider, question);
+    let InvestigationRequest::Start {
+        generation,
+        view_id,
+        ..
+    } = app
+        .take_investigation_requests()
+        .pop()
+        .expect("start request")
+    else {
+        panic!("start request")
+    };
+    assert!(app.investigation_ready(
+        generation,
+        item(view_id, "investigation-1", "session-1", question),
+    ));
+    for reply in replies {
+        assert!(app.push_investigation_event("session-1", reply.clone(), Ok(())));
+    }
+}
+
+/// The responsive frame and sticky tail do not move across the dialog's
+/// states: input, an accumulating transcript, error and the saved list share
+/// one popup, one interior and one primary-action origin at both normal
+/// sizes.
+#[test]
+fn responsive_frame_and_tail_are_stable_across_conversation_states() {
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        // Input.
+        let (provider, mut input) = demo();
+        open(&mut input, &provider);
+        input.handle(
+            Action::Raw(RawEvent::Paste("why did the requests fail".into())),
+            &provider,
+        );
+        draw(&provider, &mut input, width, height);
+        let first = input.layers.investigation.surface();
+        assert!(!first.popup.is_empty(), "no frame at {width}x{height}");
+        let primary = primary_origin(&input);
+
+        // An accumulating transcript never resizes the frame.
+        let (provider, mut talk) = demo();
+        let replies: Vec<String> = (0..10)
+            .map(|index| format!("finding {index}: {}", "bounded evidence ".repeat(8)))
+            .collect();
+        conversation(&mut talk, &provider, "why did the requests fail", &replies);
+        draw(&provider, &mut talk, width, height);
+
+        // A failed turn keeps the layer and the transcript.
+        let (provider, mut failed) = demo();
+        conversation(
+            &mut failed,
+            &provider,
+            "why did the requests fail",
+            &["first finding".to_owned()],
+        );
+        assert!(failed.push_investigation_event(
+            "session-1",
+            "the agent runner failed".to_owned(),
+            Err("runner unavailable".to_owned()),
+        ));
+        draw(&provider, &mut failed, width, height);
+
+        for (name, app) in [("input", &input), ("talk", &talk), ("failed", &failed)] {
+            let surface = app.layers.investigation.surface();
+            assert_eq!(
+                surface.popup, first.popup,
+                "{name} frame moved at {width}x{height}"
+            );
+            assert_eq!(
+                surface.interior, first.interior,
+                "{name} interior moved at {width}x{height}"
+            );
+            assert_eq!(
+                primary_origin(app),
+                primary,
+                "{name} tail moved at {width}x{height}"
+            );
+        }
+        let screen = draw(&provider, &mut input, width, height);
+        assert!(screen.contains("Investigation"), "{screen}");
+    }
+}
+
+fn primary_origin(app: &App) -> Option<(u16, u16)> {
+    let surface = app.layers.investigation.surface();
+    let mut found = None;
+    for y in surface.popup.y..surface.popup.bottom() {
+        for x in surface.popup.x..surface.popup.right() {
+            if matches!(
+                app.layers.investigation.hit((x, y)),
+                Some(InvestigationHit::Control(InvestigationControl::Submit))
+            ) {
+                found.get_or_insert((x, y));
+            }
+        }
+    }
+    found
+}
+
+/// At 54x16 the question field, the scrolling transcript and the actions are
+/// all reachable: typing lands in the question, the wheel and the More focus
+/// scroll a long transcript, and the primary fires by keyboard.
+#[test]
+fn compact_question_transcript_and_actions_stay_reachable() {
+    let (provider, mut app) = demo();
+    let replies: Vec<String> = (0..10)
+        .map(|index| format!("finding {index}: {}", "bounded evidence ".repeat(8)))
+        .collect();
+    conversation(&mut app, &provider, "why did the requests fail", &replies);
+    draw(&provider, &mut app, 54, 16);
+    let dialog = app.layers.investigation.state().expect("open");
+    assert!(
+        dialog.review_scroll_limit > 0,
+        "the transcript must overflow at 54x16"
+    );
+    // The wheel scrolls the transcript viewport.
+    let surface = app.layers.investigation.surface();
+    let mut body_cell = None;
+    for y in surface.popup.y..surface.popup.bottom() {
+        for x in surface.popup.x..surface.popup.right() {
+            if app.layers.investigation.hit((x, y)) == Some(InvestigationHit::Body) {
+                body_cell.get_or_insert((x, y));
+            }
+        }
+    }
+    let (bx, by) = body_cell.expect("transcript viewport must paint at 54x16");
+    app.handle(
+        Action::Raw(RawEvent::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: bx,
+            row: by,
+            modifiers: KeyModifiers::NONE,
+        })),
+        &provider,
+    );
+    assert_eq!(
+        app.layers.investigation.state().unwrap().review_scroll,
+        1,
+        "the wheel scrolls the transcript"
+    );
+    // Tab reaches the transcript once it overflows, and arrows scroll it.
+    draw(&provider, &mut app, 54, 16);
+    for _ in 0..8 {
+        if app.layers.investigation.state().unwrap().focus == InvestigationControl::More {
+            break;
+        }
+        key(&mut app, &provider, KeyCode::Tab);
+    }
+    assert_eq!(
+        app.layers.investigation.state().unwrap().focus,
+        InvestigationControl::More
+    );
+    key(&mut app, &provider, KeyCode::Down);
+    assert_eq!(
+        app.layers.investigation.state().unwrap().review_scroll,
+        2,
+        "More focus hands the arrows to the transcript"
+    );
+}
+
+/// Below the floor the tiny fallback owns the frame with no stale hitboxes.
+#[test]
+fn below_floor_uses_the_tiny_fallback() {
+    let (provider, mut app) = demo();
+    open(&mut app, &provider);
+    let screen = draw(&provider, &mut app, 19, 5);
+    assert!(screen.contains("terminal too small"), "{screen}");
+    assert_eq!(app.layers.investigation.hit((10, 2)), None);
+}
+
+/// Wide and combining characters clip by display width without splitting a
+/// glyph: the transcript still scrolls and the question echoes back intact.
+#[test]
+fn long_unicode_clips_with_exact_hitboxes() {
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        let (provider, mut app) = demo();
+        let replies = vec![format!(
+            "café 日本語 👩‍💻 éxpansion 漢字 {}",
+            "detail ".repeat(12)
+        )];
+        conversation(&mut app, &provider, "café 日本語 mix", &replies);
+        draw(&provider, &mut app, width, height);
+        let surface = app.layers.investigation.surface();
+        assert!(!surface.popup.is_empty());
+        assert_eq!(app.layers.investigation.hit((0, 0)), None);
+        let screen = draw(&provider, &mut app, width, height);
+        assert!(screen.contains("caf"), "{screen}");
+    }
+}

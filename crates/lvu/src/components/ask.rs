@@ -33,13 +33,15 @@ use crate::app::{
 };
 use crate::command_palette::CommandId;
 use crate::component::{Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface};
-use crate::dialog_controls::DialogStyles;
+use crate::dialog_controls::{ActionRow, DialogStyles, render_role_button, stable_action_rows};
+use crate::dialog_layout::{
+    AnchoredSpec, DialogSpec, PresentationKind, anchored_geometry, policy_size, resolve_dialog,
+};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit};
 use crate::theme::Theme;
 use crate::ui::{
-    FIELD_GUTTER, InputSurface, MESSAGE_SENTENCE_COLUMN, MessageState, dialog_frame_regions,
-    help_rows, message_rows, packed_button_rows, render_action_row, render_help_text,
-    render_message, render_placeholder, render_scrollbar, truncated, wrap_sentence,
+    FIELD_GUTTER, InputSurface, MessageState, render_help_text, render_message, render_placeholder,
+    render_responsive_frame, render_scrollbar, truncated, wrap_sentence,
 };
 
 /// Matches the legacy `MAX_AI_REQUESTS`: two in flight is the refusal
@@ -1046,7 +1048,8 @@ fn draw(
     body_hit: &mut Option<Rect>,
 ) -> Surface {
     use crate::app::{AskAiStage as S, AskControl as C};
-    use crate::dialog_layout::{DialogClass, DialogContent, PANE_INDENT, content_width};
+    use crate::dialog_layout::PANE_INDENT;
+    use crate::ui::MESSAGE_SENTENCE_COLUMN;
     let theme = ctx.theme;
     let styles = DialogStyles::new(theme);
     let ascii = ctx.ascii;
@@ -1069,7 +1072,70 @@ fn draw(
     let help = task.map(crate::app::AskTask::help).unwrap_or("");
     let (state_word, sentence) = ask_message(&dialog);
 
-    let width = content_width(area, DialogClass::L);
+    // Stable LongContent budgets: outer size is policy-only, never the
+    // request, proposal, previous answer or activity length. The header is
+    // present exactly when a prepared task explains itself (fixed at open),
+    // the message keeps its two-row maximum and the actions keep the stable
+    // width budget, so the frame and sticky tail origins are identical
+    // across input/proposal/transcript/error states. Hand-rolled row
+    // assignment below is presentation-only folding, never query membership
+    // (AGENTS.md).
+    let action_labels = ask_action_labels(&dialog);
+    let borrowed: Vec<&str> = action_labels.clone();
+    let help_rows_budget = if help.is_empty() {
+        0
+    } else {
+        let (policy_w, _) = policy_size(area, PresentationKind::LongContent);
+        let estimate = usize::from(policy_w.saturating_sub(4)).max(1);
+        wrap_sentence(help, estimate, 2).len().min(2) as u16
+    };
+    let spec = ask_spec_for(area, task.is_some(), help_rows_budget);
+    let Ok(resolved) = resolve_dialog(area, &spec, 1, &borrowed, Some(0), None) else {
+        // Below the floor the tiny fallback owns the frame; stay open with
+        // nothing drawn, as the palette does.
+        return Surface {
+            popup: Rect::default(),
+            interior: Rect::default(),
+            caret: None,
+            scrollable: false,
+            text_focus: editable && dialog.focus == C::Prompt && !dialog.kind_dropdown,
+        };
+    };
+    // Shared frame so geometry and paint share one definition; compactness
+    // comes from the geometry, never recomputed from the frame.
+    render_responsive_frame(frame, &resolved, &title, ctx.active, theme);
+    let mut surface = Surface {
+        popup: resolved.frame,
+        interior: resolved.interior,
+        caret: None,
+        // Derived below from real pane overflow, never blanket true.
+        scrollable: false,
+        // While the kind list is open it is the innermost surface and takes
+        // the keys, so `q` dismisses it rather than being typed.
+        text_focus: editable && dialog.focus == C::Prompt && !dialog.kind_dropdown,
+    };
+    let mut popup = resolved.frame;
+    let body = resolved.body.viewport;
+    if body.width == 0 || body.height == 0 {
+        return surface;
+    }
+    let message_rect = resolved.message;
+    let help_rect = resolved.help;
+    let action_geom = resolved.actions.clone();
+
+    if let Some(task) = task
+        && resolved.header.height > 0
+    {
+        frame.render_widget(
+            Paragraph::new(truncated(
+                task.summary(),
+                usize::from(resolved.header.width),
+            ))
+            .style(styles.description),
+            resolved.header,
+        );
+    }
+
     let labels: &[&str] = if show_kind {
         &["Kind", "Request"]
     } else {
@@ -1082,13 +1148,13 @@ fn draw(
         .unwrap_or(0)
         .min(18);
     // §4.2: below this the label no longer fits beside a usable field, so it
-    // stacks above it.
-    let stacked = width < label_width.saturating_add(FIELD_GUTTER).saturating_add(20);
+    // stacks above it. Stable per size, never per state.
+    let stacked = body.width < label_width.saturating_add(FIELD_GUTTER).saturating_add(20);
 
     let field_width = if stacked {
-        width
+        body.width
     } else {
-        width
+        body.width
             .saturating_sub(label_width)
             .saturating_sub(FIELD_GUTTER)
             .max(1)
@@ -1113,32 +1179,52 @@ fn draw(
     }
     let request_overflows = wrapped.lines.len() > usize::from(request_rows);
 
+    // The Kind/Request form stays fixed at the top of the body while the
+    // panes scroll beneath it, so the input and every action stay reachable
+    // however long the transcript grows. Rows before this line never scroll.
+    let fixed_end = u16::from(show_kind)
+        .saturating_mul(1u16.saturating_add(u16::from(stacked)))
+        .saturating_add(u16::from(stacked))
+        .saturating_add(request_rows);
+    let pane_viewport_h = body.height.saturating_sub(fixed_end);
     // §7.4 caps the message at two rows, but a bridge diagnostic names what
     // failed *and* what to do about it. When it does not fit, the full text
     // becomes body content so the body's own scroll reaches it; truncating the
-    // remedy away is not a diagnostic.
-    let message_height = message_rows(&sentence, width);
-    let pane_width = usize::from(width.saturating_sub(PANE_INDENT)).max(1);
-    let diagnostic: Vec<PaneLine> = if wrap_sentence(
-        &sentence,
-        usize::from(width.saturating_sub(MESSAGE_SENTENCE_COLUMN)).max(1),
-        usize::MAX,
-    )
-    .len()
-        > usize::from(message_height)
-    {
-        wrap_sentence(&sentence, pane_width, usize::MAX)
-            .into_iter()
-            .map(|text| PaneLine {
-                text,
-                error: state_word == MessageState::Error,
-            })
-            .collect()
-    } else {
-        Vec::new()
+    // remedy away is not a diagnostic. The wrap accounts for the scrollbar
+    // column the panes take on overflow, measured again once it is known, so
+    // paint never truncates a line the measure claimed fits.
+    let pane_text_full = usize::from(body.width.saturating_sub(PANE_INDENT)).max(1);
+    let wrap_panes = |text_width: usize| {
+        let sentence_width =
+            usize::from(body.width.saturating_sub(MESSAGE_SENTENCE_COLUMN).max(1)).max(1);
+        let diagnostic: Vec<PaneLine> =
+            if wrap_sentence(&sentence, sentence_width, usize::MAX).len() > 2 {
+                wrap_sentence(&sentence, text_width, usize::MAX)
+                    .into_iter()
+                    .map(|text| PaneLine {
+                        text,
+                        error: state_word == MessageState::Error,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let proposal = ask_proposal_lines(&dialog, text_width);
+        let activity = ask_activity_lines(&dialog, text_width);
+        (diagnostic, proposal, activity)
     };
-    let proposal = ask_proposal_lines(&dialog, pane_width);
-    let activity = ask_activity_lines(&dialog, pane_width);
+    let (diagnostic, proposal, activity) = wrap_panes(pane_text_full);
+    let pane_total = diagnostic.len() + proposal.len() + activity.len() + 3 * 2;
+    let pane_text_width = if pane_total > usize::from(pane_viewport_h) && pane_text_full > 1 {
+        pane_text_full.saturating_sub(1).max(1)
+    } else {
+        pane_text_full
+    };
+    let (diagnostic, proposal, activity) = if pane_text_width == pane_text_full {
+        (diagnostic, proposal, activity)
+    } else {
+        wrap_panes(pane_text_width)
+    };
     let mut panes: Vec<(&str, Option<String>, &Vec<PaneLine>)> = Vec::new();
     if !diagnostic.is_empty() {
         panes.push(("Details", None, &diagnostic));
@@ -1152,41 +1238,9 @@ fn draw(
     panes.push(("Activity", None, &activity));
     let pane_lines: Vec<usize> = panes.iter().map(|(_, _, lines)| lines.len()).collect();
     let kind_width = ask_kind_width(&dialog);
-    let measured = ask_body_layout(
-        Rect::new(0, 0, width, 1),
-        show_kind,
-        kind_width,
-        stacked,
-        label_width,
-        request_rows,
-        &pane_lines,
-    );
-
-    let action_labels = ask_action_labels(&dialog);
-    let borrowed: Vec<&str> = action_labels.clone();
-    let content = DialogContent {
-        header: u16::from(task.is_some()),
-        body: measured.height,
-        message: message_height,
-        help: help_rows(help, width),
-        actions: packed_button_rows(width, &borrowed),
-    };
-    let regions = dialog_frame_regions(frame, area, DialogClass::L, &title, &content, theme);
-    let mut popup = regions.popup;
-    let inner = regions.content;
-
-    if let Some(task) = task
-        && regions.header.height > 0
-    {
-        frame.render_widget(
-            Paragraph::new(truncated(task.summary(), usize::from(regions.header.width)))
-                .style(styles.description),
-            regions.header,
-        );
-    }
 
     let layout = ask_body_layout(
-        Rect::new(inner.x, inner.y, inner.width, 1),
+        Rect::new(0, 0, body.width, 1),
         show_kind,
         kind_width,
         stacked,
@@ -1194,16 +1248,12 @@ fn draw(
         request_rows,
         &pane_lines,
     );
-    // §9: the body is the only scrolling region, and its scrollbar replaces the
-    // retired `[ More ]` pseudo-button.
-    let overflowing = layout.height > regions.body.height;
-    let viewport = Rect::new(
-        regions.body.x,
-        regions.body.y,
-        regions.body.width.saturating_sub(u16::from(overflowing)),
-        regions.body.height,
-    );
-    let max_scroll = layout.height.saturating_sub(viewport.height);
+    // §9: the panes are the scrolling region and their scrollbar replaces the
+    // retired `[ More ]` pseudo-button. The Kind/Request form above
+    // `fixed_end` never scrolls; one projection serves paint, cursor,
+    // selection, scrollbar and mouse.
+    let pane_content = layout.height.saturating_sub(fixed_end);
+    let max_scroll = pane_content.saturating_sub(pane_viewport_h);
     dialog.review_scroll_limit = max_scroll;
     dialog.review_scroll = dialog.review_scroll.min(max_scroll);
     if dialog.focus == C::More && max_scroll == 0 {
@@ -1215,16 +1265,34 @@ fn draw(
     }
     let scroll = dialog.review_scroll;
     let project = |rect: Rect| -> Option<Rect> {
-        let top = rect.y.max(scroll);
-        let bottom = rect.bottom().min(scroll.saturating_add(viewport.height));
-        (bottom > top && rect.width > 0).then(|| {
-            Rect::new(
-                viewport.x.saturating_add(rect.x),
-                viewport.y.saturating_add(top - scroll),
-                rect.width.min(viewport.width.saturating_sub(rect.x)),
-                bottom - top,
-            )
-        })
+        if rect.width == 0 || rect.height == 0 {
+            return None;
+        }
+        if rect.bottom() <= fixed_end {
+            // Fixed form rows paint where laid out, when the body holds them.
+            (rect.bottom() <= body.height).then(|| {
+                Rect::new(
+                    body.x.saturating_add(rect.x),
+                    body.y.saturating_add(rect.y),
+                    rect.width.min(body.width.saturating_sub(rect.x)),
+                    rect.height,
+                )
+            })
+        } else if rect.y >= fixed_end {
+            // Pane rows scroll under the fixed form.
+            let y = rect.y.saturating_sub(scroll);
+            (y >= fixed_end && y < fixed_end.saturating_add(pane_viewport_h) && y < body.height)
+                .then(|| {
+                    Rect::new(
+                        body.x.saturating_add(rect.x),
+                        body.y.saturating_add(y),
+                        rect.width.min(body.width.saturating_sub(rect.x)),
+                        rect.height,
+                    )
+                })
+        } else {
+            None
+        }
     };
 
     if let Some((label, field)) = layout.kind {
@@ -1417,39 +1485,57 @@ fn draw(
         }
     }
 
-    if overflowing {
-        *body_hit = Some(regions.body);
+    // The scrollbar covers the scrolling pane region only; the fixed form
+    // above it never scrolls. It replaces the retired `[ More ]`
+    // pseudo-button, and the same projected rects drive paint and mouse.
+    if max_scroll > 0 && pane_viewport_h > 0 {
+        *body_hit = Some(body);
+        surface.scrollable = true;
         render_scrollbar(
             frame,
             Rect::new(
-                regions.body.right().saturating_sub(1),
-                regions.body.y,
+                body.right().saturating_sub(1),
+                body.y.saturating_add(fixed_end),
                 1,
-                regions.body.height,
+                pane_viewport_h,
             ),
             usize::from(scroll),
             usize::from(max_scroll),
             theme,
             ascii,
         );
+    } else if pane_viewport_h > 0 {
+        *body_hit = Some(body);
     }
 
-    render_message(frame, regions.message, state_word, &sentence, theme, ascii);
-    render_help_text(frame, regions.help, help, theme);
-    // §3: the actions come last, after every field they act on.
+    render_message(frame, message_rect, state_word, &sentence, theme, ascii);
+    render_help_text(frame, help_rect, help, theme);
+    // §3: the actions come last, after every field they act on. Painted from
+    // the shared band plan so paint and mouse share rects; one filled
+    // default, never a destructive one.
     let action_controls = ask_action_controls(&dialog);
     let focused_action = action_controls
         .iter()
         .position(|control| *control == dialog.focus);
-    for (index, rect) in render_action_row(
-        frame,
-        regions.actions,
-        &borrowed,
-        focused_action,
-        &[],
-        theme,
-    ) {
-        controls_hit.push((rect, action_controls[index]));
+    let action_row = ActionRow {
+        labels: &borrowed,
+        default: Some(0),
+        destructive: &[],
+        focused: focused_action,
+    };
+    for (index, rect) in action_geom.buttons.iter().copied() {
+        let role = action_row.role(index);
+        render_role_button(
+            frame,
+            rect,
+            borrowed[index],
+            role,
+            focused_action == Some(index),
+            theme,
+        );
+        if let Some(control) = action_controls.get(index) {
+            controls_hit.push((rect, *control));
+        }
     }
 
     if dialog.kind_dropdown
@@ -1457,13 +1543,16 @@ fn draw(
         && let Some(anchor) = project(field)
     {
         // §5.3: an anchored popup may extend past the dialog, and modal
-        // containment tests `Surface.popup`, so it joins the surface.
+        // containment tests `Surface.popup`, so it joins the surface. Shared
+        // anchored geometry from the actual field rect: the same popup,
+        // viewport and rows drive paint, selection and mouse.
         popup = popup.union(render_ask_kind_dropdown(
             frame,
             kind_hit,
             area,
             anchor,
             dialog.kind_selected,
+            ascii,
             theme,
         ));
     }
@@ -1476,13 +1565,13 @@ fn draw(
     state.prompt_width = dialog.prompt_width;
     Surface {
         popup,
-        interior: regions.interior,
+        interior: surface.interior,
         caret,
-        scrollable: overflowing,
+        scrollable: surface.scrollable,
         // While the kind list is open it is the innermost surface and takes the
         // keys, so `q` dismisses it rather than being typed — which is what the
         // legacy `Focus::AskAi` key table did with `kind_dropdown` set.
-        text_focus: editing && !dialog.kind_dropdown,
+        text_focus: surface.text_focus,
     }
 }
 /// §8.1 visible-row cap for the Request field.
@@ -1629,6 +1718,27 @@ fn ask_action_labels(dialog: &AskAiDialogState) -> Vec<&'static str> {
             C::Kind | C::Prompt | C::More => "",
         })
         .collect()
+}
+
+/// Stable LongContent budgets for Ask (see `draw`). The header is present
+/// exactly when a prepared task explains itself; the actions keep the
+/// stable maximum label set across Submit/Apply/Cancel/Widen relabellings.
+fn ask_spec_for(area: Rect, has_header: bool, help_rows: u16) -> DialogSpec {
+    // Stable maximum action labels across stages so the band never moves as
+    // Submit becomes Apply or the wider re-run appears. Display width via
+    // button_width, capped at two rows.
+    let max_labels = ["Submit a&gain", "Ask again with a &wider sample"];
+    let (policy_w, _) = policy_size(area, PresentationKind::LongContent);
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let action_rows = stable_action_rows(estimate, &max_labels).clamp(1, 2);
+    DialogSpec::new(
+        PresentationKind::LongContent,
+        u16::from(has_header),
+        3,
+        2,
+        help_rows,
+        action_rows,
+    )
 }
 
 /// §7.4: one message row, one state word from the closed vocabulary.
@@ -1789,19 +1899,29 @@ fn ask_kind_label(kind: AskAiKind) -> &'static str {
     }
 }
 
-/// §5.1 class A: the kind list is anchored to the field that opened it, with no
-/// scrim and no breadcrumb, drawn last so it sits above the dialog.
+/// The kind list is anchored to the field that opened it, with no scrim and
+/// no breadcrumb, drawn last so it sits above the dialog. Shared anchored
+/// geometry from the actual field rect: the same popup, viewport and rows
+/// drive paint, selection, scrollbar and mouse.
 fn render_ask_kind_dropdown(
     frame: &mut Frame<'_>,
     kind_hit: &mut Vec<(Rect, usize)>,
     area: Rect,
     anchor: Rect,
     selected: usize,
+    ascii: bool,
     theme: Theme,
 ) -> Rect {
     let styles = DialogStyles::new(theme);
     let kinds = [AskAiKind::Filter, AskAiKind::Enrichment];
-    let rect = crate::dialog_layout::anchored_rect(area, anchor, kinds.len(), anchor.width);
+    let preferred = kinds
+        .iter()
+        .map(|kind| UnicodeWidthStr::width(ask_kind_label(*kind)))
+        .max()
+        .unwrap_or(0) as u16;
+    let spec = AnchoredSpec::new(kinds.len(), None, preferred.saturating_add(4).max(12), 0);
+    let placed = anchored_geometry(area, anchor, &spec, selected.min(kinds.len() - 1), 0);
+    let rect = placed.popup;
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Block::default()
@@ -1810,15 +1930,18 @@ fn render_ask_kind_dropdown(
             .style(Style::default().fg(theme.base_fg).bg(theme.dialog_bg)),
         rect,
     );
-    for (index, kind) in kinds
+    let bar_w = u16::from(placed.scrollbar.is_some());
+    for (offset, kind) in kinds
         .into_iter()
-        .take(usize::from(rect.height.saturating_sub(2)))
         .enumerate()
+        .skip(placed.first_item)
+        .take(usize::from(placed.viewport.height))
     {
+        let index = placed.first_item.saturating_add(offset);
         let row = Rect::new(
-            rect.x.saturating_add(1),
-            rect.y.saturating_add(1 + index as u16),
-            rect.width.saturating_sub(2),
+            placed.viewport.x,
+            placed.viewport.y.saturating_add(offset as u16),
+            placed.viewport.width.saturating_sub(bar_w),
             1,
         );
         kind_hit.push((row, index));
@@ -1829,6 +1952,18 @@ fn render_ask_kind_dropdown(
                 styles.label
             }),
             row,
+        );
+    }
+    if let Some(bar) = placed.scrollbar {
+        crate::ui::render_scrollbar(
+            frame,
+            bar,
+            placed.first_item,
+            kinds
+                .len()
+                .saturating_sub(usize::from(placed.viewport.height)),
+            theme,
+            ascii,
         );
     }
     rect

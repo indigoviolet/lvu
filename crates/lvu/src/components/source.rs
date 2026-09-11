@@ -21,7 +21,7 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -35,13 +35,14 @@ use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface,
     is_typed_char,
 };
-use crate::dialog_controls::DialogStyles;
+use crate::dialog_controls::{ActionRow, DialogStyles, render_role_button, stable_action_rows};
+use crate::dialog_layout::{DialogSpec, PresentationKind, plan_list, policy_size, resolve_dialog};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit};
 use crate::theme::Theme;
 use crate::ui::{
-    FIELD_GUTTER, MessageState, dialog_frame_regions, help_rows, message_rows, packed_button_rows,
-    render_action_row, render_form_field, render_help_text, render_message, render_radio_row,
-    render_scrollbar, render_segmented_control, truncated,
+    FIELD_GUTTER, MessageState, render_form_field, render_help_text, render_message,
+    render_radio_row, render_responsive_frame, render_scrollbar, render_segmented_control,
+    truncated, wrap_sentence,
 };
 
 /// Typing pauses this long before a path scan is asked for. Moved with the
@@ -52,13 +53,6 @@ const SOURCE_PATH_COMPLETION_DEBOUNCE: std::time::Duration = std::time::Duration
 const MAX_SOURCE_REQUESTS: usize = 8;
 const MAX_DISCOVERY_REQUESTS: usize = 4;
 const MAX_SOURCE_AI_REQUESTS: usize = 8;
-
-/// The proposal pane's border rows, excluded from the text it can show.
-const SOURCE_PREVIEW_CHROME: u16 = 2;
-/// §5.2.1: rows a live list in this dialog reserves, before its heading.
-const SOURCE_LIST_ROWS: u16 = 6;
-/// The `Suggestions`/`N matches` heading above the completion list.
-const SOURCE_SUGGESTION_HEADING: u16 = 1;
 
 /// One queue for four kinds of work; the cap only has to stop an unbounded
 /// queue if `lvu-app` stops draining (AGENTS.md). Each kind's own refusal
@@ -1463,7 +1457,6 @@ fn render_source(
     ctx: &RenderCtx<'_>,
 ) -> Surface {
     use crate::app::SourceKind;
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width, live_rows, pane};
     use SourceControl as Control;
     use SourceDialogMode as Mode;
 
@@ -1474,7 +1467,6 @@ fn render_source(
     let mut caret_cell: Option<(u16, u16)> = None;
     let dialog = this.state.clone();
     let styles = DialogStyles::new(theme);
-    let width = content_width(area, DialogClass::L);
     let agent_label = if ascii { "Agent" } else { "🧠 Agent" };
 
     // §8.6: the three modes are a segmented control in the header, not buttons
@@ -1612,63 +1604,52 @@ fn render_source(
     }
     let action_labels: Vec<&str> = action_controls.iter().map(|(_, label)| *label).collect();
 
-    // §5.2: the body asks for the rows its *stable* content needs. Everything
-    // that changes while the user types is reserved separately below.
-    let stable_body = match dialog.mode {
-        // Kind row, path/command row, and — for a file — the gap above the
-        // suggestions pane. Command completion is a single wrapped sentence.
-        Mode::Manual => 2 + u16::from(dialog.kind == SourceKind::File),
-        // Filter, gap, candidates heading, then gap and the 3-row details pane.
-        Mode::Discovery => 2 + 1 + 1 + 3,
-        Mode::Ai => 1 + 1 + SOURCE_PREVIEW_CHROME,
+    // Stable LongContent budgets: outer size is policy-only, never async
+    // counts. Header 1 (the Manual/Discover/Agent segmented control, always
+    // present), body minimum 3 useful rows, message 2 and no help row, actions
+    // from the stable width budget so the frame and sticky tail origins are
+    // identical across manual/discovery/loading/proposal/error states.
+    // Hand-rolled row assignment below is presentation-only folding, never
+    // query membership (AGENTS.md).
+    let spec = source_spec_for(area);
+    let Ok(resolved) = resolve_dialog(area, &spec, 1, &action_labels, Some(0), None) else {
+        // Below the floor the tiny fallback owns the frame; stay open with
+        // nothing drawn, as the palette does.
+        return this.record(
+            geometry,
+            caret_cell,
+            Surface {
+                popup: Rect::default(),
+                interior: Rect::default(),
+                caret: None,
+                scrollable: false,
+                text_focus: this.text_focus(),
+            },
+        );
     };
-    let stable = DialogContent {
-        header: 1,
-        body: stable_body,
-        message: message_rows(&sentence, width),
-        help: help_rows(help, width),
-        actions: packed_button_rows(width, &action_labels),
-    };
-    // §5.2.1. The suggestions pane and the candidate list change on every
-    // keystroke: one keystroke used to move this dialog's top edge four rows
-    // and change its height by eight. They get a height from the frame instead,
-    // so the popup rect is the same before, during and after a scan; the pane's
-    // count and scrollbar carry an overlong list and blank rows carry a short
-    // one. The proposal pane is not live in this sense — it changes when the
-    // user asks for a proposal, not while typing — so it still sizes to content.
-    let live_body = match dialog.mode {
-        Mode::Manual if dialog.kind == SourceKind::File => live_rows(
-            area,
-            DialogClass::L,
-            &stable,
-            SOURCE_SUGGESTION_HEADING + SOURCE_LIST_ROWS,
-        ),
-        Mode::Manual => 0,
-        Mode::Discovery => live_rows(area, DialogClass::L, &stable, SOURCE_LIST_ROWS),
-        Mode::Ai => u16::try_from(review.len().clamp(2, 12)).unwrap_or(2),
-    };
-    let content = DialogContent {
-        body: stable_body.saturating_add(live_body),
-        ..stable
-    };
-    let regions = dialog_frame_regions(frame, area, DialogClass::L, "Add source", &content, theme);
-    let surface = Surface {
-        popup: regions.popup,
-        interior: regions.interior,
+    // Shared frame so geometry and paint share one definition; compactness
+    // comes from the geometry, never recomputed from the frame.
+    render_responsive_frame(frame, &resolved, "Add source", ctx.active, theme);
+    let mut surface = Surface {
+        popup: resolved.frame,
+        interior: resolved.interior,
         caret: None,
-        scrollable: true,
+        // Derived below from real pane overflow, never blanket true: wheel
+        // and hitboxes must match viewports that actually scroll.
+        scrollable: false,
         text_focus: this.text_focus(),
     };
-    if regions.content.width == 0 {
-        return this.record(geometry, caret_cell, surface);
-    }
+    let message_rect = resolved.message;
+    let help_rect = resolved.help;
+    let action_geom = resolved.actions.clone();
+    let roomy = !resolved.compact;
 
     let focused_mode = mode_controls
         .iter()
         .position(|control| *control == dialog.control);
     for (index, rect) in render_segmented_control(
         frame,
-        regions.header,
+        resolved.header,
         &mode_labels,
         active_mode,
         focused_mode,
@@ -1680,7 +1661,13 @@ fn render_source(
         geometry.controls.push((rect, mode_controls[index]));
     }
 
-    let body = regions.body;
+    let body = resolved.body.viewport;
+    if body.width == 0 || body.height == 0 {
+        return this.record(geometry, caret_cell, surface);
+    }
+    // One-row section gaps while roomy, zero when tight (§4.1/§5.4); every
+    // field and pane stays reachable either way.
+    let gap = u16::from(roomy);
     match dialog.mode {
         Mode::Manual => {
             let label_width = u16::try_from(UnicodeWidthStr::width("Command")).unwrap_or(7);
@@ -1734,9 +1721,9 @@ fn render_source(
 
             let rest = Rect::new(
                 body.x,
-                body.y.saturating_add(3),
+                body.y.saturating_add(2).saturating_add(gap),
                 body.width,
-                body.height.saturating_sub(3),
+                body.height.saturating_sub(2).saturating_sub(gap),
             );
             if rest.height > 0 && completions.scanning {
                 frame.render_widget(
@@ -1744,10 +1731,10 @@ fn render_source(
                     rest,
                 );
             } else if rest.height > 0 && suggestion_count == 0 && dialog.kind == SourceKind::File {
-                // §5.2.1: the reserved rows are there whether or not there is a
-                // list to put in them, so say what they are for rather than
-                // leaving the dialog with a block of dead space.
-                let rects = pane(rest, 0, 0);
+                // The list rows are there whether or not there is a list to
+                // put in them, so say what they are for rather than leaving
+                // the dialog with a block of dead space.
+                let rects = plan_list(rest, 0, 0, None, 0);
                 frame.render_widget(
                     Paragraph::new("Suggestions").style(styles.label.add_modifier(Modifier::BOLD)),
                     rects.heading,
@@ -1766,10 +1753,16 @@ fn render_source(
                     "{suggestion_count} match{}",
                     if suggestion_count == 1 { "" } else { "es" }
                 );
-                let rects = pane(
+                // One authoritative list plan: heading/count/viewport/
+                // scrollbar plus the selected window and painted row rects.
+                // The same rects drive paint, selection, scrollbar and mouse.
+                let selected = completions.selected.min(suggestion_count.saturating_sub(1));
+                let rects = plan_list(
                     rest,
                     u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
                     suggestion_count,
+                    Some(selected),
+                    0,
                 );
                 frame.render_widget(
                     Paragraph::new("Suggestions").style(styles.label.add_modifier(Modifier::BOLD)),
@@ -1783,23 +1776,13 @@ fn render_source(
                         rects.count,
                     );
                 }
-                let visible = usize::from(rects.viewport.height);
-                let selected = completions.selected.min(suggestion_count.saturating_sub(1));
-                let top = selected.saturating_sub(visible.saturating_sub(1));
-                for (offset, candidate) in completions
-                    .candidates
-                    .iter()
-                    .skip(top)
-                    .take(visible)
-                    .enumerate()
-                {
-                    let row = Rect::new(
-                        rects.viewport.x,
-                        rects.viewport.y.saturating_add(offset as u16),
-                        rects.viewport.width,
-                        1,
-                    );
-                    let chosen = top + offset == selected;
+                let top = rects.first_row;
+                for (offset, row) in rects.row_rects.iter().copied().enumerate() {
+                    let index = top.saturating_add(offset);
+                    let Some(candidate) = completions.candidates.get(index) else {
+                        continue;
+                    };
+                    let chosen = index == selected;
                     let marker = if chosen {
                         if ascii { "> " } else { "› " }
                     } else {
@@ -1817,17 +1800,18 @@ fn render_source(
                         }),
                         row,
                     );
-                    geometry.path_completion_rows.push((row, top + offset));
+                    geometry.path_completion_rows.push((row, index));
                 }
                 if let Some(bar) = rects.scrollbar {
                     render_scrollbar(
                         frame,
                         bar,
                         top,
-                        suggestion_count.saturating_sub(visible),
+                        suggestion_count.saturating_sub(rects.row_rects.len().max(1)),
                         theme,
                         ascii,
                     );
+                    surface.scrollable = true;
                 }
             } else if rest.height > 0 && dialog.kind == SourceKind::Command {
                 frame.render_widget(
@@ -1853,27 +1837,46 @@ fn render_source(
             )
             .1;
 
-            let details_rows = 3u16.min(body.height.saturating_sub(2));
+            let details_rows = 3u16.min(body.height.saturating_sub(1).saturating_sub(gap));
+            let list_y = body.y.saturating_add(1).saturating_add(gap);
             let list_area = Rect::new(
                 body.x,
-                body.y.saturating_add(2),
+                list_y,
                 body.width,
-                body.height.saturating_sub(2).saturating_sub(details_rows),
+                body.height
+                    .saturating_sub(1)
+                    .saturating_sub(gap)
+                    .saturating_sub(details_rows),
             );
             if list_area.height > 0 {
                 let total = discovery_indices.len();
-                let probe = pane(list_area, 0, total.max(1));
-                // §8.7: the heading counts what is shown against the total.
-                let shown = usize::from(probe.viewport.height).min(total);
+                let selected = dialog
+                    .discovery
+                    .selected
+                    .min(discovery_indices.len().saturating_sub(1));
+                // One authoritative list plan: heading/count/viewport/
+                // scrollbar plus the selected window and painted row rects.
+                // The same rects drive paint, selection, scrollbar and mouse.
+                // The heading counts what is shown against the total (§8.7).
+                let plan_probe = plan_list(
+                    list_area,
+                    0,
+                    total.max(1),
+                    (!discovery_indices.is_empty()).then_some(selected),
+                    0,
+                );
+                let shown = plan_probe.row_rects.len().min(total);
                 let count = if total == 0 {
                     "none".to_owned()
                 } else {
                     format!("{shown} of {total}")
                 };
-                let rects = pane(
+                let rects = plan_list(
                     list_area,
                     u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
                     total.max(1),
+                    (!discovery_indices.is_empty()).then_some(selected),
+                    0,
                 );
                 frame.render_widget(
                     Paragraph::new("Candidates").style(styles.label.add_modifier(Modifier::BOLD)),
@@ -1887,28 +1890,20 @@ fn render_source(
                         rects.count,
                     );
                 }
-                let visible = usize::from(rects.viewport.height);
-                let selected = dialog
-                    .discovery
-                    .selected
-                    .min(discovery_indices.len().saturating_sub(1));
-                let top = selected.saturating_sub(visible.saturating_sub(1));
+                let top = rects.first_row;
                 if discovery_indices.is_empty() {
                     frame.render_widget(
                         Paragraph::new("No matching candidates").style(styles.unavailable),
                         rects.viewport,
                     );
                 }
-                for (offset, index) in discovery_indices.iter().skip(top).take(visible).enumerate()
-                {
-                    let item = &dialog.discovery.items[*index];
-                    let row = Rect::new(
-                        rects.viewport.x,
-                        rects.viewport.y.saturating_add(offset as u16),
-                        rects.viewport.width,
-                        1,
-                    );
-                    let chosen = top + offset == selected;
+                for (offset, row) in rects.row_rects.iter().copied().enumerate() {
+                    let position = top.saturating_add(offset);
+                    let Some(index) = discovery_indices.get(position).copied() else {
+                        continue;
+                    };
+                    let item = &dialog.discovery.items[index];
+                    let chosen = position == selected;
                     let marker = if chosen {
                         if ascii { "> " } else { "› " }
                     } else {
@@ -1926,10 +1921,18 @@ fn render_source(
                         }),
                         row,
                     );
-                    geometry.discovery_rows.push((row, top + offset));
+                    geometry.discovery_rows.push((row, position));
                 }
                 if let Some(bar) = rects.scrollbar {
-                    render_scrollbar(frame, bar, top, total.saturating_sub(visible), theme, ascii);
+                    render_scrollbar(
+                        frame,
+                        bar,
+                        top,
+                        total.saturating_sub(rects.row_rects.len().max(1)),
+                        theme,
+                        ascii,
+                    );
+                    surface.scrollable = true;
                 }
             }
 
@@ -1952,13 +1955,19 @@ fn render_source(
                         || "No candidate selected".to_owned(),
                         |item| format!("{} · {}", item.label, item.detail),
                     );
-                // Long scan summaries must stay readable, so the pane wraps and
-                // scrolls rather than truncating (§9); only its border is gone.
-                let text = format!("{detail}\n{}", dialog.discovery.status);
-                let measure = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
-                let probe = pane(details_area, 0, usize::MAX);
-                let wrapped = measure.line_count(probe.viewport.width.max(1));
-                let rects = pane(details_area, 0, wrapped);
+                // Long scan summaries must stay readable, so the pane wraps
+                // and scrolls rather than truncating (§9). One authoritative
+                // list plan over the wrapped lines: the same rects drive
+                // paint, scrollbar and mouse.
+                let wrapped = wrap_pane_lines(
+                    details_area,
+                    &format!("{detail}\n{}", dialog.discovery.status)
+                        .lines()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
+                );
+                let total = wrapped.len().max(1);
+                let rects = plan_list(details_area, 0, total, None, dialog.discovery.status_scroll);
                 // §8.7 panes have no border, so focus is signalled on the
                 // heading. The body text keeps its readable role either way.
                 frame.render_widget(
@@ -1969,16 +1978,21 @@ fn render_source(
                     }),
                     rects.heading,
                 );
-                let scroll_limit = wrapped.saturating_sub(usize::from(rects.viewport.height));
-                let scroll = dialog.discovery.status_scroll.min(scroll_limit);
-                frame.render_widget(
-                    measure
-                        .scroll((scroll.min(u16::MAX as usize) as u16, 0))
-                        .style(styles.description),
-                    rects.viewport,
-                );
+                let scroll_limit = total.saturating_sub(rects.row_rects.len());
+                let scroll = rects.first_row.min(scroll_limit);
+                for (offset, row) in rects.row_rects.iter().copied().enumerate() {
+                    let Some(line) = wrapped.get(scroll.saturating_add(offset)) else {
+                        continue;
+                    };
+                    frame.render_widget(
+                        Paragraph::new(truncated(line, usize::from(row.width)))
+                            .style(styles.description),
+                        row,
+                    );
+                }
                 if let Some(bar) = rects.scrollbar {
                     render_scrollbar(frame, bar, scroll, scroll_limit, theme, ascii);
+                    surface.scrollable = true;
                 }
                 geometry.scroll = Some(details_area);
                 {
@@ -2004,56 +2018,85 @@ fn render_source(
             )
             .1;
 
-            // The proposal review keeps its own bordered viewport and its
-            // `lines n–m of t` counter: that bounded scroll is what makes every
-            // field reachable at 54x16 before an irreversible launch, and it is
-            // owned by the review fix rather than by this layout pass.
+            // The proposal review is a shared pane — heading, count,
+            // indented viewport, scrollbar — like every other pane, so the
+            // frame never resizes as the proposal arrives. Its bounded
+            // scroll is what makes every field reachable at 54x16 before an
+            // irreversible launch; the preview never executes.
             let preview_area = Rect::new(
                 body.x,
-                body.y.saturating_add(2),
+                body.y.saturating_add(1).saturating_add(gap),
                 body.width,
-                body.height.saturating_sub(2),
+                body.height.saturating_sub(1).saturating_sub(gap),
             );
-            if preview_area.height >= 3 {
-                let preview_block = Block::default().borders(Borders::ALL);
-                let preview_inner = preview_block.inner(preview_area);
-                let text = if review.is_empty() {
-                    "A reviewed source definition appears here; nothing runs until you start it."
-                        .to_owned()
-                } else {
-                    review.join("\n")
-                };
-                let preview = Paragraph::new(text)
-                    .wrap(Wrap { trim: false })
-                    .style(styles.description);
-                let limit = preview
-                    .line_count(preview_inner.width)
-                    .saturating_sub(usize::from(preview_inner.height));
-                let scroll = dialog.ai.preview_scroll.min(limit);
-                let title = if limit > 0 {
-                    format!(
-                        " Preview · lines {}–{} of {} ",
-                        scroll.saturating_add(1),
-                        scroll
-                            .saturating_add(usize::from(preview_inner.height))
-                            .min(limit.saturating_add(usize::from(preview_inner.height))),
-                        limit.saturating_add(usize::from(preview_inner.height))
+            if preview_area.height > 0 {
+                let wrapped: Vec<String> = if review.is_empty() {
+                    wrap_pane_lines(
+                        preview_area,
+                        &["A reviewed source definition appears here; nothing runs until you start it."
+                            .to_owned()],
                     )
                 } else {
-                    " Preview ".into()
+                    wrap_pane_lines(preview_area, &review)
                 };
-                frame.render_widget(
-                    preview
-                        .scroll((scroll.min(u16::MAX as usize) as u16, 0))
-                        .block(preview_block.title(title).border_style(Style::default().fg(
-                            if this.scroll_focused {
-                                theme.focused_input_border
-                            } else {
-                                theme.border
-                            },
-                        ))),
+                let total = wrapped.len().max(1);
+                // One authoritative list plan over the wrapped lines: the
+                // same rects drive paint, the counter, scrollbar and mouse.
+                // Count first without the counter width so the visible count
+                // cannot shift the viewport it counts.
+                let probe = plan_list(preview_area, 0, total, None, dialog.ai.preview_scroll);
+                let visible = probe.row_rects.len().max(1);
+                let limit = total.saturating_sub(visible);
+                let scroll = probe.first_row.min(limit);
+                let counter = (limit > 0).then(|| {
+                    format!(
+                        "lines {}–{} of {}",
+                        scroll.saturating_add(1),
+                        scroll.saturating_add(visible).min(total),
+                        total,
+                    )
+                });
+                let rects = plan_list(
                     preview_area,
+                    counter.as_deref().map_or(0, |text| {
+                        u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(0)
+                    }),
+                    total,
+                    None,
+                    scroll,
                 );
+                frame.render_widget(
+                    Paragraph::new("Preview").style(if this.scroll_focused {
+                        styles.shortcut.add_modifier(Modifier::BOLD)
+                    } else {
+                        styles.label.add_modifier(Modifier::BOLD)
+                    }),
+                    rects.heading,
+                );
+                if let Some(counter) = &counter
+                    && rects.count.width > 0
+                {
+                    frame.render_widget(
+                        Paragraph::new(counter.clone())
+                            .style(styles.description)
+                            .right_aligned(),
+                        rects.count,
+                    );
+                }
+                for (offset, row) in rects.row_rects.iter().copied().enumerate() {
+                    let Some(line) = wrapped.get(scroll.saturating_add(offset)) else {
+                        continue;
+                    };
+                    frame.render_widget(
+                        Paragraph::new(truncated(line, usize::from(row.width)))
+                            .style(styles.description),
+                        row,
+                    );
+                }
+                if let Some(bar) = rects.scrollbar {
+                    render_scrollbar(frame, bar, scroll, limit, theme, ascii);
+                    surface.scrollable = true;
+                }
                 geometry.scroll = (limit > 0).then_some(preview_area);
                 {
                     let state = &mut this.state;
@@ -2064,23 +2107,79 @@ fn render_source(
         }
     }
 
-    render_message(frame, regions.message, state, &sentence, theme, ascii);
-    render_help_text(frame, regions.help, help, theme);
+    render_message(frame, message_rect, state, &sentence, theme, ascii);
+    render_help_text(frame, help_rect, help, theme);
 
+    // §8.9/§8.10: one filled default (the primary action), painted from the
+    // shared band plan so paint and mouse share rects. The focus ring stays
+    // on the focused control; hidden actions keep original indices.
     let focused_action = action_controls
         .iter()
         .position(|(control, _)| *control == dialog.control);
-    for (index, rect) in render_action_row(
-        frame,
-        regions.actions,
-        &action_labels,
-        focused_action,
-        &[],
-        theme,
-    ) {
-        geometry.controls.push((rect, action_controls[index].0));
+    let action_row = ActionRow {
+        labels: &action_labels,
+        default: Some(0),
+        destructive: &[],
+        focused: focused_action,
+    };
+    for (index, rect) in action_geom.buttons.iter().copied() {
+        let role = action_row.role(index);
+        render_role_button(
+            frame,
+            rect,
+            action_labels[index],
+            role,
+            focused_action == Some(index),
+            theme,
+        );
+        if let Some((control, _)) = action_controls.get(index) {
+            geometry.controls.push((rect, *control));
+        }
     }
     this.record(geometry, caret_cell, surface)
+}
+
+/// Wrap logical lines for a list pane in `area`, accounting for the
+/// scrollbar column the shared plan takes when the content overflows, so the
+/// measure and the paint agree and no wrapped line is truncated on arrival.
+/// Blank separator lines are preserved as blank rows. Hand-rolled here is
+/// presentation-only folding, never query membership (AGENTS.md).
+fn wrap_pane_lines(area: Rect, logical: &[String]) -> Vec<String> {
+    use crate::dialog_layout::PANE_INDENT;
+    let indent = PANE_INDENT.min(area.width);
+    let probe_width = area.width.saturating_sub(indent).max(1);
+    let wrap_at = |width: u16| -> Vec<String> {
+        logical
+            .iter()
+            .flat_map(|line| {
+                if line.trim().is_empty() {
+                    vec![String::new()]
+                } else {
+                    wrap_sentence(line, usize::from(width.max(1)), usize::MAX)
+                }
+            })
+            .collect()
+    };
+    let viewport_h = area.height.saturating_sub(u16::from(area.height > 1));
+    let wrapped = wrap_at(probe_width);
+    if wrapped.len() > usize::from(viewport_h) && probe_width > 1 {
+        wrap_at(probe_width.saturating_sub(1))
+    } else {
+        wrapped
+    }
+}
+
+/// Stable LongContent budgets for Add source (see `render_source`).
+fn source_spec_for(area: Rect) -> DialogSpec {
+    // Stable maximum first-row labels (longest primary plus Rescan) so
+    // Manual/Discovery/Agent share one budget across Open/Request/Start
+    // relabellings and no async arrival moves the tail. Display width via
+    // button_width, capped at two rows.
+    let max_labels = ["Start reviewed source", "Rescan"];
+    let (policy_w, _) = policy_size(area, PresentationKind::LongContent);
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let action_rows = stable_action_rows(estimate, &max_labels).clamp(1, 2);
+    DialogSpec::new(PresentationKind::LongContent, 1, 3, 2, 0, action_rows)
 }
 
 fn source_ai_status(stage: SourceAiStage, theme: Theme) -> (&'static str, Style) {
