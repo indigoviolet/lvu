@@ -77,6 +77,73 @@ fn type_text(app: &mut App, provider: &FixtureProvider, text: &str) {
     }
 }
 
+/// Every planned action/More rect must be full-size (at least its required
+/// button width), inside the band, and pairwise disjoint: Ratatui squeezes
+/// over-wide fixed Length constraints instead of refusing, so anything less
+/// is a clipped label or a dead hitbox masquerading as geometry.
+fn assert_action_rects_valid(
+    band: ratatui::layout::Rect,
+    buttons: &[(usize, ratatui::layout::Rect)],
+    more: Option<ratatui::layout::Rect>,
+    labels: &[&str],
+    tag: &str,
+) {
+    use lvu::dialog_controls::{MORE_LABEL, button_width};
+    let mut seen: Vec<ratatui::layout::Rect> = Vec::new();
+    for (index, rect) in buttons {
+        let required = button_width(labels[*index]);
+        assert!(
+            rect.width >= required,
+            "{tag}: button {} paints {} wide, needs {required}",
+            labels[*index],
+            rect.width,
+        );
+        assert!(
+            rect.x >= band.x
+                && rect.right() <= band.right()
+                && rect.y >= band.y
+                && rect.bottom() <= band.bottom(),
+            "{tag}: button {} at {rect:?} escapes band {band:?}",
+            labels[*index],
+        );
+        assert!(
+            seen.iter().all(|prior: &ratatui::layout::Rect| {
+                prior.x >= rect.right()
+                    || rect.x >= prior.right()
+                    || prior.y >= rect.bottom()
+                    || rect.y >= prior.bottom()
+            }),
+            "{tag}: button {} at {rect:?} overlaps {seen:?}",
+            labels[*index],
+        );
+        seen.push(*rect);
+    }
+    if let Some(rect) = more {
+        let required = button_width(MORE_LABEL);
+        assert!(
+            rect.width >= required,
+            "{tag}: More paints {} wide, needs {required}",
+            rect.width
+        );
+        assert!(
+            rect.x >= band.x
+                && rect.right() <= band.right()
+                && rect.y >= band.y
+                && rect.bottom() <= band.bottom(),
+            "{tag}: More at {rect:?} escapes band {band:?}",
+        );
+        assert!(
+            seen.iter().all(|prior: &ratatui::layout::Rect| {
+                prior.x >= rect.right()
+                    || rect.x >= prior.right()
+                    || prior.y >= rect.bottom()
+                    || rect.y >= prior.bottom()
+            }),
+            "{tag}: More at {rect:?} overlaps {seen:?}",
+        );
+    }
+}
+
 #[test]
 fn a_refused_draft_is_kept_and_the_applied_view_stays_on_screen() {
     let (provider, mut app) = demo();
@@ -553,4 +620,481 @@ fn an_unbound_alt_chord_is_ignored_rather_than_typed() {
         &provider,
     );
     assert_eq!(app.search_state().unwrap().draft, "keptT");
+}
+
+#[test]
+fn completion_popup_recomputes_on_resize_and_never_goes_stale() {
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 100, 28);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    key(&mut app, &provider, KeyCode::Tab);
+    assert!(app.layers.filter.completion().is_some());
+    draw(&provider, &mut app, 100, 28);
+    let roomy_popup = app.layers.filter.completion_popup();
+    assert!(!roomy_popup.is_empty());
+
+    // Shrink to a frame where neither band around the field holds even the
+    // shrunken popup minimum with its one-row gap: the shared placement would
+    // have to slide the popup over the field to stay in-area, so nothing is
+    // painted instead. The fenced offer survives, no stale rect from the
+    // roomy size leaks through, and no fabricated hitbox swallows clicks —
+    // while the dialog itself stays usable.
+    draw(&provider, &mut app, 20, 6);
+    assert!(
+        app.layers.filter.completion().is_some(),
+        "the fenced offer survives; only gap-violating paint is refused"
+    );
+    assert!(
+        !app.layers.filter.field_rect().is_empty(),
+        "the dialog field still paints at 20x6"
+    );
+    assert!(
+        app.layers.filter.completion_popup().is_empty(),
+        "no popup that cannot keep its gap"
+    );
+    assert!(
+        app.layers.filter.completion_rects().is_empty(),
+        "no row hitboxes without a painted popup"
+    );
+    for x in 0..20 {
+        for y in 0..6 {
+            assert!(
+                !matches!(
+                    app.layers.filter.hit((x, y)),
+                    Some(lvu::components::editors::EditorHit::Completion(_))
+                ),
+                "fabricated completion hit at ({x}, {y})"
+            );
+        }
+    }
+
+    // Growing back restores the roomy placement from the repainted field.
+    draw(&provider, &mut app, 100, 28);
+    assert_eq!(app.layers.filter.completion_popup(), roomy_popup);
+}
+
+#[test]
+fn diagnostic_scroll_reveals_the_field_before_completion_opens() {
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 54, 12);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    paste(&mut app, &provider, "broken draft");
+    key(&mut app, &provider, KeyCode::Enter);
+    let request = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Err(QueryFailure {
+            purpose: request.purpose,
+            message: format!("invalid expression: {}", "details ".repeat(40)),
+        }),
+    }));
+    draw(&provider, &mut app, 54, 12);
+    assert!(
+        app.layers.filter.scroll_limit() > 0,
+        "the long diagnostic overflows into a scrollable pane"
+    );
+
+    // Drive the diagnostics to the bottom: the field (body row 0) scrolls out
+    // and genuinely paints nothing — the scrolled-out field this suite guards.
+    // Tab walks Field → completion → completion → Tabs first, offering (and
+    // dropping) popups along the way; only the fourth Tab reaches the pane.
+    key(&mut app, &provider, KeyCode::Tab);
+    key(&mut app, &provider, KeyCode::Tab);
+    key(&mut app, &provider, KeyCode::Tab);
+    assert!(app.layers.filter.tabs_focused());
+    key(&mut app, &provider, KeyCode::Tab);
+    assert!(app.layers.filter.scroll_focused());
+    assert!(app.layers.filter.completion().is_none());
+    for _ in 0..64 {
+        key(&mut app, &provider, KeyCode::Down);
+    }
+    draw(&provider, &mut app, 54, 12);
+    assert!(
+        app.layers.filter.field_rect().is_empty(),
+        "a fully scrolled pane paints no field rect"
+    );
+
+    // Tabbing back hands the keys to the field first, which the shared body
+    // scroll reveals before anything may anchor to it; only then does the
+    // next Tab offer completion against the freshly painted field.
+    key(&mut app, &provider, KeyCode::Tab);
+    draw(&provider, &mut app, 54, 12);
+    let field = app.layers.filter.field_rect();
+    assert!(!field.is_empty(), "returning to the field reveals it");
+    assert!(app.layers.filter.completion().is_none());
+    key(&mut app, &provider, KeyCode::Tab);
+    assert!(app.layers.filter.completion().is_some());
+    draw(&provider, &mut app, 54, 12);
+    let popup = app.layers.filter.completion_popup();
+    let field = app.layers.filter.field_rect();
+    assert!(!popup.is_empty());
+    let below = popup.y == field.bottom().saturating_add(1);
+    let above = popup.bottom().saturating_add(1) == field.y;
+    assert!(
+        below || above,
+        "popup {popup:?} has no one-row gap to revealed field {field:?}"
+    );
+    assert!(
+        popup.right() <= 54 && popup.bottom() <= 12,
+        "popup {popup:?} escapes the area"
+    );
+}
+
+#[test]
+fn wheel_interest_follows_real_overflow_not_an_unconditional_claim() {
+    // A plain field with no diagnostics overflows nothing: no wheel target.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 100, 28);
+    app.handle(Action::Open(Open::Search), &provider);
+    draw(&provider, &mut app, 100, 28);
+    assert!(!app.layers.filter.surface().scrollable);
+
+    // A long rejected diagnostic overflows the body: wheel wanted.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 54, 12);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    paste(&mut app, &provider, "broken draft");
+    key(&mut app, &provider, KeyCode::Enter);
+    let request = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Err(QueryFailure {
+            purpose: request.purpose,
+            message: format!("invalid expression: {}", "details ".repeat(40)),
+        }),
+    }));
+    draw(&provider, &mut app, 54, 12);
+    assert!(app.layers.filter.scroll_limit() > 0);
+    assert!(app.layers.filter.surface().scrollable);
+
+    // An open completion whose rows all fit adds no wheel interest of its own.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 100, 28);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    key(&mut app, &provider, KeyCode::Tab);
+    draw(&provider, &mut app, 100, 28);
+    assert!(app.layers.filter.completion().is_some());
+    assert!(!app.layers.filter.completion_popup().is_empty());
+    assert!(!app.layers.filter.surface().scrollable);
+
+    // Squeeze the same open popup until it must scroll: interest returns.
+    draw(&provider, &mut app, 20, 6);
+    assert!(app.layers.filter.surface().scrollable);
+}
+
+#[test]
+fn completion_popup_anchors_to_the_painted_field_with_a_one_row_gap() {
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 100, 28);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    key(&mut app, &provider, KeyCode::Tab);
+    let items = app.layers.filter.completion().unwrap().items.len();
+    assert!(items > 0, "the fixture offers completions to place");
+
+    for (width, height) in [(100u16, 28u16), (80, 24), (54, 16)] {
+        draw(&provider, &mut app, width, height);
+        let popup = app.layers.filter.completion_popup();
+        let field = app.layers.filter.field_rect();
+        let rows = app.layers.filter.completion_rects().to_vec();
+        let tag = format!("{width}x{height}");
+        assert!(!field.is_empty(), "{tag}: the field paints");
+        assert!(!popup.is_empty(), "{tag}: the popup paints");
+        assert!(!rows.is_empty(), "{tag}: rows paint");
+        // Frame-bounded: the whole popup, and every row, stays inside the
+        // render area even at narrow widths.
+        assert!(
+            popup.right() <= width && popup.bottom() <= height,
+            "{tag}: popup {popup:?} escapes the area"
+        );
+        for (rect, _) in &rows {
+            assert!(
+                rect.right() <= width && rect.bottom() <= height,
+                "{tag}: row {rect:?} escapes the area"
+            );
+        }
+        // Max-eight rule: the popup never shows more than eight item rows no
+        // matter how many the sampler offered.
+        assert!(rows.len() <= 8, "{tag}: {} rows", rows.len());
+        assert!(rows.len() <= items, "{tag}: more rows than items");
+        // One-row gap against the actual painted field: below preferred,
+        // above when below cannot fit.
+        let below = popup.y == field.bottom().saturating_add(1);
+        let above = popup.bottom().saturating_add(1) == field.y;
+        assert!(
+            below || above,
+            "{tag}: popup {popup:?} has no one-row gap to field {field:?}"
+        );
+        // Rows tile the popup viewport contiguously, one row per item, starting
+        // directly inside the border — the same rects paint and hit-testing share.
+        for (offset, (rect, _)) in rows.iter().enumerate() {
+            assert_eq!(
+                (rect.x, rect.y),
+                (popup.x + 1, popup.y + 1 + offset as u16),
+                "{tag}: row {offset} not tiled from the popup origin"
+            );
+        }
+        // Every painted row hit-tests back to its own item.
+        for (rect, index) in &rows {
+            assert_eq!(
+                app.layers.filter.hit((rect.x, rect.y)),
+                Some(lvu::components::editors::EditorHit::Completion(*index)),
+                "{tag}: row {rect:?} does not hit-test to item {index}"
+            );
+        }
+    }
+
+    // Wide: the popup shares the field's column while room allows, proving the
+    // anchor is the painted field rect rather than a viewport-centered guess.
+    draw(&provider, &mut app, 100, 28);
+    assert_eq!(
+        app.layers.filter.completion_popup().x,
+        app.layers.filter.field_rect().x,
+        "popup left-aligned with the field at roomy sizes"
+    );
+}
+
+#[test]
+fn prompt_frames_cover_the_size_matrix_without_invented_overflow() {
+    for (width, height) in [(240u16, 80u16), (140, 40), (80, 24), (54, 16)] {
+        let tag = format!("{width}x{height}");
+        // Filter Search: title, frame and both verbs directly painted.
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, width, height);
+        app.handle(Action::Open(Open::Search), &provider);
+        draw(&provider, &mut app, width, height);
+        let rendered = screen(&draw(&provider, &mut app, width, height));
+        assert!(rendered.contains("Filter"), "{tag}:\n{rendered}");
+        let frame = app.layers.filter.surface().popup;
+        assert!(
+            frame.right() <= width && frame.bottom() <= height,
+            "{tag}: frame {frame:?} escapes the area"
+        );
+        assert!(
+            app.layers.filter.more_button().is_none(),
+            "{tag}: no overflow invented while both verbs fit"
+        );
+        assert_eq!(
+            app.layers.filter.action_band().height,
+            1,
+            "{tag}: one action row, no dead row"
+        );
+        assert_action_rects_valid(
+            app.layers.filter.action_band(),
+            &[
+                (0, app.layers.filter.action_rects()[0]),
+                (1, app.layers.filter.action_rects()[1]),
+            ],
+            None,
+            &["Apply", "&Clear"],
+            &format!("{tag} Filter"),
+        );
+        assert!(rendered.contains("[ Apply ]"), "{tag}:\n{rendered}");
+        assert!(rendered.contains("[ Clear ]"), "{tag}:\n{rendered}");
+        for (rect, hit) in [
+            (
+                app.layers.filter.action_rects()[0],
+                lvu::components::editors::EditorHit::Apply,
+            ),
+            (
+                app.layers.filter.action_rects()[1],
+                lvu::components::editors::EditorHit::Clear,
+            ),
+        ] {
+            assert!(!rect.is_empty(), "{tag}: action {hit:?} paints");
+            assert_eq!(app.layers.filter.hit((rect.x, rect.y)), Some(hit));
+        }
+        // Multiline grouping: title, frame and its single verb, no overflow.
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, width, height);
+        app.handle(Action::Open(Open::Grouping), &provider);
+        draw(&provider, &mut app, width, height);
+        let rendered = screen(&draw(&provider, &mut app, width, height));
+        assert!(
+            rendered.contains("Multiline grouping"),
+            "{tag}:\n{rendered}"
+        );
+        let frame = app.layers.grouping.surface().popup;
+        assert!(
+            frame.right() <= width && frame.bottom() <= height,
+            "{tag}: frame {frame:?} escapes the area"
+        );
+        assert!(
+            app.layers.grouping.more_button().is_none(),
+            "{tag}: one verb never overflows"
+        );
+        let apply = app.layers.grouping.action_rects()[0];
+        assert_action_rects_valid(
+            app.layers.grouping.action_band(),
+            &[(0, apply)],
+            None,
+            &["Apply"],
+            &format!("{tag} Grouping"),
+        );
+        assert!(!apply.is_empty(), "{tag}: Apply paints");
+        assert_eq!(
+            app.layers.grouping.hit((apply.x, apply.y)),
+            Some(lvu::components::editors::EditorHit::Apply)
+        );
+    }
+
+    // The 20x6 floor keeps both Filter verbs directly painted: the floor
+    // budgets (header1 + body1 + actions2, message/help dropped) hold a
+    // two-row band, so Apply and Clear never need the overflow menu here.
+    // Grouping's single verb still fits directly.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 20, 6);
+    app.handle(Action::Open(Open::Search), &provider);
+    draw(&provider, &mut app, 20, 6);
+    assert!(screen(&draw(&provider, &mut app, 20, 6)).contains("Filter"));
+    assert_eq!(app.layers.filter.action_band().height, 2);
+    assert!(app.layers.filter.more_button().is_none());
+    assert_action_rects_valid(
+        app.layers.filter.action_band(),
+        &[
+            (0, app.layers.filter.action_rects()[0]),
+            (1, app.layers.filter.action_rects()[1]),
+        ],
+        None,
+        &["Apply", "&Clear"],
+        "20x6 Filter floor",
+    );
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 20, 6);
+    app.handle(Action::Open(Open::Grouping), &provider);
+    draw(&provider, &mut app, 20, 6);
+    // The 20-char title cannot spell itself out in a 20-wide frame, so assert
+    // structure instead of text: the dialog resolves, Apply paints, no overflow.
+    assert_eq!(
+        app.layers.grouping.surface().popup,
+        ratatui::layout::Rect::new(0, 0, 20, 6)
+    );
+    let apply = app.layers.grouping.action_rects()[0];
+    assert!(!apply.is_empty(), "Grouping Apply paints at 20x6");
+    assert_eq!(
+        app.layers.grouping.hit((apply.x, apply.y)),
+        Some(lvu::components::editors::EditorHit::Apply)
+    );
+    assert!(app.layers.grouping.more_button().is_none());
+
+    // Below the floor the existing tiny fallback owns the screen instead.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 19, 5);
+    app.handle(Action::Open(Open::Search), &provider);
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+    assert!(!tiny.contains("Filter"), "{tiny}");
+}
+
+#[test]
+fn floor_action_pair_paints_directly_with_kept_two_row_band() {
+    // At 20x6 the floor budgets (header1 + body1 + actions2, message/help
+    // dropped) hold a two-row band, so Apply and Clear both paint full-size
+    // with no overflow menu at all. The message row is gone, but the dialog
+    // stays fully operable by mouse and key.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 20, 6);
+    app.handle(Action::Open(Open::Search), &provider);
+    type_text(&mut app, &provider, "needle");
+    draw(&provider, &mut app, 20, 6);
+    let rendered = screen(&draw(&provider, &mut app, 20, 6));
+    assert!(rendered.contains("Filter"), "{rendered}");
+    assert_eq!(app.layers.filter.action_band().height, 2);
+    assert!(app.layers.filter.more_button().is_none());
+    assert!(app.layers.filter.more_rows().is_empty());
+    assert_action_rects_valid(
+        app.layers.filter.action_band(),
+        &[
+            (0, app.layers.filter.action_rects()[0]),
+            (1, app.layers.filter.action_rects()[1]),
+        ],
+        None,
+        &["Apply", "&Clear"],
+        "20x6 Filter floor",
+    );
+    assert!(rendered.contains("[ Apply ]"), "{rendered}");
+    assert!(rendered.contains("[ Clear ]"), "{rendered}");
+    // Both verbs work by mouse: Clear empties the draft, Apply submits it.
+    let apply = app.layers.filter.action_rects()[0];
+    let clear = app.layers.filter.action_rects()[1];
+    click(&mut app, &provider, clear.x, clear.y);
+    assert_eq!(app.search_state().unwrap().draft, "");
+    type_text(&mut app, &provider, "needle");
+    click(&mut app, &provider, apply.x, apply.y);
+    assert_eq!(app.take_query_requests().len(), 1);
+    assert!(app.layers.filter.is_open());
+    // Keyboard mnemonics still resolve without any menu in the picture.
+    key(&mut app, &provider, KeyCode::Esc);
+    assert!(!app.layers.filter.is_open());
+}
+
+#[test]
+fn action_budget_flips_exactly_where_the_pair_stops_fitting() {
+    // One column changes the policy content width from 19 to 20 cells —
+    // exactly the Apply+Clear two-button width — flipping the kept band
+    // height with nothing else moving. This pins the area-aware budget
+    // against hard-coded subtraction: a 2-cell estimate drift would put
+    // both viewports on the same side of the boundary.
+    for (width, tag, rows) in [(25u16, "narrow", 2), (26u16, "fits", 1)] {
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, width, 28);
+        app.handle(Action::Open(Open::Search), &provider);
+        draw(&provider, &mut app, width, 28);
+        assert_eq!(
+            app.layers.filter.action_band().height,
+            rows,
+            "{tag}: kept band height at {width}x28"
+        );
+        assert!(
+            app.layers.filter.more_button().is_none(),
+            "{tag}: no overflow"
+        );
+        assert_action_rects_valid(
+            app.layers.filter.action_band(),
+            &[
+                (0, app.layers.filter.action_rects()[0]),
+                (1, app.layers.filter.action_rects()[1]),
+            ],
+            None,
+            &["Apply", "&Clear"],
+            &format!("{tag} {width}x28"),
+        );
+        let rendered = screen(&draw(&provider, &mut app, width, 28));
+        assert!(rendered.contains("[ Apply ]"), "{tag}:\n{rendered}");
+        assert!(rendered.contains("[ Clear ]"), "{tag}:\n{rendered}");
+    }
+}
+
+#[test]
+fn floor_budgets_drop_message_help_only_where_they_must() {
+    // 22x10 (content 16x6): the pair needs two rows, so message/help drop
+    // and both verbs still paint directly. 22x12 (content 16x8): the full
+    // chrome fits, so the help sentence paints while the band stays two.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 22, 10);
+    app.handle(Action::Open(Open::Search), &provider);
+    draw(&provider, &mut app, 22, 10);
+    let floor = screen(&draw(&provider, &mut app, 22, 10));
+    assert!(floor.contains("[ Apply ]"), "{floor}");
+    assert!(floor.contains("[ Clear ]"), "{floor}");
+    assert!(!floor.contains("Examples"), "help drops at 22x10:\n{floor}");
+    assert_eq!(app.layers.filter.action_band().height, 2);
+
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 22, 12);
+    app.handle(Action::Open(Open::Search), &provider);
+    draw(&provider, &mut app, 22, 12);
+    let roomy = screen(&draw(&provider, &mut app, 22, 12));
+    assert!(roomy.contains("[ Apply ]"), "{roomy}");
+    assert!(roomy.contains("[ Clear ]"), "{roomy}");
+    assert!(
+        roomy.contains("Examples"),
+        "help survives at 22x12:\n{roomy}"
+    );
+    assert_eq!(app.layers.filter.action_band().height, 2);
 }

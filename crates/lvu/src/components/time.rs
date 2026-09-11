@@ -20,7 +20,7 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -37,13 +37,15 @@ use crate::component::{
     is_typed_char,
 };
 use crate::components::ask::AskOpen;
-use crate::dialog_controls::{DialogStyles, button_style, button_width, render_button};
+use crate::components::editors::draw_action_menu;
+use crate::dialog_controls::{ButtonRole, render_role_button};
+use crate::dialog_controls::{DialogStyles, button_width, render_button};
+use crate::dialog_layout::{ContextFootprint, DialogSpec, PresentationKind, ScrollViewport};
 use crate::provider::RowId;
 use crate::ui::{
-    FIELD_GUTTER, InputSurface, MESSAGE_SENTENCE_COLUMN, MessageState, clipped_width,
-    dialog_frame_regions, help_rows, message_rows, packed_button_rows, render_action_row,
-    render_help_text, render_message, render_scrollbar, time_input_window, truncated,
-    wrap_sentence,
+    FIELD_GUTTER, InputSurface, MESSAGE_SENTENCE_COLUMN, MessageState, clear_themed, clipped_width,
+    render_help_text, render_message, render_responsive_frame, render_scrollbar, time_input_window,
+    truncated, wrap_sentence,
 };
 use ratatui::widgets::Widget;
 
@@ -213,13 +215,11 @@ pub enum TimeControl {
     Apply,
     Clear,
     Recognize,
-    ScrollUp,
-    ScrollDown,
 }
 
 impl TimeControl {
     pub(crate) fn focusable(
-        has_overflow: bool,
+        _has_overflow: bool,
         start_custom: bool,
         end_custom: bool,
         confirming_field: bool,
@@ -244,9 +244,9 @@ impl TimeControl {
             controls.push(Self::EndZone);
         }
         controls.extend([Self::EndZoneMenu, Self::Apply, Self::Clear, Self::Recognize]);
-        if has_overflow {
-            controls.extend([Self::ScrollUp, Self::ScrollDown]);
-        }
+        // §9: the body scrolls under a shared scrollbar with focus reveal; the
+        // retired `▲ Scroll up` / `▼ Scroll down` pseudo-buttons were invisible
+        // focus stops that trapped Tab without painting anything.
         controls
     }
 }
@@ -267,6 +267,45 @@ pub enum TimeDropdown {
 /// editor. One second is included because a chatty stream's quiet periods are
 /// measured in seconds, not minutes.
 const GAP_THRESHOLD_CHOICES: [u64; 7] = [1, 10, 30, 60, 300, 900, 3600];
+
+/// Stable responsive budgets for the Time inspector.
+///
+/// `Contextual::Inspector` against the frozen opening-row anchor: the frame
+/// avoids the referent row when possible (above/below with a one-row gap,
+/// log-centered, shrunk into the larger band, top-biased fallback) and never
+/// chases live selection. Outer size comes from the presentation policy plus
+/// these stable maxima alone — never from the pending reading, recognition
+/// notes or diagnostic length — so valid/invalid/pending frames share one
+/// `frame` and sticky tail origins. `body_content_rows` sizes only the shared
+/// scroll extent; every field/caret/dropdown is reachable through shared body
+/// projection and focus reveal at 80x24, 54x16 and 20x6.
+///
+/// Action/message/help budgets are area-aware (see `responsive_chrome`): one
+/// action row at roomy widths, two where the verbs wrap, with message/help
+/// pre-shed to their floor at short heights so the two-row band survives
+/// degradation with full-width controls.
+///
+/// Hand-rolled budget choice here is presentation-only folding, never query
+/// membership (AGENTS.md).
+fn time_spec(area: Rect, labels: &[&str]) -> DialogSpec {
+    let (message, help, actions) = crate::components::editors::responsive_chrome(
+        area,
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        0,
+        2,
+        1,
+        1,
+        labels,
+    );
+    DialogSpec::new(
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        0,
+        1,
+        message,
+        help,
+        actions,
+    )
+}
 
 #[derive(Clone)]
 enum EitherTimeChoice {
@@ -433,6 +472,9 @@ pub enum TimeHit {
     Control(TimeControl),
     /// A row of the open anchored dropdown, by index into its choice list.
     Choice(usize),
+    /// The `More ▾` button (`None`) or a row of its open overflow menu, by
+    /// ORIGINAL action index into [`ACTION_VERBS`] for `press_action`.
+    More(Option<usize>),
 }
 
 /// Recorded by `render`, consumed by `hit()` (§5.1). Anchored dropdowns are
@@ -442,6 +484,17 @@ pub enum TimeHit {
 struct TimeGeometry {
     controls: Vec<(Rect, TimeControl)>,
     choices: Vec<(Rect, usize)>,
+    /// The painted `More ▾` button rect, if the shared action geometry planned
+    /// one this frame.
+    more_button: Option<Rect>,
+    /// Overflow action indices hidden behind `More ▾` this frame, in display
+    /// order. Event paths read this copy; paint reads the live geometry.
+    more_overflow: Vec<usize>,
+    /// Painted overflow-menu rows with ORIGINAL action indices. Empty unless
+    /// the menu painted.
+    more_rows: Vec<(Rect, usize)>,
+    /// The resolved sticky action band (kept rows after pressure).
+    action_band: Rect,
 }
 
 #[derive(Debug)]
@@ -453,6 +506,12 @@ pub struct TimeDialog {
     geometry: TimeGeometry,
     surface: Surface,
     pub outbox: Outbox<TimeRecognitionRequest>,
+    /// The action-overflow (`More ▾`) menu: open flag, selection as a position
+    /// within the overflow list, and retained scroll offset. Activation routes
+    /// through `press_action` with original action indices.
+    more_open: bool,
+    more_selected: usize,
+    more_first: usize,
 }
 
 impl Default for TimeDialog {
@@ -463,6 +522,9 @@ impl Default for TimeDialog {
             geometry: TimeGeometry::default(),
             surface: Surface::default(),
             outbox: Outbox::new(TIME_OUTBOX_CAP),
+            more_open: false,
+            more_selected: 0,
+            more_first: 0,
         }
     }
 }
@@ -491,6 +553,29 @@ impl TimeDialog {
 
     pub fn choice_rects(&self) -> &[(Rect, usize)] {
         &self.geometry.choices
+    }
+
+    /// The painted `More ▾` button rect, if overflow planned one this frame.
+    /// Tests use this to assert no invented overflow at roomy sizes.
+    pub fn more_button(&self) -> Option<Rect> {
+        self.geometry.more_button
+    }
+
+    /// Painted overflow-menu rows with original action indices. Empty unless
+    /// the menu painted.
+    pub fn more_rows(&self) -> &[(Rect, usize)] {
+        &self.geometry.more_rows
+    }
+
+    /// Whether the overflow menu is open (state, independent of paint).
+    pub fn more_open(&self) -> bool {
+        self.more_open
+    }
+
+    /// The resolved sticky action band (kept rows after pressure). Tests
+    /// assert its height equals the requested budget.
+    pub fn action_band(&self) -> Rect {
+        self.geometry.action_band
     }
 
     /// Recognizer output for the open dialog. Fenced: a report for a dialog
@@ -708,6 +793,9 @@ impl TimeDialog {
             field_error: None,
         };
         self.geometry = TimeGeometry::default();
+        self.more_open = false;
+        self.more_selected = 0;
+        self.more_first = 0;
         if let Some(view_id) = ctx.views.active_id().map(str::to_owned) {
             let _ = self.outbox.push(TimeRecognitionRequest {
                 generation,
@@ -747,14 +835,73 @@ impl TimeDialog {
             self.state.pending_field.is_some(),
             self.state.pending_text_column_present(),
         );
+        if controls.is_empty() {
+            return;
+        }
         let at = controls
             .iter()
             .position(|item| *item == self.state.focus)
             .unwrap_or(0);
+        // Focus may land on an action the last render hid behind `More ▾`;
+        // that is not an invisible stop, because the More button owns the
+        // focus ring then and Enter opens the menu (see `open_focused`).
+        // Hidden actions stay directly reachable through their mnemonics too.
         self.state.focus =
             controls[(at as isize + delta as isize).rem_euclid(controls.len() as isize) as usize];
         self.state.segment_cursor = usize::MAX;
         self.state.reveal_focus = true;
+    }
+
+    /// The overflow menu drives while it is active: selection wraps over the
+    /// stored overflow list, activation routes through `press_action` with the
+    /// ORIGINAL action index so a menu item runs exactly what its button
+    /// would.
+    fn more_active(&self) -> bool {
+        self.more_open && !self.geometry.more_overflow.is_empty()
+    }
+
+    fn open_more(&mut self, select: Option<usize>) {
+        if self.geometry.more_overflow.is_empty() {
+            return;
+        }
+        self.more_open = true;
+        let len = self.geometry.more_overflow.len();
+        self.more_selected = select
+            .and_then(|index| {
+                self.geometry
+                    .more_overflow
+                    .iter()
+                    .position(|&item| item == index)
+            })
+            .unwrap_or(0)
+            .min(len - 1);
+        self.more_first = 0;
+    }
+
+    fn move_more(&mut self, delta: i32) {
+        let len = self.geometry.more_overflow.len();
+        if len == 0 {
+            return;
+        }
+        self.more_selected = (self.more_selected as i32 + delta).rem_euclid(len as i32) as usize;
+    }
+
+    fn activate_more(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
+        let selected = self.more_selected;
+        self.more_open = false;
+        match self.geometry.more_overflow.get(selected).copied() {
+            Some(index) => self.press_action(index, ctx),
+            None => Outcome::Consumed,
+        }
+    }
+
+    fn action_index(control: TimeControl) -> Option<usize> {
+        match control {
+            TimeControl::Apply => Some(0),
+            TimeControl::Clear => Some(1),
+            TimeControl::Recognize => Some(2),
+            _ => None,
+        }
     }
 
     fn focus_control(&mut self, control: TimeControl) {
@@ -772,6 +919,21 @@ impl TimeDialog {
         if self.state.dropdown.is_some() {
             return self.choose(ctx);
         }
+        // Enter on an action the last render hid behind `More ▾` opens the
+        // menu on that action instead of running it blind: the More button
+        // owns the focus ring then. Painted actions run directly below.
+        // (An open menu never reaches here: Enter drives it in `key`.)
+        if let Some(index) = Self::action_index(self.state.focus) {
+            let painted = self
+                .geometry
+                .controls
+                .iter()
+                .any(|(_, control)| *control == self.state.focus);
+            if !painted && self.geometry.more_overflow.contains(&index) {
+                self.open_more(Some(index));
+                return Outcome::Consumed;
+            }
+        }
         let action = match self.state.focus {
             TimeControl::Basis
             | TimeControl::Window
@@ -786,8 +948,6 @@ impl TimeDialog {
             TimeControl::Apply => Some(TimeAction::Submit),
             TimeControl::Clear => Some(TimeAction::Clear),
             TimeControl::Recognize => Some(TimeAction::Recognize),
-            TimeControl::ScrollUp => Some(TimeAction::Scroll(-1)),
-            TimeControl::ScrollDown => Some(TimeAction::Scroll(1)),
             TimeControl::StartDate
             | TimeControl::StartClock
             | TimeControl::StartZone
@@ -995,14 +1155,6 @@ impl TimeDialog {
                 let choices = time_zone_choices().len() + 1;
                 self.state.highlighted = (self.state.highlighted as isize + delta as isize)
                     .rem_euclid(choices as isize) as usize;
-            }
-            None if matches!(
-                self.state.focus,
-                TimeControl::ScrollUp | TimeControl::ScrollDown
-            ) =>
-            {
-                self.state.scroll = self.state.scroll.saturating_add_signed(delta as isize);
-                self.state.reveal_focus = false;
             }
             None => {}
         }
@@ -1490,7 +1642,6 @@ enum TimeAction {
     Submit,
     Clear,
     Recognize,
-    Scroll(i32),
 }
 
 impl TimeDialog {
@@ -1511,10 +1662,6 @@ impl TimeDialog {
             TimeAction::Recognize => {
                 self.open = false;
                 Outcome::Replace(Open::Ask(AskOpen::Task(AskTask::TimestampColumn)))
-            }
-            TimeAction::Scroll(delta) => {
-                self.scroll_body(delta);
-                Outcome::Consumed
             }
         }
     }
@@ -1537,8 +1684,30 @@ impl TimeDialog {
                 _ => None,
             };
             if let Some(command) = command {
+                self.more_open = false;
                 self.edit_command(command, ctx);
                 return Outcome::Consumed;
+            }
+        }
+        // The overflow menu is transient: while it is active its own arrows
+        // and Enter drive it — even from a focused segment — and any other
+        // key dismisses it first and then processes normally.
+        if self.more_active() {
+            match key.code {
+                KeyCode::Up => {
+                    self.move_more(-1);
+                    return Outcome::Consumed;
+                }
+                KeyCode::Down => {
+                    self.move_more(1);
+                    return Outcome::Consumed;
+                }
+                KeyCode::Enter => {
+                    return self.activate_more(ctx);
+                }
+                _ => {
+                    self.more_open = false;
+                }
             }
         }
         if self.editing_segment().is_some() && key.modifiers.is_empty() {
@@ -1553,6 +1722,12 @@ impl TimeDialog {
                 self.edit_command(command, ctx);
                 return Outcome::Consumed;
             }
+        }
+        // The overflow menu is transient: Up/Down/Enter drive it while it is
+        // active; any other key dismisses it first and then processes
+        // normally, so typing never lands behind an open menu.
+        if self.more_open && !matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter) {
+            self.more_open = false;
         }
         match key.code {
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1739,18 +1914,49 @@ impl TimeDialog {
                     self.state.highlighted = index;
                     self.choose(ctx)
                 }
+                // A drawn overflow menu owns its clicks: rows activate through
+                // `press_action`, its button toggles it shut, and anything
+                // else dismisses it — the dialog underneath is not clickable
+                // through it. (`hit` only yields menu rows from a painted
+                // menu, so no drawn-check is needed here.)
+                Some(TimeHit::More(Some(index))) => {
+                    self.more_open = false;
+                    self.press_action(index, ctx)
+                }
+                Some(TimeHit::More(None)) if !self.geometry.more_rows.is_empty() => {
+                    self.more_open = false;
+                    Outcome::Consumed
+                }
+                Some(TimeHit::More(None)) => {
+                    self.open_more(None);
+                    Outcome::Consumed
+                }
                 Some(TimeHit::Control(control)) => {
+                    if self.more_open {
+                        // Dismiss the menu instead of focusing through it.
+                        self.more_open = false;
+                        return Outcome::Consumed;
+                    }
                     self.focus_control(control);
                     self.open_focused(ctx)
                 }
-                None => Outcome::Consumed,
+                None => {
+                    if self.more_open {
+                        self.more_open = false;
+                    }
+                    Outcome::Consumed
+                }
             },
             MouseEventKind::ScrollUp => {
-                self.scroll_body(-1);
+                if self.geometry.more_rows.is_empty() {
+                    self.scroll_body(-1);
+                }
                 Outcome::Consumed
             }
             MouseEventKind::ScrollDown => {
-                self.scroll_body(1);
+                if self.geometry.more_rows.is_empty() {
+                    self.scroll_body(1);
+                }
                 Outcome::Consumed
             }
             _ => Outcome::Consumed,
@@ -2207,14 +2413,29 @@ fn time_editor_layout<'a>(
 }
 
 impl TimeDialog {
+    /// Record one authoritative frame: every rect below drove paint this
+    /// frame, so hit-testing, cursors and selection agree with it (§5.1).
+    /// The wide parameter list mirrors the other geometry recorders here.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         controls: Vec<(Rect, TimeControl)>,
         choices: Vec<(Rect, usize)>,
+        more_button: Option<Rect>,
+        more_overflow: Vec<usize>,
+        more_rows: Vec<(Rect, usize)>,
+        action_band: Rect,
         caret: Option<(u16, u16)>,
         surface: Surface,
     ) -> Surface {
-        self.geometry = TimeGeometry { controls, choices };
+        self.geometry = TimeGeometry {
+            controls,
+            choices,
+            more_button,
+            more_overflow,
+            more_rows,
+            action_band,
+        };
         self.surface = Surface { caret, ..surface };
         self.surface
     }
@@ -2241,6 +2462,12 @@ impl Component for TimeDialog {
             // dropdown absorbs it rather than the whole dialog.
             Event::Dismiss => {
                 if self.state.dropdown.take().is_some() {
+                    return Outcome::Consumed;
+                }
+                // §10 frontmost-first: the overflow menu closes before the
+                // dialog it hangs from.
+                if self.more_open {
+                    self.more_open = false;
                     return Outcome::Consumed;
                 }
                 self.open = false;
@@ -2277,6 +2504,10 @@ impl Component for TimeDialog {
     }
 
     fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        // Any press dismisses the transient overflow menu first — including
+        // the menu's own items, which arrive here with original indices into
+        // `ACTION_VERBS` and run exactly what their buttons would.
+        self.more_open = false;
         match ACTION_VERBS.get(index) {
             Some(action) => self.run(*action, ctx),
             None => Outcome::Ignored,
@@ -2290,10 +2521,23 @@ impl Component for TimeDialog {
 
     fn hit(&self, point: (u16, u16)) -> Option<TimeHit> {
         // The anchored dropdown is drawn last and takes the point first.
+        // A drawn overflow menu sits above the dialog frame: its rows, then
+        // its button, mirroring paint order. Undrawn overlays claim nothing.
         self.geometry
             .choices
             .iter()
             .find_map(|(rect, index)| contains(*rect, point).then_some(TimeHit::Choice(*index)))
+            .or_else(|| {
+                self.geometry.more_rows.iter().find_map(|(rect, index)| {
+                    contains(*rect, point).then_some(TimeHit::More(Some(*index)))
+                })
+            })
+            .or_else(|| {
+                self.geometry
+                    .more_button
+                    .filter(|rect| contains(*rect, point))
+                    .map(|_| TimeHit::More(None))
+            })
             .or_else(|| {
                 self.geometry.controls.iter().find_map(|(rect, control)| {
                     contains(*rect, point).then_some(TimeHit::Control(*control))
@@ -2302,7 +2546,6 @@ impl Component for TimeDialog {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
-        use crate::dialog_layout::{DialogClass, DialogContent, content_width};
         use {TimeControl as C, TimeDropdown as D, TimeWindowChoice as W};
         let theme = ctx.theme;
         let styles = DialogStyles::new(theme);
@@ -2426,14 +2669,20 @@ impl Component for TimeDialog {
         } else {
             (MessageState::Applied, applied)
         };
-        let width = content_width(area, DialogClass::M);
+        let (policy_width, _) = crate::dialog_layout::policy_size(
+            area,
+            PresentationKind::Contextual(ContextFootprint::Inspector),
+        );
+        let width = policy_width.saturating_sub(4).max(1);
         // §7.4 caps the message at two rows, but a rejected window carries a long
         // diagnostic. When it does not fit, the full text becomes body content so
         // the body's own scroll reaches it; clipping it away is not an inspection
         // path.
         let message_width = usize::from(width.saturating_sub(MESSAGE_SENTENCE_COLUMN)).max(1);
         let wrapped_message = wrap_sentence(&sentence, message_width, usize::MAX);
-        let message_overflows = wrapped_message.len() > usize::from(message_rows(&sentence, width));
+        // Overflow against the stable two-row cap, measured at this viewport's
+        // policy width so the scroll extent matches what is painted.
+        let message_overflows = wrapped_message.len() > 2;
         let diagnostic_lines: Vec<String> = if message_overflows {
             wrap_sentence(
                 &sentence,
@@ -2443,7 +2692,10 @@ impl Component for TimeDialog {
         } else {
             Vec::new()
         };
-        // Measure the body at the class content width before the popup exists.
+        // Measure the body at the policy content width before the popup exists.
+        // The frame width that `resolve_dialog` returns derives from the same
+        // policy, so the painting layout below (at the resolved content width)
+        // keeps the same wide/narrow branch and row numbers.
         let measured = time_editor_layout(
             Rect::new(0, 0, width, 1),
             &dialog,
@@ -2453,37 +2705,45 @@ impl Component for TimeDialog {
             display.as_str(),
             reading_value.as_str(),
         );
-        let diagnostic_rows = if diagnostic_lines.is_empty() {
-            0
+        let diagnostic_extra = if diagnostic_lines.is_empty() {
+            0usize
         } else {
-            u16::try_from(diagnostic_lines.len())
-                .unwrap_or(u16::MAX)
-                .saturating_add(2)
+            diagnostic_lines.len().saturating_add(2)
         };
+        let content_rows = usize::from(measured.height).saturating_add(diagnostic_extra);
         let action_labels = action_labels(ascii);
-        let content = DialogContent {
-            header: 0,
-            body: measured.height.saturating_add(diagnostic_rows),
-            message: message_rows(&sentence, width),
-            help: help_rows(reason, width),
-            actions: packed_button_rows(width, &action_labels),
+        let spec = time_spec(area, &action_labels);
+        let Ok(geometry) = crate::dialog_layout::resolve_dialog(
+            area,
+            &spec,
+            content_rows,
+            &action_labels,
+            Some(0),
+            ctx.context_anchor,
+        ) else {
+            // Below the 20x6 floor the tiny fallback owns the frame; stay open
+            // with nothing drawn, as the palette does.
+            self.geometry = TimeGeometry::default();
+            self.surface = Surface::default();
+            return self.surface;
         };
-        let regions =
-            dialog_frame_regions(frame, area, DialogClass::M, "Time window", &content, theme);
-        // §5.2 containment is measured against everything the layer drew. An
-        // anchored dropdown is allowed to extend past the dialog (§5.3), so the
-        // popup rect is the union; `interior` stays the dialog's, because that is
-        // the text-selection surface.
+        render_responsive_frame(frame, &geometry, "Time window", true, theme);
+        // One authoritative geometry for frame/anatomy/body/actions; the open
+        // anchored dropdown joins `popup` below through its own shared
+        // geometry. While open it also owns the text selection bound, as the
+        // editors' completion does.
         let mut surface = Surface {
-            popup: regions.popup,
-            interior: regions.interior,
+            popup: geometry.frame,
+            interior: geometry.interior,
             caret: None,
-            scrollable: true,
+            scrollable: geometry.body.overflow() > 0,
             text_focus: self.editing_segment().is_some(),
         };
-        let inner = regions.content;
+        // Painting layout at the resolved content width (matches the measured
+        // width by construction above, so row numbers agree).
+        let content_width = geometry.content.width.max(1);
         let time_layout = time_editor_layout(
-            Rect::new(inner.x, inner.y, inner.width, 1),
+            Rect::new(0, 0, content_width, 1),
             &dialog,
             basis.as_str(),
             window.as_str(),
@@ -2491,43 +2751,42 @@ impl Component for TimeDialog {
             display.as_str(),
             reading_value.as_str(),
         );
-        // §9: the body scrolls under a scrollbar; the `▲ Scroll up` /
-        // `▼ Scroll down` pseudo-buttons are retired.
-        let body_height = time_layout.height.saturating_add(diagnostic_rows);
-        let overflowing = body_height > regions.body.height;
-        let viewport = Rect::new(
-            regions.body.x,
-            regions.body.y,
-            regions.body.width.saturating_sub(u16::from(overflowing)),
-            regions.body.height,
-        );
-        let max_scroll = usize::from(body_height.saturating_sub(viewport.height));
+        // Shared body projection: one scroll viewport drives paint, caret
+        // reveal, scrollbar and mouse. The focus row is revealed on Tab/field
+        // jumps (`reveal_focus`); wheel scrolling clears that flag and keeps
+        // its own offset.
+        let mut body = ScrollViewport::new(geometry.body.viewport, content_rows, dialog.scroll);
         let focus_row = time_layout
             .controls
             .iter()
             .find(|(_, control)| *control == dialog.focus)
             .map(|(rect, _)| usize::from(rect.y));
-        let mut scroll = dialog.scroll.min(max_scroll);
         if dialog.reveal_focus
             && let Some(focus_row) = focus_row
         {
-            if focus_row < scroll {
-                scroll = focus_row;
-            }
-            if focus_row >= scroll.saturating_add(usize::from(viewport.height)) {
-                scroll = focus_row + 1 - usize::from(viewport.height);
-            }
+            body =
+                ScrollViewport::new(geometry.body.viewport, content_rows, body.reveal(focus_row));
         }
-        self.state.scroll = scroll;
+        self.state.scroll = body.first_row;
         self.state.reveal_focus = false;
-        self.state.has_overflow = max_scroll > 0;
+        self.state.has_overflow = body.overflow() > 0;
+        surface.scrollable = body.overflow() > 0;
+        // Project a logical content rect (x from the component layout, y a
+        // logical row) into the shared viewport. The same rects drive paint,
+        // caret, selection and mouse; an off-screen row gets no hitbox.
         let project = |rect: Rect| {
             let y = usize::from(rect.y);
-            (y >= scroll && y < scroll + usize::from(viewport.height)).then(|| {
+            let first = body.first_row;
+            let height = usize::from(body.viewport.height);
+            (y >= first && y < first.saturating_add(height)).then(|| {
                 Rect::new(
-                    viewport.x + rect.x,
-                    viewport.y + (y - scroll) as u16,
-                    rect.width.min(viewport.width.saturating_sub(rect.x)),
+                    body.viewport.x.saturating_add(rect.x),
+                    body.viewport.y.saturating_add((y - first) as u16),
+                    rect.width.min(
+                        body.viewport
+                            .width
+                            .saturating_sub(rect.x.min(body.viewport.width)),
+                    ),
                     1,
                 )
             })
@@ -2644,7 +2903,7 @@ impl Component for TimeDialog {
             );
         }
         if !diagnostic_lines.is_empty() {
-            let heading = Rect::new(0, time_layout.height.saturating_add(1), viewport.width, 1);
+            let heading = Rect::new(0, time_layout.height.saturating_add(1), content_width, 1);
             if let Some(rect) = project(heading) {
                 frame.render_widget(
                     Paragraph::new("Diagnostics").style(styles.label.add_modifier(Modifier::BOLD)),
@@ -2658,9 +2917,7 @@ impl Component for TimeDialog {
                         .height
                         .saturating_add(2)
                         .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
-                    viewport
-                        .width
-                        .saturating_sub(crate::dialog_layout::PANE_INDENT),
+                    content_width.saturating_sub(crate::dialog_layout::PANE_INDENT),
                     1,
                 );
                 if let Some(rect) = project(logical) {
@@ -2668,37 +2925,93 @@ impl Component for TimeDialog {
                 }
             }
         }
-        if overflowing {
-            render_scrollbar(
+        if let Some(bar) = body.scrollbar {
+            render_scrollbar(frame, bar, body.first_row, body.overflow(), theme, ascii);
+        }
+        render_message(frame, geometry.message, state_word, &sentence, theme, ascii);
+        render_help_text(frame, geometry.help, reason, theme);
+        // §3: the actions live in the shared sticky band, after the fields they
+        // act on. One action geometry drives paint and hitboxes. The live
+        // overflow list and More button rect flow into `record` with the rest
+        // of this frame's geometry; event paths between renders read that
+        // recorded copy.
+        let live_overflow = geometry.actions.overflow.clone();
+        let live_more_button = geometry.actions.more;
+        let action_controls = [C::Apply, C::Clear, C::Recognize];
+        let focused_action = Self::action_index(dialog.focus);
+        // A focused action hidden behind `More ▾` maps its focus ring onto the
+        // More button: Tab never lands invisibly.
+        let hidden_focused = focused_action.is_some_and(|index| live_overflow.contains(&index));
+        for (index, rect) in &geometry.actions.buttons {
+            if let (Some(label), Some(control)) =
+                (action_labels.get(*index), action_controls.get(*index))
+            {
+                let role = if Some(*index) == geometry.actions.default {
+                    ButtonRole::Default
+                } else {
+                    ButtonRole::Normal
+                };
+                render_role_button(
+                    frame,
+                    *rect,
+                    label,
+                    role,
+                    focused_action == Some(*index),
+                    theme,
+                );
+                controls_hit.push((*rect, *control));
+            }
+        }
+        if let Some(more) = geometry.actions.more {
+            render_role_button(
                 frame,
-                Rect::new(
-                    regions.body.right().saturating_sub(1),
-                    regions.body.y,
-                    1,
-                    regions.body.height,
-                ),
-                scroll,
-                max_scroll,
+                more,
+                crate::dialog_controls::MORE_LABEL,
+                ButtonRole::Normal,
+                self.more_open || hidden_focused,
                 theme,
-                ascii,
             );
         }
-        render_message(frame, regions.message, state_word, &sentence, theme, ascii);
-        render_help_text(frame, regions.help, reason, theme);
-        // §3: the actions live in their own region, after the fields they act on.
-        let action_controls = [C::Apply, C::Clear, C::Recognize];
-        let focused_action = action_controls
-            .iter()
-            .position(|control| *control == dialog.focus);
-        for (index, rect) in render_action_row(
-            frame,
-            regions.actions,
-            &action_labels,
-            focused_action,
-            &[],
-            theme,
-        ) {
-            controls_hit.push((rect, action_controls[index]));
+        // Action overflow (`More ▾`) menu, painted before the dropdown so
+        // paint order matches hit-test order (dropdown first). Labels and
+        // roles parallel `action_labels`/`action_controls` in original index
+        // order; activation routes through `press_action`.
+        let mut more_rows = Vec::new();
+        if self.more_open && !live_overflow.is_empty() {
+            if let Some(anchor) = live_more_button {
+                let len = live_overflow.len();
+                let sel = self.more_selected.min(len - 1);
+                let roles = [ButtonRole::Default, ButtonRole::Normal, ButtonRole::Normal];
+                let (popup, rows, first, overflows) = draw_action_menu(
+                    frame,
+                    area,
+                    anchor,
+                    &action_labels,
+                    &roles,
+                    &live_overflow,
+                    sel,
+                    self.more_first,
+                    theme,
+                    ascii,
+                );
+                self.more_selected = sel;
+                self.more_first = first;
+                if !popup.is_empty() {
+                    surface.popup = surface.popup.union(popup);
+                    surface.interior = popup.inner(ratatui::layout::Margin::new(1, 1));
+                    surface.scrollable = surface.scrollable || overflows;
+                    more_rows = rows;
+                } else {
+                    // Refused placement (no gap-honoring bands): the menu
+                    // cannot show, so it is not open.
+                    self.more_open = false;
+                }
+            } else {
+                self.more_open = false;
+            }
+        } else {
+            // Overflow gone (regrew wider) means the menu has nothing to show.
+            self.more_open = false;
         }
         if let Some(dropdown) = dialog.dropdown {
             let choices: Vec<String> = match dropdown {
@@ -2741,7 +3054,14 @@ impl Component for TimeDialog {
                     .collect(),
             };
             let selected = dialog.highlighted.min(choices.len().saturating_sub(1));
-            let anchor = time_layout
+            // Anchored class A from the actual field rect: the logical input
+            // rect for this dropdown, projected through the same shared body
+            // viewport that painted it. Below preferred with a one-row gap,
+            // above when below cannot fit, edge-clamped, max eight rows with
+            // scroll and display-width rules. One geometry drives paint,
+            // scrollbar, selection and mouse; no manual popup rect and no
+            // component `Clear` beyond the shared themed clear.
+            let logical_anchor = time_layout
                 .controls
                 .iter()
                 .find(|(_, control)| {
@@ -2756,89 +3076,128 @@ impl Component for TimeDialog {
                         }
                 })
                 .map_or(Rect::default(), |(rect, _)| *rect);
-            let anchor_y = viewport.y + usize::from(anchor.y).saturating_sub(scroll) as u16;
-            let w = choices
-                .iter()
-                .map(|s| s.as_str().width())
-                .max()
-                .unwrap_or(1) as u16
-                + 4;
-            // §10: an anchored popup is not a dialog. It is drawn last and may
-            // extend past the dialog it belongs to, so it is bounded by the frame
-            // rather than by a body that now follows its content.
-            let frame_area = area;
-            let box_width = w.min(frame_area.width).max(3.min(frame_area.width));
-            let dropdown_x = viewport
-                .x
-                .saturating_add(anchor.x)
-                .min(frame_area.right().saturating_sub(box_width));
-            let below = frame_area
-                .bottom()
-                .saturating_sub(anchor_y.saturating_add(1));
-            let above = anchor_y.saturating_sub(frame_area.y);
-            // §5.1 class A: at most eight options plus the border.
-            let desired_height = (choices.len().min(8) as u16 + 2).min(frame_area.height);
-            let place_below = below >= desired_height || below >= above;
-            let available = if place_below { below } else { above };
-            let mut box_height = desired_height.min(available);
-            let mut dropdown_y = if place_below {
-                anchor_y.saturating_add(1)
-            } else {
-                anchor_y.saturating_sub(box_height)
+            let Some(field_rect) = project(logical_anchor) else {
+                // The field scrolled out of the shared viewport: the popup has
+                // no anchor to hang from, so draw the frame without it rather
+                // than a detached list.
+                return self.record(
+                    controls_hit,
+                    choices_hit,
+                    live_more_button,
+                    live_overflow,
+                    more_rows,
+                    geometry.actions.band,
+                    caret_cell,
+                    surface,
+                );
             };
-            if box_height < 3 && frame_area.height >= 3 {
-                box_height = desired_height.min(frame_area.height).max(3);
-                dropdown_y = anchor_y
-                    .saturating_add(1)
-                    .min(frame_area.bottom().saturating_sub(box_height))
-                    .max(frame_area.y);
-            }
-            let box_area = Rect::new(dropdown_x, dropdown_y, box_width, box_height);
-            if box_area.width < 3 || box_area.height < 3 {
-                return self.record(controls_hit, choices_hit, caret_cell, surface);
+            let preferred = choices
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()))
+                .max()
+                .unwrap_or(0);
+            let preferred = u16::try_from(preferred.saturating_add(4)).unwrap_or(u16::MAX);
+            let anchored_spec =
+                crate::dialog_layout::AnchoredSpec::new(choices.len(), None, preferred, 0);
+            let anchored = crate::dialog_layout::anchored_geometry(
+                area,
+                field_rect,
+                &anchored_spec,
+                selected,
+                0,
+            );
+            let box_area = anchored.popup;
+            // Class-A contract (see `draw_editor_completion_anchored`): a
+            // placement that sacrificed the one-row gap to stay in-area covers
+            // its own anchor, so the frame is drawn without the popup rather
+            // than with a detached-or-covering list. Hit-testing falls through
+            // to the controls naturally via the empty `choices_hit`.
+            let gap_below = box_area.y == field_rect.bottom().saturating_add(1);
+            let gap_above = box_area.bottom().saturating_add(1) == field_rect.y;
+            if box_area.width < 3 || box_area.height < 3 || !(gap_below || gap_above) {
+                return self.record(
+                    controls_hit,
+                    choices_hit,
+                    live_more_button,
+                    live_overflow,
+                    more_rows,
+                    geometry.actions.band,
+                    caret_cell,
+                    surface,
+                );
             }
             surface.popup = surface.popup.union(box_area);
-            frame.render_widget(Clear, box_area);
-            let choice_height = usize::from(box_area.height - 2);
-            let choice_scroll = selected.saturating_add(1).saturating_sub(choice_height);
+            // While open the anchored popup owns the text selection bound, as
+            // the editors' completion does, so clicks on its rows contain.
+            surface.interior = box_area.inner(ratatui::layout::Margin::new(1, 1));
+            surface.caret = None;
+            clear_themed(frame, box_area, theme);
             frame.render_widget(
-                List::new(
-                    choices
-                        .iter()
-                        .enumerate()
-                        .skip(choice_scroll)
-                        .map(|(index, value)| {
-                            ListItem::new(value.as_str()).style(if index == selected {
-                                styles.selection
-                            } else {
-                                button_style(theme, false, false)
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(styles.label),
-                ),
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent)),
                 box_area,
             );
-            for (offset, i) in (choice_scroll..choices.len())
-                .take(choice_height)
+            let viewport = anchored.viewport;
+            let row_width = viewport
+                .width
+                .saturating_sub(u16::from(anchored.scrollbar.is_some()));
+            let mut lines = Vec::new();
+            for (offset, (index, value)) in choices
+                .iter()
+                .enumerate()
+                .skip(anchored.first_item)
+                .take(usize::from(viewport.height))
                 .enumerate()
             {
+                let chosen = index == selected;
+                lines.push(ratatui::text::Line::styled(
+                    format!(
+                        "{} {}",
+                        if chosen { ">" } else { " " },
+                        clipped_width(value, usize::from(row_width.saturating_sub(2))),
+                    ),
+                    if chosen {
+                        styles.selection
+                    } else {
+                        styles.description
+                    },
+                ));
                 choices_hit.push((
                     Rect::new(
-                        box_area.x + 1,
-                        box_area.y + 1 + offset as u16,
-                        box_area.width.saturating_sub(2),
+                        viewport.x,
+                        viewport.y.saturating_add(offset as u16),
+                        row_width,
                         1,
                     ),
-                    i,
+                    index,
                 ));
             }
+            if choices.is_empty() {
+                lines.push(ratatui::text::Line::styled(
+                    "(no choices)",
+                    styles.unavailable,
+                ));
+            }
+            frame.render_widget(
+                Paragraph::new(lines),
+                Rect::new(viewport.x, viewport.y, row_width, viewport.height),
+            );
+            if let Some(bar) = anchored.scrollbar {
+                let limit = choices.len().saturating_sub(usize::from(viewport.height));
+                render_scrollbar(frame, bar, anchored.first_item, limit, theme, ascii);
+            }
         }
-        self.record(controls_hit, choices_hit, caret_cell, surface)
+        self.record(
+            controls_hit,
+            choices_hit,
+            live_more_button,
+            live_overflow,
+            more_rows,
+            geometry.actions.band,
+            caret_cell,
+            surface,
+        )
     }
 }
 
@@ -2849,6 +3208,8 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
 impl TimeDialog {
     /// A palette command reaches the layer as `Event::Command` (§4.3).
     fn command(&mut self, id: CommandId, ctx: &mut Ctx<'_>) -> Outcome {
+        // Palette commands act on the dialog, dismissing the transient menu.
+        self.more_open = false;
         match id {
             CommandId::TimeClear => self.clear(ctx),
             CommandId::TimeAroundSelected => {

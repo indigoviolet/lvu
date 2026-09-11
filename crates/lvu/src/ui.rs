@@ -2315,6 +2315,11 @@ pub(crate) fn render_enrichment_button(
 /// rect and the row rects it painted, so the owner records exactly what was
 /// drawn: the two layers that offer completion — Advanced and the enrichment
 /// step editor — each keep them in their own geometry (§5.1).
+///
+/// Legacy centered variant retained for the enrichment step editor until its
+/// owner migrates to the anchored form below. New callers must use
+/// [`draw_editor_completion_anchored`], which places the popup from the actual
+/// field rect through shared [`crate::dialog_layout::anchored_geometry`].
 pub(crate) fn draw_editor_completion(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2383,6 +2388,149 @@ pub(crate) fn draw_editor_completion(
         sections[1],
     );
     (popup, rows)
+}
+
+/// Anchored completion popup for the contextual editors.
+///
+/// Class A through shared [`crate::dialog_layout::anchored_geometry`]: placed
+/// from the actual `field` rect with a one-row gap below preferred (above when
+/// below cannot fit, edge-clamped in x), at most eight item rows plus border
+/// and a one-row status footer, scrolling when neither side holds the desired
+/// rows. Preferred width is the longest option's display width plus four (min
+/// 12). The popup is bounded by `area` — the full render frame, so it may
+/// overhang its parent dialog — and the caller keeps `Surface.popup` as the
+/// exact union. One geometry drives paint, the returned row hitboxes, the
+/// scrollbar and the footer, so cursor/selection/mouse agree. No centered
+/// fallback and no manual popup rect. Returns the popup rect, the painted row
+/// hitboxes, and whether the item list overflows its viewport (scrollbar
+/// shown); callers derive `Surface.scrollable` from real overflow instead of
+/// asserting it.
+///
+/// Class-A contract, enforced here: exactly one blank row separates the field
+/// from the popup border. When neither band holds even the shrunken minimum,
+/// the shared placement keeps the popup in-area by sliding it over the field;
+/// painting that would cover the anchor the popup explains, so nothing is
+/// painted instead — empty rect, no rows, no overflow claim. Callers treat an
+/// empty popup as "not drawn" for containment, selection and mouse.
+//
+// Hand-rolled row painting here is presentation-only folding: it maps the
+// shared anchored viewport rows to painted cells, never query membership
+// (AGENTS.md: the query engine computes, the app names/presents).
+pub(crate) fn draw_editor_completion_anchored(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    field: Rect,
+    completion: &crate::app::EditorCompletionState,
+    theme: Theme,
+    ascii: bool,
+) -> (Rect, Vec<(Rect, usize)>, bool) {
+    let longest = completion
+        .items
+        .iter()
+        .map(|item| UnicodeWidthStr::width(item.label.as_str()))
+        .max()
+        .unwrap_or(0);
+    let preferred = u16::try_from(longest.saturating_add(4)).unwrap_or(u16::MAX);
+    let spec = crate::dialog_layout::AnchoredSpec::new(completion.items.len(), None, preferred, 1);
+    let geometry = crate::dialog_layout::anchored_geometry(
+        area,
+        field,
+        &spec,
+        completion.selected,
+        completion.top,
+    );
+    let popup = geometry.popup;
+    let mut rows: Vec<(Rect, usize)> = Vec::new();
+    // See the contract note above: a popup that cannot keep its one-row gap
+    // to the field is not painted at all.
+    let gap_below = popup.y == field.bottom().saturating_add(1);
+    let gap_above = popup.bottom().saturating_add(1) == field.y;
+    if popup.width < 3 || popup.height < 3 || !(gap_below || gap_above) {
+        return (Rect::default(), Vec::new(), false);
+    }
+    clear_themed(frame, popup, theme);
+    let styles = DialogStyles::new(theme);
+    frame.render_widget(
+        Block::default()
+            .title(match completion.kind {
+                crate::app::EditorCompletionKind::Field => " Complete field ",
+                crate::app::EditorCompletionKind::SampledValue => {
+                    " Static sampled string literals "
+                }
+            })
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent)),
+        popup,
+    );
+    let viewport = geometry.viewport;
+    if viewport.width == 0 || viewport.height == 0 {
+        return (Rect::default(), Vec::new(), false);
+    }
+    let row_width = viewport
+        .width
+        .saturating_sub(u16::from(geometry.scrollbar.is_some()));
+    if completion.items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("(no sampled completions)").style(styles.unavailable),
+            Rect::new(viewport.x, viewport.y, row_width, 1.min(viewport.height)),
+        );
+    } else {
+        let visible = usize::from(viewport.height);
+        let mut lines = Vec::new();
+        for (offset, (index, item)) in completion
+            .items
+            .iter()
+            .enumerate()
+            .skip(geometry.first_item)
+            .take(visible)
+            .enumerate()
+        {
+            let selected = index == completion.selected;
+            lines.push(Line::styled(
+                format!(
+                    "{} {}",
+                    if selected { ">" } else { " " },
+                    clipped_width(&item.label, usize::from(row_width.saturating_sub(2)))
+                ),
+                if selected {
+                    styles.selection
+                } else {
+                    styles.description
+                },
+            ));
+            rows.push((
+                Rect::new(
+                    viewport.x,
+                    viewport.y.saturating_add(offset as u16),
+                    row_width,
+                    1,
+                ),
+                index,
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect::new(viewport.x, viewport.y, row_width, viewport.height),
+        );
+        if let Some(bar) = geometry.scrollbar {
+            let limit = completion
+                .items
+                .len()
+                .saturating_sub(usize::from(viewport.height));
+            render_scrollbar(frame, bar, geometry.first_item, limit, theme, ascii);
+        }
+    }
+    if geometry.footer.height > 0 && geometry.footer.width > 0 {
+        frame.render_widget(
+            Paragraph::new(clipped_width(
+                &completion.status,
+                usize::from(geometry.footer.width),
+            ))
+            .style(styles.description),
+            geometry.footer,
+        );
+    }
+    (popup, rows, geometry.scrollbar.is_some())
 }
 
 /// §12.7. Rows the proposal preview keeps for its own border and heading.
