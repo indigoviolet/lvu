@@ -13316,7 +13316,7 @@ root = \"/tmp/elsewhere\"\n",
         assert!(snapshot.advanced_error.is_none());
         assert!(snapshot.grouping_error.is_none());
 
-        composition.memory.stop();
+        composition.memory.stop().expect("memory worker stops");
         for (_, stopped) in manager.shutdown().await {
             assert!(stopped.unwrap().complete);
         }
