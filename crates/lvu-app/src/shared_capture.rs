@@ -1134,40 +1134,66 @@ async fn recover_union_commit(
         }
         let remaining = deadline - now;
         let attempt = remaining.min(UNION_COMMIT_ATTEMPT_TIMEOUT);
-        let commit = tokio::time::timeout(attempt, async {
+        // Deadline discipline: the outer bound is the remaining absolute
+        // deadline (covering the client-mutex wait plus the RPC) while the
+        // inner attempt stays min(10s, remaining). On every nonfinal
+        // attempt the outer bound is strictly greater, so a timeout is
+        // always the inner recoverable one: it records the attempt stale
+        // and releases the exchange before reporting, which keeps late
+        // replies drainable and the connection reusable. An outer win
+        // would instead cancel the exchange mid-flight — no stale record,
+        // `in_flight` stuck — and the next exchange would retire on the
+        // shifted stream; that failure mode was measured as a full-deadline
+        // spin, so the bounds must never coincide before the deadline.
+        // Only the final attempt can meet the outer bound, and there
+        // cancellation is terminal: the deadline error returns at once
+        // with no recovery following it.
+        let commit = tokio::time::timeout(remaining, async {
             let mut client = client.lock().await;
             client
                 .request_union_commit(window_id, &request, attempt)
                 .await
         })
         .await;
-        if let Ok(Ok(receipt)) = commit {
-            if receipt.worker_session != expected_session
-                || receipt.union_view_id != request.union_view_id
-                || receipt.candidate_generation != request.candidate_generation
-                || receipt.nonce != request.nonce
-                || receipt.digest != request.digest
-            {
-                // A receipt that does not bind this attempt is worker
-                // confusion, not a slow answer: no status poll from the
-                // same peer could be trusted either, so this fails the
-                // submission loudly rather than adopting or re-deriving.
+        match commit {
+            Ok(Ok(receipt)) => {
+                if receipt.worker_session != expected_session
+                    || receipt.union_view_id != request.union_view_id
+                    || receipt.candidate_generation != request.candidate_generation
+                    || receipt.nonce != request.nonce
+                    || receipt.digest != request.digest
+                {
+                    // A receipt that does not bind this attempt is worker
+                    // confusion, not a slow answer: no status poll from the
+                    // same peer could be trusted either, so this fails the
+                    // submission loudly rather than adopting or re-deriving.
+                    return Err(
+                        "union commit receipt does not bind this attempt; failing closed".into(),
+                    );
+                }
+                match receipt.outcome {
+                    lvu_shared::union_commit::CommitOutcome::Pending => {
+                        // Admitted and verifying: fall through to status
+                        // recovery, which observes settlement with the same
+                        // identity.
+                    }
+                    _ => return Ok(receipt),
+                }
+            }
+            // Inner ambiguity (transport fault or recoverable attempt
+            // timeout): delivery is ambiguous (the worker may still settle
+            // late), so recover by status instead of claiming anything.
+            Ok(Err(_)) => {}
+            // Outer elapsed: the absolute deadline passed mid-attempt, so
+            // this is terminal — no status poll follows a dead deadline.
+            Err(_) => {
                 return Err(
-                    "union commit receipt does not bind this attempt; failing closed".into(),
+                    "remote union commit exceeded its deadline without a terminal receipt".into(),
                 );
             }
-            match receipt.outcome {
-                lvu_shared::union_commit::CommitOutcome::Pending => {
-                    // Admitted and verifying: fall through to status
-                    // recovery, which observes settlement with the same
-                    // identity.
-                }
-                _ => return Ok(receipt),
-            }
         }
-        // Transport fault or attempt timeout: delivery is ambiguous
-        // (the worker may still settle late), so recover by status
-        // instead of claiming anything.
+        // Ambiguous delivery (or an admitted-but-unsettled attempt):
+        // recover by status instead of claiming anything.
         match recover_union_status(client, window_id, &request, deadline).await {
             UnionStatusOutcome::Settled(outcome) => {
                 // The receipt is fully determined by the original request
@@ -1212,7 +1238,12 @@ async fn recover_union_status(
         }
         let remaining = deadline - now;
         let attempt = remaining.min(UNION_STATUS_ATTEMPT_TIMEOUT);
-        let status = tokio::time::timeout(attempt, async {
+        // Same deadline discipline as the commit path: the outer bound is
+        // the remaining absolute deadline while the inner poll stays
+        // min(10s, remaining), so a timeout is always the inner
+        // recoverable one — stale bookkeeping runs, late replies stay
+        // drainable — and only a dead deadline ends the wait.
+        let status = tokio::time::timeout(remaining, async {
             let mut client = client.lock().await;
             client
                 .request_union_status(
@@ -2794,6 +2825,107 @@ mod tests {
         assert!(
             seen.iter().any(|kind| kind == "union_status"),
             "recovery must poll status, saw: {seen:?}"
+        );
+    }
+
+    /// Repeated timeouts keep the connection usable: against a peer that
+    /// drops every frame, each attempt must time out through the INNER
+    /// recoverable bound — never through an outer cancellation racing it
+    /// at the same instant. An outer win would cancel the exchange
+    /// mid-flight (no stale record, `in_flight` stuck), retire the client
+    /// on its next use, and spin the recovery loop on instant failures
+    /// until the absolute deadline: the measured 40s full-deadline spin.
+    /// So after the deadline error the client must still serve: a direct
+    /// status poll reports a fresh ambiguity, never retirement or a stuck
+    /// exchange. Exactly one commit goes out (only `Unknown` replays, and
+    /// no reply ever arrives to say it); the status polls partition the
+    /// rest of the single absolute deadline.
+    #[tokio::test]
+    async fn union_transport_repeated_timeouts_leave_client_usable() {
+        let root = tempfile::tempdir().unwrap();
+        lvu_shared::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (peer, seen) = ScriptedPeer::new();
+        tokio::spawn(peer.serve(listener, move |kind, id| match kind {
+            "hello" => Some(lvu_shared::WorkerEvent::Welcome {
+                request_id: id.into(),
+                worker_pid: 1,
+                protocol: lvu_shared::PROTOCOL_VERSION,
+                worker_session: "session-u".into(),
+                sources: Vec::new(),
+            }),
+            // Every frame is dropped: commit and status alike.
+            _ => None,
+        }));
+        let (client, _) = WorkerClient::connect(root.path(), &socket, "window-u", 6216)
+            .await
+            .expect("connect");
+        let store = SharedStore::from_client(client);
+        let transport = store
+            .union_transport("window-u".into())
+            .expect("transport builds on a live session");
+        let started = std::time::Instant::now();
+        let receiver = <UnionCommitTransport as lvu_view::RemoteUnionCommitTransport>::submit(
+            &transport,
+            "session-u",
+            union_test_commit("window-u"),
+            started + Duration::from_secs(25),
+        )
+        .expect("submit accepts a live deadline");
+        let error = await_submit(receiver, Duration::from_secs(40))
+            .await
+            .expect_err("an all-dropping peer must fail the submission");
+        assert!(
+            error.contains("deadline"),
+            "total silence must end at the absolute deadline: {error}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(25),
+            "the submission must run the full deadline, not fail early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(35),
+            "nothing may run past the deadline plus scheduling slack: {elapsed:?}"
+        );
+        // The discriminator: every timeout above was inner, so the shared
+        // connection is still healthy. A direct poll reports a NEW
+        // ambiguity with stale bookkeeping — retirement or a stuck
+        // in-flight flag would prove an outer cancellation poisoned it.
+        let probe = {
+            let mut client = store.client.lock().await;
+            client
+                .request_union_status(
+                    "window-u",
+                    "union-view-u",
+                    11,
+                    "nonce-11",
+                    &[0xB7; lvu_shared::union_commit::COMMIT_DIGEST_BYTES],
+                    Duration::from_secs(2),
+                )
+                .await
+        };
+        let error = probe.expect_err("dropped poll must stay ambiguous");
+        assert!(
+            error.contains("status poll"),
+            "post-deadline poll must take the recoverable path: {error}"
+        );
+        assert!(
+            !error.contains("retired") && !error.contains("never completed"),
+            "no outer cancellation may have poisoned the connection: {error}"
+        );
+        let seen = seen.lock().expect("seen poisoned");
+        assert_eq!(
+            seen.iter().filter(|kind| *kind == "union_commit").count(),
+            1,
+            "silence is ambiguity, never a replay trigger, saw: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|kind| kind == "union_status"),
+            "recovery must poll status within the deadline, saw: {seen:?}"
         );
     }
 
