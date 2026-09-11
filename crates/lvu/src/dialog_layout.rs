@@ -8,10 +8,13 @@
 
 use ratatui::{
     buffer::Buffer,
-    layout::{Margin, Rect},
+    layout::{Constraint, Flex, Layout, Margin, Rect},
     style::{Color, Style},
+    widgets::{Block, Padding},
 };
+use unicode_width::UnicodeWidthStr;
 
+use crate::dialog_controls::{self, ActionGeometry};
 use crate::theme::Theme;
 
 /// Size classes from §5.1. `A` (anchored popups) is not a dialog: it is placed
@@ -583,4 +586,1072 @@ pub fn anchored_rect(area: Rect, field: Rect, items: usize, width_hint: u16) -> 
     };
     let x = field.x.min(area.right().saturating_sub(width));
     Rect::new(x, y, width, height)
+}
+
+// --- Responsive presentation policy (phase A foundation) ---
+//
+// Centralized, reusable geometry for every dialog. Outer size depends only on
+// the presentation policy plus stable region budgets, never on async item
+// counts or transcript length, so one result drives later render, scroll,
+// cursor, selection and hitbox consumers. Existing `DialogClass` callers keep
+// working through the compatibility adapters below; no component is switched
+// to a new kind in this phase.
+
+/// Tiny floor from `ui::layout`: below this the terminal-too-small fallback
+/// owns the frame and no ordinary dialog is attempted.
+pub const TINY_MIN_WIDTH: u16 = 20;
+/// Tiny floor height (see [`TINY_MIN_WIDTH`]).
+pub const TINY_MIN_HEIGHT: u16 = 6;
+/// Ordinary dialogs leave at least one cell between frame and viewport edge.
+pub const FRAME_INSET_CELLS: u16 = 1;
+
+/// Contextual footprint: a prompt edits one live field, an inspector explains
+/// a frozen visible row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextFootprint {
+    Prompt,
+    Inspector,
+}
+
+/// Responsive presentation kind.
+///
+/// `FullFrame` is reserved for the startup title and the terminal-too-small
+/// fallback; no ordinary dialog adopts it (see [`PresentationKind::is_ordinary`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentationKind {
+    Contextual(ContextFootprint),
+    SelfContainedForm,
+    LongContent,
+    Palette,
+    FullFrame,
+}
+
+impl PresentationKind {
+    /// False only for the reserved [`PresentationKind::FullFrame`].
+    pub fn is_ordinary(&self) -> bool {
+        !matches!(self, Self::FullFrame)
+    }
+
+    /// Top-biased at `H/8`: prompts and the palette stay near the work.
+    pub fn top_biased(&self) -> bool {
+        matches!(
+            self,
+            Self::Contextual(ContextFootprint::Prompt) | Self::Palette
+        )
+    }
+
+    /// Reference mapping from the legacy class. For migration planning only;
+    /// no caller switches kinds through this in phase A.
+    pub fn from_class(class: DialogClass) -> Self {
+        match class {
+            DialogClass::S => Self::Contextual(ContextFootprint::Prompt),
+            DialogClass::M => Self::SelfContainedForm,
+            DialogClass::L => Self::LongContent,
+            DialogClass::P => Self::Palette,
+        }
+    }
+
+    /// (percent, min, max) width tokens, border included.
+    fn width_policy(&self) -> (u16, u16, u16) {
+        match self {
+            Self::Contextual(ContextFootprint::Prompt) => (68, 48, 96),
+            Self::Contextual(ContextFootprint::Inspector) => (82, 64, 144),
+            Self::SelfContainedForm => (78, 64, 120),
+            Self::LongContent => (90, 72, 160),
+            Self::Palette => (64, 50, 96),
+            Self::FullFrame => (100, 0, u16::MAX),
+        }
+    }
+
+    /// (percent, min, max) height tokens, border included.
+    fn height_policy(&self) -> (u16, u16, u16) {
+        match self {
+            Self::Contextual(ContextFootprint::Prompt) => (36, 11, 16),
+            Self::Contextual(ContextFootprint::Inspector) => (62, 14, 36),
+            Self::SelfContainedForm => (58, 14, 36),
+            Self::LongContent => (86, 18, 64),
+            Self::Palette => (60, 12, 30),
+            Self::FullFrame => (100, 0, u16::MAX),
+        }
+    }
+}
+
+/// Percentage share via [`Constraint::Percentage`], so the policy is structural:
+/// rounded to nearest by Ratatui, then clamped by the caller.
+fn percent_share(total: u16, percent: u16) -> u16 {
+    if total == 0 {
+        return 0;
+    }
+    let probe = Rect::new(0, 0, total, 1);
+    Layout::horizontal([Constraint::Percentage(percent)]).split(probe)[0].width
+}
+
+fn percent_height_share(total: u16, percent: u16) -> u16 {
+    if total == 0 {
+        return 0;
+    }
+    let probe = Rect::new(0, 0, 1, total);
+    Layout::vertical([Constraint::Percentage(percent)]).split(probe)[0].height
+}
+
+/// Clamped policy extent for one axis, capped to a one-cell viewport inset.
+fn policy_extent(total: u16, percent: u16, min: u16, max: u16) -> u16 {
+    let share = percent_share(total, percent);
+    let clamped = share.clamp(min.min(max), max);
+    let inset_cap = total.saturating_sub(FRAME_INSET_CELLS.saturating_mul(2));
+    clamped.min(inset_cap.max(1)).max(1).min(total.max(1))
+}
+
+fn policy_height_extent(total: u16, percent: u16, min: u16, max: u16) -> u16 {
+    let share = percent_height_share(total, percent);
+    let clamped = share.clamp(min.min(max), max);
+    let inset_cap = total.saturating_sub(FRAME_INSET_CELLS.saturating_mul(2));
+    clamped.min(inset_cap.max(1)).max(1).min(total.max(1))
+}
+
+/// True below the 20x6 floor: the caller draws the terminal-too-small surface.
+pub fn is_tiny(viewport: Rect) -> bool {
+    viewport.width < TINY_MIN_WIDTH || viewport.height < TINY_MIN_HEIGHT
+}
+
+/// Policy frame size for `kind` on `viewport`.
+///
+/// - Tiny viewports are rejected by the caller (see [`is_tiny`]); this returns
+///   the full frame there so callers never divide by zero.
+/// - Compact (`W < 64 || H < 20`) collapses every ordinary kind to `W-2 x H-2`,
+///   or the full frame when that cannot satisfy the 20x6 safety floor.
+/// - Roomy viewports use percentage/clamp tokens capped to a one-cell inset.
+/// - `FullFrame` always returns the viewport.
+pub fn policy_size(viewport: Rect, kind: PresentationKind) -> (u16, u16) {
+    if matches!(kind, PresentationKind::FullFrame) {
+        return (viewport.width, viewport.height);
+    }
+    if is_tiny(viewport) {
+        return (viewport.width, viewport.height);
+    }
+    if is_compact(viewport) {
+        let width = viewport.width.saturating_sub(2);
+        let height = viewport.height.saturating_sub(2);
+        if width < TINY_MIN_WIDTH || height < TINY_MIN_HEIGHT {
+            return (viewport.width, viewport.height);
+        }
+        return (width.max(1), height.max(1));
+    }
+    let (wp, wmin, wmax) = kind.width_policy();
+    let (hp, hmin, hmax) = kind.height_policy();
+    let width = policy_extent(viewport.width, wp, wmin, wmax)
+        .max(TINY_MIN_WIDTH.min(viewport.width))
+        .min(viewport.width);
+    let height = policy_height_extent(viewport.height, hp, hmin, hmax).min(viewport.height);
+    (width.max(1), height.max(1))
+}
+
+/// Block padding for the dialog frame.
+///
+/// Roomy uses one cell of padding inside the border (total side 2, matching
+/// §4.1 `side`, with top/bottom pad rows); compact drops the vertical pads.
+/// Expressed via [`Block::padding`] so rendering and geometry share it. The
+/// reviewed plan names these totals as `Padding::new(2, 2, 1, 1)`; with
+/// `Block::bordered` the border supplies one cell, so the padding itself is
+/// `Padding::new(1, 1, 1, 1)` roomy and `Padding::new(1, 1, 0, 0)` compact.
+pub fn frame_padding(is_compact_viewport: bool) -> Padding {
+    if is_compact_viewport {
+        Padding::new(1, 1, 0, 0)
+    } else {
+        Padding::new(1, 1, 1, 1)
+    }
+}
+
+/// Shared frame block: bordered in the caller's color, padded per viewport.
+pub fn frame_block(is_compact_viewport: bool) -> Block<'static> {
+    Block::bordered().padding(frame_padding(is_compact_viewport))
+}
+
+/// Frozen opening-row anchor for contextual inspectors (pure seam, unwired).
+///
+/// Captured when the first layer opens and retained across async frames and
+/// `Replace`; it never chases live row movement. `log` is the log viewport
+/// the dialog is centered over horizontally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextAnchor {
+    pub row: Rect,
+    pub log: Rect,
+}
+
+impl ContextAnchor {
+    pub fn new(row: Rect, log: Rect) -> Self {
+        Self { row, log }
+    }
+}
+
+/// Explicit refusal: the viewport cannot hold even the essential anatomy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeometryError {
+    TooSmall,
+}
+
+/// Stable budgets for one dialog.
+///
+/// Width/height come from the presentation policy; these budgets split the
+/// interior. They are maxima chosen when the dialog opens (message/help wrap
+/// caps, action-row cap at two, header presence, body minimum), never live
+/// item counts or transcript length, so the outer frame is identical across
+/// pending/empty/populated/error states.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DialogSpec {
+    pub presentation: PresentationKind,
+    pub header_rows: u16,
+    pub body_min_rows: u16,
+    pub message_rows: u16,
+    pub help_rows: u16,
+    pub action_rows: u16,
+}
+
+impl DialogSpec {
+    /// Budgets are clamped to their stable ranges: header 0..=1, body minimum
+    /// at least 1, message/help/action 0..=2.
+    pub fn new(
+        presentation: PresentationKind,
+        header_rows: u16,
+        body_min_rows: u16,
+        message_rows: u16,
+        help_rows: u16,
+        action_rows: u16,
+    ) -> Self {
+        Self {
+            presentation,
+            header_rows: header_rows.min(1),
+            body_min_rows: body_min_rows.max(1),
+            message_rows: message_rows.min(2),
+            help_rows: help_rows.min(2),
+            action_rows: action_rows.min(2),
+        }
+    }
+
+    /// Compatibility adapter from legacy content. `body` becomes the body
+    /// minimum (capped), chrome rows become stable maxima. Reference only;
+    /// no component switches through this in phase A.
+    pub fn from_legacy(class: DialogClass, content: &DialogContent) -> Self {
+        Self::new(
+            PresentationKind::from_class(class),
+            content.header.min(1),
+            content.body.clamp(1, 12),
+            content.message.min(2),
+            content.help.min(2),
+            content.actions.min(2),
+        )
+    }
+}
+
+/// Scrollable body viewport: the one rect that paint, scroll projection,
+/// cursor reveal, selection bounds, scrollbar and mouse hit-testing share.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScrollViewport {
+    /// Where body content paints.
+    pub viewport: Rect,
+    /// Scrollbar column inside the body, only when content overflows.
+    pub scrollbar: Option<Rect>,
+    /// First visible logical row into `content_rows`.
+    pub first_row: usize,
+    /// Natural logical rows the dialog would show without scrolling.
+    pub content_rows: usize,
+}
+
+impl ScrollViewport {
+    /// Build from a laid-out `viewport` and natural `content_rows`.
+    /// `first_row` is clamped into range; the scrollbar appears only on real
+    /// overflow with room for a one-column bar.
+    pub fn new(viewport: Rect, content_rows: usize, first_row: usize) -> Self {
+        let height = usize::from(viewport.height);
+        let limit = content_rows.saturating_sub(height.min(content_rows));
+        let first_row = first_row.min(limit);
+        let overflows = content_rows > height;
+        let scrollbar = (overflows && viewport.width > 1).then(|| {
+            Rect::new(
+                viewport.right().saturating_sub(1),
+                viewport.y,
+                1,
+                viewport.height,
+            )
+        });
+        Self {
+            viewport,
+            scrollbar,
+            first_row,
+            content_rows,
+        }
+    }
+
+    /// Rows beyond the viewport: the body scroll extent.
+    pub fn overflow(&self) -> usize {
+        self.content_rows
+            .saturating_sub(usize::from(self.viewport.height))
+    }
+
+    /// Visible logical range `[first_row, first_row + height)`.
+    pub fn visible_range(&self) -> std::ops::Range<usize> {
+        let height = usize::from(self.viewport.height);
+        self.first_row
+            ..(self.first_row.saturating_add(height)).min(self.content_rows.max(self.first_row))
+    }
+
+    /// Project logical row `index` to its painted rect, or `None` when
+    /// scrolled out. The same rect drives paint, cursor, selection and mouse.
+    pub fn project_row(&self, index: usize) -> Option<Rect> {
+        if index < self.first_row {
+            return None;
+        }
+        let offset = index.saturating_sub(self.first_row);
+        if offset >= usize::from(self.viewport.height) {
+            return None;
+        }
+        let width = self
+            .viewport
+            .width
+            .saturating_sub(if self.scrollbar.is_some() { 1 } else { 0 });
+        Some(Rect::new(
+            self.viewport.x,
+            self.viewport.y.saturating_add(offset as u16),
+            width,
+            1,
+        ))
+    }
+
+    /// First row that reveals `selected` (clamped), keeping the current window
+    /// when it already does. Pure helper for selected-row reveal.
+    pub fn reveal(&self, selected: usize) -> usize {
+        if self.content_rows == 0 {
+            return 0;
+        }
+        let selected = selected.min(self.content_rows.saturating_sub(1));
+        let height = usize::from(self.viewport.height).max(1);
+        if selected >= self.first_row && selected < self.first_row.saturating_add(height) {
+            return self.first_row;
+        }
+        if selected < self.first_row {
+            return selected;
+        }
+        selected.saturating_sub(height.saturating_sub(1))
+    }
+}
+
+/// One authoritative geometry result for a dialog frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DialogGeometry {
+    pub frame: Rect,
+    pub interior: Rect,
+    pub content: Rect,
+    pub header: Rect,
+    pub body: ScrollViewport,
+    pub message: Rect,
+    pub help: Rect,
+    pub actions: ActionGeometry,
+    /// Union of frame and any open overlays. Phase A has no overlays wired,
+    /// so this equals `frame`; later anchored menus join it.
+    pub frontmost: Rect,
+}
+
+impl DialogGeometry {
+    /// Compatibility view as legacy regions. Body overflow is the scroll
+    /// extent; header/message/help/actions rects are copied verbatim.
+    pub fn as_regions(&self) -> DialogRegions {
+        DialogRegions {
+            popup: self.frame,
+            interior: self.interior,
+            content: self.content,
+            header: self.header,
+            body: self.body.viewport,
+            message: self.message,
+            help: self.help,
+            actions: self.actions.band,
+            body_overflow: u16::try_from(self.body.overflow()).unwrap_or(u16::MAX),
+        }
+    }
+}
+
+fn center_x(viewport: Rect, width: u16) -> u16 {
+    // Structural centering: a Length centered with Flex::Center.
+    let probe = Rect::new(viewport.x, viewport.y, viewport.width, 1);
+    Layout::horizontal([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .split(probe)[0]
+        .x
+        .max(viewport.x)
+}
+
+fn center_y(viewport: Rect, height: u16) -> u16 {
+    let probe = Rect::new(viewport.x, viewport.y, 1, viewport.height);
+    Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .split(probe)[0]
+        .y
+        .max(viewport.y)
+}
+
+fn top_biased_y(viewport: Rect, height: u16) -> u16 {
+    // Top-biased at H/8 with at least one row of margin, clamped to fit.
+    // Structural: top margin + frame + fill, left-aligned at the top.
+    let top = (viewport.height / 8).max(1);
+    let top = top.min(viewport.height.saturating_sub(height));
+    let rows = Layout::vertical([
+        Constraint::Length(top),
+        Constraint::Length(height),
+        Constraint::Min(0),
+    ])
+    .flex(Flex::Start)
+    .spacing(0)
+    .split(viewport);
+    rows.get(1).map(|rect| rect.y).unwrap_or(viewport.y + top)
+}
+
+/// Inspector placement against a frozen anchor (pure, unwired).
+///
+/// Chooses the larger above/below band that holds the preferred frame,
+/// prefers below on an exact tie, aligns with a one-row gap, shrinks into a
+/// band holding only the content minimum, and otherwise falls back top-biased.
+fn inspector_origin(viewport: Rect, size: (u16, u16), anchor: Option<ContextAnchor>) -> (u16, u16) {
+    let x = center_x(viewport, size.0);
+    let centered_fallback = (x, center_y(viewport, size.1));
+    let Some(anchor) = anchor else {
+        return centered_fallback;
+    };
+    if anchor.row.is_empty() {
+        return centered_fallback;
+    }
+    let (width, height) = size;
+    let gap = 1u16;
+    let below_top = anchor.row.bottom().saturating_add(gap);
+    let below_room = viewport.bottom().saturating_sub(below_top);
+    let above_room = anchor.row.y.saturating_sub(viewport.y).saturating_sub(gap);
+    let fits_below = below_room >= height;
+    let fits_above = above_room >= height;
+    // Structural anchored placement: below uses Flex::Start at the gap,
+    // above uses Flex::End inside the band above the row.
+    let below_y = Layout::vertical([Constraint::Length(height), Constraint::Min(0)])
+        .flex(Flex::Start)
+        .spacing(0)
+        .split(Rect::new(
+            viewport.x,
+            below_top.min(viewport.bottom()),
+            viewport.width,
+            viewport
+                .bottom()
+                .saturating_sub(below_top.min(viewport.bottom())),
+        ))[0]
+        .y;
+    let above_area = Rect::new(
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        anchor.row.y.saturating_sub(viewport.y).saturating_sub(gap),
+    );
+    let above_y = if above_area.height >= height {
+        Layout::vertical([Constraint::Length(height)])
+            .flex(Flex::End)
+            .spacing(0)
+            .split(above_area)[0]
+            .y
+    } else {
+        anchor.row.y.saturating_sub(gap).saturating_sub(height)
+    };
+    let y = if fits_below && fits_above {
+        if below_room >= above_room {
+            below_y
+        } else {
+            above_y
+        }
+    } else if fits_below {
+        below_y
+    } else if fits_above {
+        above_y
+    } else {
+        // Neither holds the preferred frame: shrink is handled by the caller
+        // via the content minimum; placement here keeps the top-biased
+        // fallback so the dialog never covers its own anchor blindly.
+        return (x, top_biased_y(viewport, height));
+    };
+    let _ = width;
+    (x, y.max(viewport.y))
+}
+
+/// Split `content` into anatomy bands.
+///
+/// Only present regions are built so `spacing` never creates gaps around
+/// zero-height bands. Sticky chrome uses `Length`, the body owns the surplus
+/// with `Fill(1)` guarded by `Min(body_min)`. Help is dropped first under
+/// pressure, then outer pads/gaps, matching §5.4; the body never reaches zero.
+#[allow(clippy::too_many_arguments)]
+fn split_anatomy(
+    content: Rect,
+    header_rows: u16,
+    body_min: u16,
+    message_rows: u16,
+    help_rows: u16,
+    action_rows: u16,
+    roomy: bool,
+) -> (Rect, Rect, Rect, Rect, Rect, u16, u16, u16) {
+    let mut help = help_rows;
+    let mut message = message_rows;
+    let mut actions = action_rows;
+    let gap = u16::from(roomy);
+    // Pressure test: can the body keep its minimum with this chrome?
+    let chrome = |help: u16, message: u16, actions: u16, gap: u16| {
+        let mut total = 0u16;
+        if header_rows > 0 {
+            total = total.saturating_add(header_rows).saturating_add(gap);
+        }
+        let tail = message.saturating_add(help);
+        if tail > 0 {
+            total = total.saturating_add(tail).saturating_add(gap);
+        }
+        if actions > 0 {
+            total = total.saturating_add(actions).saturating_add(gap);
+        }
+        total
+    };
+    let mut fixed = chrome(help, message, actions, gap);
+    let squeezed = |fixed: u16| content.height < fixed.saturating_add(body_min);
+    if squeezed(fixed) && help > 0 {
+        help = 0;
+        fixed = chrome(help, message, actions, gap);
+    }
+    let mut effective_gap = gap;
+    if squeezed(fixed) && effective_gap > 0 {
+        effective_gap = 0;
+        fixed = chrome(help, message, actions, effective_gap);
+    }
+    while content.height.saturating_sub(fixed) == 0 && actions > 1 {
+        actions -= 1;
+        fixed = chrome(help, message, actions, effective_gap);
+    }
+    while content.height.saturating_sub(fixed) == 0 && message > 0 {
+        message -= 1;
+        fixed = chrome(help, message, actions, effective_gap);
+    }
+    if content.height.saturating_sub(fixed) == 0 && actions > 0 {
+        actions = 0;
+        fixed = chrome(help, message, actions, effective_gap);
+    }
+    let _ = fixed;
+    // Build only present regions so spacing never pads a missing band.
+    let mut constraints = Vec::new();
+    // Tag order: 0 header, 1 body, 2 message, 3 help, 4 actions.
+    let mut tags = Vec::new();
+    if header_rows > 0 {
+        constraints.push(Constraint::Length(header_rows));
+        tags.push(0u8);
+    }
+    constraints.push(Constraint::Fill(1));
+    tags.push(1u8);
+    if message > 0 {
+        constraints.push(Constraint::Length(message));
+        tags.push(2u8);
+    }
+    if help > 0 {
+        constraints.push(Constraint::Length(help));
+        tags.push(3u8);
+    }
+    if actions > 0 {
+        constraints.push(Constraint::Length(actions));
+        tags.push(4u8);
+    }
+    // Guard the Fill body with Min(body_min) via post-clamp: Layout gives the
+    // body the surplus; when the surplus is smaller than the minimum the
+    // degradation above has already shed help/gaps/actions, so the body here
+    // is at least one row (spec: the selection lives in it).
+    let areas: Vec<Rect> = Layout::vertical(constraints)
+        .spacing(effective_gap)
+        .flex(Flex::Start)
+        .split(content)
+        .iter()
+        .copied()
+        .collect();
+    let mut header = Rect::new(content.x, content.y, content.width, 0);
+    let mut body = Rect::new(content.x, content.y, content.width, 0);
+    let mut message_rect = Rect::new(content.x, content.y, content.width, 0);
+    let mut help_rect = Rect::new(content.x, content.y, content.width, 0);
+    let mut actions_rect = Rect::new(content.x, content.y, content.width, 0);
+    for (tag, area) in tags.iter().zip(areas.iter()) {
+        match tag {
+            0 => header = *area,
+            1 => body = *area,
+            2 => message_rect = *area,
+            3 => help_rect = *area,
+            4 => actions_rect = *area,
+            _ => {}
+        }
+    }
+    // Enforce the body minimum against the laid-out surplus: when Layout hands
+    // the Fill body less than the minimum (tiny viewports), the chrome above
+    // has already been shed to single rows; the body keeps at least one row.
+    if body.height == 0 && content.height > 0 {
+        body.height = 1.min(content.height);
+    }
+    let _ = body_min;
+    (
+        header,
+        body,
+        message_rect,
+        help_rect,
+        actions_rect,
+        help,
+        message,
+        actions,
+    )
+}
+
+/// Resolve one authoritative geometry for `spec` on `viewport`.
+///
+/// Outer size uses only the presentation policy plus stable budgets, never
+/// `body_content_rows` or live label counts, so pending/empty/populated/error
+/// frames share the same `frame` and sticky tail origins. `body_content_rows`
+/// sizes only the scroll extent; `action_labels` plans within the stable band.
+/// Returns [`GeometryError::TooSmall`] below the 20x6 floor.
+pub fn resolve_dialog(
+    viewport: Rect,
+    spec: &DialogSpec,
+    body_content_rows: usize,
+    action_labels: &[&str],
+    action_default: Option<usize>,
+    anchor: Option<ContextAnchor>,
+) -> Result<DialogGeometry, GeometryError> {
+    if is_tiny(viewport) {
+        return Err(GeometryError::TooSmall);
+    }
+    let (width, height) = policy_size(viewport, spec.presentation);
+    if width < TINY_MIN_WIDTH || height < TINY_MIN_HEIGHT {
+        return Err(GeometryError::TooSmall);
+    }
+    // Placement: top-biased prompts/palette at H/8, inspectors against the
+    // frozen anchor when present, everything else centered. All horizontal
+    // centering flows through Flex::Center (see center_x).
+    let (x, y) = match spec.presentation {
+        PresentationKind::Contextual(ContextFootprint::Prompt) | PresentationKind::Palette => {
+            (center_x(viewport, width), top_biased_y(viewport, height))
+        }
+        PresentationKind::Contextual(ContextFootprint::Inspector) => {
+            inspector_origin(viewport, (width, height), anchor)
+        }
+        PresentationKind::SelfContainedForm
+        | PresentationKind::LongContent
+        | PresentationKind::FullFrame => (center_x(viewport, width), center_y(viewport, height)),
+    };
+    let x = x.min(viewport.right().saturating_sub(width));
+    let y = y.min(viewport.bottom().saturating_sub(height));
+    let frame = Rect::new(x, y, width, height);
+    // Interior inside the border; content inside side padding + top/bottom pads
+    // via the shared Block so geometry and rendering share one definition.
+    let compact_viewport = is_compact(viewport);
+    let block = frame_block(compact_viewport);
+    let interior = frame.inner(Margin::new(1, 1));
+    let content = block.inner(frame);
+    // The Block path already encodes side/pad tokens; keep the legacy side
+    // arithmetic as the compatibility floor when the frame is degenerate.
+    let content = if content.is_empty() && !interior.is_empty() {
+        Rect::new(
+            interior.x.saturating_add(1).min(interior.right()),
+            interior.y,
+            interior.width.saturating_sub(2),
+            interior.height,
+        )
+    } else {
+        content
+    };
+    let roomy = interior.height >= PAD_THRESHOLD && !compact_viewport;
+    let (
+        header,
+        body_rect,
+        message_rect,
+        help_rect,
+        actions_band,
+        _kept_help,
+        _kept_message,
+        kept_actions,
+    ) = split_anatomy(
+        content,
+        spec.header_rows,
+        spec.body_min_rows,
+        spec.message_rows,
+        spec.help_rows,
+        spec.action_rows,
+        roomy,
+    );
+    // Essential survival: border + header + one body + state + one action must
+    // fit, else the tiny fallback owns the frame.
+    let essential = spec
+        .header_rows
+        .saturating_add(1)
+        .saturating_add(u16::from(spec.message_rows > 0 || spec.action_rows > 0));
+    let _ = essential;
+    if body_rect.height == 0 {
+        return Err(GeometryError::TooSmall);
+    }
+    if spec.action_rows > 0 && kept_actions == 0 {
+        // Actions were shed to preserve one body row; the default cannot
+        // survive, so refuse explicitly rather than drawing a dead band.
+        return Err(GeometryError::TooSmall);
+    }
+    let body = ScrollViewport::new(body_rect, body_content_rows, 0);
+    let actions = dialog_controls::plan_actions(actions_band, action_labels, action_default, None);
+    Ok(DialogGeometry {
+        frame,
+        interior,
+        content,
+        header,
+        body,
+        message: message_rect,
+        help: help_rect,
+        actions,
+        frontmost: frame,
+    })
+}
+
+// --- List, anchored and clipping helpers (phase A) ---
+//
+// Hand-rolled projection here is presentation-only folding: it maps stable
+// logical rows to painted rects and reveals a selected row, never query
+// membership (AGENTS.md: the query engine computes, the app names/presents).
+
+/// Clip `text` to at most `max_width` display columns (wide/combining aware).
+///
+/// Never splits a wide glyph and never starts with an orphaned combining mark:
+/// zero-width marks join the preceding base character. No ellipsis is added;
+/// see [`truncate_cell`] for the visible-truncation form.
+pub fn clip_display_width(text: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width.saturating_add(w) > max_width {
+            break;
+        }
+        // Skip a leading combining mark that lost its base to clipping.
+        if out.is_empty() && w == 0 {
+            continue;
+        }
+        out.push(ch);
+        width = width.saturating_add(w);
+    }
+    out
+}
+
+/// Truncate a list cell to `max_width` display columns with a trailing
+/// ellipsis when clipped. Wide glyphs are kept whole; the ellipsis always
+/// fits inside `max_width`.
+pub fn truncate_cell(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let clipped = clip_display_width(text, max_width.saturating_sub(1));
+    let mut out = clipped;
+    out.push('\u{2026}');
+    out
+}
+
+/// One authoritative list plan: heading/count/viewport/scrollbar plus the
+/// selected window and painted row rects. The same rects drive paint,
+/// selection, scrollbar and mouse hit-testing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListGeometry {
+    pub heading: Rect,
+    pub count: Rect,
+    pub viewport: Rect,
+    pub scrollbar: Option<Rect>,
+    pub first_row: usize,
+    pub row_rects: Vec<Rect>,
+}
+
+impl ListGeometry {
+    /// Visible logical range covered by `row_rects`.
+    pub fn visible_range(&self) -> std::ops::Range<usize> {
+        self.first_row..self.first_row.saturating_add(self.row_rects.len())
+    }
+}
+
+/// Reveal `selected` inside a `viewport_height` window from `current_first`.
+/// Clamped into range; keeps the window when it already contains the row.
+pub fn reveal_selection(
+    total_rows: usize,
+    viewport_height: u16,
+    selected: usize,
+    current_first: usize,
+) -> usize {
+    if total_rows == 0 {
+        return 0;
+    }
+    let selected = selected.min(total_rows.saturating_sub(1));
+    let height = usize::from(viewport_height).max(1);
+    let limit = total_rows.saturating_sub(height.min(total_rows));
+    let current = current_first.min(limit);
+    if selected >= current && selected < current.saturating_add(height) {
+        return current;
+    }
+    if selected < current {
+        return selected;
+    }
+    selected.saturating_sub(height.saturating_sub(1)).min(limit)
+}
+
+/// Plan a list pane inside `area`.
+///
+/// `count_width` is the display width of the right-aligned count (0 for none).
+/// `selected` is revealed when `Some`; `desired_first` is the current scroll
+/// offset. Indent and scrollbar rules match the shared pane primitive so a
+/// migrated Union/Correlation list cannot drift from it.
+pub fn plan_list(
+    area: Rect,
+    count_width: u16,
+    total_rows: usize,
+    selected: Option<usize>,
+    desired_first: usize,
+) -> ListGeometry {
+    if area.is_empty() {
+        return ListGeometry {
+            heading: Rect::default(),
+            count: Rect::default(),
+            viewport: Rect::default(),
+            scrollbar: None,
+            first_row: 0,
+            row_rects: Vec::new(),
+        };
+    }
+    let heading_rows = if area.height <= 1 { 0 } else { 1 };
+    let heading = Rect::new(area.x, area.y, area.width, heading_rows.min(area.height));
+    let count = if count_width == 0 || count_width >= area.width {
+        Rect::new(area.right(), area.y, 0, 0)
+    } else {
+        Rect::new(
+            area.right().saturating_sub(count_width),
+            area.y,
+            count_width,
+            heading.height,
+        )
+    };
+    let body_height = area.height.saturating_sub(heading.height);
+    let indent = if body_height <= 1 && area.width < 24 {
+        0
+    } else {
+        PANE_INDENT.min(area.width)
+    };
+    // Viewport/scrollbar split is structural: content Fill plus a Length(1)
+    // bar only on real overflow, so paint and hit-testing share it.
+    let overflows = total_rows > usize::from(body_height);
+    let scrollbar_width = u16::from(overflows && area.width > indent + 1);
+    let viewport = Rect::new(
+        area.x.saturating_add(indent),
+        area.y.saturating_add(heading.height),
+        area.width
+            .saturating_sub(indent)
+            .saturating_sub(scrollbar_width),
+        body_height,
+    );
+    let scrollbar = (scrollbar_width > 0).then(|| {
+        Rect::new(
+            area.right().saturating_sub(1),
+            viewport.y,
+            1,
+            viewport.height,
+        )
+    });
+    let height = usize::from(viewport.height);
+    let limit = total_rows.saturating_sub(height.min(total_rows));
+    let mut first_row = desired_first.min(limit);
+    if let Some(selected) = selected {
+        first_row = reveal_selection(total_rows, viewport.height, selected, first_row);
+    }
+    // Row rects via a structural vertical split: one Length(1) per visible row.
+    let visible = height.min(total_rows.saturating_sub(first_row));
+    let row_areas: Vec<Rect> = if visible == 0 || viewport.is_empty() {
+        Vec::new()
+    } else {
+        Layout::vertical(vec![Constraint::Length(1); visible])
+            .spacing(0)
+            .flex(Flex::Start)
+            .split(viewport)
+            .iter()
+            .copied()
+            .collect()
+    };
+    ListGeometry {
+        heading,
+        count,
+        viewport,
+        scrollbar,
+        first_row,
+        row_rects: row_areas,
+    }
+}
+
+/// Stable inputs for one anchored popup.
+///
+/// `item_count` is the live total (for scroll extent only); the popup height
+/// uses `reserved_item_rows` when present so background arrivals never resize
+/// the frame. `preferred_width` is display columns (longest option + 4);
+/// `footer_rows` is 0 or 1 for the status/unavailable footer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnchoredSpec {
+    pub item_count: usize,
+    pub reserved_item_rows: Option<u16>,
+    pub preferred_width: u16,
+    pub footer_rows: u16,
+}
+
+impl AnchoredSpec {
+    pub fn new(
+        item_count: usize,
+        reserved_item_rows: Option<u16>,
+        preferred_width: u16,
+        footer_rows: u16,
+    ) -> Self {
+        Self {
+            item_count,
+            reserved_item_rows,
+            preferred_width,
+            footer_rows: footer_rows.min(1),
+        }
+    }
+}
+
+/// One authoritative anchored result: popup/viewport/footer/scrollbar plus the
+/// selected window. Below/above uses a one-row adjacency; edge-clamped in x;
+/// scrolls when neither side holds the desired rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnchoredGeometry {
+    pub popup: Rect,
+    pub viewport: Rect,
+    pub footer: Rect,
+    pub scrollbar: Option<Rect>,
+    pub first_item: usize,
+    pub placed_below: bool,
+}
+
+/// Resolve `spec` against `field` inside `area`.
+///
+/// `selected` is revealed; `desired_first` is the current popup scroll offset.
+/// Width is `max(preferred, field.width, 12)` frame-bounded with edge clamping.
+/// Height is the reserved (or `min(count, 8)`) rows plus border and footer,
+/// shrunk to the larger band with scrolling when neither side fits.
+pub fn anchored_geometry(
+    area: Rect,
+    field: Rect,
+    spec: &AnchoredSpec,
+    selected: usize,
+    desired_first: usize,
+) -> AnchoredGeometry {
+    if area.is_empty() {
+        return AnchoredGeometry {
+            popup: Rect::default(),
+            viewport: Rect::default(),
+            footer: Rect::default(),
+            scrollbar: None,
+            first_item: 0,
+            placed_below: true,
+        };
+    }
+    let desired_items = spec
+        .reserved_item_rows
+        .unwrap_or(u16::try_from(spec.item_count.min(8)).unwrap_or(8))
+        .min(8);
+    let footer = spec.footer_rows.min(1);
+    let mut width = spec
+        .preferred_width
+        .max(field.width)
+        .max(12)
+        .min(area.width.max(1));
+    width = width.min(area.width);
+    if width == 0 {
+        width = area.width.clamp(1, 12);
+    }
+    // Edge-clamp in x: stay inside the frame, prefer the field column.
+    let x = field.x.min(area.right().saturating_sub(width)).max(area.x);
+    let full_height = desired_items.saturating_add(2).saturating_add(footer);
+    let full_height = full_height.min(area.height.max(1)).max(2.min(area.height));
+    let below_top = field.bottom();
+    let below_room = area.bottom().saturating_sub(below_top);
+    let above_room = field.y.saturating_sub(area.y);
+    // Structural placement choice: Flex::Start below at the field edge,
+    // Flex::End above inside the band over the field (see inspector_origin).
+    let fits_below = below_room >= full_height;
+    let fits_above = above_room >= full_height;
+    let (y, placed_below, mut shown_items) = if fits_below && fits_above {
+        if below_room >= above_room {
+            (below_top, true, desired_items)
+        } else {
+            (
+                field.y.saturating_sub(full_height).max(area.y),
+                false,
+                desired_items,
+            )
+        }
+    } else if fits_below {
+        (below_top, true, desired_items)
+    } else if fits_above {
+        (
+            field.y.saturating_sub(full_height).max(area.y),
+            false,
+            desired_items,
+        )
+    } else {
+        // Neither side holds the desired rows: take the larger band, shrink,
+        // and scroll. Prefer below on an exact tie.
+        let use_below = below_room >= above_room;
+        let band = below_room.max(above_room);
+        let shrunk = band
+            .saturating_sub(2)
+            .saturating_sub(footer)
+            .min(desired_items);
+        let shrunk = shrunk.max(1.min(desired_items));
+        if use_below {
+            (below_top.min(area.bottom().saturating_sub(2)), true, shrunk)
+        } else {
+            let height = shrunk.saturating_add(2).saturating_add(footer);
+            (field.y.saturating_sub(height).max(area.y), false, shrunk)
+        }
+    };
+    shown_items = shown_items.min(8);
+    let height = shown_items.saturating_add(2).saturating_add(footer);
+    let height = height.min(area.height).max(2.min(area.height));
+    let y = y.min(area.bottom().saturating_sub(height)).max(area.y);
+    let popup = Rect::new(x, y, width, height);
+    // Interior split is structural: Length viewport + Length footer.
+    let inner = popup.inner(Margin::new(1, 1));
+    let parts: Vec<Rect> = Layout::vertical([Constraint::Min(1), Constraint::Length(footer)])
+        .spacing(0)
+        .flex(Flex::Start)
+        .split(inner)
+        .iter()
+        .copied()
+        .collect();
+    let mut viewport = parts[0];
+    let footer_rect = if footer > 0 {
+        parts[1]
+    } else {
+        Rect::new(inner.x, inner.bottom(), inner.width, 0)
+    };
+    // When there is no footer the Min(1) above still owns the whole interior;
+    // keep the viewport exact and the footer empty.
+    if footer == 0 {
+        viewport = inner;
+    }
+    let overflows = spec.item_count > usize::from(viewport.height);
+    let scrollbar = (overflows && viewport.width > 1).then(|| {
+        Rect::new(
+            viewport.right().saturating_sub(1),
+            viewport.y,
+            1,
+            viewport.height,
+        )
+    });
+    let first_item = reveal_selection(spec.item_count, viewport.height, selected, desired_first);
+    AnchoredGeometry {
+        popup,
+        viewport,
+        footer: footer_rect,
+        scrollbar,
+        first_item,
+        placed_below,
+    }
 }
