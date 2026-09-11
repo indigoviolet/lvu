@@ -234,18 +234,19 @@ def run_story(binary: pathlib.Path) -> None:
             app.wait_for("file beta", timeout=6.0)
 
             # Literal search stays in Rust, publishes stable matching IDs, and
-            # remains independent from the command view.
+            # remains independent from the command view. The open Filter
+            # dialog covers the matching row, so status is awaited first,
+            # the dialog is closed, and only then are rows asserted.
             app.send(b"/")
+            app.wait_for(FILTER_TITLE)
+            time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
             app.send(b"beta")
             app.send(b"\r")
-            searched = app.wait_until(
-                lambda text: 'search:"beta"' in text
-                and "matched 1/" in text
-                and "file beta" in text,
-                "native literal search result",
+            app.wait_until(
+                lambda text: 'search:"beta"' in text and "matched 1/" in text,
+                "native literal search accepted",
                 timeout=8.0,
             )
-            assert "file alpha" not in searched
             app.send(b"\x1b")
             # Wait for the dialog to be gone before the next key: Esc and `]`
             # landing in one read parse as Alt-] (see test_search_race_pty),
@@ -256,6 +257,11 @@ def run_story(binary: pathlib.Path) -> None:
                 lambda text: FILTER_TITLE not in text,
                 "literal editor closed",
             )
+            settled = app.wait_until(
+                lambda text: "file beta" in text and "file alpha" not in text,
+                "native literal search rows after close",
+            )
+            assert 'search:"beta"' in settled
 
             app.send(b"]")
             independent = app.wait_for("command stdout", timeout=4.0)
@@ -330,6 +336,8 @@ def run_story(binary: pathlib.Path) -> None:
             )
 
             app.send(b"/")
+            app.wait_for(FILTER_TITLE)
+            time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
             app.send(b"\x7f" * len("beta"))
             app.send(b"\r")
             app.wait_until(
@@ -439,7 +447,11 @@ def run_memory_restore_story(binary: pathlib.Path) -> None:
         first = PtyApp(binary, ["--capture-dir", str(capture), "--file", str(source)], width=160, height=25)
         try:
             first.wait_for("beta early", timeout=6.0)
-            first.send(b"/"); first.send(b"beta"); first.send(b"\r")
+            first.send(b"/")
+            first.wait_for(FILTER_TITLE)
+            time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
+            first.send(b"beta")
+            first.send(b"\r")
             first.wait_until(lambda text: 'search:"beta"' in text and "matched " in text, "accepted remembered literal", timeout=8.0)
             first.send(b"\x1b")
             first.wait_until(lambda text: FILTER_TITLE not in text, "editor closed")
@@ -818,8 +830,8 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
             app.wait_for("pl.col('level') == 'ERROR'")
             app.send(b"\r")
             app.wait_until(
-                lambda text: "advanced:on" in text and '"message":"failed"' in text,
-                "completed native advanced filter",
+                lambda text: "advanced:on" in text and "matched 1/2" in text,
+                "completed native advanced filter accepted",
                 timeout=12.0,
             )
             app.send(b"\x1b")
@@ -936,16 +948,25 @@ def run_named_views_story(binary: pathlib.Path) -> None:
             # A saved step returns to the list layer, so one Escape closes it.
             app.send(b"\x1b")
             app.wait_until(lambda text: "┌ Enrichment " not in text, "named enrichment closed")
-            app.send(b"/"); app.send(b"error"); app.send(b"\r")
+            app.send(b"/")
+            app.wait_for(FILTER_TITLE)
+            time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
+            app.send(b"error")
+            app.send(b"\r")
             app.wait_until(
-                lambda text: 'search:"error"' in text and "error first" in text,
-                "errors view filter",
+                lambda text: 'search:"error"' in text,
+                "errors view accepted",
                 timeout=8.0,
             )
             app.send(b"\x1b")
             app.wait_until(
                 lambda text: " Search " not in text,
                 "errors editor closed",
+            )
+            app.wait_until(
+                lambda text: "error first" in text,
+                "errors view filter",
+                timeout=8.0,
             )
 
             # A blank view starts without cloned constraints.
@@ -957,7 +978,11 @@ def run_named_views_story(binary: pathlib.Path) -> None:
             app.send(b"Info\r")
             info = app.wait_for("Info")
             assert 'search:"error"' not in info and "enrich:on" not in info
-            app.send(b"/"); app.send(b"info"); app.send(b"\r")
+            app.send(b"/")
+            app.wait_for(FILTER_TITLE)
+            time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
+            app.send(b"info")
+            app.send(b"\r")
             app.wait_until(lambda text: 'search:"info"' in text, "info filter applied", timeout=8.0)
             app.send(b"\x1b")
             app.wait_until(lambda text: " Search " not in text, "info editor closed")
@@ -1938,16 +1963,25 @@ def run_multiline_grouping_story(binary: pathlib.Path) -> None:
             app.wait_for("[3 physical lines]", timeout=5.0)
 
             app.send(b"/")
+            app.wait_for(FILTER_TITLE)
+            time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
             app.send(b"late.rs")
             app.send(b"\r")
-            orphan = app.wait_for("orphan continuation", timeout=10.0)
-            assert "Error: first" not in orphan and "ERROR next event" not in orphan
+            app.wait_until(
+                lambda text: 'search:"late.rs"' in text,
+                "late.rs search accepted",
+                timeout=10.0,
+            )
             app.send(b"\x1b")
             app.wait_until(
                 lambda text: "Live literal substring" not in text,
-                "search editor closed before clearing",
+                "search editor closed before asserting rows",
             )
+            orphan = app.wait_for("orphan continuation", timeout=10.0)
+            assert "Error: first" not in orphan and "ERROR next event" not in orphan
             app.send(b"/")
+            app.wait_for(FILTER_TITLE)
+            time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
             app.send(b"\x7f" * len("late.rs"))
             app.send(b"\r")
             app.wait_until(

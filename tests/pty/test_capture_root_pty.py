@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 
-from test_lvu_pty import PtyApp
+from test_lvu_pty import FILTER_TITLE, PtyApp
 
 
 RECORDS = "alpha one\nbeta two\ngamma three\n"
@@ -66,14 +66,19 @@ def launch(binary, source, cwd, environment, width=170, height=26):
 
 def apply_search(app):
     app.send(b"/")
-    app.wait_for("Search")
+    app.wait_for(FILTER_TITLE)
+    time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
     app.send(b"beta")
     # A draft on All events applies only when it is submitted.
     app.send(b"\r")
-    app.wait_until(lambda text: "beta two" in text and "alpha one" not in text
-                   and 'search:"beta"' in text, "search applied", timeout=8)
+    # The open Filter dialog covers the matching row, so accepted status
+    # is awaited first, the dialog is closed, and only then are rows
+    # asserted.
+    app.wait_until(lambda text: 'search:"beta"' in text, "search accepted", timeout=8)
     app.send(b"\x1b")
-    app.wait_until(lambda text: "Search" not in text, "search form closed")
+    app.wait_until(lambda text: FILTER_TITLE not in text, "search form closed")
+    app.wait_until(lambda text: "beta two" in text and "alpha one" not in text,
+                   "search applied", timeout=8)
 
 
 def settle_bridge(app, candidates):
