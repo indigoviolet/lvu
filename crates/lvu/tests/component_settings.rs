@@ -805,3 +805,186 @@ fn tiny_pressure_keeps_every_field_reachable_with_matching_wheel() {
         let _ = surface.scrollable;
     }
 }
+
+/// Negative control for the retained pane offset: scrolling the
+/// effective-values/body pane to the tail and then wrapping focus from More
+/// back to Provider must reveal the Provider field and caret through the same
+/// shared body `ScrollViewport` — never leave them off-screen — while keeping
+/// the retained pane scroll for the return trip. Covers forward wrap,
+/// reverse traversal, mouse focus and dropdown close at every tight size.
+#[test]
+fn wrapping_from_a_scrolled_tail_reveals_the_focused_field() {
+    use lvu::dialog_layout::ScrollViewport;
+
+    for (width, height) in [(80u16, 24u16), (54, 16), (20, 6)] {
+        let (provider, mut app) = demo();
+        app.handle(Action::Open(Open::Settings), &provider);
+        draw(&provider, &mut app, width, height);
+        // Reach the effective-values pane: it only exists while the shared
+        // body genuinely overflows.
+        focus(&mut app, &provider, SettingsControl::More);
+        draw(&provider, &mut app, width, height);
+        // Scroll to the tail with the same keys a user would press.
+        for _ in 0..256 {
+            let limit = app
+                .layers
+                .settings
+                .state()
+                .map(|d| d.details_scroll_limit)
+                .unwrap_or(0);
+            let at = app
+                .layers
+                .settings
+                .state()
+                .map(|d| d.details_scroll)
+                .unwrap_or(0);
+            if limit == 0 || at >= limit {
+                break;
+            }
+            key(&mut app, &provider, KeyCode::Down);
+        }
+        draw(&provider, &mut app, width, height);
+        let tail_first = app.layers.settings.body_first_row();
+        let tail_viewport = app.layers.settings.body_viewport();
+        let tail_content = app.layers.settings.body_content_rows();
+        assert!(
+            app.layers.settings.state().unwrap().details_scroll > 0
+                || app.layers.settings.state().unwrap().details_scroll_limit == 0,
+            "tail scroll must advance at {width}x{height}"
+        );
+
+        // Wrap forward: More → Provider. Tab always moves focus, even where
+        // Down would scroll instead.
+        key(&mut app, &provider, KeyCode::Tab);
+        draw(&provider, &mut app, width, height);
+        assert_eq!(
+            app.layers.settings.state().unwrap().focus,
+            SettingsControl::Field(SettingsField::Provider),
+            "Tab must wrap More back to Provider at {width}x{height}"
+        );
+        let provider_row = app.layers.settings.focused_body_row();
+        let expected =
+            ScrollViewport::new(tail_viewport, tail_content, tail_first).reveal(provider_row);
+        assert_eq!(
+            app.layers.settings.body_first_row(),
+            expected,
+            "stored first_row must be the shared reveal result at {width}x{height}"
+        );
+        let surface = app.layers.settings.surface();
+        let field = app
+            .layers
+            .settings
+            .control_rects()
+            .iter()
+            .find(|(_, c)| *c == SettingsControl::Field(SettingsField::Provider))
+            .map(|(r, _)| *r)
+            .expect("wrapped Provider field must be painted");
+        assert!(contains(surface.popup, (field.x, field.y)));
+        assert_eq!(
+            app.layers.settings.hit((field.x, field.y)),
+            Some(lvu::components::settings::SettingsHit::Control(
+                SettingsControl::Field(SettingsField::Provider)
+            )),
+            "wrapped Provider paint/hit disagree at {width}x{height}"
+        );
+        let caret = app
+            .layers
+            .settings
+            .surface()
+            .caret
+            .expect("wrapped Provider caret must draw");
+        assert!(
+            contains(field, caret),
+            "wrapped Provider caret {caret:?} outside {field:?} at {width}x{height}"
+        );
+
+        // Reverse traversal restores the retained tail instead of resetting it
+        // (BackTab always moves focus, even where Down would scroll).
+        key(&mut app, &provider, KeyCode::BackTab);
+        draw(&provider, &mut app, width, height);
+        assert_eq!(
+            app.layers.settings.state().unwrap().focus,
+            SettingsControl::More,
+            "reverse traversal must return to More at {width}x{height}"
+        );
+        assert_eq!(
+            app.layers.settings.body_first_row(),
+            tail_first,
+            "returning to More must restore the retained tail at {width}x{height}"
+        );
+
+        // Mouse focus on a painted row reveals without resetting the window.
+        key(&mut app, &provider, KeyCode::Tab);
+        draw(&provider, &mut app, width, height);
+        assert_eq!(
+            app.layers.settings.state().unwrap().focus,
+            SettingsControl::Field(SettingsField::Provider)
+        );
+        if let Some((rect, _)) = app
+            .layers
+            .settings
+            .control_rects()
+            .iter()
+            .find(|(_, c)| *c == SettingsControl::Field(SettingsField::Theme))
+            .map(|(r, c)| (*r, *c))
+        {
+            let before = app.layers.settings.body_first_row();
+            click(&mut app, &provider, (rect.x, rect.y));
+            draw(&provider, &mut app, width, height);
+            assert_eq!(
+                app.layers.settings.state().unwrap().focus,
+                SettingsControl::Field(SettingsField::Theme)
+            );
+            let theme_row = app.layers.settings.focused_body_row();
+            let kept = ScrollViewport::new(
+                app.layers.settings.body_viewport(),
+                app.layers.settings.body_content_rows(),
+                before,
+            )
+            .reveal(theme_row);
+            assert_eq!(
+                app.layers.settings.body_first_row(),
+                kept,
+                "mouse focus must reveal through the same viewport at {width}x{height}"
+            );
+        }
+
+        // Dropdown open/close leaves the anchor field revealed. Normalize:
+        // the mouse step above may already have opened it via activation.
+        focus(
+            &mut app,
+            &provider,
+            SettingsControl::Field(SettingsField::Theme),
+        );
+        draw(&provider, &mut app, width, height);
+        if app.layers.settings.state().unwrap().dropdown.is_some() {
+            key(&mut app, &provider, KeyCode::Esc);
+            draw(&provider, &mut app, width, height);
+        }
+        let before = app.layers.settings.body_first_row();
+        key(&mut app, &provider, KeyCode::Enter);
+        draw(&provider, &mut app, width, height);
+        assert!(
+            !app.layers.settings.theme_choice_rects().is_empty(),
+            "dropdown must open at {width}x{height}"
+        );
+        key(&mut app, &provider, KeyCode::Esc);
+        draw(&provider, &mut app, width, height);
+        assert!(
+            app.layers.settings.state().unwrap().dropdown.is_none(),
+            "dropdown must close at {width}x{height}"
+        );
+        let theme_row = app.layers.settings.focused_body_row();
+        let kept = ScrollViewport::new(
+            app.layers.settings.body_viewport(),
+            app.layers.settings.body_content_rows(),
+            before,
+        )
+        .reveal(theme_row);
+        assert_eq!(
+            app.layers.settings.body_first_row(),
+            kept,
+            "dropdown close must not reset the window at {width}x{height}"
+        );
+    }
+}

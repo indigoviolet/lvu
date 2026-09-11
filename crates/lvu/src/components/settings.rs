@@ -190,12 +190,17 @@ pub enum SettingsHit {
     Choice(usize),
 }
 
-/// Recorded by `render`, consumed by `hit()`. Every rect here was painted this
-/// frame.
+/// Recorded by `render`, consumed by `hit()` and by tests asserting the shared
+/// scroll contract. Every rect here was painted this frame; the body triple
+/// is the exact shared `ScrollViewport` the paint consumed.
 #[derive(Clone, Debug, Default)]
 struct SettingsGeometry {
     controls: Vec<(Rect, SettingsControl)>,
     choices: Vec<(Rect, usize)>,
+    body_viewport: Rect,
+    body_content: usize,
+    body_first: usize,
+    focused_row: usize,
 }
 
 /// What the shell still has to do with a successful save: the appearance to
@@ -221,6 +226,9 @@ pub struct SettingsDialog {
     /// `None` means the field has not been edited yet, so its caret is the end
     /// of the value — what `CursorBank::get_or_end` did for it before.
     cursors: [Option<TextCursor>; 8],
+    /// Last frame's shared body `first_row`, so the next focus transition can
+    /// reveal through the same `ScrollViewport` instead of jumping to the top.
+    last_body_first: usize,
     geometry: SettingsGeometry,
     surface: Surface,
     pub outbox: Outbox<SettingsRequest>,
@@ -234,6 +242,7 @@ impl Default for SettingsDialog {
             next_generation: 1,
             state: None,
             cursors: [None; 8],
+            last_body_first: 0,
             geometry: SettingsGeometry::default(),
             surface: Surface::default(),
             outbox: Outbox::new(SETTINGS_OUTBOX_CAP),
@@ -271,6 +280,26 @@ impl SettingsDialog {
 
     pub fn theme_choice_rects(&self) -> &[(Rect, usize)] {
         &self.geometry.choices
+    }
+
+    /// Last frame's shared body viewport, content extent, first visible row
+    /// and revealed focus row. Tests assert the stored `first_row` is exactly
+    /// the shared `ScrollViewport::reveal` result, so paint, hitboxes and
+    /// wheel cannot disagree about the window.
+    pub fn body_viewport(&self) -> Rect {
+        self.geometry.body_viewport
+    }
+
+    pub fn body_content_rows(&self) -> usize {
+        self.geometry.body_content
+    }
+
+    pub fn body_first_row(&self) -> usize {
+        self.geometry.body_first
+    }
+
+    pub fn focused_body_row(&self) -> usize {
+        self.geometry.focused_row
     }
 
     /// A successful save. The dialog's own generation fences it: an older
@@ -677,14 +706,27 @@ impl SettingsDialog {
         Outcome::Consumed
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         controls: Vec<(Rect, SettingsControl)>,
         choices: Vec<(Rect, usize)>,
         caret: Option<(u16, u16)>,
         surface: Surface,
+        body_viewport: Rect,
+        body_content: usize,
+        body_first: usize,
+        focused_row: usize,
     ) -> Surface {
-        self.geometry = SettingsGeometry { controls, choices };
+        self.geometry = SettingsGeometry {
+            controls,
+            choices,
+            body_viewport,
+            body_content,
+            body_first,
+            focused_row,
+        };
+        self.last_body_first = body_first;
         self.surface = Surface { caret, ..surface };
         self.surface
     }
@@ -745,8 +787,10 @@ impl Component for SettingsDialog {
             details_scroll_limit: 0,
         });
         // A new dialog is a new caret identity, which is what bumping the
-        // generation meant for `CursorBank`.
+        // generation meant for `CursorBank`. The shared body window also
+        // restarts at the top; per-focus reveal rebuilds it from there.
         self.cursors = [None; 8];
+        self.last_body_first = 0;
         self.geometry = SettingsGeometry::default();
         self.open = true;
     }
@@ -811,7 +855,16 @@ impl Component for SettingsDialog {
         let mut choices_hit: Vec<(Rect, usize)> = Vec::new();
         let mut caret_cell: Option<(u16, u16)> = None;
         let Some(dialog) = self.state.clone() else {
-            return self.record(controls_hit, choices_hit, None, Surface::default());
+            return self.record(
+                controls_hit,
+                choices_hit,
+                None,
+                Surface::default(),
+                Rect::default(),
+                0,
+                0,
+                0,
+            );
         };
         let values = dialog.draft.clone();
         let agent_label = if ascii { "Agent" } else { "🧠" };
@@ -909,6 +962,10 @@ impl Component for SettingsDialog {
                     scrollable: false,
                     text_focus: dialog.dropdown.is_none(),
                 },
+                Rect::default(),
+                natural_usize,
+                0,
+                0,
             );
         };
         render_responsive_frame(frame, &resolved, "Settings", ctx.active, theme);
@@ -925,7 +982,16 @@ impl Component for SettingsDialog {
         };
         let body = resolved.body.viewport;
         if body.width == 0 || body.height == 0 {
-            return self.record(controls_hit, choices_hit, caret_cell, surface);
+            return self.record(
+                controls_hit,
+                choices_hit,
+                caret_cell,
+                surface,
+                body,
+                natural_usize,
+                0,
+                0,
+            );
         }
         let message_rect = resolved.message;
         let help_rect = resolved.help;
@@ -979,9 +1045,22 @@ impl Component for SettingsDialog {
         let base_offset = focus_row
             .saturating_sub(visible.saturating_sub(1))
             .min(max_offset);
-        let offset = base_offset
-            .saturating_add(u16::try_from(dialog.details_scroll).unwrap_or(u16::MAX))
-            .min(max_offset);
+        // Every focus transition reveals through the same shared viewport:
+        // the retained pane offset only applies while More holds focus, so a
+        // More→Provider wrap (and reverse traversal, mouse focus, dropdown
+        // close) cannot leave the focused field off-screen. The stored pane
+        // value is retained, never reset, so returning to More restores it.
+        let focus_is_more = dialog.focus == Control::More;
+        let stored_first = self.last_body_first;
+        let revealed =
+            ScrollViewport::new(body, natural_usize, stored_first).reveal(usize::from(focus_row));
+        let offset = if focus_is_more {
+            base_offset
+                .saturating_add(u16::try_from(dialog.details_scroll).unwrap_or(u16::MAX))
+                .min(max_offset)
+        } else {
+            u16::try_from(revealed).unwrap_or(u16::MAX).min(max_offset)
+        };
         // One authoritative body viewport: same rects drive paint, cursor,
         // selection, scrollbar and mouse; no independent projection.
         let body_scroll = ScrollViewport::new(body, natural_usize, usize::from(offset));
@@ -1538,7 +1617,16 @@ impl Component for SettingsDialog {
             }
         }
 
-        self.record(controls_hit, choices_hit, caret_cell, surface)
+        self.record(
+            controls_hit,
+            choices_hit,
+            caret_cell,
+            surface,
+            body_scroll.viewport,
+            natural_usize,
+            body_scroll.first_row,
+            usize::from(focus_row),
+        )
     }
 }
 

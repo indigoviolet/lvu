@@ -178,9 +178,17 @@ def run(binary: pathlib.Path) -> None:
         first.resize(54, 12)
         first.wait_for("[ More ]")
         first.send(b"\t" * 9)
-        # LongContent frames are policy-sized with stable message/help bands;
-        # the body still overflows at 150x40, so More persists there. Only the
-        # huge frame holds the full form + effective values without scrolling.
+        # LongContent frames are policy-sized with stable message/help bands:
+        # the body still overflows at the 150x40 policy size, so the stable
+        # [ More ] overflow control remains present and reachable there. Only
+        # the huge frame holds the full form + effective values unscrolled.
+        first.resize(150, 40)
+        first.wait_until(
+            lambda text: "[ More ]" in text and "[ Save ]" in text,
+            "stable-budget overflow control persists at 150x40",
+        )
+        focus_more(first)
+        first.send(b"\x1b[B")
         first.resize(240, 80)
         resized = first.wait_until(
             lambda text: "[ More ]" not in text and "[ Save ]" in text,
