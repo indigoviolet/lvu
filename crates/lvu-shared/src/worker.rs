@@ -4877,6 +4877,175 @@ mod tests {
         .expect("outer pin-test deadline exceeded: failing instead of hanging");
     }
 
+    /// Real-socket union dispatch: actual framed UnionCommit/UnionStatus
+    /// through serve/attach on this service, proving protocol wiring end
+    /// to end — bound happy receipt, original-identity status recovery,
+    /// foreign-identity refusal. Timing and deadline behavior belong to
+    /// the scripted-peer transport suite, not here: every RPC below is
+    /// answered at once by a live worker, and the harness bounds each
+    /// read. Strict store semantics hold throughout (foreign window ids
+    /// still fail at dispatch), and shutdown is clean.
+    #[tokio::test]
+    async fn real_socket_union_commit_recovery() {
+        use crate::union_commit::{CommitRequest, UnionSourceFence};
+
+        let root = tempfile::tempdir().expect("scratch root");
+        let log = root.path().join("sock.log");
+        std::fs::write(&log, "one\n").expect("seed log");
+        let config = test_config(root.path());
+        let (service, warning) =
+            WorkerService::open(config, Arc::new(AdmitAll)).expect("open serves");
+        assert!(warning.is_none());
+        let (mut client, mut decoder) = attach(&service, 203).await;
+        let window = "window-203";
+
+        // Start through the wire so the source is worker-known.
+        let definition = file_definition(87, &log);
+        let start = serde_json::to_value(WorkerRequest::RequestStart {
+            request_id: "sock-start".into(),
+            definition: serde_json::to_value(&definition).unwrap(),
+        })
+        .unwrap();
+        match rpc(&mut client, &mut decoder, start).await.as_slice() {
+            [WorkerEvent::Started { source_id, .. }] => {
+                assert_eq!(*source_id, definition.id.0.to_string())
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+        // Settle the seed through the worker's own progress before
+        // freezing the fence: exact truth, never a guess.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let progress = loop {
+            let progress = service
+                .poll_source_progress(&definition.id.0.to_string())
+                .expect("progress polls");
+            if progress.records >= 1 {
+                break progress;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("seed never published");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let watermark = progress
+            .high_watermark
+            .map(|record| record.sequence)
+            .expect("seed watermark");
+        let fence = UnionSourceFence {
+            source_id: definition.id.0.to_string(),
+            generation: progress.generation,
+            high_watermark: Some(watermark),
+        };
+        let commit_value = |request_id: &str,
+                            generation: u64,
+                            nonce: &str,
+                            digest: crate::union_commit::CommitDigest,
+                            fences: Vec<UnionSourceFence>| {
+            serde_json::to_value(StoreMethod::UnionCommit {
+                request_id: request_id.into(),
+                window_id: window.into(),
+                request: CommitRequest {
+                    window_id: window.into(),
+                    union_view_id: "u-sock".into(),
+                    candidate_generation: generation,
+                    nonce: nonce.into(),
+                    digest,
+                    frozen: fences,
+                },
+            })
+            .unwrap()
+        };
+
+        // Bound happy receipt over the wire: the receipt binds the exact
+        // attempt identity and authorizes the frozen set verbatim.
+        let events = rpc(
+            &mut client,
+            &mut decoder,
+            commit_value(
+                "sock-commit-1",
+                1,
+                "n-sock-1",
+                [0xD1; crate::union_commit::COMMIT_DIGEST_BYTES],
+                vec![fence.clone()],
+            ),
+        )
+        .await;
+        let receipt = match events.as_slice() {
+            [WorkerEvent::Store(StoreEvent::UnionCommitted { receipt, .. })] => receipt.clone(),
+            other => panic!("expected a committed receipt, got {other:?}"),
+        };
+        assert_eq!(receipt.worker_session, service.worker_session());
+        assert_eq!(receipt.window_id, window);
+        assert_eq!(receipt.union_view_id, "u-sock");
+        assert_eq!(receipt.candidate_generation, 1);
+        assert_eq!(receipt.nonce, "n-sock-1");
+        assert_eq!(
+            receipt.digest,
+            [0xD1; crate::union_commit::COMMIT_DIGEST_BYTES]
+        );
+        match receipt.outcome {
+            crate::union_commit::CommitOutcome::Committed { current } => assert_eq!(
+                current,
+                vec![fence.clone()],
+                "happy receipt authorizes the frozen set verbatim"
+            ),
+            other => panic!("expected Committed, got {other:?}"),
+        }
+
+        // Original-identity status recovery: the exact attempt re-derives
+        // its settled outcome through a status frame.
+        let status = serde_json::to_value(StoreMethod::UnionStatus {
+            request_id: "sock-status-1".into(),
+            window_id: window.into(),
+            union_view_id: "u-sock".into(),
+            candidate_generation: 1,
+            nonce: "n-sock-1".into(),
+            digest: [0xD1; crate::union_commit::COMMIT_DIGEST_BYTES],
+        })
+        .unwrap();
+        match rpc(&mut client, &mut decoder, status).await.as_slice() {
+            [WorkerEvent::Store(StoreEvent::UnionStatus { status, .. })] => assert!(
+                matches!(
+                    status,
+                    UnionCommitStatus::Settled(
+                        crate::union_commit::CommitOutcome::Committed { .. }
+                    )
+                ),
+                "original identity must re-derive its settlement: {status:?}"
+            ),
+            other => panic!("expected settled status, got {other:?}"),
+        }
+
+        // Foreign identity: same window, view and generation, but another
+        // nonce and digest — refused as a conflict without verifying or
+        // settling anything.
+        let events = rpc(
+            &mut client,
+            &mut decoder,
+            commit_value(
+                "sock-commit-2",
+                1,
+                "n-foreign",
+                [0x00; crate::union_commit::COMMIT_DIGEST_BYTES],
+                vec![fence],
+            ),
+        )
+        .await;
+        match events.as_slice() {
+            [WorkerEvent::Store(StoreEvent::UnionCommitted { receipt, .. })] => assert!(
+                matches!(
+                    receipt.outcome,
+                    crate::union_commit::CommitOutcome::NonceConflict
+                ),
+                "foreign identity must be refused, got {:?}",
+                receipt.outcome
+            ),
+            other => panic!("expected a conflict receipt, got {other:?}"),
+        }
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
     /// Degraded workspace: a database the store cannot open still yields a
     /// serving worker. Capture, progress and presence work (raw browsing);
     /// every mediated store op fails loudly naming the cause; the database
