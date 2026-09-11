@@ -4409,11 +4409,17 @@ impl Composition {
     /// Writes down the sources this session holds, so the next launch in this
     /// capture root resumes the set rather than guessing it from what the
     /// workspace saw most recently. Written whenever the set changes, not only
-    /// at shutdown, so a session that is killed still resumes.
+    /// at shutdown, so a session that is killed still resumes. Refuses loudly
+    /// when the existing manifest is unreadable by this build (newer schema,
+    /// corruption): storing would lossy-rewrite bytes it cannot parse, so
+    /// the durable file keeps its bytes and mtime instead.
     fn record_session(&mut self, app: &mut App) {
-        if let Err(error) =
-            session::store(&self.capture_root.join("workspace"), &self.session_sources)
-        {
+        let workspace = self.capture_root.join("workspace");
+        if let Err(error) = session::recordable(&workspace) {
+            app.action_notice = Some(format!("session not recorded: {error}"));
+            return;
+        }
+        if let Err(error) = session::store(&workspace, &self.session_sources) {
             app.action_notice = Some(format!("session not recorded: {error}"));
         }
     }
@@ -8307,16 +8313,34 @@ fn prepend_notice(app: &mut App, notice: Option<String>) {
     });
 }
 
-/// Re-acquires a remembered source through the sidebar's Restart, so a resumed
-/// command is launched exactly the way an explicit restart launches it — with
-/// the recorded program, working directory and environment of its definition.
+/// Re-acquires a remembered file source through the sidebar's Restart, so a
+/// resumed file is relaunched exactly the way an explicit restart relaunches
+/// it. A remembered command is never executed and a remembered endpoint is
+/// never contacted on this path (mirroring the manager's restore refusal):
+/// both are refused with a distinct error so the startup loop lists them as
+/// not acquiring and an explicit sidebar Restart remains the only launcher.
 async fn resume_definition(
     manager: &Arc<SourceManager>,
     shared: Option<Arc<shared_capture::SharedStore>>,
     definition: SourceDefinition,
 ) -> Result<StartedSource, String> {
-    let view_id = view_id(definition.id);
     let name = definition.name.clone();
+    match &definition.acquisition {
+        Acquisition::Command { .. } => {
+            return Err(format!(
+                "resume {name}: remembered commands never start automatically; \
+                 use Restart for an explicit launch"
+            ));
+        }
+        Acquisition::Http { .. } => {
+            return Err(format!(
+                "resume {name}: remembered endpoints are never contacted automatically; \
+                 use Restart for an explicit launch"
+            ));
+        }
+        _ => {}
+    }
+    let view_id = view_id(definition.id);
     if shared_capture::worker_route(shared.is_some(), &definition) {
         // Worker-owned resume: the worker dedups against live captures
         // (Present), so resume-after-crash and second-window attach take
@@ -12591,6 +12615,66 @@ root = \"/tmp/elsewhere\"\n",
         assert_eq!(candidate.source.id, authoritative_id);
         assert!(discovery_status(&result).contains("1 candidates"));
     }
+
+    /// `record_session` refuses loudly when the existing manifest is
+    /// unreadable by this build: the file keeps its bytes, mtime and
+    /// unknown fields instead of suffering a lossy rewrite. A missing
+    /// manifest still records normally (positive control). Async only
+    /// because the shared fixture starts runtime-backed workers.
+    #[tokio::test]
+    async fn record_session_leaves_unreadable_manifests_untouched() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager: _manager,
+        } = batch_fixture();
+        let workspace = composition.capture_root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let manifest = workspace.join("session.json");
+        std::fs::write(
+            &manifest,
+            "{\"schema_version\":2,\"sources\":[],\"future_field\":\"keep-me\"}\n",
+        )
+        .expect("plant newer manifest");
+        let before = std::fs::read(&manifest).expect("manifest bytes");
+        let mtime_before = std::fs::metadata(&manifest)
+            .expect("manifest metadata")
+            .modified()
+            .expect("manifest mtime");
+        composition.session_sources = vec![batch_definition(914, "fresh")];
+        composition.record_session(&mut app);
+        assert_eq!(
+            std::fs::read(&manifest).expect("manifest bytes after"),
+            before,
+            "record_session must not rewrite an unreadable manifest"
+        );
+        assert_eq!(
+            std::fs::metadata(&manifest)
+                .expect("metadata after")
+                .modified()
+                .expect("mtime after"),
+            mtime_before,
+            "record_session must not touch the manifest"
+        );
+        let notice = app.action_notice.as_deref().unwrap_or("");
+        assert!(
+            notice.contains("session not recorded")
+                && notice.contains("leaving durable bytes unchanged"),
+            "refusal must be loud and name the guarantee: {notice}"
+        );
+        assert!(
+            std::fs::read_to_string(&manifest)
+                .expect("read back")
+                .contains("future_field"),
+            "unknown future field survives the refused record"
+        );
+        std::fs::remove_file(&manifest).expect("clear manifest");
+        composition.record_session(&mut app);
+        let stored = super::session::load(&workspace).expect("fresh record loads");
+        assert_eq!(stored.len(), 1, "a missing manifest still records normally");
+        assert_eq!(stored[0].id, composition.session_sources[0].id);
+    }
 }
 
 #[cfg(test)]
@@ -12755,6 +12839,72 @@ mod source_control_tests {
             "resumed command lost its recorded environment: {text}"
         );
         for (_, stopped) in next.shutdown().await {
+            assert!(stopped.unwrap().complete);
+        }
+    }
+
+    /// Startup resume refuses remembered commands and endpoints distinctly
+    /// instead of launching them: files re-acquire, but a recorded program
+    /// is never executed and a recorded URL is never contacted without an
+    /// explicit sidebar Restart (which keeps working through
+    /// `control_source`). Nothing is left running behind the refusal.
+    #[tokio::test]
+    async fn resume_refuses_remembered_commands_and_endpoints() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(
+            SourceManager::new(root.path().join("capture"), RuntimeConfig::default()).unwrap(),
+        );
+        let input = root.path().join("resume.log");
+        std::fs::write(&input, "one\n").expect("seed log");
+        let file =
+            definition(SourceArgument::File(input.clone()), root.path()).expect("file definition");
+        resume_definition(&manager, None, file.clone())
+            .await
+            .expect("remembered files still resume");
+        let command = definition(
+            SourceArgument::Command(r#"printf should-never-appear"#.into()),
+            root.path(),
+        )
+        .expect("command definition");
+        let refused = match resume_definition(&manager, None, command.clone()).await {
+            Ok(_) => panic!("remembered command must not launch"),
+            Err(reason) => reason,
+        };
+        assert!(
+            refused.contains("never start automatically"),
+            "command refusal names the rule: {refused}"
+        );
+        assert!(
+            manager.source(command.id).is_none(),
+            "refused resume must leave nothing running"
+        );
+        let endpoint = lvu_core::SourceDefinition {
+            schema_version: 1,
+            id: lvu_core::SourceId(uuid::Uuid::from_u128(913)),
+            name: "remembered-http".into(),
+            acquisition: lvu_core::Acquisition::Http {
+                url: "http://127.0.0.1:9/no-contact".into(),
+                framing: lvu_core::HttpFraming::Newline,
+                reconnect: Default::default(),
+                headers: Vec::new(),
+                limits: Default::default(),
+            },
+            identity_hints: Default::default(),
+            retention: None,
+        };
+        let refused = match resume_definition(&manager, None, endpoint.clone()).await {
+            Ok(_) => panic!("remembered endpoint must not be contacted"),
+            Err(reason) => reason,
+        };
+        assert!(
+            refused.contains("never contacted automatically"),
+            "endpoint refusal names the rule: {refused}"
+        );
+        assert!(
+            manager.source(endpoint.id).is_none(),
+            "refused resume must leave nothing running"
+        );
+        for (_, stopped) in manager.shutdown().await {
             assert!(stopped.unwrap().complete);
         }
     }

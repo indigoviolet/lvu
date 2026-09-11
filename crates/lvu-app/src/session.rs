@@ -101,6 +101,21 @@ pub fn store(workspace_root: &Path, sources: &[SourceDefinition]) -> Result<(), 
     .map_err(|error| format!("write {}: {error}", path.display()))
 }
 
+/// Whether replacing the manifest is safe: true when it loads (including
+/// absent, which loads as empty). A present-but-unreadable manifest —
+/// newer schema, corruption, oversize — must keep its bytes and mtime:
+/// `store` writes only this build's shape and would silently discard what
+/// it cannot parse, so callers refuse loudly instead of storing.
+pub fn recordable(workspace_root: &Path) -> Result<(), String> {
+    match load(workspace_root) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!(
+            "existing session manifest is unreadable by this build ({error}); \
+             leaving durable bytes unchanged"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +167,36 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace directory");
         std::fs::write(manifest_path(&workspace), b"{}").expect("write manifest");
         assert!(load(&workspace).expect("empty manifest").is_empty());
+    }
+
+    /// Degraded-operation gate: an absent or readable manifest may be
+    /// replaced; a present-but-unreadable one (newer schema, corruption,
+    /// oversize) refuses, so no caller can lossy-rewrite bytes it cannot
+    /// parse. The refusal is the whole proof — `recordable` only reads —
+    /// and the bytes below are asserted identical by the caller-level
+    /// tests that plant them.
+    #[test]
+    fn recordable_refuses_only_what_load_cannot_parse() {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let workspace = root.path().join("workspace");
+        assert!(recordable(&workspace).is_ok(), "absent manifest records");
+        let sources = vec![file_definition("a.log")];
+        store(&workspace, &sources).expect("store manifest");
+        assert!(recordable(&workspace).is_ok(), "readable manifest records");
+        std::fs::write(
+            manifest_path(&workspace),
+            "{\"schema_version\":2,\"sources\":[],\"future_field\":\"keep-me\"}\n",
+        )
+        .expect("write newer manifest");
+        let refused = recordable(&workspace).expect_err("newer schema must refuse");
+        assert!(
+            refused.contains("leaving durable bytes unchanged"),
+            "refusal names the guarantee: {refused}"
+        );
+        std::fs::write(manifest_path(&workspace), b"{not json").expect("write corrupt");
+        assert!(
+            recordable(&workspace).is_err(),
+            "corrupt manifest must refuse"
+        );
     }
 }

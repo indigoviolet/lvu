@@ -769,6 +769,14 @@ impl WorkerService {
     /// the durable write there is no cancellation point. Thus shutdown may
     /// abort a pre-publication settlement safely, or drain a wholly published
     /// one, but can never leave only half of bindings/definitions/session.
+    ///
+    /// Degraded persistence (see `store_unavailable`) never reaches the
+    /// durable write: the in-memory session still updates so progress,
+    /// presence and resume-in-memory keep working, but the manifest file
+    /// is left byte-identical and the returned warning says so loudly.
+    /// Rewriting it through the lossy `SessionSet` projection while the
+    /// workspace is incompatible would silently discard fields this build
+    /// cannot read back.
     async fn publish_started(
         &self,
         definition: &SourceDefinition,
@@ -784,11 +792,29 @@ impl WorkerService {
         if !session.iter().any(|value| value.id == definition.id) {
             session.push(definition.clone());
         }
+        if let Some(reason) = self.store_unavailable.as_deref() {
+            return Some(format!(
+                "workspace store unavailable ({reason}); capture started but the \
+                 session manifest was not rewritten — durable bytes unchanged"
+            ));
+        }
         let snapshot = session.clone();
         store_session_set(&self.config.workspace_root, &snapshot).err()
     }
 
+    /// Drop one source from the in-memory session and persist the note.
+    /// Degraded persistence refuses loudly instead (second net behind the
+    /// `stop_inner` gate, which refuses before anything stops): the
+    /// manifest note is a durable write, and rewriting it while the
+    /// workspace is incompatible is unsafe.
     async fn note_session_stopped(&self, id: SourceId) -> Result<(), String> {
+        if let Some(reason) = self.store_unavailable.as_deref() {
+            return Err(format!(
+                "workspace store unavailable ({reason}); refusing to rewrite the \
+                 session manifest — stop refused, capture still running, \
+                 durable bytes unchanged"
+            ));
+        }
         let mut session = self.session.lock().await;
         session.retain(|definition| definition.id != id);
         let snapshot = session.clone();
@@ -1298,6 +1324,20 @@ impl WorkerService {
     }
 
     async fn stop_inner(&self, id: SourceId) -> Result<(), String> {
+        // Degraded persistence refuses before anything stops: the session
+        // note below is a durable write, and rewriting the manifest while
+        // the workspace is incompatible is unsafe. Refusing up front keeps
+        // capture running (raw browsing proceeds) with the session and the
+        // manifest still agreeing; refusing after the manager stop would
+        // leave a half-applied stop. Detach and shutdown never take this
+        // path, so last-window drain and the shutdown bound are unaffected.
+        if let Some(reason) = self.store_unavailable.as_deref() {
+            return Err(format!(
+                "workspace store unavailable ({reason}); refusing to rewrite the \
+                 session manifest — stop refused, capture still running, \
+                 durable bytes unchanged"
+            ));
+        }
         self.stdin_bindings.lock().await.remove(&id);
         if let Some(handle) = self.manager.source(id)
             && !handle.progress().state.is_terminal()
@@ -4487,6 +4527,20 @@ mod tests {
         header[60..64].copy_from_slice(&9999u32.to_be_bytes());
         std::fs::write(&db, &header).expect("fixture database");
         let before = std::fs::read(&db).expect("fixture bytes");
+        // A manifest carrying a field this build never emits: the lossy
+        // `SessionSet` projection would drop it on any rewrite, so its
+        // survival proves no rewrite happened — not merely an equal shape.
+        let manifest = workspace.join("session.json");
+        std::fs::write(
+            &manifest,
+            "{\"schema_version\":1,\"sources\":[],\"future_field\":\"keep-me\"}\n",
+        )
+        .expect("fixture manifest");
+        let manifest_before = std::fs::read(&manifest).expect("manifest bytes");
+        let manifest_mtime_before = std::fs::metadata(&manifest)
+            .expect("manifest metadata")
+            .modified()
+            .expect("manifest mtime");
 
         let mut config = test_config(root.path());
         config.workspace_root = workspace.clone();
@@ -4511,7 +4565,16 @@ mod tests {
             .await
             .expect("capture starts degraded")
         {
-            StartedOutcome::Started { source_id, .. } => source_id,
+            StartedOutcome::Started {
+                source_id, warning, ..
+            } => {
+                let warning = warning.expect("degraded start warns about the manifest");
+                assert!(
+                    warning.contains("session manifest was not rewritten"),
+                    "start warning names the skipped rewrite: {warning}"
+                );
+                source_id
+            }
             other => panic!("expected a live capture, got {other:?}"),
         };
         assert_eq!(source_id, definition.id);
@@ -4520,6 +4583,43 @@ mod tests {
             .poll_source_progress(&source_id.0.to_string())
             .expect("progress polls degraded");
         assert_eq!(progress.source_id, source_id);
+        // The manifest is byte-identical with its mtime untouched: the
+        // start above updated only the in-memory session, and the unknown
+        // future field survives, proving no lossy rewrite — not just an
+        // equal re-serialization.
+        assert_eq!(
+            std::fs::read(&manifest).expect("manifest bytes after start"),
+            manifest_before,
+            "degraded start never rewrites the session manifest"
+        );
+        assert_eq!(
+            std::fs::metadata(&manifest)
+                .expect("manifest metadata after start")
+                .modified()
+                .expect("manifest mtime after start"),
+            manifest_mtime_before,
+            "degraded start never touches the manifest"
+        );
+        // Stop is refused loudly instead of persisting an unsafe note:
+        // capture keeps running (raw browsing proceeds) and the manifest
+        // stays byte-identical.
+        let refused = service
+            .request_stop(source_id)
+            .await
+            .expect_err("degraded stop must refuse, not persist");
+        assert!(
+            refused.contains("refusing to rewrite the session manifest"),
+            "stop refusal names the hazard: {refused}"
+        );
+        let progress = service
+            .poll_source_progress(&source_id.0.to_string())
+            .expect("capture still runs after refused stop");
+        assert_eq!(progress.source_id, source_id);
+        assert_eq!(
+            std::fs::read(&manifest).expect("manifest bytes after refused stop"),
+            manifest_before,
+            "refused stop leaves durable bytes unchanged"
+        );
 
         // Every mediated store op fails loudly naming the cause — never a
         // silent empty, never a fake success.
