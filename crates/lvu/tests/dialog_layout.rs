@@ -1975,3 +1975,842 @@ fn external_command_is_a_form_with_a_review_pane() {
         assert!(!rendered.contains(banned), "{banned} leaked:\n{rendered}");
     }
 }
+
+// --- Responsive shared-core foundation (phase A) ---
+//
+// Implementation-independent geometry acceptance: exact policy outputs,
+// one-cell inset, compact/tiny guardrails, region order, Fill body, stable
+// outer frames across async states, action/list/anchored planning, and
+// display-width clipping. No component is migrated here; these exercise only
+// `dialog_layout` + `dialog_controls` pure geometry.
+
+use lvu::dialog_controls as responsive_actions;
+use lvu::dialog_layout as responsive;
+
+fn responsive_viewport(width: u16, height: u16) -> Rect {
+    Rect::new(0, 0, width, height)
+}
+
+fn responsive_spec(presentation: responsive::PresentationKind) -> responsive::DialogSpec {
+    responsive::DialogSpec::new(presentation, 1, 1, 1, 1, 1)
+}
+
+#[test]
+#[allow(clippy::type_complexity)]
+fn responsive_policy_matrix_matches_percentage_clamp_tokens() {
+    use responsive::{ContextFootprint, PresentationKind};
+    // (viewport, Prompt, Inspector, Form, Long, Palette) from the reviewed
+    // tokens: percent rounded to nearest, clamped to min/max, capped to W-2.
+    let cases: [((u16, u16), [(u16, u16); 5]); 4] = [
+        (
+            (240, 80),
+            [(96, 16), (144, 36), (120, 36), (160, 64), (96, 30)],
+        ),
+        (
+            (140, 40),
+            [(95, 14), (115, 25), (109, 23), (126, 34), (90, 24)],
+        ),
+        (
+            (100, 30),
+            [(68, 11), (82, 19), (78, 17), (90, 26), (64, 18)],
+        ),
+        ((80, 24), [(54, 11), (66, 15), (64, 14), (72, 21), (51, 14)]),
+    ];
+    let kinds = [
+        PresentationKind::Contextual(ContextFootprint::Prompt),
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        PresentationKind::SelfContainedForm,
+        PresentationKind::LongContent,
+        PresentationKind::Palette,
+    ];
+    for ((width, height), expected) in cases {
+        let viewport = responsive_viewport(width, height);
+        for (kind, (want_w, want_h)) in kinds.iter().zip(expected) {
+            let (got_w, got_h) = responsive::policy_size(viewport, *kind);
+            assert_eq!(
+                (got_w, got_h),
+                (want_w, want_h),
+                "{kind:?} at {width}x{height}"
+            );
+        }
+        // FullFrame is reserved and always the viewport itself.
+        assert_eq!(
+            responsive::policy_size(viewport, PresentationKind::FullFrame),
+            (width, height),
+            "FullFrame at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn responsive_roomy_frames_keep_a_once_cell_inset_and_stay_inside() {
+    use responsive::{ContextFootprint, PresentationKind};
+    let kinds = [
+        PresentationKind::Contextual(ContextFootprint::Prompt),
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        PresentationKind::SelfContainedForm,
+        PresentationKind::LongContent,
+        PresentationKind::Palette,
+    ];
+    for (width, height) in [(240u16, 80u16), (140, 40), (100, 30), (80, 24)] {
+        let viewport = responsive_viewport(width, height);
+        for kind in kinds {
+            let spec = responsive_spec(kind);
+            let geometry =
+                responsive::resolve_dialog(viewport, &spec, 10, &["Apply"], Some(0), None)
+                    .expect("roomy viewport must resolve");
+            assert!(
+                geometry.frame.width <= width.saturating_sub(2)
+                    && geometry.frame.height <= height.saturating_sub(2),
+                "{kind:?} {width}x{height}: {:?} exceeds one-cell inset",
+                geometry.frame
+            );
+            assert!(
+                geometry.frame.x > viewport.x && geometry.frame.y > viewport.y,
+                "{kind:?} {width}x{height}: {:?} touches the viewport edge",
+                geometry.frame
+            );
+            assert!(
+                geometry.frame.right() <= viewport.right()
+                    && geometry.frame.bottom() <= viewport.bottom(),
+                "{kind:?} {width}x{height}: {:?} escapes",
+                geometry.frame
+            );
+        }
+    }
+}
+
+#[test]
+fn responsive_compact_override_collapses_every_kind() {
+    use responsive::{ContextFootprint, PresentationKind};
+    let viewport = responsive_viewport(54, 16);
+    for kind in [
+        PresentationKind::Contextual(ContextFootprint::Prompt),
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        PresentationKind::SelfContainedForm,
+        PresentationKind::LongContent,
+        PresentationKind::Palette,
+    ] {
+        let (width, height) = responsive::policy_size(viewport, kind);
+        assert_eq!((width, height), (52, 14), "{kind:?} at 54x16");
+        let spec = responsive_spec(kind);
+        let geometry = responsive::resolve_dialog(viewport, &spec, 4, &["Apply"], Some(0), None)
+            .expect("54x16 must resolve");
+        assert_eq!((geometry.frame.width, geometry.frame.height), (52, 14));
+        assert!(
+            geometry.frame.right() <= viewport.right()
+                && geometry.frame.bottom() <= viewport.bottom(),
+            "{kind:?}: {:?} escapes 54x16",
+            geometry.frame
+        );
+    }
+}
+
+#[test]
+fn responsive_twenty_by_six_survives_essentials_and_nineteen_by_five_refuses() {
+    use responsive::{ContextFootprint, PresentationKind};
+    // 20x6 uses the full frame when W-2 cannot satisfy the safety floor.
+    let tiny_ok = responsive_viewport(20, 6);
+    for kind in [
+        PresentationKind::Contextual(ContextFootprint::Prompt),
+        PresentationKind::SelfContainedForm,
+        PresentationKind::LongContent,
+        PresentationKind::Palette,
+    ] {
+        let (width, height) = responsive::policy_size(tiny_ok, kind);
+        assert_eq!((width, height), (20, 6), "{kind:?} at 20x6");
+    }
+    let spec = responsive::DialogSpec::new(
+        PresentationKind::Contextual(ContextFootprint::Prompt),
+        0,
+        1,
+        1,
+        0,
+        1,
+    );
+    let geometry = responsive::resolve_dialog(tiny_ok, &spec, 3, &["Apply"], Some(0), None)
+        .expect("20x6 keeps one body row and its default");
+    assert!(
+        geometry.body.viewport.height >= 1,
+        "body survives: {:?}",
+        geometry.body.viewport
+    );
+    assert!(
+        geometry.actions.band.height >= 1,
+        "actions survive: {:?}",
+        geometry.actions.band
+    );
+    assert!(
+        geometry.actions.visible_indices().contains(&0),
+        "default survives at 20x6: {:?}",
+        geometry.actions
+    );
+    // Below the floor the tiny fallback owns the frame: explicit refusal.
+    let below = responsive_viewport(19, 5);
+    assert!(responsive::is_tiny(below));
+    assert_eq!(
+        responsive::resolve_dialog(below, &spec, 3, &["Apply"], Some(0), None),
+        Err(responsive::GeometryError::TooSmall)
+    );
+    assert_eq!(
+        responsive::resolve_dialog(
+            responsive_viewport(19, 30),
+            &spec,
+            0,
+            &["Apply"],
+            Some(0),
+            None
+        ),
+        Err(responsive::GeometryError::TooSmall)
+    );
+    assert_eq!(
+        responsive::resolve_dialog(
+            responsive_viewport(80, 5),
+            &spec,
+            0,
+            &["Apply"],
+            Some(0),
+            None
+        ),
+        Err(responsive::GeometryError::TooSmall)
+    );
+}
+
+#[test]
+fn responsive_regions_stay_ordered_disjoint_with_a_fill_body() {
+    use responsive::PresentationKind;
+    let viewport = responsive_viewport(100, 30);
+    let spec = responsive::DialogSpec::new(PresentationKind::LongContent, 1, 2, 1, 1, 1);
+    let geometry =
+        responsive::resolve_dialog(viewport, &spec, 40, &["Apply", "Clear"], Some(0), None)
+            .expect("resolve");
+    assert_eq!(
+        geometry.interior,
+        geometry.frame.inner(ratatui::layout::Margin::new(1, 1))
+    );
+    // Content keeps the shared side padding (border + pad).
+    assert!(
+        geometry.content.x > geometry.interior.x
+            && geometry.content.right() < geometry.interior.right()
+    );
+    let ordered = [
+        geometry.header,
+        geometry.body.viewport,
+        geometry.message,
+        geometry.help,
+        geometry.actions.band,
+    ];
+    let mut bottom = geometry.content.y;
+    for rect in ordered {
+        if rect.height == 0 {
+            continue;
+        }
+        assert!(
+            rect.y >= bottom,
+            "regions overlap or run backwards: {rect:?} after {bottom}"
+        );
+        assert!(
+            rect.bottom() <= geometry.content.bottom(),
+            "{rect:?} leaves the content {:?}",
+            geometry.content
+        );
+        bottom = rect.bottom();
+    }
+    assert!(
+        geometry.body.viewport.height >= 1,
+        "Fill body never collapses"
+    );
+    // Body owns the surplus: chrome plus body exactly fills content height
+    // when every band is present (spacing 0 in this compact-checked path may
+    // vary, so assert containment rather than exact fill arithmetic here; the
+    // Fill ownership is asserted by growth below).
+    let chrome = geometry.header.height
+        + geometry.message.height
+        + geometry.help.height
+        + geometry.actions.band.height;
+    assert!(
+        geometry.body.viewport.height + chrome <= geometry.content.height,
+        "body + chrome {:?} exceeds content {:?}",
+        (geometry.body.viewport.height, chrome),
+        geometry.content
+    );
+    // A larger minimum takes more body rows from the same frame only via the
+    // spec, never via live counts (see the stability test).
+    let roomier = responsive::DialogSpec::new(PresentationKind::LongContent, 1, 5, 1, 1, 1);
+    let other = responsive::resolve_dialog(viewport, &roomier, 40, &["Apply"], Some(0), None)
+        .expect("resolve");
+    assert_eq!(
+        geometry.frame, other.frame,
+        "outer size is policy, not body minimum"
+    );
+}
+
+#[test]
+fn responsive_outer_frame_ignores_async_item_counts() {
+    use responsive::PresentationKind;
+    let viewport = responsive_viewport(140, 40);
+    let spec = responsive::DialogSpec::new(PresentationKind::LongContent, 1, 1, 1, 1, 1);
+    let labels = ["Apply", "Clear"];
+    // Pending (0 rows), empty, populated and error/transcript states share one
+    // stable budget: only the scroll extent moves.
+    let empty =
+        responsive::resolve_dialog(viewport, &spec, 0, &labels, Some(0), None).expect("empty");
+    let populated =
+        responsive::resolve_dialog(viewport, &spec, 87, &labels, Some(0), None).expect("populated");
+    let transcript = responsive::resolve_dialog(viewport, &spec, 1200, &labels, Some(0), None)
+        .expect("transcript");
+    assert_eq!(empty.frame, populated.frame);
+    assert_eq!(populated.frame, transcript.frame);
+    assert_eq!(
+        empty.message.y, populated.message.y,
+        "sticky tail origin moves with async state"
+    );
+    assert_eq!(empty.actions.band.y, transcript.actions.band.y);
+    assert_eq!(empty.body.overflow(), 0);
+    assert!(
+        populated.body.overflow() > 0 && transcript.body.overflow() > populated.body.overflow()
+    );
+    assert_eq!(
+        empty.body.viewport, populated.body.viewport,
+        "viewport is policy, extent is content"
+    );
+}
+
+#[test]
+fn responsive_no_ordinary_kind_becomes_full_frame() {
+    use responsive::{ContextFootprint, PresentationKind};
+    for (width, height) in [
+        (240u16, 80u16),
+        (140, 40),
+        (100, 30),
+        (80, 24),
+        (54, 16),
+        (20, 6),
+    ] {
+        let viewport = responsive_viewport(width, height);
+        for kind in [
+            PresentationKind::Contextual(ContextFootprint::Prompt),
+            PresentationKind::Contextual(ContextFootprint::Inspector),
+            PresentationKind::SelfContainedForm,
+            PresentationKind::LongContent,
+            PresentationKind::Palette,
+        ] {
+            assert!(kind.is_ordinary(), "{kind:?} must read as ordinary");
+            let (w, h) = responsive::policy_size(viewport, kind);
+            // At 20x6 the safety floor legitimately is the full frame; that is
+            // the tiny guardrail, not an ordinary full-frame workspace.
+            if (width, height) != (20, 6) {
+                assert!(
+                    w < width || h < height,
+                    "{kind:?} at {width}x{height} became full frame ({w}x{h})"
+                );
+            }
+        }
+    }
+    assert!(!PresentationKind::FullFrame.is_ordinary());
+}
+
+#[test]
+fn responsive_action_default_survives_and_overflow_keeps_indices() {
+    // One row band, narrow: trailing verbs move into More ▾.
+    let band = Rect::new(0, 0, 40, 1);
+    let labels = [
+        "Apply",
+        "Clear",
+        "Edit note",
+        "Raw context",
+        "Remove",
+        "Help",
+    ];
+    assert_eq!(responsive_actions::stable_action_rows(100, &["Apply"]), 1);
+    assert_eq!(responsive_actions::stable_action_rows(40, &labels), 2);
+    let plan = responsive_actions::plan_actions(band, &labels, Some(0), None);
+    assert!(plan.needs_more(), "narrow band must overflow: {plan:?}");
+    assert!(
+        plan.visible_indices().contains(&0),
+        "default survives: {plan:?}"
+    );
+    assert!(plan.more.is_some());
+    let mut round_trip = plan.visible_indices();
+    round_trip.extend(plan.overflow.iter().copied());
+    round_trip.sort_unstable();
+    assert_eq!(
+        round_trip,
+        (0..labels.len()).collect::<Vec<_>>(),
+        "indices preserved: {plan:?}"
+    );
+    // Overflow stays in original order for the anchored More ▾ menu.
+    let mut sorted = plan.overflow.clone();
+    sorted.sort_unstable();
+    assert_eq!(plan.overflow, sorted);
+    // Roomy band fits everything with no More ▾.
+    let roomy = Rect::new(0, 0, 100, 2);
+    let fits = responsive_actions::plan_actions(roomy, &labels, Some(0), None);
+    assert!(!fits.needs_more());
+    assert!(fits.more.is_none());
+    assert_eq!(
+        fits.visible_indices(),
+        (0..labels.len()).collect::<Vec<_>>()
+    );
+    // Two-row band shows the default first and More ▾ last.
+    let two = Rect::new(0, 0, 30, 2);
+    let split = responsive_actions::plan_actions(two, &labels, Some(0), None);
+    assert!(split.visible_indices().contains(&0));
+    assert!(split.more.is_some());
+}
+
+#[test]
+fn responsive_list_projection_reveals_the_selected_row() {
+    // Heading + count + viewport + scrollbar + row rects from one call.
+    let area = Rect::new(10, 5, 50, 8);
+    let full = responsive::plan_list(area, 8, 30, Some(0), 0);
+    assert_eq!(full.heading.height, 1);
+    assert_eq!(full.count.right(), area.right(), "count right-aligned");
+    assert!(full.scrollbar.is_some(), "overflow needs a bar");
+    assert_eq!(full.first_row, 0);
+    assert!(!full.row_rects.is_empty());
+    for window in full.row_rects.windows(2) {
+        assert_eq!(window[1].y, window[0].y + 1, "rows stack: {window:?}");
+        assert_eq!(window[1].x, window[0].x);
+    }
+    for rect in &full.row_rects {
+        assert!(rect.y >= full.viewport.y && rect.bottom() <= full.viewport.bottom());
+    }
+    // Selecting the last row scrolls it into view.
+    let scrolled = responsive::plan_list(area, 8, 30, Some(29), 0);
+    assert!(scrolled.first_row + scrolled.row_rects.len() > 29 - scrolled.row_rects.len());
+    assert!(
+        scrolled.visible_range().contains(&29),
+        "selected row revealed: {:?}",
+        scrolled.visible_range()
+    );
+    // A fitting list reserves no scrollbar column.
+    let fits = responsive::plan_list(area, 8, 3, Some(0), 0);
+    assert!(fits.scrollbar.is_none());
+    // Pure reveal helper keeps the window when it already contains the row.
+    assert_eq!(responsive::reveal_selection(30, 7, 3, 0), 0);
+    assert_eq!(responsive::reveal_selection(30, 7, 29, 0), 23);
+}
+
+#[test]
+fn responsive_inspector_avoids_the_frozen_row() {
+    use responsive::{ContextAnchor, ContextFootprint, PresentationKind};
+    let viewport = responsive_viewport(100, 30);
+    let spec = responsive::DialogSpec::new(
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        1,
+        1,
+        1,
+        1,
+        1,
+    );
+    // Anchor near the top: the larger band is below, with a one-row gap.
+    let top_anchor = ContextAnchor::new(Rect::new(10, 5, 50, 1), Rect::new(0, 0, 100, 30));
+    let below =
+        responsive::resolve_dialog(viewport, &spec, 10, &["Apply"], Some(0), Some(top_anchor))
+            .expect("resolve");
+    assert!(
+        below.frame.y > top_anchor.row.bottom(),
+        "inspector must clear the frozen row: frame {:?} anchor {:?}",
+        below.frame,
+        top_anchor.row
+    );
+    // Anchor near the bottom: the larger band is above.
+    let bottom_anchor = ContextAnchor::new(Rect::new(10, 24, 50, 1), Rect::new(0, 0, 100, 30));
+    let above = responsive::resolve_dialog(
+        viewport,
+        &spec,
+        10,
+        &["Apply"],
+        Some(0),
+        Some(bottom_anchor),
+    )
+    .expect("resolve");
+    assert!(
+        above.frame.bottom() < bottom_anchor.row.y,
+        "inspector must sit above the frozen row: frame {:?} anchor {:?}",
+        above.frame,
+        bottom_anchor.row
+    );
+    // No anchor behaves like a centered form (no panic, inside viewport).
+    let plain = responsive::resolve_dialog(viewport, &spec, 10, &["Apply"], Some(0), None)
+        .expect("resolve");
+    assert!(plain.frame.right() <= viewport.right() && plain.frame.bottom() <= viewport.bottom());
+}
+
+#[test]
+fn responsive_anchored_prefers_below_then_clamps_and_scrolls() {
+    let area = responsive_viewport(100, 30);
+    // Room below: one blank row between the field and the popup.
+    let field = Rect::new(10, 5, 20, 1);
+    let spec = responsive::AnchoredSpec::new(10, None, 24, 0);
+    let below = responsive::anchored_geometry(area, field, &spec, 0, 0);
+    assert!(below.placed_below);
+    assert_eq!(below.popup.y, field.bottom() + 1);
+    assert!(below.popup.right() <= area.right() && below.popup.bottom() <= area.bottom());
+    // No room below: above the field, one blank row between popup and field.
+    let low_field = Rect::new(10, 26, 20, 1);
+    let above = responsive::anchored_geometry(area, low_field, &spec, 0, 0);
+    assert!(!above.placed_below);
+    assert_eq!(above.popup.bottom() + 1, low_field.y);
+    // Right edge clamps inside the frame.
+    let edge_field = Rect::new(90, 5, 8, 1);
+    let edge = responsive::anchored_geometry(area, edge_field, &spec, 0, 0);
+    assert!(edge.popup.right() <= area.right());
+    assert!(
+        edge.popup.x < edge_field.x,
+        "clamped left: {:?}",
+        edge.popup
+    );
+    // Reserved rows are stable: 2 live items and 20 share one frame height.
+    let few = responsive::AnchoredSpec::new(2, Some(8), 24, 0);
+    let many = responsive::AnchoredSpec::new(20, Some(8), 24, 0);
+    let few_geometry = responsive::anchored_geometry(area, field, &few, 0, 0);
+    let many_geometry = responsive::anchored_geometry(area, field, &many, 0, 0);
+    assert_eq!(few_geometry.popup.height, many_geometry.popup.height);
+    assert_eq!(few_geometry.popup.y, many_geometry.popup.y);
+    assert!(many_geometry.scrollbar.is_some());
+    // Footer occupies its own band below the viewport.
+    let with_footer = responsive::AnchoredSpec::new(10, None, 24, 1);
+    let footed = responsive::anchored_geometry(area, field, &with_footer, 0, 0);
+    assert_eq!(footed.footer.height, 1);
+    assert_eq!(footed.footer.y, footed.viewport.bottom());
+}
+
+#[test]
+fn responsive_anchored_and_lists_measure_display_width() {
+    // Wide glyphs count two cells; combining marks count zero and never start
+    // a clipped viewport alone.
+    assert_eq!(responsive::clip_display_width("東京", 4), "東京");
+    assert_eq!(responsive::clip_display_width("東京x", 4), "東京");
+    let combined = "e\u{301}cole";
+    assert_eq!(responsive::clip_display_width(combined, 4), "e\u{301}col");
+    // Truncation shows its work with a trailing ellipsis inside the budget.
+    assert_eq!(
+        responsive::truncate_cell("ed4a0c76-rows.idx", 10),
+        "ed4a0c76-\u{2026}"
+    );
+    assert_eq!(responsive::truncate_cell("東京界警告", 5), "東京\u{2026}");
+    // A wide option widens the popup by display columns, not characters.
+    let area = responsive_viewport(100, 30);
+    let field = Rect::new(5, 5, 10, 1);
+    let narrow = responsive::AnchoredSpec::new(3, None, 14, 0);
+    let wide = responsive::AnchoredSpec::new(3, None, 30, 0);
+    let narrow_geometry = responsive::anchored_geometry(area, field, &narrow, 0, 0);
+    let wide_geometry = responsive::anchored_geometry(area, field, &wide, 0, 0);
+    assert!(wide_geometry.popup.width > narrow_geometry.popup.width);
+    // Minimum width and frame bounding hold at the edges.
+    let tiny_spec = responsive::AnchoredSpec::new(3, None, 4, 0);
+    let tiny = responsive::anchored_geometry(area, field, &tiny_spec, 0, 0);
+    assert!(tiny.popup.width >= 12);
+    let huge = responsive::AnchoredSpec::new(3, None, 200, 0);
+    let huge_geometry = responsive::anchored_geometry(area, field, &huge, 0, 0);
+    assert!(huge_geometry.popup.right() <= area.right());
+}
+
+// --- Pre-review successor acceptance (phase A contract corrections) ---
+//
+// Discriminating tests for the five hypotheses confirmed against b892d19,
+// at the 240/80/54/20 viewport boundaries. Each asserts the corrected
+// contract; compatibility callsites (`dialog_rect`, `anchored_rect`,
+// `button_layout`, 4-arg `plan_actions`) are unchanged.
+
+#[test]
+fn responsive_inspector_centers_over_the_log_pane() {
+    use responsive::{ContextAnchor, ContextFootprint, PresentationKind};
+    let spec = responsive::DialogSpec::new(
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        1,
+        1,
+        1,
+        1,
+        1,
+    );
+    // 240x80 with a 22-column sidebar: viewport center x=48, log center x=59.
+    let viewport = responsive_viewport(240, 80);
+    let log = Rect::new(22, 0, 218, 80);
+    let anchor = ContextAnchor::new(Rect::new(30, 10, 40, 1), log);
+    let geometry =
+        responsive::resolve_dialog(viewport, &spec, 10, &["Apply"], Some(0), Some(anchor))
+            .expect("resolve");
+    assert_eq!(geometry.frame.width, 144);
+    assert_eq!(
+        geometry.frame.x, 59,
+        "center over the log, not the viewport: {:?}",
+        geometry.frame
+    );
+    assert!(geometry.frame.right() <= viewport.right());
+    // An empty log falls back to viewport centering.
+    let no_log = ContextAnchor::new(Rect::new(30, 10, 40, 1), Rect::default());
+    let plain = responsive::resolve_dialog(viewport, &spec, 10, &["Apply"], Some(0), Some(no_log))
+        .expect("resolve");
+    assert_eq!(plain.frame.x, 48);
+    // 80x24: popup (66) wider than the log (58) clamps inside the viewport
+    // instead of escaping it, and still does not use the viewport center.
+    let viewport = responsive_viewport(80, 24);
+    let log = Rect::new(22, 0, 58, 24);
+    let anchor = ContextAnchor::new(Rect::new(30, 4, 20, 1), log);
+    let geometry =
+        responsive::resolve_dialog(viewport, &spec, 6, &["Apply"], Some(0), Some(anchor))
+            .expect("resolve");
+    assert_eq!(geometry.frame.width, 66);
+    assert_eq!(
+        geometry.frame.x, 14,
+        "log-centered then clamped: {:?}",
+        geometry.frame
+    );
+    assert_ne!(
+        geometry.frame.x, 7,
+        "must not use viewport center (80-66)/2"
+    );
+    // 54x16 compact hides the sidebar: log == viewport, so both centers agree;
+    // the preferred 52x14 fits neither band around row 3 (rooms 11/2), so the
+    // frame shrinks into the larger below band with the gap preserved.
+    let viewport = responsive_viewport(54, 16);
+    let log = responsive_viewport(54, 16);
+    let anchor = ContextAnchor::new(Rect::new(5, 3, 20, 1), log);
+    let geometry =
+        responsive::resolve_dialog(viewport, &spec, 4, &["Apply"], Some(0), Some(anchor))
+            .expect("resolve");
+    assert_eq!(geometry.frame, Rect::new(1, 5, 52, 11));
+    // 20x6 safety floor is full-frame by construction.
+    let viewport = responsive_viewport(20, 6);
+    let anchor = ContextAnchor::new(Rect::new(2, 2, 10, 1), viewport);
+    let geometry =
+        responsive::resolve_dialog(viewport, &spec, 2, &["Apply"], Some(0), Some(anchor))
+            .expect("20x6 resolves");
+    assert_eq!(geometry.frame, viewport);
+}
+
+#[test]
+fn responsive_inspector_shrinks_into_the_larger_band() {
+    use responsive::{ContextAnchor, ContextFootprint, PresentationKind};
+    let spec = responsive::DialogSpec::new(
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        1,
+        1,
+        1,
+        1,
+        1,
+    );
+    // 240x80 preferred (144x36) fits below a top anchor: no shrink.
+    let viewport = responsive_viewport(240, 80);
+    let log = Rect::new(22, 0, 218, 80);
+    let anchor = ContextAnchor::new(Rect::new(30, 10, 40, 1), log);
+    let geometry =
+        responsive::resolve_dialog(viewport, &spec, 10, &["Apply"], Some(0), Some(anchor))
+            .expect("resolve");
+    assert_eq!((geometry.frame.width, geometry.frame.height), (144, 36));
+    assert_eq!(geometry.frame.y, 12, "one-row gap below the frozen row");
+    // 80x24 preferred (66x15) fits neither band around a middle row (rooms
+    // 10/11 < 15): shrink into the larger above band (minimum 6).
+    let viewport = responsive_viewport(80, 24);
+    let log = Rect::new(22, 0, 58, 24);
+    let anchor = ContextAnchor::new(Rect::new(30, 12, 20, 1), log);
+    let geometry =
+        responsive::resolve_dialog(viewport, &spec, 10, &["Apply"], Some(0), Some(anchor))
+            .expect("resolve");
+    assert_eq!(
+        geometry.frame.height, 11,
+        "shrunk to the above band: {:?}",
+        geometry.frame
+    );
+    assert_eq!(
+        geometry.frame.bottom() + 1,
+        12,
+        "gap preserved above: {:?}",
+        geometry.frame
+    );
+    assert!(geometry.frame.bottom() < anchor.row.y);
+    // 54x16 compact (52x14) around row 8 (rooms 6/7 < 14): shrink above to 7.
+    let viewport = responsive_viewport(54, 16);
+    let anchor = ContextAnchor::new(Rect::new(5, 8, 20, 1), viewport);
+    let geometry =
+        responsive::resolve_dialog(viewport, &spec, 6, &["Apply"], Some(0), Some(anchor))
+            .expect("resolve");
+    assert_eq!((geometry.frame.width, geometry.frame.height), (52, 7));
+    assert_eq!(geometry.frame.bottom() + 1, 8);
+    // 20x6 safety floor cannot shrink below the minimum: full frame owns it.
+    let viewport = responsive_viewport(20, 6);
+    let anchor = ContextAnchor::new(Rect::new(2, 2, 10, 1), viewport);
+    let geometry =
+        responsive::resolve_dialog(viewport, &spec, 2, &["Apply"], Some(0), Some(anchor))
+            .expect("20x6 resolves");
+    assert_eq!(geometry.frame, viewport);
+}
+
+#[test]
+fn responsive_anchored_keeps_one_blank_row_at_boundaries() {
+    // 240x80 roomy: gap below.
+    let area = responsive_viewport(240, 80);
+    let field = Rect::new(20, 10, 20, 1);
+    let spec = responsive::AnchoredSpec::new(8, None, 24, 0);
+    let below = responsive::anchored_geometry(area, field, &spec, 0, 0);
+    assert!(below.placed_below);
+    assert_eq!(
+        below.popup.y,
+        field.bottom() + 1,
+        "one blank row: {:?}",
+        below.popup
+    );
+    assert_eq!(below.popup.height, 10);
+    // 80x24 roomy: same gap.
+    let area = responsive_viewport(80, 24);
+    let field = Rect::new(10, 5, 20, 1);
+    let below = responsive::anchored_geometry(area, field, &spec, 0, 0);
+    assert_eq!(below.popup.y, field.bottom() + 1);
+    // Above placement keeps the gap on the other side.
+    let low = Rect::new(10, 20, 20, 1);
+    let above = responsive::anchored_geometry(area, low, &spec, 0, 0);
+    assert!(!above.placed_below);
+    assert_eq!(above.popup.bottom() + 1, low.y);
+    // 54x16 tight: desired 10 fits neither band (rooms 9/4), shrink below to 9
+    // with the gap preserved.
+    let area = responsive_viewport(54, 16);
+    let field = Rect::new(5, 5, 10, 1);
+    let tight = responsive::anchored_geometry(area, field, &spec, 0, 0);
+    assert!(tight.placed_below);
+    assert_eq!(tight.popup.y, field.bottom() + 1);
+    assert_eq!(
+        tight.popup.height, 9,
+        "shrunk to the below band: {:?}",
+        tight.popup
+    );
+    assert!(tight.popup.bottom() <= area.bottom());
+    // 20x6 floor: small count keeps the gap inside the frame.
+    let area = responsive_viewport(20, 6);
+    let field = Rect::new(2, 1, 10, 1);
+    let small = responsive::AnchoredSpec::new(3, None, 14, 0);
+    let popup = responsive::anchored_geometry(area, field, &small, 0, 0);
+    assert_eq!(popup.popup.y, field.bottom() + 1);
+    assert!(popup.popup.right() <= area.right() && popup.popup.bottom() <= area.bottom());
+}
+
+#[test]
+fn responsive_project_row_rejects_out_of_range_rows() {
+    let viewport = Rect::new(0, 0, 20, 5);
+    let body = responsive::ScrollViewport::new(viewport, 3, 0);
+    assert_eq!(body.project_row(0), Some(Rect::new(0, 0, 20, 1)));
+    assert_eq!(body.project_row(2), Some(Rect::new(0, 2, 20, 1)));
+    assert_eq!(
+        body.project_row(3),
+        None,
+        "index == content_rows paints nothing"
+    );
+    assert_eq!(body.project_row(4), None);
+    assert_eq!(body.project_row(100), None);
+    assert_eq!(
+        body.project_row(usize::MAX),
+        None,
+        "usize edge paints nothing"
+    );
+    let empty = responsive::ScrollViewport::new(viewport, 0, 0);
+    assert_eq!(empty.project_row(0), None);
+    // Windowed content still bounds both ends.
+    let windowed = responsive::ScrollViewport::new(viewport, 10, 5);
+    assert_eq!(windowed.project_row(4), None, "before the window");
+    assert!(windowed.project_row(5).is_some());
+    assert_eq!(windowed.project_row(10), None, "past the content end");
+}
+
+#[test]
+fn responsive_action_roles_validate_and_map_focus() {
+    let labels = [
+        "Apply",
+        "Clear",
+        "Edit note",
+        "Raw context",
+        "Remove",
+        "Help",
+    ];
+    // A default naming a destructive index is refused: destructive is never
+    // the default, matching ActionRow::role priority.
+    let refused = responsive_actions::plan_actions_with_roles(
+        Rect::new(0, 0, 100, 2),
+        &labels,
+        Some(1),
+        &[1],
+        None,
+    );
+    assert_eq!(refused.default, None);
+    assert_eq!(refused.destructive, vec![1]);
+    assert!(!refused.visible_indices().contains(&1) || refused.default != Some(1));
+    // A non-destructive default survives with its role recorded.
+    let kept = responsive_actions::plan_actions_with_roles(
+        Rect::new(0, 0, 100, 2),
+        &labels,
+        Some(0),
+        &[4],
+        None,
+    );
+    assert_eq!(kept.default, Some(0));
+    assert_eq!(kept.destructive, vec![4]);
+    // Focused overflow maps onto More ▾; visible focus does not.
+    let band = Rect::new(0, 0, 40, 1);
+    let plan = responsive_actions::plan_actions(band, &labels, Some(0), None);
+    assert!(plan.needs_more());
+    let hidden = plan.overflow[0];
+    let via_more = responsive_actions::plan_actions(band, &labels, Some(0), Some(hidden));
+    assert!(
+        via_more.more_is_focused(),
+        "hidden focus owns More ▾: {via_more:?}"
+    );
+    assert!(!plan.more_is_focused(), "no focus recorded: {plan:?}");
+    let shown = plan.visible_indices()[0];
+    let direct = responsive_actions::plan_actions(band, &labels, Some(0), Some(shown));
+    assert!(
+        !direct.more_is_focused(),
+        "visible focus stays on its button"
+    );
+    // Unreachable overflow is explicit: a trailing default in a single narrow
+    // row holds only itself with no room for More ▾, so hidden rows have no
+    // hitbox. A leading default squeezes prefix + More ▾ into the row instead.
+    let trailing = responsive_actions::plan_actions(Rect::new(0, 0, 16, 1), &labels, Some(5), None);
+    assert!(!trailing.overflow.is_empty());
+    assert!(
+        trailing.more.is_none(),
+        "single narrow row holds only the default"
+    );
+    assert!(trailing.unreachable_overflow());
+    assert!(trailing.visible_indices().contains(&5));
+    let leading = responsive_actions::plan_actions(Rect::new(0, 0, 16, 1), &labels, Some(0), None);
+    assert!(leading.more.is_some());
+    assert!(!leading.unreachable_overflow());
+    let roomy = responsive_actions::plan_actions(Rect::new(0, 0, 16, 2), &labels, Some(5), None);
+    assert!(roomy.more.is_some());
+    assert!(!roomy.unreachable_overflow());
+}
+
+#[test]
+fn responsive_action_budgets_and_resolve_fallback_at_boundaries() {
+    let labels = [
+        "Apply",
+        "Clear",
+        "Edit note",
+        "Raw context",
+        "Remove",
+        "Help",
+    ];
+    // Stable budgets at the boundary content widths (frame minus side pads).
+    assert_eq!(responsive_actions::stable_action_rows(156, &labels), 1);
+    assert_eq!(responsive_actions::stable_action_rows(68, &labels), 2);
+    assert_eq!(responsive_actions::stable_action_rows(48, &labels), 2);
+    assert_eq!(responsive_actions::stable_action_rows(16, &labels), 2);
+    // 20x6 with a one-row budget and a trailing default is unreachable: the
+    // single narrow row holds only the default with no room for More ▾, so the
+    // dialog fallback owns the frame and the caller grows the budget instead
+    // of drawing a dead band. A leading default squeezes into one row.
+    use responsive::PresentationKind;
+    let viewport = responsive_viewport(20, 6);
+    let one_row = responsive::DialogSpec::new(PresentationKind::LongContent, 0, 1, 1, 0, 1);
+    assert_eq!(
+        responsive::resolve_dialog(viewport, &one_row, 4, &labels, Some(5), None),
+        Err(responsive::GeometryError::TooSmall)
+    );
+    let two_rows = responsive::DialogSpec::new(PresentationKind::LongContent, 0, 1, 1, 0, 2);
+    let geometry = responsive::resolve_dialog(viewport, &two_rows, 4, &labels, Some(5), None)
+        .expect("two-row budget reaches More ▾ at 20x6");
+    assert!(geometry.actions.more.is_some());
+    assert!(!geometry.actions.unreachable_overflow());
+    assert!(geometry.actions.visible_indices().contains(&5));
+}

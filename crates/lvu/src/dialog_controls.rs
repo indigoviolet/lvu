@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
@@ -348,4 +348,426 @@ pub fn button_layout(
         ),
     ));
     visible
+}
+
+// --- Responsive action planning (phase A foundation) ---
+//
+// Hand-rolled row assignment here is presentation-only folding: it decides
+// which stable action labels share a one-row band, never query membership or
+// filtering (AGENTS.md: the query engine computes, the app names/presents).
+
+/// Overflow menu label. Measured with [`button_width`] like every label, so
+/// planning and painting agree on its cells (`More ▾` is width 6 + brackets).
+pub const MORE_LABEL: &str = "More \u{25be}";
+/// Stable maximum action rows (§5.4): wrap to two rows, beyond that `More ▾`.
+pub const MAX_ACTION_ROWS: u16 = 2;
+
+/// One authoritative plan for an action band.
+///
+/// `band` is the sticky actions region handed out by the dialog geometry
+/// (0–2 rows). `buttons` holds the visible buttons with their original label
+/// indices in drawn order; `overflow` holds the hidden indices in original
+/// order for the anchored `More ▾` menu and `press_action`. `more` is the
+/// `More ▾` hitbox when `overflow` is reachable through it. `default` is the
+/// filled default (§8.9), always in `buttons` when the band has room for one
+/// row; a default naming a destructive index is refused (destructive is never
+/// the default, as in `ActionRow::role`). `focused` records the focus index
+/// the caller passed; when it names a hidden row the `More ▾` menu owns the
+/// focus ring (see [`ActionGeometry::more_is_focused`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionGeometry {
+    pub band: Rect,
+    pub buttons: Vec<(usize, Rect)>,
+    pub overflow: Vec<usize>,
+    pub more: Option<Rect>,
+    pub default: Option<usize>,
+    pub focused: Option<usize>,
+    pub destructive: Vec<usize>,
+}
+
+impl ActionGeometry {
+    /// True when trailing actions moved into `More ▾`.
+    pub fn needs_more(&self) -> bool {
+        !self.overflow.is_empty()
+    }
+
+    /// Visible index set, in drawn order. Useful for asserting stable order.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        self.buttons.iter().map(|(index, _)| *index).collect()
+    }
+
+    /// True when the recorded focus names a hidden row: the `More ▾` menu
+    /// owns the focus ring and Enter opens it rather than pressing a button.
+    pub fn more_is_focused(&self) -> bool {
+        match (self.focused, self.more) {
+            (Some(focused), Some(_)) => self.overflow.contains(&focused),
+            _ => false,
+        }
+    }
+
+    /// True when hidden rows exist but `More ▾` has no hitbox (a single narrow
+    /// row holding only the default). The hidden actions are unreachable by
+    /// mouse; callers treat this as the dialog fallback (`TooSmall`) and grow
+    /// the stable action budget to two rows rather than drawing a dead band.
+    pub fn unreachable_overflow(&self) -> bool {
+        !self.overflow.is_empty() && self.more.is_none()
+    }
+}
+
+/// Stable action budget for `labels` at `width`: 0 when there are no labels,
+/// otherwise 1 when everything fits in one row and 2 when it wraps.
+///
+/// Capped at [`MAX_ACTION_ROWS`]; anything beyond two rows becomes `More ▾`
+/// overflow in [`plan_actions`]. Labels are stable per dialog (verbs, not
+/// async item counts), so this budget is stable while the dialog is open.
+pub fn stable_action_rows(width: u16, labels: &[&str]) -> u16 {
+    if width == 0 || labels.is_empty() {
+        return 0;
+    }
+    let mut rows = 1u16;
+    let mut x = 0u16;
+    for label in labels {
+        let w = button_width(label).min(width);
+        if x != 0 && x.saturating_add(w) > width {
+            rows = rows.saturating_add(1);
+            x = 0;
+        }
+        x = x.saturating_add(w).saturating_add(BUTTON_GUTTER);
+    }
+    rows.clamp(1, MAX_ACTION_ROWS)
+}
+
+fn place_row_buttons(row: Rect, widths: &[u16]) -> Vec<Rect> {
+    if row.is_empty() || widths.is_empty() {
+        return Vec::new();
+    }
+    // Structural placement: one Length per button, gutter via spacing,
+    // left-aligned via Flex::Start so paint, cursor and hitboxes share it.
+    let constraints: Vec<Constraint> = widths.iter().map(|w| Constraint::Length(*w)).collect();
+    Layout::horizontal(constraints)
+        .spacing(BUTTON_GUTTER)
+        .flex(Flex::Start)
+        .split(row)
+        .iter()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .copied()
+        .collect()
+}
+
+fn fit_count_in_row(width: u16, widths: &[u16], start: usize) -> usize {
+    let mut x = 0u16;
+    let mut count = 0usize;
+    for w in &widths[start..] {
+        // `x` already includes the trailing gutter of the previous button,
+        // which is exactly the leading gap for this one.
+        let end = if count == 0 { *w } else { x.saturating_add(*w) };
+        if end > width {
+            break;
+        }
+        x = end.saturating_add(BUTTON_GUTTER);
+        count += 1;
+    }
+    count
+}
+
+/// Plan `labels` into `band` (0–2 rows) with a stable default and `More ▾`.
+///
+/// - When everything fits, every label is visible and `more` is `None`.
+/// - Beyond two rows, trailing non-primary actions move into `More ▾`;
+///   hidden actions keep original indices for `press_action`.
+/// - The default (when `Some` and in range) is always visible when the band
+///   has at least one row: dialogs order the default first, and the fallback
+///   below preserves it even for a trailing default by showing it alone with
+///   `More ▾` underneath.
+/// - A focused index inside `overflow` is reached via `More ▾`; the caller
+///   styles `more` as focused in that case.
+pub fn plan_actions(
+    band: Rect,
+    labels: &[&str],
+    default: Option<usize>,
+    focused: Option<usize>,
+) -> ActionGeometry {
+    plan_actions_with_roles(band, labels, default, &[], focused)
+}
+
+/// Plan with explicit destructive roles (see [`ActionRow::role`]).
+///
+/// `destructive` indices are validated into range and stored; a `default`
+/// naming one is refused to `None` because a destructive action is never the
+/// default. Visibility is stable in labels/default/destructive only: `focused`
+/// never reshuffles the visible set, it maps onto `More ▾` when hidden (see
+/// [`ActionGeometry::more_is_focused`]).
+pub fn plan_actions_with_roles(
+    band: Rect,
+    labels: &[&str],
+    default: Option<usize>,
+    destructive: &[usize],
+    focused: Option<usize>,
+) -> ActionGeometry {
+    let destructive_set: Vec<usize> = destructive
+        .iter()
+        .copied()
+        .filter(|index| *index < labels.len())
+        .collect();
+    let valid_default = default
+        .filter(|index| *index < labels.len())
+        .filter(|index| !destructive_set.contains(index));
+    let valid_focused = focused.filter(|index| *index < labels.len());
+    if band.is_empty() || labels.is_empty() {
+        return ActionGeometry {
+            band,
+            buttons: Vec::new(),
+            overflow: (0..labels.len()).collect(),
+            more: None,
+            default: valid_default,
+            focused: valid_focused,
+            destructive: destructive_set.clone(),
+        };
+    }
+    let widths: Vec<u16> = labels
+        .iter()
+        .map(|label| button_width(label).min(band.width))
+        .collect();
+    let max_rows = band.height.clamp(1, MAX_ACTION_ROWS);
+    // Structural row split: one Length(1) per band row, no extra gaps inside
+    // the sticky band (gaps around the band belong to the dialog anatomy).
+    let row_rects: Vec<Rect> = Layout::vertical(vec![Constraint::Length(1); max_rows as usize])
+        .spacing(0)
+        .flex(Flex::Start)
+        .split(band)
+        .iter()
+        .copied()
+        .collect();
+
+    // Fast path: everything fits without overflow.
+    {
+        let mut rows_used = 1u16;
+        let mut x = 0u16;
+        let mut fits = true;
+        for w in &widths {
+            if x != 0 && x.saturating_add(*w) > band.width {
+                rows_used = rows_used.saturating_add(1);
+                x = 0;
+                if rows_used > max_rows {
+                    fits = false;
+                    break;
+                }
+            }
+            x = x.saturating_add(*w).saturating_add(BUTTON_GUTTER);
+        }
+        if fits {
+            // Assign rows greedily, then place each row structurally.
+            let mut buttons = Vec::new();
+            let mut row_start = 0usize;
+            let mut row_index = 0usize;
+            let mut x = 0u16;
+            for (index, w) in widths.iter().enumerate() {
+                if index != row_start && x.saturating_add(*w) > band.width {
+                    let rects = place_row_buttons(row_rects[row_index], &widths[row_start..index]);
+                    for (offset, rect) in rects.into_iter().enumerate() {
+                        buttons.push((row_start + offset, rect));
+                    }
+                    row_index += 1;
+                    row_start = index;
+                    x = 0;
+                }
+                x = x.saturating_add(*w).saturating_add(BUTTON_GUTTER);
+            }
+            let rects = place_row_buttons(row_rects[row_index], &widths[row_start..]);
+            for (offset, rect) in rects.into_iter().enumerate() {
+                buttons.push((row_start + offset, rect));
+            }
+            return ActionGeometry {
+                band,
+                buttons,
+                overflow: Vec::new(),
+                more: None,
+                default: valid_default,
+                focused: valid_focused,
+                destructive: destructive_set.clone(),
+            };
+        }
+    }
+
+    let more_w = button_width(MORE_LABEL).min(band.width);
+    // Overflow path: reserve More ▾ in the last row.
+    if max_rows == 1 {
+        let row = row_rects[0];
+        // Largest prefix fitting alongside More ▾ in one row.
+        let mut x = 0u16;
+        let mut keep = 0usize;
+        for w in &widths {
+            let end = if keep == 0 { *w } else { x.saturating_add(*w) };
+            // Room for gutter + More ▾ after this button (unless it is the
+            // only content and More ▾ must share anyway).
+            let with_more = end.saturating_add(BUTTON_GUTTER).saturating_add(more_w);
+            let fits = if keep == 0 {
+                // A single button plus More ▾ may exceed a very narrow band;
+                // the default still survives below via the fallback.
+                end.saturating_add(BUTTON_GUTTER).saturating_add(more_w) <= band.width
+                    || *w <= band.width
+            } else {
+                with_more <= band.width
+            };
+            if !fits {
+                break;
+            }
+            x = end.saturating_add(BUTTON_GUTTER);
+            keep += 1;
+            if keep >= labels.len() {
+                break;
+            }
+        }
+        // Default survival: with one row and a very narrow band the default
+        // alone wins over More ▾ (spec: never remove the default). A trailing
+        // default means the visible set is non-contiguous, handled below.
+        if let Some(d) = valid_default
+            && d >= keep
+            && keep < labels.len()
+        {
+            // Non-contiguous fallback: first-row prefix would drop the
+            // default, so show the default alone with More ▾. Overflow keeps
+            // original order minus the default.
+            let row_widths = [widths[d]];
+            let placed = place_row_buttons(row, &row_widths);
+            let more_row_widths = [more_w];
+            // More ▾ shares the same single row after the default when it
+            // fits, otherwise it has no room and stays hidden (default wins).
+            let both = [widths[d], more_w];
+            if widths[d]
+                .saturating_add(BUTTON_GUTTER)
+                .saturating_add(more_w)
+                <= band.width
+            {
+                let both_placed = place_row_buttons(row, &both);
+                return ActionGeometry {
+                    band,
+                    buttons: vec![(d, both_placed[0])],
+                    overflow: (0..labels.len()).filter(|i| *i != d).collect(),
+                    more: Some(both_placed[1]),
+                    default: valid_default,
+                    focused: valid_focused,
+                    destructive: destructive_set.clone(),
+                };
+            }
+            let _ = more_row_widths;
+            return ActionGeometry {
+                band,
+                buttons: vec![(d, placed[0])],
+                overflow: (0..labels.len()).filter(|i| *i != d).collect(),
+                more: None,
+                default: valid_default,
+                focused: valid_focused,
+                destructive: destructive_set.clone(),
+            };
+        }
+        let visible = keep.min(labels.len());
+        let mut constraints: Vec<Constraint> = widths[..visible]
+            .iter()
+            .map(|w| Constraint::Length(*w))
+            .collect();
+        constraints.push(Constraint::Length(more_w));
+        let placed: Vec<Rect> = Layout::horizontal(constraints)
+            .spacing(BUTTON_GUTTER)
+            .flex(Flex::Start)
+            .split(row)
+            .iter()
+            .copied()
+            .collect();
+        let mut buttons = Vec::new();
+        for (index, rect) in placed[..visible].iter().enumerate() {
+            buttons.push((index, *rect));
+        }
+        return ActionGeometry {
+            band,
+            buttons,
+            overflow: (visible..labels.len()).collect(),
+            more: Some(placed[visible]),
+            default: valid_default,
+            focused: valid_focused,
+            destructive: destructive_set.clone(),
+        };
+    }
+
+    // Two-row overflow: first row takes a prefix without More ▾, last row
+    // takes the next buttons that fit alongside More ▾.
+    let first_capacity = fit_count_in_row(band.width, &widths, 0);
+    let first_keep = first_capacity.min(labels.len());
+    let mut second_keep = 0usize;
+    {
+        let mut x = 0u16;
+        for w in widths.iter().skip(first_keep) {
+            let end = if second_keep == 0 {
+                *w
+            } else {
+                x.saturating_add(*w)
+            };
+            if end.saturating_add(BUTTON_GUTTER).saturating_add(more_w) > band.width {
+                break;
+            }
+            x = end.saturating_add(BUTTON_GUTTER);
+            second_keep += 1;
+        }
+    }
+    let mut visible_end = first_keep.saturating_add(second_keep).min(labels.len());
+    // Default survival for a trailing default: show the default alone in the
+    // first row and More ▾ alone in the last row; everything else overflows.
+    if let Some(d) = valid_default
+        && d >= visible_end
+    {
+        let first_row = row_rects[0];
+        let last_row = row_rects[1];
+        let default_rect = place_row_buttons(first_row, &[widths[d]])[0];
+        let more_rect = place_row_buttons(last_row, &[more_w])[0];
+        let mut overflow: Vec<usize> = (0..labels.len()).collect();
+        overflow.retain(|i| *i != d);
+        return ActionGeometry {
+            band,
+            buttons: vec![(d, default_rect)],
+            overflow,
+            more: Some(more_rect),
+            default: valid_default,
+            focused: valid_focused,
+            destructive: destructive_set.clone(),
+        };
+    }
+    visible_end = visible_end.max(valid_default.map(|d| d + 1).unwrap_or(0).min(labels.len()));
+    // Re-derive the first/second split for the (possibly extended) prefix.
+    let first_row_count = fit_count_in_row(band.width, &widths, 0).min(visible_end);
+    let second_row_count = visible_end.saturating_sub(first_row_count);
+    let first_rects = place_row_buttons(row_rects[0], &widths[0..first_row_count]);
+    let mut buttons = Vec::new();
+    for (offset, rect) in first_rects.into_iter().enumerate() {
+        buttons.push((offset, rect));
+    }
+    let more_rect = if second_row_count == 0 {
+        place_row_buttons(row_rects[1], &[more_w])[0]
+    } else {
+        let mut constraints: Vec<Constraint> = widths[first_row_count..visible_end]
+            .iter()
+            .map(|w| Constraint::Length(*w))
+            .collect();
+        constraints.push(Constraint::Length(more_w));
+        let placed: Vec<Rect> = Layout::horizontal(constraints)
+            .spacing(BUTTON_GUTTER)
+            .flex(Flex::Start)
+            .split(row_rects[1])
+            .iter()
+            .copied()
+            .collect();
+        for (offset, rect) in placed[..second_row_count].iter().enumerate() {
+            buttons.push((first_row_count + offset, *rect));
+        }
+        placed[second_row_count]
+    };
+    ActionGeometry {
+        band,
+        buttons,
+        overflow: (visible_end..labels.len()).collect(),
+        more: Some(more_rect),
+        default: valid_default,
+        focused: valid_focused,
+        destructive: destructive_set.clone(),
+    }
 }
