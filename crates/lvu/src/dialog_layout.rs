@@ -896,8 +896,13 @@ impl ScrollViewport {
     }
 
     /// Project logical row `index` to its painted rect, or `None` when
-    /// scrolled out. The same rect drives paint, cursor, selection and mouse.
+    /// scrolled out or beyond the logical content. The same rect drives paint,
+    /// cursor, selection and mouse, so an out-of-range row must never receive
+    /// a hitbox.
     pub fn project_row(&self, index: usize) -> Option<Rect> {
+        if index >= self.content_rows {
+            return None;
+        }
         if index < self.first_row {
             return None;
         }
@@ -949,6 +954,13 @@ pub struct DialogGeometry {
     /// Union of frame and any open overlays. Phase A has no overlays wired,
     /// so this equals `frame`; later anchored menus join it.
     pub frontmost: Rect,
+    /// The original viewport compactness decision (`W < 64 || H < 20`) that
+    /// sized this geometry. Rendering must reuse this value instead of
+    /// re-deriving compactness from the frame, because a roomy viewport can
+    /// resolve to a frame that itself looks compact (e.g. a 48x11 prompt on
+    /// a 70x30 viewport); recomputing would swap the Block padding under the
+    /// laid-out content.
+    pub compact: bool,
 }
 
 impl DialogGeometry {
@@ -969,14 +981,33 @@ impl DialogGeometry {
     }
 }
 
-fn center_x(viewport: Rect, width: u16) -> u16 {
+fn center_x_in(area: Rect, width: u16) -> u16 {
     // Structural centering: a Length centered with Flex::Center.
-    let probe = Rect::new(viewport.x, viewport.y, viewport.width, 1);
-    Layout::horizontal([Constraint::Length(width)])
+    if area.is_empty() {
+        return area.x;
+    }
+    let probe = Rect::new(area.x, area.y, area.width.max(1), 1);
+    Layout::horizontal([Constraint::Length(width.min(area.width))])
         .flex(Flex::Center)
         .split(probe)[0]
         .x
-        .max(viewport.x)
+        .max(area.x)
+}
+
+fn center_x(viewport: Rect, width: u16) -> u16 {
+    center_x_in(viewport, width)
+}
+
+/// Minimum frame height holding the essential anatomy.
+///
+/// Border plus header plus `body_min` rows plus one state row when the spec
+/// has a message budget plus one action row when it has an action budget.
+/// Help is droppable and gaps are zero under pressure.
+fn min_frame_height(spec: &DialogSpec) -> u16 {
+    2u16.saturating_add(spec.header_rows)
+        .saturating_add(spec.body_min_rows.max(1))
+        .saturating_add(u16::from(spec.message_rows > 0))
+        .saturating_add(u16::from(spec.action_rows > 0))
 }
 
 fn center_y(viewport: Rect, height: u16) -> u16 {
@@ -1006,19 +1037,40 @@ fn top_biased_y(viewport: Rect, height: u16) -> u16 {
 
 /// Inspector placement against a frozen anchor (pure, unwired).
 ///
-/// Chooses the larger above/below band that holds the preferred frame,
-/// prefers below on an exact tie, aligns with a one-row gap, shrinks into a
-/// band holding only the content minimum, and otherwise falls back top-biased.
-fn inspector_origin(viewport: Rect, size: (u16, u16), anchor: Option<ContextAnchor>) -> (u16, u16) {
-    let x = center_x(viewport, size.0);
-    let centered_fallback = (x, center_y(viewport, size.1));
+/// Centers horizontally over the frozen log pane when one is retained and
+/// otherwise over the viewport. Chooses the larger above/below band that holds
+/// the preferred frame with a one-row gap, prefers below on an exact tie,
+/// shrinks into the larger band when it holds the content minimum, and only
+/// then falls back top-biased (e.g. the 20x6 safety floor, which is full-frame
+/// by construction).
+fn inspector_placement(
+    viewport: Rect,
+    spec: &DialogSpec,
+    size: (u16, u16),
+    anchor: Option<ContextAnchor>,
+) -> (u16, u16, u16, u16) {
+    let (width, height) = size;
+    let centered_fallback = (
+        center_x(viewport, width),
+        center_y(viewport, height),
+        width,
+        height,
+    );
     let Some(anchor) = anchor else {
         return centered_fallback;
     };
     if anchor.row.is_empty() {
         return centered_fallback;
     }
-    let (width, height) = size;
+    // Horizontal: over the retained log pane when present, clamped inside the
+    // viewport so a narrow log never pushes the frame out of frame.
+    let x = if anchor.log.is_empty() || anchor.log.width == 0 {
+        center_x(viewport, width)
+    } else {
+        center_x_in(anchor.log, width)
+            .min(viewport.right().saturating_sub(width))
+            .max(viewport.x)
+    };
     let gap = 1u16;
     let below_top = anchor.row.bottom().saturating_add(gap);
     let below_room = viewport.bottom().saturating_sub(below_top);
@@ -1054,24 +1106,39 @@ fn inspector_origin(viewport: Rect, size: (u16, u16), anchor: Option<ContextAnch
     } else {
         anchor.row.y.saturating_sub(gap).saturating_sub(height)
     };
-    let y = if fits_below && fits_above {
+    if fits_below && fits_above {
         if below_room >= above_room {
-            below_y
-        } else {
-            above_y
+            return (x, below_y, width, height);
         }
-    } else if fits_below {
-        below_y
-    } else if fits_above {
-        above_y
-    } else {
-        // Neither holds the preferred frame: shrink is handled by the caller
-        // via the content minimum; placement here keeps the top-biased
-        // fallback so the dialog never covers its own anchor blindly.
-        return (x, top_biased_y(viewport, height));
-    };
-    let _ = width;
-    (x, y.max(viewport.y))
+        return (x, above_y, width, height);
+    }
+    if fits_below {
+        return (x, below_y, width, height);
+    }
+    if fits_above {
+        return (x, above_y, width, height);
+    }
+    // Neither band holds the preferred frame: shrink into the larger band when
+    // it holds the content minimum, preserving the one-row gap and the log
+    // centering above. Otherwise the safety floor owns the frame.
+    let minimum = min_frame_height(spec).min(height);
+    let use_below = below_room >= above_room;
+    let band = below_room.max(above_room);
+    if band >= minimum && minimum > 0 {
+        let shrunk = band.min(height).max(minimum.min(band));
+        if use_below {
+            let y = below_top.min(viewport.bottom().saturating_sub(shrunk));
+            return (x, y.max(viewport.y), width, shrunk);
+        }
+        let y = anchor
+            .row
+            .y
+            .saturating_sub(gap)
+            .saturating_sub(shrunk)
+            .max(viewport.y);
+        return (x, y, width, shrunk);
+    }
+    (x, top_biased_y(viewport, height), width, height)
 }
 
 /// Split `content` into anatomy bands.
@@ -1223,18 +1290,27 @@ pub fn resolve_dialog(
         return Err(GeometryError::TooSmall);
     }
     // Placement: top-biased prompts/palette at H/8, inspectors against the
-    // frozen anchor when present, everything else centered. All horizontal
-    // centering flows through Flex::Center (see center_x).
-    let (x, y) = match spec.presentation {
-        PresentationKind::Contextual(ContextFootprint::Prompt) | PresentationKind::Palette => {
-            (center_x(viewport, width), top_biased_y(viewport, height))
-        }
+    // frozen anchor (log-centered, shrunk to the larger band when needed),
+    // everything else centered. All horizontal centering flows through
+    // Flex::Center (see center_x_in).
+    let (x, y, width, height) = match spec.presentation {
+        PresentationKind::Contextual(ContextFootprint::Prompt) | PresentationKind::Palette => (
+            center_x(viewport, width),
+            top_biased_y(viewport, height),
+            width,
+            height,
+        ),
         PresentationKind::Contextual(ContextFootprint::Inspector) => {
-            inspector_origin(viewport, (width, height), anchor)
+            inspector_placement(viewport, spec, (width, height), anchor)
         }
         PresentationKind::SelfContainedForm
         | PresentationKind::LongContent
-        | PresentationKind::FullFrame => (center_x(viewport, width), center_y(viewport, height)),
+        | PresentationKind::FullFrame => (
+            center_x(viewport, width),
+            center_y(viewport, height),
+            width,
+            height,
+        ),
     };
     let x = x.min(viewport.right().saturating_sub(width));
     let y = y.min(viewport.bottom().saturating_sub(height));
@@ -1293,6 +1369,13 @@ pub fn resolve_dialog(
     }
     let body = ScrollViewport::new(body_rect, body_content_rows, 0);
     let actions = dialog_controls::plan_actions(actions_band, action_labels, action_default, None);
+    if actions.unreachable_overflow() {
+        // Hidden actions exist but More ▾ has no hitbox (a single narrow row
+        // holding only the default). The overflow is unreachable by mouse, so
+        // refuse explicitly: the caller grows the stable action budget to two
+        // rows rather than drawing a dead band.
+        return Err(GeometryError::TooSmall);
+    }
     Ok(DialogGeometry {
         frame,
         interior,
@@ -1303,6 +1386,7 @@ pub fn resolve_dialog(
         help: help_rect,
         actions,
         frontmost: frame,
+        compact: compact_viewport,
     })
 }
 
@@ -1569,31 +1653,33 @@ pub fn anchored_geometry(
     let x = field.x.min(area.right().saturating_sub(width)).max(area.x);
     let full_height = desired_items.saturating_add(2).saturating_add(footer);
     let full_height = full_height.min(area.height.max(1)).max(2.min(area.height));
-    let below_top = field.bottom();
-    let below_room = area.bottom().saturating_sub(below_top);
-    let above_room = field.y.saturating_sub(area.y);
-    // Structural placement choice: Flex::Start below at the field edge,
-    // Flex::End above inside the band over the field (see inspector_origin).
+    // Approved one-cell gap: one blank row between the field and the popup,
+    // below preferred and above when below cannot fit.
+    let gap = 1u16;
+    let below_top = field.bottom().saturating_add(gap);
+    let below_room = area.bottom().saturating_sub(below_top.min(area.bottom()));
+    let above_room = field.y.saturating_sub(area.y).saturating_sub(gap);
+    // Structural placement choice: Flex::Start below at the gap,
+    // Flex::End above inside the band over the field (see inspector_placement).
     let fits_below = below_room >= full_height;
     let fits_above = above_room >= full_height;
+    let above_y_for = |height: u16| {
+        field
+            .y
+            .saturating_sub(gap)
+            .saturating_sub(height)
+            .max(area.y)
+    };
     let (y, placed_below, mut shown_items) = if fits_below && fits_above {
         if below_room >= above_room {
             (below_top, true, desired_items)
         } else {
-            (
-                field.y.saturating_sub(full_height).max(area.y),
-                false,
-                desired_items,
-            )
+            (above_y_for(full_height), false, desired_items)
         }
     } else if fits_below {
         (below_top, true, desired_items)
     } else if fits_above {
-        (
-            field.y.saturating_sub(full_height).max(area.y),
-            false,
-            desired_items,
-        )
+        (above_y_for(full_height), false, desired_items)
     } else {
         // Neither side holds the desired rows: take the larger band, shrink,
         // and scroll. Prefer below on an exact tie.
@@ -1608,7 +1694,7 @@ pub fn anchored_geometry(
             (below_top.min(area.bottom().saturating_sub(2)), true, shrunk)
         } else {
             let height = shrunk.saturating_add(2).saturating_add(footer);
-            (field.y.saturating_sub(height).max(area.y), false, shrunk)
+            (above_y_for(height), false, shrunk)
         }
     };
     shown_items = shown_items.min(8);

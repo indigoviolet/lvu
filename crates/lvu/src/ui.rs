@@ -2825,9 +2825,12 @@ pub(crate) fn dialog_frame_regions(
 /// Phase A responsive frame renderer (foundation only, no component switched).
 ///
 /// Draws `geometry.frame` with the shared padded [`Block`] so geometry and
-/// paint share one definition: bordered, titled, padded per viewport via
-/// `dialog_layout::frame_block`. Clearing uses the dialog surface so the
-/// scrimmed workspace never shows through.
+/// paint share one definition: bordered, titled, padded per the resolved
+/// `geometry.compact` decision. The compactness is read from the geometry —
+/// never recomputed from the frame — because a roomy viewport can resolve to
+/// a frame that itself looks compact, and recomputing would swap the Block
+/// padding under the laid-out content. Clearing uses the dialog surface so
+/// the scrimmed workspace never shows through.
 #[allow(dead_code)]
 pub(crate) fn render_responsive_frame(
     frame: &mut Frame<'_>,
@@ -2842,9 +2845,8 @@ pub(crate) fn render_responsive_frame(
         theme.border
     };
     clear_themed(frame, geometry.frame, theme);
-    let compact = crate::dialog_layout::is_compact(frame.area());
     frame.render_widget(
-        crate::dialog_layout::frame_block(compact)
+        crate::dialog_layout::frame_block(geometry.compact)
             .title(Span::styled(
                 format!(" {title} "),
                 Style::default().fg(colour).add_modifier(Modifier::BOLD),
@@ -3588,5 +3590,63 @@ mod presentation_tests {
                 .iter()
                 .any(|span| span.style.fg == Some(theme.json.null))
         );
+    }
+}
+
+#[cfg(test)]
+mod responsive_frame_agreement_tests {
+    use super::render_responsive_frame;
+    use crate::dialog_layout::{
+        self, ContextFootprint, DialogSpec, PresentationKind, frame_block, is_compact,
+    };
+    use crate::theme::ThemeId;
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+    /// A roomy viewport can resolve to a frame that itself looks compact.
+    /// The renderer must reuse the resolved compactness decision instead of
+    /// recomputing it from the frame, or the Block padding swaps under the
+    /// laid-out content. Real TestBackend agreement below.
+    #[test]
+    fn renderer_reuses_the_resolved_compactness_decision() {
+        let viewport = Rect::new(0, 0, 70, 30);
+        assert!(!is_compact(viewport), "70x30 is a roomy viewport");
+        let spec = DialogSpec::new(
+            PresentationKind::Contextual(ContextFootprint::Prompt),
+            0,
+            1,
+            1,
+            0,
+            1,
+        );
+        let geometry = dialog_layout::resolve_dialog(viewport, &spec, 4, &["Apply"], Some(0), None)
+            .expect("resolve");
+        assert_eq!((geometry.frame.width, geometry.frame.height), (48, 11));
+        assert!(
+            is_compact(Rect::new(0, 0, geometry.frame.width, geometry.frame.height)),
+            "the resolved frame itself looks compact: {:?}",
+            geometry.frame
+        );
+        assert!(!geometry.compact, "but it was resolved roomy");
+        // One Block definition drives both sides.
+        assert_eq!(
+            frame_block(geometry.compact).inner(geometry.frame),
+            geometry.content
+        );
+        // Roomy keeps a pad row: content starts two rows inside the frame.
+        assert_eq!(geometry.content.y, geometry.frame.y + 2);
+        assert_eq!(geometry.content.x, geometry.frame.x + 2);
+        // Real buffer: the border draws, the pad row above the content origin
+        // stays dialog background, and the content origin sits below it.
+        let theme = ThemeId::LoveDark.theme();
+        let mut terminal = Terminal::new(TestBackend::new(70, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render_responsive_frame(frame, &geometry, "Prompt", true, theme))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        assert_eq!(buffer[(geometry.frame.x, geometry.frame.y)].symbol(), "┌");
+        let pad = &buffer[(geometry.content.x, geometry.frame.y + 1)];
+        assert_eq!(pad.symbol(), " ");
+        assert_eq!(pad.style().bg, Some(theme.dialog_bg));
+        assert!(geometry.content.y > geometry.frame.y + 1);
     }
 }
