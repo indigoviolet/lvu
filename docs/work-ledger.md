@@ -3078,3 +3078,52 @@ the production `union_submit_defers` regression, fmt and targeted Clippy pass.
 Its retained command-enrichment repetition failed once at the immediate `/proc`
 descendant-state assertion; zero candidate code touches that module. The race
 remains explicit combined-gate risk, not a waived green result.
+
+
+### Responsive geometry core and shell integrated — 2026-09-11
+
+The phase-A responsive policy initially reached `b892d19`; fresh Terra held it
+on unreachable narrow action overflow, out-of-range body projection, inspector
+placement that could cover its frozen row, and render/geometry padding drift.
+Muse corrected those issues through `73f5acc5c16c9d4155b8a7d96e9fda7373ec4954`,
+tree `4b2690d529a56b9d1a6bb6a4a5683751916c27d4`. Independent review passed 57
+dialog-layout tests, the TestBackend renderer, package check and all-target
+`lvu` Clippy. Primary integrated that exact core at `63d8e1d`.
+
+The shell/palette slice first produced `81f35db`. Review confirmed its stable
+Palette geometry, single extra scrim, real no-painted-row fallback and shared
+cursor/selection/hitbox projection, but held an asynchronous Source-success
+path that selected `Logs` before closing the final layer and left its frozen
+anchor live. Successor `bc200f147f00b364c9d002e969288d43703f2cc4`, tree
+`d708087e8f4889643a0133d6df8278fd06479128`, clears an anchor whenever a named
+close empties the stack, preserves both `Some` and resize-invalidated `None`
+across a no-redraw `Replace`, and removes both synthetic palette row fallbacks.
+Negative controls fail on the old Source/Replace paths. Exact focused results:
+25 palette, 63 dialog-layout, 5 scrim and 169 UI-state tests, check and Clippy.
+
+The review PTY then exposed a controller defect rather than a palette timeout:
+a 121-byte `<capture>/shared-worker/control.sock` exceeded `sockaddr_un`; the
+worker failed bind, `ensure_worker` spawned another every 25 ms, and about 100
+unreaped children accumulated before the five-second election error. The
+causal overrun log is
+`terra-responsive-dialog-shell-review/bc200f1-pty-overrun-diagnostic.log`.
+Controller successor `f470270d02c9e1fc7fe8615c486f1069d1b5a564`, tree
+`fe126f186c6dec38ecb65ff1927381d7597d21be`, uses one canonical capture identity,
+a conservative direct-path limit and a deterministic euid-owned 0700 runtime
+socket for long roots. It bounds each ensure invocation to one spawn and starts
+a reaper before the child, including late-handoff kill/wait. Fresh Terra passed
+145 `lvu-shared` tests, 27 app shared-capture tests, touched-package Clippy and
+a 193-byte-path actual PTY with one session and clean unlink; logs are the
+`long-socket-f470270-*` files under `lvu-terra-controller-review-scratch/`.
+
+Primary cherry-picked only that reviewed controller commit as `65d81b1`, then
+built isolated combined merge `44a7a06bfbc5a4058d4c6035c6406d7a38dd7157`,
+tree `c155f7e9549816cd9ec5c2bd13793265e109e5f6`, with `bc200f1` as its second
+parent. Final Terra review found disjoint, conflict-free reviewed path sets and
+passed fmt, the four responsive suites, `lvu`/`lvu-app` check, all-target `lvu`
+Clippy, the complete original-budget palette PTY, and a 235-byte-path PTY with
+one worker and clean socket removal. Combined binary SHA-256:
+`27b3709ccd011881c0d5b0c59031484238277bd13778412f9929419cae6c614e`.
+Primary fast-forwarded to that exact reviewed merge. Earlier exact-`81f35db`
+and exact-`bc200f1` PTY failures remain preserved; this is cleared shared core,
+not component migration, full PTY-matrix or published-release acceptance.
