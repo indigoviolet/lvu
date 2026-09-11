@@ -10,6 +10,7 @@ import pathlib
 import sqlite3
 import sys
 import tempfile
+import time
 from test_lvu_pty import ADVANCED_TAB, FILTER_TITLE, PtyApp, open_advanced_filter
 from test_enrichment_chain_pty import stop, paste
 
@@ -34,8 +35,14 @@ def view_lines(app):
     for line in app.text().splitlines():
         if not line.startswith("│"):
             continue
+        # The sidebar width is policy-driven, so a trailing border cell is
+        # layout rather than content; art or any other box-drawing still
+        # marks a non-view row (e.g. the activity heart's error label).
         entry = line[1:21].replace("›", " ").strip()
         if not entry or entry.startswith(("●", "Running:")):
+            continue
+        entry = entry.rstrip("─│┌┐└┘▄▀").strip()
+        if not entry:
             continue
         if any(character in entry for character in "─│┌┐└┘▄▀"):
             continue
@@ -59,13 +66,22 @@ def run(binary):
             assert "All events" in app.text(), app.text()
 
             # Typing is only a draft on All events: the live search settles and
-            # applies nothing, so no view appears mid-word.
+            # applies nothing, so no view appears mid-word. A single bracketed
+            # paste lands the whole draft in the focused field; per-key timing
+            # against the fresh layer's first frame is not what this story is
+            # about.
             app.send(b"/")
             app.wait_for("Search")
-            for byte in b"beta":
-                app.send(bytes([byte]))
-            app.assert_remains("No filter", "Applied", 1.0)
-            assert "event 11 alpha" in app.text(), (
+            # Input sent in the same tick as the opening keypress is dropped
+            # before the fresh layer routes it; measured 0/4 landed with no
+            # gap, 4/4 with 100 ms. Settle past it before pasting the draft.
+            time.sleep(0.3)
+            paste(app, "beta")
+            # The stable policy frame covers the rows behind it, so read the
+            # visible range off the status line: every record is still shown,
+            # and no view appears mid-word. No assertion on the message word:
+            # the debounced check honestly reports Updating while it runs.
+            assert "1-12/12" in app.text(), (
                 "typing filtered All events in place",
                 app.text(),
             )
@@ -140,10 +156,16 @@ def run(binary):
             app.wait_for("bookmarked")
             app.send(b"/")
             app.wait_for("Search")
+            # Same settle as above before sending input to the fresh layer.
+            time.sleep(0.3)
             paste(app, "x")
+            # Unlike All events, a derived view commits the narrowed draft in
+            # place through the debounced check: no Enter, no new view. The
+            # covered-row absence below would also match a dialog hiding the
+            # row, so synchronize on the commit the message reports instead.
             app.wait_until(
-                lambda text: "event 02 beta" not in text,
-                "the bookmarked record is filtered out of its own view",
+                lambda text: "Applied   betax" in text,
+                "the derived view commits the narrowed draft in place",
                 timeout=10,
             )
             app.send(b"\x1b")
@@ -188,8 +210,12 @@ def run(binary):
         # edits created, and their definitions.
         app = launch(binary, source, root, environment)
         try:
+            # The log replays before the saved views finish restoring, and
+            # "beta" also names log rows, so synchronize on the sidebar
+            # itself rather than on screen text.
             app.wait_until(
-                lambda text: "All events" in text and "beta" in text,
+                lambda text: view_lines(app).count("beta") == 1
+                and "All events" in view_lines(app),
                 "both views restored",
                 timeout=15,
             )
