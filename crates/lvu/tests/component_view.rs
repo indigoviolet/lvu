@@ -196,13 +196,28 @@ fn membership_reads_the_shared_sources_and_hit_testing_matches_what_was_drawn() 
     alt(&mut app, &provider, KeyCode::Char('m'));
     let rendered = screen(&draw(&provider, &mut app, 94, 22));
     assert!(rendered.contains("Apply membership"), "{rendered}");
-    assert!(rendered.contains("extra source 3"), "{rendered}");
+    // Responsive frame is policy-stable: a 6-row list scrolls inside it rather
+    // than growing it, so the last row arrives via selection reveal, not on
+    // the first frame. Short lists still show fully; long ones window.
     assert!(
         !app.layers.view.surface().text_focus,
         "a list is not a field"
     );
 
     // Every drawn row is hit-testable at the rect it was drawn in.
+    for (rect, index) in app.layers.view.source_rects().to_vec() {
+        assert_eq!(
+            app.layers.view.hit((rect.x, rect.y)),
+            Some(ViewHit::Source(index))
+        );
+    }
+    // Reveal the last row by moving selection to it; the shared list geometry
+    // windows it into view and paint/mouse share those rects.
+    for _ in 0..5 {
+        key(&mut app, &provider, KeyCode::Down);
+    }
+    let revealed = screen(&draw(&provider, &mut app, 94, 22));
+    assert!(revealed.contains("extra source 3"), "{revealed}");
     for (rect, index) in app.layers.view.source_rects().to_vec() {
         assert_eq!(
             app.layers.view.hit((rect.x, rect.y)),
@@ -225,6 +240,12 @@ fn membership_reads_the_shared_sources_and_hit_testing_matches_what_was_drawn() 
     );
 
     // The owning source is not removable, and saying so is the dialog's job.
+    // Selection is on the last row; reveal the first row again so the owning
+    // source is back in the shared window before clicking it.
+    for _ in 0..5 {
+        key(&mut app, &provider, KeyCode::Up);
+    }
+    draw(&provider, &mut app, 94, 22);
     app.layers.view.outbox.take();
     let owning = app
         .layers
@@ -433,6 +454,255 @@ fn header_focus_moves_and_selects_modes_without_touching_drafts_or_membership() 
     draw(&provider, &mut app, 90, 24);
     key(&mut app, &provider, KeyCode::Char(' '));
     assert_ne!(app.layers.view.source_ids(), before);
+}
+
+#[test]
+fn responsive_frame_is_policy_stable_across_modes_lists_and_sizes() {
+    use lvu::dialog_layout::{PresentationKind, policy_size};
+
+    // Required matrix: huge, medium, standard, compact, floor and below-floor.
+    // Outer frames come from SelfContainedForm policy alone; Clone (1-row form)
+    // and Sources (list) share one frame and sticky tail origins at each size.
+    for (width, height) in [(240u16, 80u16), (140, 40), (80, 24), (54, 16), (20, 6)] {
+        for mode in [ViewDialogMode::Clone, ViewDialogMode::Sources] {
+            let (provider, mut app) = demo();
+            // Long list for the Sources mode: 6 rows force the shared window.
+            if mode == ViewDialogMode::Sources {
+                for index in 0..4 {
+                    app.sources.push(SourceItem {
+                        id: format!("extra-{index}"),
+                        name: format!("extra source {index}"),
+                        health: "open".into(),
+                    });
+                }
+            }
+            app.handle(Action::Open(Open::View), &provider);
+            if mode == ViewDialogMode::Sources {
+                alt(&mut app, &provider, KeyCode::Char('m'));
+            }
+            let buffer = draw(&provider, &mut app, width, height);
+            let rendered = screen(&buffer);
+            let surface = app.layers.view.surface();
+            let (want_w, want_h) = policy_size(
+                ratatui::layout::Rect::new(0, 0, width, height),
+                PresentationKind::SelfContainedForm,
+            );
+            assert_eq!(
+                (surface.popup.width, surface.popup.height),
+                (want_w, want_h),
+                "{width}x{height} {mode:?} frame must be policy"
+            );
+            // No ordinary dialog becomes full-frame except the 20x6 safety floor.
+            if (width, height) != (20, 6) {
+                assert!(
+                    surface.popup.width < width || surface.popup.height < height,
+                    "{width}x{height} became full frame"
+                );
+            }
+            // Segmented header is the only mode control; sole Apply default.
+            // At the 20x6 floor the header is 16 cells, so the explicit
+            // compact set (Bl/Clone/Ren/Src) renders instead of the full one —
+            // same four modes, same mnemonics, still one segment per mode.
+            assert_eq!(app.layers.view.tab_rects().len(), 4, "{width}x{height}");
+            assert_eq!(app.layers.view.control_rects().len(), 1, "{width}x{height}");
+            if (width, height) == (20, 6) {
+                for compact in ["Bl", "Clone", "Ren", "Src"] {
+                    assert!(
+                        rendered.contains(compact),
+                        "{width}x{height} missing compact segment {compact}:\n{rendered}"
+                    );
+                }
+            } else {
+                for segment in ["New blank", "Clone", "Rename", "Sources"] {
+                    assert!(
+                        rendered.contains(segment),
+                        "{width}x{height} missing header segment {segment}:\n{rendered}"
+                    );
+                }
+            }
+            if mode == ViewDialogMode::Sources {
+                // At the 20x6 floor the 20-cell "Apply membership" button clips
+                // to its 16-cell band; the default still survives as "Apply".
+                if (width, height) == (20, 6) {
+                    assert!(rendered.contains("Apply"), "{rendered}");
+                } else {
+                    assert!(rendered.contains("Apply membership"), "{rendered}");
+                }
+            } else {
+                assert!(rendered.contains("[ Apply ]"), "{rendered}");
+                // Caret lives inside the Name field rect, same authority paint
+                // and hitboxes share.
+                let caret = surface.caret.expect("name field draws a caret");
+                assert!(
+                    caret.0 >= surface.popup.x && caret.0 < surface.popup.right(),
+                    "{width}x{height} caret escapes frame"
+                );
+                // The name form never scrolls: name modes are never scrollable.
+                assert!(
+                    !surface.scrollable,
+                    "{width}x{height} {mode:?} form must not want the wheel"
+                );
+            }
+            // Six sources overflow the shared list viewport at 80x24 and below,
+            // so the Sources mode wants the wheel exactly there; at roomy
+            // 140x40 the same six fit and it does not.
+            if mode == ViewDialogMode::Sources {
+                if (width, height) == (80, 24) {
+                    assert!(
+                        surface.scrollable,
+                        "80x24 Sources list overflows and must want the wheel"
+                    );
+                } else if (width, height) == (140, 40) {
+                    assert!(
+                        !surface.scrollable,
+                        "140x40 fits six sources and must not want the wheel"
+                    );
+                }
+            }
+            // Every segment rect is nonempty, disjoint, fully inside the
+            // header and the popup, painted, and hit-tests to its own mode —
+            // at the floor exactly as at roomy sizes (no waiver: the compact
+            // set tiles the 16-cell header exactly).
+            {
+                let tabs = app.layers.view.tab_rects().to_vec();
+                assert_eq!(tabs.len(), 4, "{width}x{height}");
+                for (rect, m) in &tabs {
+                    assert_eq!(rect.height, 1, "{width}x{height} {m:?}");
+                    assert!(rect.width > 0, "{width}x{height} {m:?} segment is empty");
+                    assert!(
+                        rect.x >= surface.popup.x
+                            && rect.right() <= surface.popup.right()
+                            && rect.y >= surface.popup.y
+                            && rect.bottom() <= surface.popup.bottom(),
+                        "{width}x{height} {m:?} {rect:?} escapes popup {:?}",
+                        surface.popup
+                    );
+                    assert_eq!(
+                        app.layers.view.hit((rect.x, rect.y)),
+                        Some(ViewHit::Tab(*m)),
+                        "{width}x{height}"
+                    );
+                }
+                for pair in tabs.windows(2) {
+                    assert!(
+                        pair[0].0.right() <= pair[1].0.x,
+                        "{width}x{height} segments overlap: {:?}",
+                        pair
+                    );
+                }
+            }
+            for (rect, control) in app.layers.view.control_rects().to_vec() {
+                assert_eq!(
+                    app.layers.view.hit((rect.x, rect.y)),
+                    Some(ViewHit::Control(control)),
+                    "{width}x{height}"
+                );
+            }
+            for (rect, index) in app.layers.view.source_rects().to_vec() {
+                assert_eq!(
+                    app.layers.view.hit((rect.x, rect.y)),
+                    Some(ViewHit::Source(index)),
+                    "{width}x{height}"
+                );
+            }
+            // Floor reachability: every compact segment is mouse-selectable
+            // and Left/Right/Enter all work there. Click each tab in turn;
+            // each switch lands in the arriving mode's body without
+            // submitting, and the header keeps Left/Right afterwards.
+            if (width, height) == (20, 6) {
+                for want in ViewDialogMode::ALL {
+                    draw(&provider, &mut app, width, height);
+                    let point = app
+                        .layers
+                        .view
+                        .tab_rects()
+                        .iter()
+                        .find(|(_, m)| *m == want)
+                        .map(|(rect, _)| (rect.x, rect.y))
+                        .expect("every mode has a floor segment");
+                    click(&mut app, &provider, point);
+                    assert_eq!(app.layers.view.mode(), want, "floor click");
+                    assert!(
+                        app.layers.view.outbox.take().is_empty(),
+                        "choosing a mode is not submitting"
+                    );
+                }
+                // Header traversal from the floor: Tab to Tabs, Left/Right
+                // cycle all four modes, Enter selects without submitting.
+                key(&mut app, &provider, KeyCode::Tab);
+                key(&mut app, &provider, KeyCode::Tab);
+                assert_eq!(app.layers.view.control(), ViewDialogControl::Tabs);
+                let start = app.layers.view.mode();
+                for _ in 0..ViewDialogMode::ALL.len() {
+                    key(&mut app, &provider, KeyCode::Right);
+                }
+                assert_eq!(app.layers.view.mode(), start, "Right must wrap");
+                assert_eq!(app.layers.view.control(), ViewDialogControl::Tabs);
+                key(&mut app, &provider, KeyCode::Enter);
+                assert!(app.layers.view.outbox.take().is_empty());
+                // Bare mnemonics resolve through the full labels (same
+                // letters, same order) even where the compact set is drawn.
+                // Redraw first, as the real loop does: dismissal routing reads
+                // the last render's text focus, and the clicks above left a
+                // text-field focus published.
+                draw(&provider, &mut app, width, height);
+                key(&mut app, &provider, KeyCode::Char('s'));
+                assert_eq!(app.layers.view.mode(), ViewDialogMode::Sources);
+                key(&mut app, &provider, KeyCode::Char('b'));
+                assert_eq!(app.layers.view.mode(), ViewDialogMode::Blank);
+            }
+            // Keyboard: Tab cycles Tabs→body→Apply; mouse: header click switches
+            // mode without submitting, Apply click submits via outbox.
+            if (width, height) == (80, 24) {
+                if mode == ViewDialogMode::Clone {
+                    key(&mut app, &provider, KeyCode::Tab);
+                    assert_eq!(app.layers.view.control(), ViewDialogControl::Apply);
+                    // Enter on Apply submits (outbox), not closes.
+                    key(&mut app, &provider, KeyCode::Enter);
+                    assert_eq!(app.layers.view.outbox.take().len(), 1);
+                } else {
+                    // Sources list: Down moves selection, Space toggles, Enter
+                    // submits membership; all preserve stable frame.
+                    let before_frame = app.layers.view.surface().popup;
+                    key(&mut app, &provider, KeyCode::Down);
+                    draw(&provider, &mut app, width, height);
+                    assert_eq!(app.layers.view.surface().popup, before_frame);
+                }
+            }
+        }
+        // Identical outer geometry across modes at this size.
+        let (provider, mut app) = demo();
+        for index in 0..4 {
+            app.sources.push(SourceItem {
+                id: format!("x-{index}"),
+                name: format!("x {index}"),
+                health: "open".into(),
+            });
+        }
+        app.handle(Action::Open(Open::View), &provider);
+        draw(&provider, &mut app, width, height);
+        let clone_frame = app.layers.view.surface().popup;
+        alt(&mut app, &provider, KeyCode::Char('m'));
+        draw(&provider, &mut app, width, height);
+        let sources_frame = app.layers.view.surface().popup;
+        assert_eq!(
+            clone_frame, sources_frame,
+            "{width}x{height} frame must not move with mode"
+        );
+    }
+
+    // Below the 20x6 floor the tiny fallback owns the frame, not the dialog.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::View), &provider);
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+
+    // At the 20x6 floor the default survives with one body row.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::View), &provider);
+    let floor = screen(&draw(&provider, &mut app, 20, 6));
+    assert!(floor.contains("Apply"), "{floor}");
+    assert_eq!(app.layers.view.tab_rects().len(), 4);
 }
 
 #[test]

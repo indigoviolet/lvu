@@ -32,7 +32,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::Line,
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Widget},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Widget},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -40,12 +40,11 @@ use crate::app::{
     FOLD_LOOKBACK_CHOICES, FOLD_MINIMUM_RUN_CHOICES, QueryPurpose, Views, move_control,
 };
 use crate::component::{Component, Ctx, Event, Open, Outcome, RenderCtx, Surface, ViewEvent};
-use crate::dialog_controls::{ActionRow, DialogStyles};
-use crate::dialog_layout::MIN_LIVE_ROWS;
+use crate::dialog_controls::DialogStyles;
+use crate::dialog_layout::{DialogSpec, MIN_LIVE_ROWS, PresentationKind};
 use crate::provider::{FoldNormalisation, RowProvider, ViewportRequest};
 use crate::ui::{
-    FIELD_GUTTER, InputSurface, MessageState, help_rows, message_rows, packed_button_rows,
-    render_actions, render_help_text, render_message, truncated,
+    FIELD_GUTTER, InputSurface, MessageState, render_help_text, render_message, truncated,
 };
 
 /// Rows sampled to discover which columns a view actually carries. The same
@@ -62,26 +61,25 @@ const FOLD_MAX_ROW_FIELDS: usize = 128;
 const FOLD_MAX_COMPOSED_FIELDS: usize = 8;
 /// The name a generated fold column takes, before disambiguation.
 const FOLD_COLUMN_NAME: &str = "fold_key";
-/// §5.1 caps a class A popup at eight rows; that is what the picker asks for.
+/// The shared anchored popup caps at eight item rows; that is what the picker asks for.
 const FOLD_PICKER_ROWS: u16 = 8;
 
-/// §5.2.1: how many rows an open picker reserves, from the frame alone.
+/// §5.2.1: how many rows an open picker reserves, from the full frame area alone.
 ///
 /// The key-column list is a live region. Its content comes from a bounded
 /// sample of the view's rows, so a source that is still arriving can add a
 /// column while the list is open, and the compose list gains and loses nothing
-/// but its checkmarks. `anchored_rect` sizes a class A popup from its item
-/// count, which would move the list's rows under the cursor when that happens;
-/// reserving the rows instead makes the popup rect identical from one frame to
-/// the next. An overlong list scrolls behind a trailing `+N more`, which is the
-/// §5.2.1 affordance for a region with no pane heading; a short one leaves the
-/// remaining rows blank.
+/// but its checkmarks. `anchored_geometry` with a reserved `AnchoredSpec` keeps
+/// the popup rect identical from one frame to the next instead of sizing from
+/// the live item count, which would move the list's rows under the cursor when
+/// that happens. An overlong list scrolls inside the reserved viewport behind
+/// the shared scrollbar; a short one leaves the remaining rows blank.
 ///
 /// This is not `dialog_layout::live_rows`, whose spare-row arithmetic is for a
 /// region *inside* a body the dialog has to fit. An anchored popup is bounded
-/// by the frame and may extend past the dialog it belongs to (§10), so the
-/// frame is what the reservation comes from — with the same `MIN_LIVE_ROWS`
-/// floor, because a one-row list is not a list.
+/// by the full Ratatui/terminal frame area and may overhang the dialog it
+/// belongs to (§10), so the full `area` is what the reservation comes from —
+/// with the same `MIN_LIVE_ROWS` floor, because a one-row list is not a list.
 fn picker_rows(area: Rect) -> usize {
     // Border rows, plus one row of anchor above and below.
     let available = area.height.saturating_sub(4);
@@ -94,6 +92,17 @@ fn picker_rows(area: Rect) -> usize {
 
 /// How the derived column is named wherever the user meets it.
 pub const PATTERN_COLUMN_LABEL: &str = "Message pattern";
+
+/// Stable responsive budgets for the Folding dialog.
+///
+/// Outer size is `SelfContainedForm` policy plus stable maxima only, never the
+/// pattern-key row count, the sampled column count or pending state. The form
+/// rows are stable (4 or 5); the key-column picker is a live region with
+/// reserved rows, so background arrivals never resize its popup. Hand-rolled
+/// row counts here are presentation-only folding (AGENTS.md).
+pub fn folding_spec() -> DialogSpec {
+    DialogSpec::new(PresentationKind::SelfContainedForm, 0, 5, 2, 2, 1)
+}
 
 /// Which control has focus. UI-only state, so it lives here (§7.3).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -837,7 +846,7 @@ impl Component for FoldingDialog {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
-        use crate::dialog_layout::{DialogClass, DialogContent, anchored_rect, content_width};
+        use crate::dialog_layout::{anchored_geometry, resolve_dialog};
 
         let theme = ctx.theme;
         let ascii = ctx.ascii;
@@ -935,35 +944,54 @@ impl Component for FoldingDialog {
         };
         let action_controls = [FoldingControl::Collapse];
         let action_labels = ["Collapse expanded runs"];
-        let width = content_width(area, DialogClass::M);
-        let content = DialogContent {
-            header: 0,
-            body: u16::try_from(rows.len()).unwrap_or(4),
-            message: message_rows(&sentence, width),
-            help: help_rows(help, width),
-            actions: packed_button_rows(width, &action_labels),
-        };
         let title = match ctx.views.active_item() {
             Some(view) => format!("Folding · {}", view.name),
             None => "Folding".to_owned(),
         };
-        let regions =
-            crate::ui::dialog_frame_regions(frame, area, DialogClass::M, &title, &content, theme);
+        // Responsive frame: SelfContainedForm policy plus stable budgets only.
+        // Body rows (4 or 5) size only the scroll extent; the frame is identical
+        // with and without Normalisation. The picker below reserves its rows.
+        let spec = folding_spec();
+        let body_content = rows.len();
+        let Ok(geometry) = resolve_dialog(area, &spec, body_content, &action_labels, Some(0), None)
+        else {
+            self.geometry = FoldingGeometry::default();
+            self.surface = Surface::default();
+            return self.surface;
+        };
+        crate::ui::render_responsive_frame(frame, &geometry, &title, ctx.active, theme);
+        // Body scroll reveals the focused form row at 20x6; otherwise the
+        // 4-5 rows fit and first_row stays 0. One shared viewport drives paint
+        // and hitboxes below.
+        let focused_index = rows
+            .iter()
+            .position(|(control, _, _)| *control == focused)
+            .unwrap_or(0);
+        let body_viewport = geometry.body.viewport;
+        let body_first = if body_viewport.height == 0 {
+            0
+        } else {
+            crate::dialog_layout::ScrollViewport::new(body_viewport, body_content, 0)
+                .reveal(focused_index)
+        };
+        let body_scroll =
+            crate::dialog_layout::ScrollViewport::new(body_viewport, body_content, body_first);
         let mut surface = Surface {
-            popup: regions.popup,
-            interior: regions.interior,
+            popup: geometry.frontmost,
+            interior: geometry.interior,
             caret: None,
-            // Nothing here scrolls except an open list, and the wheel over the
-            // dialog itself must not reach the log behind it either way.
-            scrollable: self.dropdown.is_some(),
+            // Derived from actual overflow, never merely dropdown-open: the
+            // wheel over the dialog must not reach the log behind it either
+            // way, and an open picker adds its own overflow below.
+            scrollable: body_scroll.overflow() > 0,
             text_focus: false,
         };
         self.geometry = FoldingGeometry {
-            body: regions.body,
+            body: body_viewport,
             ..FoldingGeometry::default()
         };
         self.surface = surface;
-        if regions.content.width == 0 {
+        if geometry.content.width == 0 {
             return surface;
         }
 
@@ -973,19 +1001,18 @@ impl Component for FoldingDialog {
             .max()
             .unwrap_or(0)
             .min(18);
-        let field_x = regions
+        let field_x = geometry
             .content
             .x
             .saturating_add(label_width)
             .saturating_add(FIELD_GUTTER);
-        for (offset, (control, label, value)) in rows.iter().enumerate() {
-            let y = regions
-                .body
-                .y
-                .saturating_add(u16::try_from(offset).unwrap_or(0));
-            if y >= regions.body.bottom() {
-                break;
-            }
+        for (index, (control, label, value)) in rows.iter().enumerate() {
+            // One shared viewport drives paint and hitboxes: scrolled-out rows
+            // paint nothing and receive no hitbox.
+            let Some(row_rect) = body_scroll.project_row(index) else {
+                continue;
+            };
+            let y = row_rect.y;
             let is_focused = *control == focused;
             frame.render_widget(
                 Paragraph::new(*label).style(if is_focused {
@@ -994,19 +1021,19 @@ impl Component for FoldingDialog {
                     styles.label
                 }),
                 Rect::new(
-                    regions.content.x,
+                    geometry.content.x,
                     y,
-                    label_width.min(regions.content.width),
+                    label_width.min(geometry.content.width),
                     1,
                 ),
             );
-            if field_x >= regions.content.right() {
+            if field_x >= geometry.content.right() {
                 continue;
             }
             let field = Rect::new(
                 field_x,
                 y,
-                regions.content.right().saturating_sub(field_x),
+                geometry.content.right().saturating_sub(field_x),
                 1,
             );
             if *control == FoldingControl::Enabled {
@@ -1056,32 +1083,34 @@ impl Component for FoldingDialog {
 
         render_message(
             frame,
-            regions.message,
+            geometry.message,
             message_state,
             &sentence,
             theme,
             ascii,
         );
-        render_help_text(frame, regions.help, help, theme);
+        render_help_text(frame, geometry.help, help, theme);
         // §8.2/§8.9: the row is declared, and the one verb in it is the
-        // default, so it carries the fill.
-        let default_action = action_controls
+        // default, so it carries the fill. One shared plan drives paint and
+        // mouse so the fill and the Enter arm cannot disagree.
+        let focused_action = action_controls
             .iter()
-            .position(|control| *control == Self::default_control());
-        for (index, rect) in render_actions(
-            frame,
-            regions.actions,
-            ActionRow {
-                labels: &action_labels,
-                default: default_action,
-                destructive: &[],
-                focused: action_controls
-                    .iter()
-                    .position(|control| *control == focused),
-            },
-            theme,
-        ) {
-            controls_hit.push((rect, action_controls[index]));
+            .position(|control| *control == focused);
+        for (index, rect) in geometry.actions.buttons.iter() {
+            let control = action_controls[*index];
+            crate::dialog_controls::render_role_button(
+                frame,
+                *rect,
+                action_labels[*index],
+                if geometry.actions.default == Some(*index) {
+                    crate::dialog_controls::ButtonRole::Default
+                } else {
+                    crate::dialog_controls::ButtonRole::Normal
+                },
+                focused_action == Some(*index),
+                theme,
+            );
+            controls_hit.push((*rect, control));
         }
 
         if let Some(dropdown) = self.dropdown {
@@ -1097,39 +1126,61 @@ impl Component for FoldingDialog {
                             FoldingDropdown::Normalisation => FoldingControl::Normalisation,
                         }
                 })
-                .map_or(regions.body, |(rect, _)| *rect);
-            // §5.2.1: the reservation and the width both come from the frame
-            // and the field, never from the choices. The key-column list is fed
-            // by a bounded sample of the view's rows, so a column that appears
-            // while the list is open — or a checkmark added in compose mode —
-            // must not resize the popup or move the rows under the cursor.
-            // §10: an anchored popup is not a dialog; it may extend past the
-            // dialog it belongs to and is bounded by the frame.
-            let reserved = picker_rows(area);
-            let box_area = anchored_rect(area, anchor, reserved, 0);
+                .map_or(body_viewport, |(rect, _)| *rect);
+            // §5.2.1: the reservation comes from the full frame area and the
+            // field, never from the choices. The key-column list is fed by a
+            // bounded sample of the view's rows, so a column that appears while
+            // the list is open — or a checkmark added in compose mode — must not
+            // resize the popup or move the rows under the cursor. §10: an
+            // anchored popup is not a dialog; it is bounded by the full
+            // Ratatui/terminal frame area and may overhang the dialog it belongs
+            // to, with Surface.popup unioned below for containment. One shared
+            // anchored_geometry call drives popup, viewport, scrollbar,
+            // selection window, paint and mouse.
+            let reserved = u16::try_from(picker_rows(area)).unwrap_or(8).clamp(2, 8);
+            let preferred = choices
+                .iter()
+                .map(|choice| {
+                    u16::try_from(unicode_width::UnicodeWidthStr::width(choice.as_str()))
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
+                .saturating_add(4);
+            let selected = self.highlighted.min(choices.len().saturating_sub(1));
+            let anchored_spec = crate::dialog_layout::AnchoredSpec::new(
+                choices.len(),
+                Some(reserved),
+                preferred,
+                0,
+            );
+            let popup = anchored_geometry(area, anchor, &anchored_spec, selected, 0);
+            let box_area = popup.popup;
+            // Scrollability is derived from actual overflow: body scroll extent
+            // or a live picker total exceeding its reserved viewport (scrollbar
+            // present), never merely dropdown-open.
+            surface.scrollable = surface.scrollable
+                || popup.scrollbar.is_some()
+                || choices.len() > usize::from(popup.viewport.height.max(1));
             if box_area.width >= 3 && box_area.height >= 3 {
                 surface.popup = surface.popup.union(box_area);
-                frame.render_widget(Clear, box_area);
-                let rows = usize::from(box_area.height.saturating_sub(2));
-                let cell_width = usize::from(box_area.width.saturating_sub(2));
-                // §5.2.1 overflow: the last reserved row says how much is not
-                // shown, because a bare popup has no §8.7 heading to carry a
-                // count.
-                let overflowing = choices.len() > rows;
-                let visible = if overflowing {
-                    rows.saturating_sub(1)
-                } else {
-                    rows
-                };
-                let selected = self.highlighted.min(choices.len().saturating_sub(1));
-                let scroll = selected
-                    .saturating_add(1)
-                    .saturating_sub(visible)
-                    .min(choices.len().saturating_sub(visible.min(choices.len())));
-                let mut items: Vec<ListItem> = choices
+                // Themed clear: a bare Clear would repaint with the terminal
+                // default background instead of the dialog surface.
+                crate::ui::clear_themed(frame, box_area, theme);
+                // Viewport rows share one authority: the shared first_item
+                // window drives paint, scrollbar and hitboxes alike. The whole
+                // viewport paints choices — no row is stolen for a `+N more`
+                // summary, which is what used to hide the highlighted last
+                // item behind the revealed window's end. The shared scrollbar
+                // alone communicates overflow.
+                let viewport = popup.viewport;
+                let cell_width = usize::from(viewport.width);
+                let first = popup.first_item.min(choices.len());
+                let visible = usize::from(viewport.height);
+                let items: Vec<ListItem> = choices
                     .iter()
                     .enumerate()
-                    .skip(scroll)
+                    .skip(first)
                     .take(visible)
                     .map(|(index, value)| {
                         ListItem::new(Line::from(truncated(value, cell_width))).style(
@@ -1141,16 +1192,6 @@ impl Component for FoldingDialog {
                         )
                     })
                     .collect();
-                if overflowing {
-                    let hidden = choices.len().saturating_sub(visible);
-                    items.push(
-                        ListItem::new(Line::from(truncated(
-                            &format!("+{hidden} more"),
-                            cell_width,
-                        )))
-                        .style(styles.description),
-                    );
-                }
                 frame.render_widget(
                     List::new(items).block(
                         Block::default()
@@ -1159,12 +1200,24 @@ impl Component for FoldingDialog {
                     ),
                     box_area,
                 );
-                for (offset, index) in (scroll..choices.len()).take(visible).enumerate() {
+                if let Some(bar) = popup.scrollbar {
+                    // Scrollbar shares the popup's window: offset is the shared
+                    // first_item, limit is the hidden tail.
+                    crate::ui::render_scrollbar(
+                        frame,
+                        bar,
+                        first,
+                        choices.len().saturating_sub(visible.min(choices.len())),
+                        theme,
+                        ascii,
+                    );
+                }
+                for (offset, index) in (first..choices.len()).take(visible).enumerate() {
                     choices_hit.push((
                         Rect::new(
-                            box_area.x.saturating_add(1),
-                            box_area.y.saturating_add(1).saturating_add(offset as u16),
-                            box_area.width.saturating_sub(2),
+                            viewport.x,
+                            viewport.y.saturating_add(offset as u16),
+                            viewport.width,
                             1,
                         ),
                         index,
@@ -1174,7 +1227,7 @@ impl Component for FoldingDialog {
         }
 
         self.geometry = FoldingGeometry {
-            body: regions.body,
+            body: body_viewport,
             controls: controls_hit,
             choices: choices_hit,
         };

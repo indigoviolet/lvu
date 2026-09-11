@@ -26,12 +26,10 @@ use crate::app::{
 use crate::component::{Component, Ctx, Event, Open, Outcome, RenderCtx, Surface};
 use crate::components::enrichment::stale_command_steps;
 use crate::components::folding::fold_key_label;
-use crate::dialog_controls::{ActionRow, DialogStyles};
+use crate::dialog_controls::DialogStyles;
+use crate::dialog_layout::{DialogSpec, PresentationKind};
 use crate::provider::ViewOrder;
-use crate::ui::{
-    MessageState, dialog_frame_regions, help_rows, message_rows, packed_button_rows,
-    render_actions, render_help_text, render_message, render_scrollbar, truncated,
-};
+use crate::ui::{MessageState, render_help_text, render_message, truncated};
 
 /// One row of the summary. The order of `ALL` is the order the rows are drawn
 /// in, which is the order the view evaluates them: what it reads, the window
@@ -417,6 +415,16 @@ const CONTROLS: [SummaryControl; 2] = [SummaryControl::List, SummaryControl::Ope
 /// The one button's label; `&` marks the letter that presses it (§8.10).
 const OPEN_LABEL: &str = "&Open";
 
+/// Stable responsive budgets for the View summary.
+///
+/// Outer size is `LongContent` policy plus stable maxima only, never the
+/// applied-operation count or pending state. Eleven fixed rows keep their
+/// shape (`—` for unapplied); the body owns the surplus via the shared list
+/// pane. Hand-rolled row counts here are presentation-only folding (AGENTS.md).
+pub fn view_summary_spec() -> DialogSpec {
+    DialogSpec::new(PresentationKind::LongContent, 0, 3, 2, 1, 1)
+}
+
 impl ViewSummaryDialog {
     pub fn is_open(&self) -> bool {
         self.open
@@ -459,7 +467,7 @@ impl ViewSummaryDialog {
             SummaryRow::Search => Open::Search,
             SummaryRow::Filter => Open::Advanced,
             SummaryRow::Grouping => Open::Grouping,
-            SummaryRow::Fold => Open::Grouping,
+            SummaryRow::Fold => Open::Folding,
             SummaryRow::Columns => match state.pinned_columns.first() {
                 Some(column) => Open::FieldColumn {
                     column: column.clone(),
@@ -639,7 +647,7 @@ impl Component for ViewSummaryDialog {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
-        use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
+        use crate::dialog_layout::{plan_list, resolve_dialog};
 
         let theme = ctx.theme;
         let ascii = ctx.ascii;
@@ -652,7 +660,6 @@ impl Component for ViewSummaryDialog {
         let total = entries.len();
         let selected = self.selected.min(total.saturating_sub(1));
         let labels = [OPEN_LABEL];
-        let width = content_width(area, DialogClass::M);
 
         // §7.4: one message row. The state is what the readiness row says;
         // the sentence counts what is applied.
@@ -683,67 +690,69 @@ impl Component for ViewSummaryDialog {
         };
         let help = "Rows follow the order the view evaluates them.";
 
-        // §5.2: the body is the list pane — heading plus one row per entry,
-        // which is a fixed count — so height follows stable content.
-        let body_rows = 1 + u16::try_from(total.max(1)).unwrap_or(1);
-        let content = DialogContent {
-            header: 0,
-            body: body_rows,
-            message: message_rows(&sentence, width),
-            help: help_rows(help, width),
-            actions: packed_button_rows(width, &labels),
-        };
         let title = match ctx.views.active_item() {
             Some(view) => format!("View summary · {}", view.name),
             None => "View summary".to_owned(),
         };
-        let regions = dialog_frame_regions(frame, area, DialogClass::M, &title, &content, theme);
-        let surface = Surface {
-            popup: regions.popup,
-            interior: regions.interior,
+        // Responsive frame: LongContent policy plus stable budgets only. Eleven
+        // fixed rows keep their shape; the body owns the surplus via the shared
+        // list pane. Short/long applied states share one frame and tail.
+        let spec = view_summary_spec();
+        let Ok(geometry) = resolve_dialog(area, &spec, 1, &labels, Some(0), None) else {
+            self.geometry = SummaryGeometry::default();
+            self.surface = Surface::default();
+            return self.surface;
+        };
+        crate::ui::render_responsive_frame(frame, &geometry, &title, ctx.active, theme);
+        let mut surface = Surface {
+            popup: geometry.frontmost,
+            interior: geometry.interior,
             caret: None,
-            scrollable: true,
+            // Derived from the 11-row list overflow below, never asserted.
+            scrollable: false,
             text_focus: false,
         };
         self.geometry = SummaryGeometry {
-            body: regions.body,
+            body: geometry.body.viewport,
             ..SummaryGeometry::default()
         };
         self.surface = surface;
-        if regions.content.width == 0 || !ctx.active {
+        if geometry.content.width == 0 || !ctx.active {
             return surface;
         }
 
         let mut rows: Vec<(Rect, usize)> = Vec::new();
         let mut controls: Vec<(Rect, SummaryControl)> = Vec::new();
 
-        // §8.5/§8.7: a list is a pane with a heading, a count and a scrollbar
-        // only when the rows do not fit.
-        let rects = pane(regions.body, 12, total);
+        // §8.5/§8.7: one shared plan_list call drives heading, count,
+        // viewport, scrollbar, selection window, paint and mouse.
+        let count_text = format!("{} of {total}", selected.saturating_add(1));
+        let count_width =
+            u16::try_from(unicode_width::UnicodeWidthStr::width(count_text.as_str())).unwrap_or(0);
+        let list = plan_list(
+            geometry.body.viewport,
+            if total > 0 { count_width } else { 0 },
+            total,
+            Some(selected),
+            0,
+        );
         frame.render_widget(
             Paragraph::new("Operations").style(styles.label.add_modifier(Modifier::BOLD)),
-            rects.heading,
+            list.heading,
         );
-        if rects.count.width > 0 && total > 0 {
+        if list.count.width > 0 && total > 0 {
             frame.render_widget(
-                Paragraph::new(Line::from(format!("{} of {total}", selected + 1)))
+                Paragraph::new(Line::from(count_text))
                     .style(styles.description)
                     .right_aligned(),
-                rects.count,
+                list.count,
             );
         }
-        let visible = usize::from(rects.viewport.height);
-        // §9: the viewport windows on the selection.
-        let first = selected
-            .saturating_sub(visible.saturating_sub(1))
-            .min(total.saturating_sub(visible.min(total)));
-        for (offset, (index, entry)) in entries
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take(visible)
-            .enumerate()
-        {
+        for (offset, row) in list.row_rects.iter().enumerate() {
+            let index = list.first_row.saturating_add(offset);
+            let Some(entry) = entries.get(index) else {
+                continue;
+            };
             let is_selected = index == selected;
             let marker = if is_selected {
                 if ascii { "> " } else { "› " }
@@ -758,12 +767,6 @@ impl Component for ViewSummaryDialog {
                 " ".repeat(padding),
                 entry.value
             );
-            let row = Rect::new(
-                rects.viewport.x,
-                rects.viewport.y.saturating_add(offset as u16),
-                rects.viewport.width,
-                1,
-            );
             let style = if is_selected && self.control == SummaryControl::List {
                 styles.selection
             } else if is_selected {
@@ -774,45 +777,52 @@ impl Component for ViewSummaryDialog {
                 styles.description
             };
             // §9: a long value truncates with a trailing `…`, never mid-glyph.
+            // Same row rects drive paint and mouse below.
             frame.render_widget(
                 Paragraph::new(truncated(&text, usize::from(row.width))).style(style),
-                row,
+                *row,
             );
-            rows.push((row, index));
+            rows.push((*row, index));
         }
-        if let Some(bar) = rects.scrollbar {
-            render_scrollbar(
+        if let Some(bar) = list.scrollbar {
+            crate::ui::render_scrollbar(
                 frame,
                 bar,
-                first,
-                total.saturating_sub(visible),
+                list.first_row,
+                total.saturating_sub(list.row_rects.len()),
                 theme,
                 ascii,
             );
         }
+        // The wheel is wanted exactly when the 11-row list overflows its
+        // shared viewport.
+        surface.scrollable = list.scrollbar.is_some();
 
-        render_message(frame, regions.message, state, &sentence, theme, ascii);
-        render_help_text(frame, regions.help, help, theme);
+        render_message(frame, geometry.message, state, &sentence, theme, ascii);
+        render_help_text(frame, geometry.help, help, theme);
 
-        // §8.9: one button, and it is the default.
+        // §8.9: one button, and it is the default. Shared plan drives paint
+        // and mouse.
         let focused = (self.control == SummaryControl::Open).then_some(0);
-        for (index, rect) in render_actions(
-            frame,
-            regions.actions,
-            ActionRow {
-                labels: &labels,
-                default: Some(0),
-                destructive: &[],
-                focused,
-            },
-            theme,
-        ) {
-            debug_assert_eq!(index, 0);
-            controls.push((rect, Self::default_control()));
+        for (index, rect) in geometry.actions.buttons.iter() {
+            debug_assert_eq!(*index, 0);
+            crate::dialog_controls::render_role_button(
+                frame,
+                *rect,
+                labels[*index],
+                if geometry.actions.default == Some(*index) {
+                    crate::dialog_controls::ButtonRole::Default
+                } else {
+                    crate::dialog_controls::ButtonRole::Normal
+                },
+                focused == Some(*index),
+                theme,
+            );
+            controls.push((*rect, Self::default_control()));
         }
 
         self.geometry = SummaryGeometry {
-            body: regions.body,
+            body: geometry.body.viewport,
             rows,
             controls,
         };

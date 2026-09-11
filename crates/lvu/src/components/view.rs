@@ -29,11 +29,11 @@ use crate::component::{
     ViewEvent, is_typed_char,
 };
 use crate::dialog_controls::DialogStyles;
+use crate::dialog_layout::{DialogSpec, PresentationKind};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit, reset_cursor_to_end};
 use crate::ui::{
-    FIELD_GUTTER, MessageState, clipped_width, dialog_frame_regions, help_rows, message_rows,
-    packed_button_rows, place_input_cursor_at, render_action_row, render_help_text, render_message,
-    render_scrollbar, render_segmented_control,
+    FIELD_GUTTER, MessageState, clipped_width, place_input_cursor_at, render_help_text,
+    render_message, render_scrollbar, render_segmented_control,
 };
 
 /// The dialog refuses a submission when the queue is full and says so in its
@@ -468,6 +468,18 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
 /// header underlines.
 const VIEW_TAB_LABELS: [&str; 4] = ["New &blank", "&Clone", "&Rename", "&Sources"];
 
+/// Compact header segments for narrow headers (the 20x6 floor): the full set
+/// needs 30 cells with separators, so below that the same four modes render
+/// abbreviated. Same order, same underlined mnemonics (`b`/`c`/`r`/`s`), same
+/// `ViewDialogMode::ALL` mapping — only the drawn text is shorter. Exact-fit
+/// budget: 2 + 5 + 3 + 3 label cells plus 3 one-cell separators = 16, the
+/// narrowest content width an ordinary dialog resolves at.
+const VIEW_TAB_LABELS_COMPACT: [&str; 4] = ["&Bl", "&Clone", "&Ren", "&Src"];
+
+/// Content width below which the full segment set cannot fit and the compact
+/// set takes over: full labels plus separators measure 9 + 5 + 6 + 7 + 3.
+const VIEW_TABS_FULL_WIDTH: u16 = 30;
+
 /// The one action-row verb (§8.9). It is the only button the dialog draws.
 fn view_apply_label(mode: ViewDialogMode) -> &'static str {
     if mode == ViewDialogMode::Sources {
@@ -475,6 +487,19 @@ fn view_apply_label(mode: ViewDialogMode) -> &'static str {
     } else {
         "Apply"
     }
+}
+
+/// Stable responsive budgets for the View dialog.
+///
+/// Outer size comes from `SelfContainedForm` policy alone, never from the
+/// mode, the source count or pending state, so Clone/Rename/Blank/Sources
+/// share one frame and sticky tail origins. The body owns no scroll of its
+/// own (the membership list scrolls inside it via the shared list geometry);
+/// the message/help/action bands are stable maxima. Hand-rolled row counts
+/// here are presentation-only folding: they size scroll extents, never query
+/// membership (AGENTS.md).
+pub fn view_spec() -> DialogSpec {
+    DialogSpec::new(PresentationKind::SelfContainedForm, 1, 4, 1, 2, 1)
 }
 
 /// Everything the shell's §8.10 resolver may press, in `press_action` order:
@@ -663,7 +688,7 @@ impl Component for ViewDialog {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
-        use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
+        use crate::dialog_layout::{plan_list, resolve_dialog};
 
         let theme = ctx.theme;
         let ascii = ctx.ascii;
@@ -675,7 +700,6 @@ impl Component for ViewDialog {
         let sources_mode = self.mode == ViewDialogMode::Sources;
         let apply_label = view_apply_label(self.mode);
         let apply_labels = [apply_label];
-        let width = content_width(area, DialogClass::M);
 
         let (state, sentence) = match self.error.as_deref() {
             Some(error) => (MessageState::Error, error.to_owned()),
@@ -694,31 +718,28 @@ impl Component for ViewDialog {
             ""
         };
 
-        // §5.2: the body asks for exactly the rows its content needs. The Sources
-        // list is a pane (heading + one row per source) capped at 12.
-        let body_rows = if sources_mode {
-            1 + u16::try_from(ctx.sources.len().clamp(1, 12)).unwrap_or(1)
-        } else {
-            1
-        };
-        let content = DialogContent {
-            header: 1,
-            body: body_rows,
-            message: message_rows(&sentence, width),
-            help: help_rows(help, width),
-            actions: packed_button_rows(width, &apply_labels),
-        };
-
         let title = match ctx.views.active_item() {
             Some(view) => format!("View · {}", view.name),
             None => "View".to_owned(),
         };
-        let regions = dialog_frame_regions(frame, area, DialogClass::M, &title, &content, theme);
+        // Responsive frame: outer size is SelfContainedForm policy plus stable
+        // budgets only, never mode/source/pending counts, so all four modes
+        // share one frame and sticky tail origins. Body content rows size only
+        // the scroll extent (1: the list scrolls inside via plan_list).
+        let spec = view_spec();
+        let Ok(geometry) = resolve_dialog(area, &spec, 1, &apply_labels, Some(0), None) else {
+            self.geometry = ViewGeometry::default();
+            self.surface = Surface::default();
+            return self.surface;
+        };
+        crate::ui::render_responsive_frame(frame, &geometry, &title, ctx.active, theme);
         let mut surface = Surface {
-            popup: regions.popup,
-            interior: regions.interior,
+            popup: geometry.frontmost,
+            interior: geometry.interior,
             caret: None,
-            scrollable: true,
+            // Derived from actual list overflow below: the name form never
+            // scrolls, so name modes are never scrollable.
+            scrollable: false,
             text_focus: self.text_editing(),
         };
 
@@ -731,65 +752,70 @@ impl Component for ViewDialog {
             .position(|mode| *mode == self.mode)
             .unwrap_or(0);
         let focused = (self.control == ViewDialogControl::Tabs).then_some(active);
-        let tabs: Vec<(Rect, ViewDialogMode)> = render_segmented_control(
-            frame,
-            regions.header,
-            &VIEW_TAB_LABELS,
-            active,
-            focused,
-            theme,
-        )
-        .into_iter()
-        .zip(ViewDialogMode::ALL)
-        .collect();
+        // Narrow headers cannot fit the full segment set without clipping
+        // segments outside the popup; the compact set keeps every mode
+        // painted, disjoint, inside the header and mouse-selectable.
+        // Mnemonic resolution still reads the full labels (same letters, same
+        // order), so keys and clicks agree on every size.
+        let tab_labels = if geometry.header.width < VIEW_TABS_FULL_WIDTH {
+            &VIEW_TAB_LABELS_COMPACT
+        } else {
+            &VIEW_TAB_LABELS
+        };
+        let tabs: Vec<(Rect, ViewDialogMode)> =
+            render_segmented_control(frame, geometry.header, tab_labels, active, focused, theme)
+                .into_iter()
+                .zip(ViewDialogMode::ALL)
+                .collect();
 
         // Recorded before the early return so a dialog too narrow to draw a
         // body still hit-tests its header rather than last frame's body.
         self.geometry = ViewGeometry {
-            body: regions.body,
+            body: geometry.body.viewport,
             tabs: tabs.clone(),
             ..ViewGeometry::default()
         };
         self.surface = surface;
-        if regions.content.width == 0 {
+        if geometry.content.width == 0 {
             return surface;
         }
 
         if sources_mode {
             // §8.5/§8.7: a list is a pane — heading with a count, indented rows,
-            // and a scrollbar only when the rows do not fit.
+            // and a scrollbar only when the rows do not fit. One shared
+            // plan_list call drives paint, selection, scrollbar and mouse.
             let total = ctx.sources.len();
-            let rects = pane(regions.body, 12, total);
+            let count_text = format!(
+                "{} of {total}",
+                self.selected_source.saturating_add(1).min(total.max(1))
+            );
+            let count_width =
+                u16::try_from(unicode_width::UnicodeWidthStr::width(count_text.as_str()))
+                    .unwrap_or(0);
+            let list = plan_list(
+                geometry.body.viewport,
+                count_width,
+                total,
+                Some(self.selected_source.min(total.saturating_sub(1))),
+                0,
+            );
             frame.render_widget(
                 Paragraph::new("Sources").style(styles.label.add_modifier(Modifier::BOLD)),
-                rects.heading,
+                list.heading,
             );
-            if rects.count.width > 0 {
+            if list.count.width > 0 {
                 frame.render_widget(
-                    Paragraph::new(Line::from(format!(
-                        "{} of {total}",
-                        self.selected_source.saturating_add(1).min(total.max(1))
-                    )))
-                    .style(styles.description)
-                    .right_aligned(),
-                    rects.count,
+                    Paragraph::new(Line::from(count_text))
+                        .style(styles.description)
+                        .right_aligned(),
+                    list.count,
                 );
             }
-            let visible = usize::from(rects.viewport.height);
-            // §9: the viewport windows on the selection so the cursor is always
-            // drawn, and the same window feeds the row hitboxes below.
-            let first = self
-                .selected_source
-                .saturating_sub(visible.saturating_sub(1))
-                .min(total.saturating_sub(visible.min(total)));
-            for (offset, (index, source)) in ctx
-                .sources
-                .iter()
-                .enumerate()
-                .skip(first)
-                .take(visible)
-                .enumerate()
-            {
+            for (offset, row) in list.row_rects.iter().enumerate() {
+                let index = list.first_row.saturating_add(offset);
+                let Some(source) = ctx.sources.get(index) else {
+                    continue;
+                };
                 let order = self.source_ids.iter().position(|id| id == &source.id);
                 let selected = index == self.selected_source;
                 let checkbox = if order.is_some() { "[x]" } else { "[ ]" };
@@ -802,12 +828,6 @@ impl Component for ViewDialog {
                     .map(|value| format!("{:>2} ", value + 1))
                     .unwrap_or_else(|| "   ".to_owned());
                 let text = format!("{marker}{checkbox} {position}{}", source.name);
-                let row = Rect::new(
-                    rects.viewport.x,
-                    rects.viewport.y.saturating_add(offset as u16),
-                    rects.viewport.width,
-                    1,
-                );
                 frame.render_widget(
                     Paragraph::new(clipped_width(&text, usize::from(row.width))).style(
                         if selected {
@@ -816,67 +836,94 @@ impl Component for ViewDialog {
                             styles.description
                         },
                     ),
-                    row,
+                    *row,
                 );
-                sources.push((row, index));
+                sources.push((*row, index));
             }
-            if let Some(bar) = rects.scrollbar {
+            if let Some(bar) = list.scrollbar {
                 render_scrollbar(
                     frame,
                     bar,
-                    first,
-                    total.saturating_sub(visible),
+                    list.first_row,
+                    total.saturating_sub(list.row_rects.len().min(total)),
                     theme,
                     ascii,
                 );
             }
+            // The wheel is wanted exactly when the membership list overflows
+            // its shared viewport.
+            surface.scrollable = list.scrollbar.is_some();
         } else {
             // §4.2: one labelled row. The field rect is exactly what gets painted,
             // and the caret is placed inside it.
             let label_width = u16::try_from(UnicodeWidthStr::width("Name")).unwrap_or(4);
-            let field_x = regions
+            let field_x = geometry
                 .content
                 .x
                 .saturating_add(label_width)
                 .saturating_add(FIELD_GUTTER);
-            let row = Rect::new(regions.content.x, regions.body.y, regions.content.width, 1);
-            frame.render_widget(Paragraph::new("Name").style(styles.label), row);
-            let field = Rect::new(
-                field_x.min(regions.content.right()),
-                row.y,
-                regions.content.right().saturating_sub(field_x),
+            let row = Rect::new(
+                geometry.content.x,
+                geometry.body.viewport.y,
+                geometry.content.width,
                 1,
             );
-            if field.width > 0 {
-                // The field paints its caret whether or not it has focus, and
-                // a button-focused dialog showed it at the end of the name:
-                // `App::active_text_cursor` returned `None` for any control but
-                // `Input`, and the old call fell back to the draft's length.
-                let at = if self.text_editing() {
-                    self.cursor.char_index
-                } else {
-                    self.draft.chars().count()
-                };
-                caret = place_input_cursor_at(frame, field, 0, 0, &self.draft, at, theme);
+            // The body viewport can be shorter than the content at 20x6; the
+            // single form row is the body minimum, so it is always visible.
+            if row.y < geometry.body.viewport.bottom() {
+                frame.render_widget(Paragraph::new("Name").style(styles.label), row);
+                let field = Rect::new(
+                    field_x.min(geometry.content.right()),
+                    row.y,
+                    geometry.content.right().saturating_sub(field_x),
+                    1,
+                );
+                if field.width > 0 {
+                    // The field paints its caret whether or not it has focus, and
+                    // a button-focused dialog showed it at the end of the name:
+                    // `App::active_text_cursor` returned `None` for any control but
+                    // `Input`, and the old call fell back to the draft's length.
+                    let at = if self.text_editing() {
+                        self.cursor.char_index
+                    } else {
+                        self.draft.chars().count()
+                    };
+                    caret = place_input_cursor_at(frame, field, 0, 0, &self.draft, at, theme);
+                }
             }
         }
 
-        render_message(frame, regions.message, state, &sentence, theme, ascii);
-        render_help_text(frame, regions.help, help, theme);
+        render_message(frame, geometry.message, state, &sentence, theme, ascii);
+        render_help_text(frame, geometry.help, help, theme);
 
         // §3: the action row holds exactly one verb (§8.9). It is the default
         // the name field and the membership list submit; the modes live in the
-        // header above and never here.
+        // header above and never here. One shared plan drives paint and mouse.
         let focused = (self.control == ViewDialogControl::Apply).then_some(0);
-        for (_, rect) in
-            render_action_row(frame, regions.actions, &apply_labels, focused, &[], theme)
-        {
-            controls_hit.push((rect, ViewDialogControl::Apply));
+        // The shared geometry already planned the single default button; render
+        // it from those rects so paint and hitboxes share one authority.
+        for (index, rect) in geometry.actions.buttons.iter() {
+            debug_assert_eq!(*index, 0);
+            crate::dialog_controls::render_role_button(
+                frame,
+                *rect,
+                apply_label,
+                if geometry.actions.default == Some(*index) {
+                    crate::dialog_controls::ButtonRole::Default
+                } else {
+                    crate::dialog_controls::ButtonRole::Normal
+                },
+                focused == Some(*index),
+                theme,
+            );
+            controls_hit.push((*rect, ViewDialogControl::Apply));
         }
+        // A More menu is unreachable here: one button always fits its band, so
+        // overflow would mean the shared planner and this renderer disagree.
 
         surface.caret = caret;
         self.geometry = ViewGeometry {
-            body: regions.body,
+            body: geometry.body.viewport,
             sources,
             tabs,
             controls: controls_hit,

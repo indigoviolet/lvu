@@ -202,8 +202,10 @@ fn every_kind_of_applied_state_is_on_the_stack_in_evaluation_order() {
     }
     // Values are asserted exactly above. The fixed-width list deliberately
     // truncates long values, so rendering asserts the meaningful visible
-    // prefixes rather than requiring the untruncated backing strings.
-    assert!(rendered.contains("merged, capture (arri…"), "{rendered}");
+    // prefixes rather than requiring the untruncated backing strings. The
+    // responsive LongContent frame is wider than the old class-M one, so the
+    // Sources row may now fit untruncated; accept either.
+    assert!(rendered.contains("merged, capture (arri"), "{rendered}");
     assert!(
         rendered.contains("2 rules: 1 level:error → red"),
         "{rendered}"
@@ -261,7 +263,7 @@ fn enter_on_each_row_replaces_the_summary_with_the_owning_layer_and_its_item() {
         (SummaryRow::Search, LayerId::Filter),
         (SummaryRow::Filter, LayerId::Filter),
         (SummaryRow::Grouping, LayerId::Grouping),
-        (SummaryRow::Fold, LayerId::Grouping),
+        (SummaryRow::Fold, LayerId::Folding),
         (SummaryRow::Columns, LayerId::Fields),
         (SummaryRow::Colour, LayerId::ColorRules),
         (SummaryRow::Readiness, LayerId::Enrichment),
@@ -307,6 +309,13 @@ fn enter_on_each_row_replaces_the_summary_with_the_owning_layer_and_its_item() {
                 assert_eq!(fields[selected].path, "level", "{row:?}");
             }
             SummaryRow::Colour => assert!(app.layers.color_rules.is_open()),
+            // The Fold row is owned by the Folding dialog: Enter replaces the
+            // summary with it, on the key column the summary names.
+            SummaryRow::Fold => {
+                assert!(app.layers.folding.is_open());
+                let rendered = screen(&draw(&provider, &mut app, 100, 30));
+                assert!(rendered.contains("Folding"), "{rendered}");
+            }
             _ => {}
         }
         // Back to the base screen for the next row.
@@ -316,6 +325,32 @@ fn enter_on_each_row_replaces_the_summary_with_the_owning_layer_and_its_item() {
             "{row:?}: Escape closes the owner"
         );
     }
+}
+
+#[test]
+fn the_fold_row_routes_to_folding_and_escape_returns_to_base() {
+    let (provider, mut app) = demo();
+    apply_everything(&mut app);
+    open_summary(&mut app, &provider);
+    draw(&provider, &mut app, 100, 30);
+    // Fold is row index 7 in evaluation order; the Grouping row stays the
+    // Multiline grouping dialog's (covered per-row above).
+    for _ in 0..7 {
+        key(&mut app, &provider, KeyCode::Down, KeyModifiers::NONE);
+    }
+    assert_eq!(app.layers.view_summary.selected_row(), SummaryRow::Fold);
+    key(&mut app, &provider, KeyCode::Enter, KeyModifiers::NONE);
+    // A Replace, not a child: the summary is gone and Folding owns the stack.
+    assert_eq!(app.layers.stack, vec![LayerId::Folding]);
+    assert!(!app.layers.view_summary.is_open());
+    assert!(app.layers.folding.is_open());
+    let rendered = screen(&draw(&provider, &mut app, 100, 30));
+    assert!(rendered.contains("Folding · "), "{rendered}");
+    assert!(!rendered.contains("View summary"), "{rendered}");
+    // Escape closes Folding back to the base screen, not to the summary.
+    key(&mut app, &provider, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(app.layers.stack.is_empty());
+    assert!(!app.layers.folding.is_open());
 }
 
 #[test]
@@ -378,7 +413,100 @@ fn the_button_its_mnemonic_and_the_mouse_open_the_selected_row_too() {
         Some(SummaryHit::Control(SummaryControl::Open))
     );
     click(&mut app, &provider, (button_x + 2, button_y));
-    assert_eq!(app.layers.stack, vec![LayerId::Grouping]);
+    // The clicked row is Fold, which the Folding dialog owns — not Grouping.
+    assert_eq!(app.layers.stack, vec![LayerId::Folding]);
+    assert!(app.layers.folding.is_open());
+}
+
+#[test]
+fn responsive_frame_is_policy_stable_across_sizes_with_shared_list_geometry() {
+    use lvu::dialog_layout::{PresentationKind, policy_size};
+
+    // Eleven fixed rows keep their shape at every size; LongContent policy
+    // owns the outer frame, the shared Operations pane owns heading/count/
+    // scrollbar/row rects for paint, selection, scroll and mouse.
+    for (width, height) in [(240u16, 80u16), (140, 40), (80, 24), (54, 16), (20, 6)] {
+        let (provider, mut app) = demo();
+        apply_everything(&mut app);
+        open_summary(&mut app, &provider);
+        let buffer = draw(&provider, &mut app, width, height);
+        let rendered = screen(&buffer);
+        let surface = app.layers.view_summary.surface();
+        let (want_w, want_h) = policy_size(
+            ratatui::layout::Rect::new(0, 0, width, height),
+            PresentationKind::LongContent,
+        );
+        assert_eq!(
+            (surface.popup.width, surface.popup.height),
+            (want_w, want_h),
+            "{width}x{height} frame must be policy"
+        );
+        if (width, height) != (20, 6) {
+            assert!(
+                surface.popup.width < width || surface.popup.height < height,
+                "{width}x{height} became full frame"
+            );
+        }
+        assert!(rendered.contains("View summary"), "{rendered}");
+        // At the 20x6 floor the 1-row body drops its Operations heading to
+        // preserve the selection row; larger sizes keep heading/count.
+        if (width, height) != (20, 6) {
+            assert!(rendered.contains("Operations"), "{rendered}");
+            assert!(rendered.contains("of 11"), "{rendered}");
+        }
+        assert!(
+            rendered.contains("[ Open ]") || rendered.contains("Open"),
+            "{rendered}"
+        );
+        // The wheel is wanted exactly when the 11-row list overflows: roomy
+        // 240x80 fits it, compact 54x16 does not.
+        if (width, height) == (240, 80) {
+            assert!(
+                !surface.scrollable,
+                "240x80 fits eleven rows and must not want the wheel"
+            );
+        } else if (width, height) == (54, 16) {
+            assert!(
+                surface.scrollable,
+                "54x16 overflows eleven rows and must want the wheel"
+            );
+        }
+        // Selection, cursor equivalent (highlight) and hitboxes share one
+        // authority: the selected row (index 0, "View") hit-tests. Search for
+        // the dialog's own selected row, not the base sidebar's "› All events"
+        // showing through beside the dialog on wide frames.
+        let selected_y = (0..buffer.area.height).find(|y| {
+            let line = (0..buffer.area.width)
+                .map(|x| buffer[(x, *y)].symbol())
+                .collect::<String>();
+            line.contains("› View")
+        });
+        if (width, height) != (20, 6) {
+            let y = selected_y.expect("selected View row is drawn");
+            let point = (buffer.area.width / 2, y);
+            // Wide frames show base text beside the dialog; the midpoint of a
+            // 240-wide frame is inside the 160-wide dialog, so this is the
+            // dialog row, not the sidebar.
+            assert!(
+                app.layers.view_summary.hit(point).is_some(),
+                "{width}x{height} selected row has no hitbox"
+            );
+        }
+        // Keyboard moves selection without moving the frame; mouse selects.
+        if (width, height) == (80, 24) {
+            let before = surface.popup;
+            key(&mut app, &provider, KeyCode::Down, KeyModifiers::NONE);
+            draw(&provider, &mut app, width, height);
+            assert_eq!(app.layers.view_summary.surface().popup, before);
+            assert_eq!(app.layers.view_summary.selected(), 1);
+        }
+    }
+
+    // Below the floor the tiny fallback owns the frame.
+    let (provider, mut app) = demo();
+    open_summary(&mut app, &provider);
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
 }
 
 #[test]

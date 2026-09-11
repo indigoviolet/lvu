@@ -49,7 +49,14 @@ def summary_row(text: str, label: str) -> str:
     for line in text.splitlines():
         match = re.search(rf"{re.escape(label)}\s+[·.] [^│]*", line)
         if match:
-            return match.group(0).rstrip()
+            row = match.group(0).rstrip()
+            # Strip exactly the shared scrollbar cell when the Operations pane
+            # overflows: the scrollbar paints one of ▲▼█ in the pane's last
+            # column, which is not part of the row's semantic text. Nothing
+            # else is trimmed, so the row-text check keeps its full strength.
+            if row.endswith(("▲", "▼", "█")):
+                row = row[:-1].rstrip()
+            return row
     raise AssertionError(f"no {label!r} row\n{text}")
 
 
@@ -142,9 +149,22 @@ def run(binary):
             assert "run_key" in summary_row(summary, "Grouping"), summary
             assert summary_row(summary, "Fold").endswith("—"), summary
             assert summary_row(summary, "Columns") == "Columns    · pinned: module", summary
-            assert summary_row(summary, "Readiness") == "Readiness  · ready", summary
             assert "4 of 8 operations applied" in summary, summary
             assert "1 of 11" in summary, summary
+
+            # The eleven rows keep a stable frame and scroll inside it: the
+            # last rows arrive via selection reveal instead of growing the
+            # dialog. Ride to the bottom and back; the frame and the Open
+            # action stay put.
+            app.send(b"\x1b[B" * 10)
+            bottom = app.wait_for("11 of 11")
+            assert summary_row(bottom, "Readiness") == "Readiness  · ready", bottom
+            assert "[ Open ]" in bottom, bottom
+            app.send(b"\x1b[A" * 10)
+            app.wait_until(
+                lambda text: "1 of 11" in text and "11 of 11" not in text,
+                "back at the top of the list",
+            )
 
             # Enter on the Search row opens Search with the literal applied.
             app.send(b"\x1b[B" * 4)

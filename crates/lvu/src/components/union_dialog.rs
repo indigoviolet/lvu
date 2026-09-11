@@ -18,12 +18,9 @@ use ratatui::{Frame, layout::Rect, widgets::Paragraph};
 
 use crate::app::Views;
 use crate::component::{CommandEntry, Component, Ctx, Event, Outcome, RenderCtx, Surface};
-use crate::dialog_controls::{ActionRow, DialogStyles};
-use crate::dialog_layout::{DialogClass, DialogContent, content_width};
-use crate::ui::{
-    MessageState, help_rows, message_rows, packed_button_rows, render_actions, render_help_text,
-    render_message, truncated,
-};
+use crate::dialog_controls::DialogStyles;
+use crate::dialog_layout::{DialogSpec, PresentationKind};
+use crate::ui::{MessageState, render_help_text, render_message, truncated};
 
 use super::union::{UnionDialog, UnionDialogRequest};
 
@@ -78,6 +75,32 @@ const UNION_ACTIONS: [&str; 2] = ["&Create union", "Cancel"];
 
 const UNION_HELP: &str = "Up/Down move · Space toggles a view · Enter creates · Esc closes. \
      Ties break by list order; equal times keep input order.";
+
+/// Stable responsive budgets for the Union chooser.
+///
+/// Outer size is `LongContent` policy plus stable maxima only, never the
+/// candidate count, the selection count or pending state. The body owns the
+/// surplus via the shared list pane; the message/help/action bands are stable
+/// per viewport width only. With static Create/Cancel labels both buttons fit
+/// across supported sizes at and above the 20x6 floor, so there is never an
+/// overflow menu: `overflow`/`more` stay empty and no More control is drawn.
+/// Hand-rolled row counts here are presentation-only folding (AGENTS.md).
+pub fn union_spec(viewport: ratatui::layout::Rect) -> DialogSpec {
+    // Stable budgets from policy width + stable labels only. Actions need two
+    // rows at the 20x6 floor (16-cell band cannot hold Create + Cancel in one
+    // row) and one row elsewhere. The message keeps one row at the floor so
+    // the two action rows survive pressure with one body row; elsewhere it
+    // keeps two rows so longer selection sentences are never ellipsized.
+    // Degradation still sheds help first, then clamps the message to one
+    // ellipsized row only at the boundary.
+    let policy_width = crate::dialog_layout::policy_size(viewport, PresentationKind::LongContent)
+        .0
+        .saturating_sub(4)
+        .max(1);
+    let actions = crate::dialog_controls::stable_action_rows(policy_width, &UNION_ACTIONS).max(1);
+    let message = if viewport.height <= 6 { 1 } else { 2 };
+    DialogSpec::new(PresentationKind::LongContent, 0, 3, message, 2, actions)
+}
 
 #[derive(Debug, Default)]
 pub struct UnionDialogComponent {
@@ -295,13 +318,15 @@ impl Component for UnionDialogComponent {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
+        use crate::dialog_layout::{plan_list, resolve_dialog};
+        use ratatui::style::Modifier;
+
         let theme = ctx.theme;
         let ascii = ctx.ascii;
         let styles = DialogStyles::new(theme);
         let candidates = Self::candidates(ctx.views);
         self.highlighted = self.highlighted.min(candidates.len().saturating_sub(1));
         let selected = self.draft.inputs();
-        let width = content_width(area, DialogClass::M);
         let (message_state, sentence) = match self.draft.error() {
             Some(error) => (MessageState::Error, error.to_owned()),
             None => {
@@ -334,109 +359,156 @@ impl Component for UnionDialogComponent {
                 }
             }
         };
-        let content = DialogContent {
-            header: 0,
-            body: u16::try_from(candidates.len().max(1)).unwrap_or(4),
-            message: message_rows(&sentence, width),
-            help: help_rows(UNION_HELP, width),
-            actions: packed_button_rows(width, &UNION_ACTIONS),
+        // Responsive frame: LongContent policy plus stable budgets only. Body
+        // rows size only the scroll extent; the frame and sticky tail are
+        // identical for short/long lists and pending/error states.
+        let spec = union_spec(area);
+        let Ok(geometry) = resolve_dialog(area, &spec, 1, &UNION_ACTIONS, Some(0), None) else {
+            self.geometry = UnionGeometry::default();
+            self.surface = Surface::default();
+            return self.surface;
         };
-        let regions = crate::ui::dialog_frame_regions(
-            frame,
-            area,
-            DialogClass::M,
-            "Union views",
-            &content,
-            theme,
-        );
-        let surface = Surface {
-            popup: regions.popup,
-            interior: regions.interior,
+        crate::ui::render_responsive_frame(frame, &geometry, "Union views", ctx.active, theme);
+        let mut surface = Surface {
+            popup: geometry.frontmost,
+            interior: geometry.interior,
             caret: None,
-            scrollable: candidates.len() > usize::from(regions.body.height),
+            // Derived from the actual list overflow below, never asserted.
+            scrollable: false,
             text_focus: false,
         };
         self.geometry = UnionGeometry {
-            body: regions.body,
+            body: geometry.body.viewport,
             ..UnionGeometry::default()
         };
         self.surface = surface;
-        if regions.content.width == 0 {
+        if geometry.content.width == 0 {
             return surface;
         }
         let mut inputs_hit: Vec<(Rect, usize)> = Vec::new();
         if candidates.is_empty() {
             frame.render_widget(
                 Paragraph::new("no views are open").style(styles.label),
-                regions.body,
+                geometry.body.viewport,
             );
-        }
-        let visible = usize::from(regions.body.height).max(1);
-        if self.highlighted < self.scroll {
-            self.scroll = self.highlighted;
-        } else if self.highlighted >= self.scroll.saturating_add(visible) {
-            self.scroll = self.highlighted.saturating_add(1).saturating_sub(visible);
-        }
-        self.scroll = self.scroll.min(candidates.len().saturating_sub(visible));
-        for (visible_offset, (offset, (id, name))) in candidates
-            .iter()
-            .enumerate()
-            .skip(self.scroll)
-            .take(visible)
-            .enumerate()
-        {
-            let y = regions
-                .body
-                .y
-                .saturating_add(u16::try_from(visible_offset).unwrap_or(0));
-            if y >= regions.body.bottom() {
-                break;
-            }
-            let row = Rect::new(regions.content.x, y, regions.content.width, 1);
-            let checked = selected.contains(id);
-            let mark = if checked { "[x]" } else { "[ ]" };
-            let line = format!("{mark} {name}");
-            let style = if offset == self.highlighted {
-                styles.selection
-            } else {
-                styles.label
-            };
+        } else {
+            // Shared list pane: heading + count + viewport + scrollbar from one
+            // call. Same rects drive paint, selection, scrollbar and mouse.
+            let count_text = format!(
+                "{} of {}",
+                self.highlighted.saturating_add(1).min(candidates.len()),
+                candidates.len()
+            );
+            let count_width =
+                u16::try_from(unicode_width::UnicodeWidthStr::width(count_text.as_str()))
+                    .unwrap_or(0);
+            let list = plan_list(
+                geometry.body.viewport,
+                count_width,
+                candidates.len(),
+                Some(self.highlighted),
+                self.scroll,
+            );
+            self.scroll = list.first_row;
             frame.render_widget(
-                Paragraph::new(truncated(&line, usize::from(row.width))).style(style),
-                row,
+                Paragraph::new("Views").style(styles.label.add_modifier(Modifier::BOLD)),
+                list.heading,
             );
-            inputs_hit.push((row, offset));
+            if list.count.width > 0 {
+                frame.render_widget(
+                    Paragraph::new(ratatui::text::Line::from(count_text))
+                        .style(styles.description)
+                        .right_aligned(),
+                    list.count,
+                );
+            }
+            for (offset, row) in list.row_rects.iter().enumerate() {
+                let index = list.first_row.saturating_add(offset);
+                let Some((id, name)) = candidates.get(index) else {
+                    continue;
+                };
+                let checked = selected.contains(id);
+                let mark = if checked { "[x]" } else { "[ ]" };
+                // Selection gutter survives NO_COLOR, as every shared list.
+                let gutter = if index == self.highlighted {
+                    if ascii { "> " } else { "› " }
+                } else {
+                    "  "
+                };
+                let line = format!("{gutter}{mark} {name}");
+                let style = if index == self.highlighted {
+                    styles.selection
+                } else {
+                    styles.label
+                };
+                frame.render_widget(
+                    Paragraph::new(truncated(&line, usize::from(row.width))).style(style),
+                    *row,
+                );
+                inputs_hit.push((*row, index));
+            }
+            if let Some(bar) = list.scrollbar {
+                crate::ui::render_scrollbar(
+                    frame,
+                    bar,
+                    list.first_row,
+                    candidates.len().saturating_sub(list.row_rects.len()),
+                    theme,
+                    ascii,
+                );
+            }
+            // The wheel is wanted exactly when the candidate list overflows
+            // its shared viewport. The heading row counts: a list exactly as
+            // long as the body still overflows once the heading takes its row.
+            surface.scrollable = list.scrollbar.is_some();
         }
         render_message(
             frame,
-            regions.message,
+            geometry.message,
             message_state,
             &sentence,
             theme,
             ascii,
         );
-        render_help_text(frame, regions.help, UNION_HELP, theme);
+        render_help_text(frame, geometry.help, UNION_HELP, theme);
         let focused_button = match self.focus {
             UnionFocus::Inputs => None,
             UnionFocus::Create => Some(0),
             UnionFocus::Cancel => Some(1),
         };
+        // Both static buttons always fit their stable band (two rows at the
+        // 20x6 floor, one row elsewhere), so the shared plan never overflows:
+        // assert rather than drawing an inert More control with no hitbox,
+        // state or press path.
+        debug_assert!(
+            geometry.actions.overflow.is_empty() && geometry.actions.more.is_none(),
+            "static Create/Cancel must fit without overflow: {:?}",
+            geometry.actions
+        );
         let mut buttons_hit: Vec<(Rect, usize)> = Vec::new();
-        for (index, rect) in render_actions(
-            frame,
-            regions.actions,
-            ActionRow {
-                labels: &UNION_ACTIONS,
-                default: Some(0),
-                destructive: &[],
-                focused: focused_button,
-            },
-            theme,
-        ) {
-            buttons_hit.push((rect, index));
+        for (index, rect) in geometry.actions.buttons.iter() {
+            crate::dialog_controls::render_role_button(
+                frame,
+                *rect,
+                UNION_ACTIONS[*index],
+                if geometry.actions.default == Some(*index) {
+                    crate::dialog_controls::ButtonRole::Default
+                } else {
+                    crate::dialog_controls::ButtonRole::Normal
+                },
+                focused_button == Some(*index),
+                theme,
+            );
+            buttons_hit.push((*rect, *index));
         }
         self.geometry.inputs = inputs_hit;
         self.geometry.buttons = buttons_hit;
+        // Surface popup stays the frame: no anchored overlay is wired here, so
+        // frontmost == frame and containment matches paint. Publish the final
+        // surface (including the derived scrollable flag): `surface()` must
+        // answer what this frame painted, not the pre-list provisional.
+        surface.popup = geometry.frontmost;
+        self.surface = surface;
         surface
     }
 
