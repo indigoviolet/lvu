@@ -1137,3 +1137,89 @@ fn long_unicode_clips_with_exact_hitboxes() {
         assert!(screen.contains("café"), "{screen}");
     }
 }
+
+/// A view revision bump after open but before submit binds the new revision,
+/// and Submit again after a fence trip re-freezes so the turn can recover.
+/// The fence still refuses completions bound to older revisions; only the
+/// binding point moves from open to Submit.
+#[test]
+fn submit_binds_the_current_revision_and_submit_again_recovers() {
+    let (provider, mut app) = demo();
+    open(&mut app, &provider, AskOpen::Generic);
+    let view_id = app.layers.ask.state().unwrap().view_id.clone();
+    let opened = app.views.definition_revision(&view_id).unwrap();
+    app.handle(
+        Action::Raw(RawEvent::Paste("only errors".into())),
+        &provider,
+    );
+    // Background churn lands between open and submit.
+    app.views.touch(&view_id);
+    let current = app.views.definition_revision(&view_id).unwrap();
+    assert_eq!(current, opened + 1);
+    submit(&mut app, &provider);
+
+    let lvu::AskAiRequest::Start {
+        generation,
+        view_id: request_view,
+        definition_revision: bound,
+        ..
+    } = app.take_ask_ai_requests().pop().expect("start request")
+    else {
+        panic!("start request")
+    };
+    assert_eq!(request_view, view_id);
+    assert_eq!(
+        bound, current,
+        "Submit must bind the revision as it stands at Submit, not at open"
+    );
+    // The rest of the turn is fenced to the bound revision, so it completes
+    // with its real outcome instead of tripping the fence.
+    assert!(app.finish_ask_ai(generation, &view_id, bound, Err("bridge down".into()),));
+    let dialog = app.layers.ask.state().unwrap();
+    assert_eq!(dialog.stage, AskAiStage::Error);
+    assert!(dialog.progress.contains("bridge down"), "{dialog:?}");
+
+    // A genuine fence trip: submit binds R, churn moves the view past it, and
+    // the completion for R is refused with the fence message.
+    submit(&mut app, &provider);
+    let lvu::AskAiRequest::Start {
+        generation,
+        definition_revision: bound,
+        ..
+    } = app.take_ask_ai_requests().pop().expect("start request")
+    else {
+        panic!("start request")
+    };
+    assert_eq!(bound, app.views.definition_revision(&view_id).unwrap());
+    app.views.touch(&view_id);
+    assert!(!app.finish_ask_ai(generation, &view_id, bound, Err("bridge down".into()),));
+    let dialog = app.layers.ask.state().unwrap();
+    assert_eq!(dialog.stage, AskAiStage::Error);
+    assert!(
+        dialog.progress.contains("request a fresh proposal"),
+        "{dialog:?}"
+    );
+
+    // Submit again re-freezes at the new revision under the same task
+    // identity and generation; completing it carries the real outcome.
+    submit(&mut app, &provider);
+    let lvu::AskAiRequest::Start {
+        generation: second_generation,
+        definition_revision: rebound,
+        ..
+    } = app.take_ask_ai_requests().pop().expect("start request")
+    else {
+        panic!("start request")
+    };
+    assert_eq!(second_generation, generation, "task identity is preserved");
+    assert_eq!(rebound, app.views.definition_revision(&view_id).unwrap());
+    assert_ne!(rebound, bound, "Submit again must re-freeze, not reuse");
+    assert!(app.finish_ask_ai(
+        second_generation,
+        &view_id,
+        rebound,
+        Err("bridge down".into()),
+    ));
+    let dialog = app.layers.ask.state().unwrap();
+    assert!(dialog.progress.contains("bridge down"), "{dialog:?}");
+}
