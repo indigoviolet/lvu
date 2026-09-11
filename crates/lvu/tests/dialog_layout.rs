@@ -2762,9 +2762,10 @@ fn responsive_action_roles_validate_and_map_focus() {
         !direct.more_is_focused(),
         "visible focus stays on its button"
     );
-    // Unreachable overflow is explicit: a trailing default in a single narrow
-    // row holds only itself with no room for More ▾, so hidden rows have no
-    // hitbox. A leading default squeezes prefix + More ▾ into the row instead.
+    // Unreachable overflow is explicit: in a single narrow row, a default
+    // whose button plus More ▾ does not fit exactly holds only itself with no
+    // More hitbox — for a leading default as well as a trailing one — so the
+    // resolver refuses and the caller allocates two stable rows.
     let trailing = responsive_actions::plan_actions(Rect::new(0, 0, 16, 1), &labels, Some(5), None);
     assert!(!trailing.overflow.is_empty());
     assert!(
@@ -2774,8 +2775,13 @@ fn responsive_action_roles_validate_and_map_focus() {
     assert!(trailing.unreachable_overflow());
     assert!(trailing.visible_indices().contains(&5));
     let leading = responsive_actions::plan_actions(Rect::new(0, 0, 16, 1), &labels, Some(0), None);
-    assert!(leading.more.is_some());
-    assert!(!leading.unreachable_overflow());
+    assert!(!leading.overflow.is_empty());
+    assert!(
+        leading.more.is_none(),
+        "Apply plus More needs 21 cells, not 16: {leading:?}"
+    );
+    assert!(leading.unreachable_overflow());
+    assert_eq!(leading.visible_indices(), vec![0]);
     let roomy = responsive_actions::plan_actions(Rect::new(0, 0, 16, 2), &labels, Some(5), None);
     assert!(roomy.more.is_some());
     assert!(!roomy.unreachable_overflow());
@@ -2796,10 +2802,10 @@ fn responsive_action_budgets_and_resolve_fallback_at_boundaries() {
     assert_eq!(responsive_actions::stable_action_rows(68, &labels), 2);
     assert_eq!(responsive_actions::stable_action_rows(48, &labels), 2);
     assert_eq!(responsive_actions::stable_action_rows(16, &labels), 2);
-    // 20x6 with a one-row budget and a trailing default is unreachable: the
-    // single narrow row holds only the default with no room for More ▾, so the
+    // 20x6 with a one-row budget and six verbs is unreachable: the single
+    // narrow row holds only the default with no room for More ▾, so the
     // dialog fallback owns the frame and the caller grows the budget instead
-    // of drawing a dead band. A leading default squeezes into one row.
+    // of drawing a dead band.
     use responsive::PresentationKind;
     let viewport = responsive_viewport(20, 6);
     let one_row = responsive::DialogSpec::new(PresentationKind::LongContent, 0, 1, 1, 0, 1);
@@ -2814,7 +2820,6 @@ fn responsive_action_budgets_and_resolve_fallback_at_boundaries() {
     assert!(!geometry.actions.unreachable_overflow());
     assert!(geometry.actions.visible_indices().contains(&5));
 }
-
 // --- Phase B shared-core: frozen context anchor lifecycle ---
 //
 // Capture comes from the same last-rendered base geometry/hit regions when the
@@ -3230,4 +3235,107 @@ fn anchor_invalidates_on_resize_and_captures_compact_logs() {
         Some(anchor),
         "async frames must not recapture the compact anchor"
     );
+}
+#[test]
+fn responsive_action_one_row_more_needs_exact_fit() {
+    // Apply is 9 cells, Help is 8, More is 10, gutter is 2. Leading-slot
+    // exact fit is 9+2+10 = 21 with ["Apply", ..]; trailing Help exact fit is
+    // 8+2+10 = 20. A one-row band reports reachable More only on an exact fit.
+    // (Two labels both fit in 21 without More, so this test uses three to
+    // force overflow: Apply 9, Clear 9, Help 8.)
+    use responsive_actions::button_width;
+    let labels = ["Apply", "Clear", "Help"];
+    assert_eq!(button_width("Apply"), 9);
+    assert_eq!(button_width("Help"), 8);
+    assert_eq!(button_width(responsive_actions::MORE_LABEL), 10);
+    // Exactly at fit, default index 0: Apply plus More, rest overflows.
+    let exact = responsive_actions::plan_actions(Rect::new(0, 0, 21, 1), &labels, Some(0), None);
+    assert!(!exact.unreachable_overflow());
+    assert!(exact.more.is_some(), "exact fit keeps More reachable");
+    assert_eq!(exact.visible_indices(), vec![0]);
+    assert_eq!(exact.overflow, vec![1, 2]);
+    // Just below fit: default alone, no More, explicit unreachable.
+    let narrow = responsive_actions::plan_actions(Rect::new(0, 0, 20, 1), &labels, Some(0), None);
+    assert_eq!(narrow.visible_indices(), vec![0]);
+    assert_eq!(narrow.overflow, vec![1, 2]);
+    assert!(narrow.more.is_none());
+    assert!(narrow.unreachable_overflow());
+    // Trailing default at exact fit (20): Help plus More, prefix overflows.
+    let trailing = responsive_actions::plan_actions(Rect::new(0, 0, 20, 1), &labels, Some(2), None);
+    assert_eq!(trailing.visible_indices(), vec![2]);
+    assert_eq!(trailing.overflow, vec![0, 1]);
+    assert!(trailing.more.is_some());
+    assert!(!trailing.unreachable_overflow());
+    // Trailing default just below fit (19): default alone, prefix overflows.
+    let trailing_narrow =
+        responsive_actions::plan_actions(Rect::new(0, 0, 19, 1), &labels, Some(2), None);
+    assert_eq!(trailing_narrow.visible_indices(), vec![2]);
+    assert_eq!(trailing_narrow.overflow, vec![0, 1]);
+    assert!(trailing_narrow.more.is_none());
+    assert!(trailing_narrow.unreachable_overflow());
+    // Destructive-default refusal composes with the fit rule: the destructive
+    // index cannot be the default, so the first button shows instead.
+    let refused = responsive_actions::plan_actions_with_roles(
+        Rect::new(0, 0, 20, 1),
+        &labels,
+        Some(0),
+        &[0],
+        None,
+    );
+    assert_eq!(refused.default, None);
+    assert_eq!(refused.visible_indices(), vec![0]);
+    assert!(refused.unreachable_overflow());
+    // Reported rects are authoritative: full button widths, in-band, disjoint.
+    for plan in [&exact, &trailing, &narrow, &trailing_narrow] {
+        let mut spans: Vec<(u16, u16)> = plan
+            .buttons
+            .iter()
+            .map(|(index, rect)| {
+                assert_eq!(rect.height, 1);
+                assert_eq!(rect.y, plan.band.y);
+                assert!(
+                    rect.x >= plan.band.x && rect.right() <= plan.band.right(),
+                    "button {index} {rect:?} escapes {:?}",
+                    plan.band
+                );
+                assert_eq!(
+                    rect.width,
+                    button_width(labels[*index]),
+                    "button {index} must keep its full width (no squeeze)"
+                );
+                (rect.x, rect.right())
+            })
+            .collect();
+        if let Some(more) = plan.more {
+            assert_eq!(more.height, 1);
+            assert_eq!(more.width, button_width(responsive_actions::MORE_LABEL));
+            assert!(more.x >= plan.band.x && more.right() <= plan.band.right());
+            spans.push((more.x, more.right()));
+        }
+        spans.sort_unstable();
+        for window in spans.windows(2) {
+            assert!(
+                window[1].0 >= window[0].1,
+                "hitboxes overlap in {:?}",
+                plan.band
+            );
+        }
+    }
+    // The old squeezed shape is gone: exact-fit rects are never narrowed.
+    assert_eq!(exact.buttons[0].1.width, 9);
+    assert_eq!(exact.more.expect("exact").width, 10);
+    // Resolver wiring: one-row refuses, two rows carry default plus More.
+    use responsive::PresentationKind;
+    let viewport = responsive_viewport(20, 6);
+    let one = responsive::DialogSpec::new(PresentationKind::LongContent, 0, 1, 0, 0, 1);
+    assert_eq!(
+        responsive::resolve_dialog(viewport, &one, 2, &labels, Some(0), None),
+        Err(responsive::GeometryError::TooSmall)
+    );
+    let two = responsive::DialogSpec::new(PresentationKind::LongContent, 0, 1, 0, 0, 2);
+    let geometry = responsive::resolve_dialog(viewport, &two, 2, &labels, Some(0), None)
+        .expect("two rows carry default plus More");
+    assert_eq!(geometry.actions.visible_indices(), vec![0]);
+    assert_eq!(geometry.actions.overflow, vec![1, 2]);
+    assert!(geometry.actions.more.is_some());
 }

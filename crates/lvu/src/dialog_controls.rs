@@ -594,23 +594,19 @@ pub fn plan_actions_with_roles(
     // Overflow path: reserve More ▾ in the last row.
     if max_rows == 1 {
         let row = row_rects[0];
-        // Largest prefix fitting alongside More ▾ in one row.
+        // Largest prefix whose exact widths plus gutters plus More ▾ fit.
+        // Strict containment: a first button that fits alone but not with
+        // More ▾ is NOT kept. Letting it through and then placing
+        // Length(button) + Length(More) in the too-narrow row makes Ratatui
+        // squeeze both widths, and the geometry would report a reachable More
+        // hitbox whose painted rect is clipped/overlapped. The keep==0 path
+        // below preserves the default alone with more None instead, so the
+        // unreachable flag converts to TooSmall in the resolver.
         let mut x = 0u16;
         let mut keep = 0usize;
         for w in &widths {
             let end = if keep == 0 { *w } else { x.saturating_add(*w) };
-            // Room for gutter + More ▾ after this button (unless it is the
-            // only content and More ▾ must share anyway).
-            let with_more = end.saturating_add(BUTTON_GUTTER).saturating_add(more_w);
-            let fits = if keep == 0 {
-                // A single button plus More ▾ may exceed a very narrow band;
-                // the default still survives below via the fallback.
-                end.saturating_add(BUTTON_GUTTER).saturating_add(more_w) <= band.width
-                    || *w <= band.width
-            } else {
-                with_more <= band.width
-            };
-            if !fits {
+            if end.saturating_add(BUTTON_GUTTER).saturating_add(more_w) > band.width {
                 break;
             }
             x = end.saturating_add(BUTTON_GUTTER);
@@ -618,6 +614,44 @@ pub fn plan_actions_with_roles(
             if keep >= labels.len() {
                 break;
             }
+        }
+        if keep == 0 {
+            // Nothing fits alongside More ▾ in prefix order: preserve the
+            // valid non-destructive default alone (first button when no
+            // default validates). More ▾ joins it only on an exact pair fit;
+            // otherwise More stays hidden so unreachable_overflow is true.
+            let fallback = valid_default
+                .unwrap_or(0)
+                .min(labels.len().saturating_sub(1));
+            if widths[fallback]
+                .saturating_add(BUTTON_GUTTER)
+                .saturating_add(more_w)
+                <= band.width
+            {
+                let both = [widths[fallback], more_w];
+                let both_placed = place_row_buttons(row, &both);
+                return ActionGeometry {
+                    band,
+                    buttons: vec![(fallback, both_placed[0])],
+                    overflow: (0..labels.len()).filter(|i| *i != fallback).collect(),
+                    more: Some(both_placed[1]),
+                    default: valid_default,
+                    focused: valid_focused,
+                    destructive: destructive_set.clone(),
+                };
+            }
+            let placed = place_row_buttons(row, &[widths[fallback]]);
+            let mut overflow: Vec<usize> = (0..labels.len()).collect();
+            overflow.retain(|i| *i != fallback);
+            return ActionGeometry {
+                band,
+                buttons: vec![(fallback, placed[0])],
+                overflow,
+                more: None,
+                default: valid_default,
+                focused: valid_focused,
+                destructive: destructive_set.clone(),
+            };
         }
         // Default survival: with one row and a very narrow band the default
         // alone wins over More ▾ (spec: never remove the default). A trailing
