@@ -1192,7 +1192,12 @@ fn submit_binds_the_current_revision_and_submit_again_recovers() {
     };
     assert_eq!(bound, app.views.definition_revision(&view_id).unwrap());
     app.views.touch(&view_id);
-    assert!(!app.finish_ask_ai(generation, &view_id, bound, Err("bridge down".into()),));
+    assert!(!app.finish_ask_ai(
+        generation,
+        &view_id,
+        bound,
+        Ok(("level == 'ERROR'".into(), "proposal".into())),
+    ));
     let dialog = app.layers.ask.state().unwrap();
     assert_eq!(dialog.stage, AskAiStage::Error);
     assert!(

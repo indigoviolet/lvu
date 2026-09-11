@@ -3264,3 +3264,18 @@ The Fields PTY verifies Exclude and Filter as separate functional forks rather
 than relying on a transient notice an immediate completion can replace; it
 passes end to end. Log:
 `primary-sol-scratch/v018-fields-mnemonics-focus-fix2.log`.
+
+Responsive PTY repairs through the primary now cover dialog/canonical sizing,
+View summary/shared controls/layered dismissal, correlation and every union
+story, whole-view readiness, Fields mnemonics, and Time field/text-format
+review. These changes wait for accepted state, close a covering dialog before
+asserting base rows, and use component-owned display geometry; they do not
+extend product deadlines.
+
+Ask now binds its view-definition fence at Submit/Submit again rather than
+dialog open. Successful stale proposals still fail closed, while a concrete
+bridge/provider failure is always safe and useful to show because it cannot
+mutate the view. The direct submit/recovery regression and all-target `lvu`
+Clippy pass; the actual bridge-diagnostics PTY passes all five failure modes
+against the rebuilt primary. Evidence:
+`primary-sol-scratch/v018-bridge-diagnostics-final2.log`.

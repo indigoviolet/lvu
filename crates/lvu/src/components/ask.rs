@@ -623,13 +623,17 @@ impl AskDialog {
         }) else {
             return false;
         };
-        if !current {
-            dialog.stage = AskAiStage::Error;
-            dialog.focus = AskControl::Prompt;
-            dialog.progress = "view definition changed; request a fresh proposal".into();
-            return false;
-        }
         match result {
+            Ok(_) if !current => {
+                // A successful proposal is definition-dependent and must fail
+                // closed. A concrete bridge/provider failure below cannot
+                // mutate the view, so keep that actionable diagnostic even if
+                // background restore work advanced the definition meanwhile.
+                dialog.stage = AskAiStage::Error;
+                dialog.focus = AskControl::Prompt;
+                dialog.progress = "view definition changed; request a fresh proposal".into();
+                return false;
+            }
             Ok((value, explanation)) => {
                 dialog.expression = Some(value);
                 dialog.explanation = Some(explanation);
