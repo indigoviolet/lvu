@@ -48,12 +48,16 @@ def run(binary: pathlib.Path) -> None:
             # `X` from the log pane stops the source; nothing appended while it
             # is stopped may reach the view. The 80-column status line clips
             # the per-source notice to `sample.log: capture…`, so arrival of
-            # the notice plus the capture actually halting is the assertion.
-            # (The sidebar row keeps its `Running:` label after the worker
-            # acknowledges the stop — a product sync defect reported
-            # separately — so this story pins the functional behavior.)
+            # the notice plus the capture actually halting is the assertion;
+            # the sidebar then publishes the terminal health (`Stopped:`)
+            # instead of freezing at its last `Running:` tick.
             app.send(b"X")
             app.wait_for("sample.log: capture", timeout=8.0)
+            app.wait_until(
+                lambda text: "Stopped:" in text,
+                "the sidebar publishes the stopped health",
+                timeout=12.0,
+            )
             with source.open("a") as output:
                 output.write("while stopped\n")
             app.assert_remains("first line", "while stopped", duration=0.3)
@@ -71,6 +75,11 @@ def run(binary: pathlib.Path) -> None:
             app.wait_until(lambda text: "Sources / views" in text, "sidebar focused")
             app.send(b"X")
             app.wait_for("sample.log: capture", timeout=8.0)
+            app.wait_until(
+                lambda text: "Stopped:" in text,
+                "the sidebar publishes the stopped health",
+                timeout=12.0,
+            )
             with source.open("a") as output:
                 output.write("held back\n")
             app.assert_remains("while stopped", "held back", duration=0.3)

@@ -20,7 +20,10 @@ def run(binary):
             app.wait_for('file-first')
             # Shared capture names the outcome per source: stopping reports
             # `{name}: capture stopped`, restarting `{name}: capture restarted`.
+            # The sidebar publishes the terminal health too (`Stopped:`),
+            # not just the status notice.
             app.send(b'\x1bs'); app.wait_for('capture stopped')
+            app.wait_until(lambda text: 'Stopped:' in text, 'sidebar shows the stopped source')
             with file.open('a') as output: output.write('after-stop\n')
             app.assert_remains('file-first','after-stop',duration=0.3)
             app.send(b'\x1br'); app.wait_for('after-stop')

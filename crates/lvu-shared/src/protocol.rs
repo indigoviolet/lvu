@@ -52,6 +52,17 @@ pub enum WorkerRequest {
         request_id: String,
         source_id: String,
     },
+    /// Record a window-local source (stdin today) in the session set
+    /// without acquiring anything worker-side: `{definition}` is a
+    /// `SourceDefinition` value. Answered by `SessionNoted`/`Refused`.
+    /// A later window restores it as a visible entry the resume path
+    /// refuses loudly (stdin cannot restart) instead of dropping it
+    /// silently; nothing here starts capture, replays a byte, or
+    /// fabricates acquisition.
+    NoteSessionMember {
+        request_id: String,
+        definition: serde_json::Value,
+    },
     /// Subscribe this connection to bounded `SourceStatus` events.
     StatusSubscribe { request_id: String },
     /// A forwarded stdin chunk (base64), `seq`-ordered per source; the
@@ -111,6 +122,11 @@ pub enum WorkerEvent {
     Stopped {
         request_id: String,
         source_id: String,
+    },
+    /// Answer to `NoteSessionMember`: the definition joined the session
+    /// set (or was already there) and the manifest was rewritten.
+    SessionNoted {
+        request_id: String,
     },
     /// Bounded health/progress snapshot for sidebars (names, states, record
     /// counts, last errors). Data stays in journals; this is presence only.

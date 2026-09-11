@@ -356,6 +356,20 @@ impl SharedStore {
         })
     }
 
+    /// Record a window-local source (stdin today) in the worker's session
+    /// set without acquiring anything there. A later window restores it
+    /// as a visible entry the resume path refuses loudly (stdin cannot
+    /// restart) instead of dropping it silently. A refusal here never
+    /// fails the capture itself — the caller reports it and proceeds.
+    pub async fn note_local_source(
+        &self,
+        definition: &lvu_core::SourceDefinition,
+    ) -> Result<(), String> {
+        let dto =
+            serde_json::to_value(definition).map_err(|error| format!("session note: {error}"))?;
+        self.client.lock().await.note_session_member(&dto).await
+    }
+
     /// Build the live read handle for an acquired source and start its
     /// feeder: one initial poll becomes the trusted cache, then a task
     /// keeps it fresh until stopped. Shared by start and restart paths.
@@ -484,10 +498,13 @@ impl SharedStore {
             .is_some_and(|(task, _)| !task.is_finished())
     }
 
-    /// Whether this session owns the source's capture (worker-started
-    /// and not stopped): the routing predicate for stop/restart paths.
-    /// Locally acquired sources (stdin, or any pre-shared flow) are never
-    /// owned here and keep their manager paths.
+    /// Whether this session adopted the source's capture: worker-started
+    /// (running or stopped) and never handed back. This is the routing
+    /// predicate for stop/restart paths — a retained stopped handle keeps
+    /// routing shared so a repeated stop re-polls honestly and a restart
+    /// replaces through the same path. Locally acquired sources (stdin, or
+    /// any pre-shared flow) are never owned here and keep their manager
+    /// paths.
     pub fn owns_source(&self, source_id: SourceId) -> bool {
         self.handles
             .lock()
@@ -515,6 +532,12 @@ impl SharedStore {
     /// the retained handle so stop/error diagnostics (notably
     /// `last_error`) stay readable afterwards. A failed final poll never
     /// fails the stop itself.
+    ///
+    /// The handle stays in the session map: `source_progress` keeps
+    /// serving the terminal snapshot, so UI health reads Stopped instead
+    /// of freezing at the last Running tick. Restart and a later start
+    /// replace the entry (and respawn its feeder) through the same slot,
+    /// so retention never double-drives a capture.
     ///
     /// Lock discipline (a past self-deadlock): every guard here lives in
     /// its own statement. The client guard from the final poll must drop
@@ -547,10 +570,6 @@ impl SharedStore {
             let _ =
                 tokio::task::spawn_blocking(move || handle.update_progress(&session, tick)).await;
         }
-        self.handles
-            .lock()
-            .expect("shared handles poisoned")
-            .remove(&source_id);
         Ok(())
     }
 
@@ -2175,6 +2194,40 @@ mod tests {
         // diagnostics stay readable after the capture ends.
         store.stop_source(definition.id).await.expect("stop");
         assert!(shared.handle.progress().state.is_terminal());
+        // The session retains the stopped handle: UI health keeps serving
+        // the terminal snapshot through `source_progress` instead of
+        // freezing at the last Running tick, and the source stays routed
+        // shared so a repeated stop re-polls honestly.
+        let published = store
+            .source_progress(definition.id)
+            .expect("stopped handle stays published");
+        assert!(published.state.is_terminal());
+        assert!(store.owns_source(definition.id));
+    }
+
+    #[tokio::test]
+    async fn note_local_source_persists_stdin_without_acquiring() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = serving(root.path()).await;
+        let store = attach_window(&fixture, "window-n", 6113).await;
+        let definition = SourceDefinition {
+            schema_version: 1,
+            id: SourceId(uuid::Uuid::from_u128(79)),
+            name: "standard input".into(),
+            acquisition: Acquisition::Stdin,
+            identity_hints: Default::default(),
+            retention: None,
+        };
+        store.note_local_source(&definition).await.expect("note");
+        // Session-only: nothing was acquired, so nothing feeds, nothing
+        // is owned, and no progress exists — yet the definition persists
+        // for a later window to restore visibly.
+        assert!(!store.feeder_alive(definition.id));
+        assert!(!store.owns_source(definition.id));
+        assert!(store.source_progress(definition.id).is_none());
+        let members =
+            lvu_shared::worker::load_session_set(&fixture.capture_root.join("workspace")).unwrap();
+        assert_eq!(members, vec![definition]);
     }
 
     /// Scripted peer with a request-kind log. The decision function maps
