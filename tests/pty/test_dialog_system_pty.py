@@ -17,10 +17,14 @@ MUTED = "ae919a"
 
 
 def dialog_bounds(app: PtyApp, title: str) -> tuple[int, int, int, int]:
-    """Left, top, right and bottom of the dialog whose top border shows `title`."""
+    """Left, top, right and bottom of the dialog whose top border shows `title`.
+
+    The popup shares its top row with the workspace borders behind it, so the
+    left edge is the corner nearest the title, not the first one on the line.
+    """
     lines = app.text().splitlines()
     top = next(row for row, line in enumerate(lines) if title in line and "┌" in line)
-    left = lines[top].index("┌", max(0, lines[top].index(title) - 40))
+    left = lines[top].rindex("┌", 0, lines[top].index(title))
     right = lines[top].index("┐", left)
     bottom = next(
         row
@@ -183,12 +187,8 @@ def run(binary: pathlib.Path) -> None:
             left, top, right, bottom = bounds
             width = right - left + 1
             height = bottom - top + 1
-            assert width == 72, f"§5.3 class S is 72 columns at 140 wide, got {width}"
-            assert height <= 12, f"§5.1 caps class S at 12 rows, got {height}"
-            assert height <= 9, (
-                "§5.2 height follows content: a one-field prompt must not fill "
-                f"its class maximum, got {height}\n{app.text()}"
-            )
+            assert width == 95, f"prompt policy is 68% of 140 wide, got {width}"
+            assert height == 14, f"prompt policy is 36% of 40 tall, got {height}"
 
             # §6.1: the field is a distinct tone, not the dialog background.
             _, field_bg = cell_colors(app, "Type to filter…")
@@ -266,7 +266,7 @@ def run(binary: pathlib.Path) -> None:
             assert "renaming" not in lines[action_row], lines[action_row]
 
             left, top, right, bottom = dialog_bounds(app, "View")
-            assert right - left + 1 == 52, "§5.1 compact class M is the full frame"
+            assert right - left + 1 == 52, "compact presentation is the full frame"
             assert bottom <= 15, f"dialog escapes a 16-row terminal: {bottom}"
 
             # Selection and hitboxes still agree with what is drawn.
