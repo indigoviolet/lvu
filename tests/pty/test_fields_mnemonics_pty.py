@@ -58,15 +58,26 @@ def run(binary: pathlib.Path) -> None:
                 assert label in fields, f"{label} missing at 80x24:\n{fields}"
 
             # `x` is E&xclude. Bare, with no text field in this dialog to type
-            # into, and no Alt anywhere.
+            # into, and no Alt anywhere. The async fork can replace the
+            # transient notice before a PTY poll sees it, so verify the
+            # resulting view, then return to All events for the independent
+            # Filter mnemonic below.
             app.send(b"x")
-            excluded = app.wait_for("excluding", timeout=8.0)
-            assert "excluding level = " in excluded, excluded
+            app.wait_until(lambda text: "› Filtered" in text, "exclude fork", timeout=8.0)
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Fields · record" not in text, "Fields closed")
+            app.send(b"[")
+            app.wait_until(
+                lambda text: "› All events" in text and "line 4" in text,
+                "back on the complete source view",
+                timeout=8.0,
+            )
+            app.send(b"i")
+            app.wait_for("[ Filter ]", timeout=8.0)
 
-            # `f` is &Filter, and it joins to what is already applied.
+            # `f` is &Filter and produces the exact ERROR membership.
             app.send(b"f")
-            filtered = app.wait_for("filtering to", timeout=8.0)
-            assert "filtering to level" in filtered, filtered
+            app.wait_until(lambda text: "› Filtered" in text, "filter fork", timeout=8.0)
             app.send(b"\x1b")
             membership = app.wait_until(
                 lambda text: "Fields · record" not in text and "line 4" in text

@@ -4029,6 +4029,34 @@ fn stale_restore_is_fenced_per_named_view() {
 }
 
 #[test]
+fn async_view_selection_keeps_an_open_layer_as_the_input_owner() {
+    let (provider, mut app) = demo();
+    let current = app.active_view_id().unwrap().to_owned();
+    let other = app
+        .views()
+        .iter()
+        .find(|view| view.id != current)
+        .expect("fixture has another view")
+        .id
+        .clone();
+
+    app.handle(Action::Open(Open::Fields), &provider);
+    assert_eq!(app.layers.top(), Some(LayerId::Fields));
+    assert_eq!(app.focus, Focus::Layer);
+
+    // This is the shape of an asynchronous source/query completion selecting
+    // its resulting view after the user has already opened a dialog.
+    app.select_view(&other);
+    assert_eq!(app.layers.top(), Some(LayerId::Fields));
+    assert_eq!(app.focus, Focus::Layer);
+
+    // The next plain q belongs to the visible layer, not the base Quit action.
+    app.handle(raw_key(KeyCode::Char('q')), &provider);
+    assert_eq!(app.layers.top(), None);
+    assert_eq!(app.focus, Focus::Logs);
+}
+
+#[test]
 fn user_rename_fences_whole_restore_and_rejects_sibling_name() {
     let provider = EmptyProvider;
     let source = SourceItem {

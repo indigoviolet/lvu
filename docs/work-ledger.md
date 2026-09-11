@@ -3251,3 +3251,16 @@ The shared PTY cleanup helper now dismisses any text-taking layer before sending
 assertion as an exit timeout. It allows the documented ten-second final-window
 settlement bound plus two seconds for PTY observation. The 32 failed PTYs are
 being repaired by behavior cluster before another complete matrix.
+
+Record-context follow-up `bab9162` updates the empty-state `Inspect context`
+label, selects a settled 503 record before inspecting its JSON tree, and waits
+for real Fields actions before mnemonic use. Live evidence also exposed a
+central focus invariant: `App::select_view` unconditionally selected Logs when
+an asynchronous source/query completion changed views, even if a modal layer
+was still open. The dialog remained painted while keys used the base keymap.
+`select_view` now keeps `Focus::Layer` whenever the stack is nonempty, with a
+direct regression covering async-style selection and layer-owned dismissal.
+The Fields PTY verifies Exclude and Filter as separate functional forks rather
+than relying on a transient notice an immediate completion can replace; it
+passes end to end. Log:
+`primary-sol-scratch/v018-fields-mnemonics-focus-fix2.log`.

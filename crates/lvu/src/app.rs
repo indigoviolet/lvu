@@ -5661,12 +5661,22 @@ impl App {
     }
 
     pub fn select_view(&mut self, view_id: &str) {
+        let layer_open = self.layers.top().is_some();
         if let Some(index) = self.views.items.iter().position(|view| view.id == view_id) {
             if self.active_view_id() != Some(view_id) {
                 self.cancel_active_correlation();
             }
             self.views.selected = index;
-            self.focus = Focus::Logs;
+            // Source/query completions can select a view while a dialog is
+            // already open. The layer stack is the modal authority; moving
+            // focus to Logs here leaves the dialog painted but routes its keys
+            // through the base keymap. User selection at the base still lands
+            // in Logs, while an open layer keeps owning input.
+            self.focus = if layer_open {
+                Focus::Layer
+            } else {
+                Focus::Logs
+            };
             self.record_view_selection(view_id);
         }
     }
