@@ -30,7 +30,8 @@ use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface,
 };
 use crate::details::{disclosure, json_kind_style};
-use crate::dialog_controls::{ActionRow, DialogStyles};
+use crate::dialog_controls::{ButtonRole, DialogStyles, stable_action_rows};
+use crate::dialog_layout::{ContextFootprint, DialogSpec, PresentationKind, plan_list};
 use crate::field_stats::{FieldStats, MAX_STATS_ROWS, ValueType, field_stats};
 use crate::json_spans::JsonKind;
 use crate::json_tree::{JsonTree, RowShape, json_path, nested_suffix, top_level_key};
@@ -38,8 +39,8 @@ use crate::provider::{DisplayRow, RowId, RowProvider};
 use crate::text_edit::TextTarget;
 use crate::theme::Theme;
 use crate::ui::{
-    FIELD_GUTTER, MessageState, dialog_frame_regions, help_rows, message_rows, packed_button_rows,
-    render_actions, render_help_text, render_message, render_scrollbar, truncated,
+    FIELD_GUTTER, MessageState, help_rows, message_rows, render_help_text, render_message,
+    render_responsive_frame, render_scrollbar, truncated,
 };
 
 /// §12.11: the name column, wide enough for the field names a record carries
@@ -170,18 +171,6 @@ pub fn field_rows(
             },
         })
         .collect()
-}
-
-/// Scrolls only far enough to keep `selected` on screen, as the shared
-/// viewport helper did.
-fn reveal(top: usize, selected: usize, visible: usize) -> usize {
-    if selected < top {
-        selected
-    } else if visible > 0 && selected >= top.saturating_add(visible) {
-        selected.saturating_add(1).saturating_sub(visible)
-    } else {
-        top
-    }
 }
 
 fn contains(area: Rect, point: (u16, u16)) -> bool {
@@ -361,6 +350,53 @@ fn action_buttons(
         (fold_label, C::Fold),
         ("Co&rrelate", C::Correlate),
     ]
+}
+
+/// Stable Contextual Inspector budgets: outer size is policy-only, never async
+/// field counts or stats. Header 0, body minimum 3, message/help stable maxima
+/// from the longest sentences at the policy width, actions from the stable
+/// 8-verb maximum so empty/populated/pending share one frame and sticky tail.
+/// Hand-rolled pane splitting below is presentation-only folding, never query
+/// membership (AGENTS.md).
+fn fields_spec_for(area: Rect) -> DialogSpec {
+    // Stable maximum first-row labels (populated with all verbs) so empty and
+    // populated share one budget across opens and no async arrival moves tail.
+    const MAX_LABELS: [&str; 8] = [
+        "&Pin",
+        "&Filter",
+        "E&xclude",
+        "&Color",
+        "&Severity",
+        "&Timestamp",
+        "Fol&d",
+        "Co&rrelate",
+    ];
+    const FULL_HELP: &str =
+        "Pinned fields become log columns; a nested value acts through its top-level field.";
+    const PENDING: &str = "field data for this record has not arrived yet";
+    const DISABLED: &str = "select a record to see its fields";
+    let (policy_w, _) = crate::dialog_layout::policy_size(
+        area,
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+    );
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let action_rows = stable_action_rows(estimate, &MAX_LABELS).clamp(1, 2);
+    let message = if area.height <= 6 {
+        1
+    } else {
+        message_rows(PENDING, estimate)
+            .max(message_rows(DISABLED, estimate))
+            .clamp(1, 2)
+    };
+    let help = help_rows(FULL_HELP, estimate).min(2);
+    DialogSpec::new(
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        0,
+        3,
+        message,
+        help,
+        action_rows,
+    )
 }
 
 impl FieldsDialog {
@@ -1217,14 +1253,12 @@ impl Component for FieldsDialog {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
-        use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
         use FieldPickerControl as C;
         let theme = ctx.theme;
         let styles = DialogStyles::new(theme);
         let ascii = ctx.ascii;
         let mut rows_hit: Vec<(Rect, usize)> = Vec::new();
         let mut controls_hit: Vec<(Rect, FieldPickerControl)> = Vec::new();
-        let width = content_width(area, DialogClass::L);
         let row = anchored_row(ctx.views, ctx.provider);
         let has_anchor = anchor_id(ctx.views).is_some();
         let title = match anchor_id(ctx.views) {
@@ -1252,7 +1286,8 @@ impl Component for FieldsDialog {
         } else {
             (MessageState::Ready, String::new())
         };
-        // §12.11: no message row when there is no state to report.
+        // §12.11: no message text when there is no state to report; the stable
+        // band stays blank so the frame does not move.
         let quiet = sentence.is_empty();
         let help = if fields.is_empty() {
             ""
@@ -1297,45 +1332,59 @@ impl Component for FieldsDialog {
             _ => None,
         };
 
-        let side_by_side = width >= SIDE_BY_SIDE_WIDTH;
-        let list_rows = fields.len().clamp(1, 16) as u16;
-        let value_rows = if fields.is_empty() {
-            0
-        } else {
-            VALUE_PANE_LINES + 1
+        // Responsive frame: Contextual Inspector policy plus stable budgets
+        // only. Body rows size only the scroll extent; the frame and sticky
+        // tail are identical for short/long field lists and pending/empty/
+        // populated states. The frozen RenderCtx anchor places the inspector;
+        // no layer computes its own row rectangle.
+        let spec = fields_spec_for(area);
+        let Ok(geometry) = crate::dialog_layout::resolve_dialog(
+            area,
+            &spec,
+            1,
+            &action_labels,
+            Some(0),
+            ctx.context_anchor,
+        ) else {
+            // Below the 20x6 floor the existing tiny fallback owns the frame;
+            // stay open with nothing drawn, as the palette does.
+            return self.record(
+                rows_hit,
+                controls_hit,
+                Surface {
+                    popup: Rect::default(),
+                    interior: Rect::default(),
+                    caret: None,
+                    scrollable: false,
+                    text_focus: false,
+                },
+            );
         };
-        let body_rows = if side_by_side {
-            (list_rows + 1).max(value_rows)
-        } else {
-            (list_rows.min(8) + 1) + u16::from(value_rows > 0) + value_rows
-        };
-        let content = DialogContent {
-            header: 0,
-            body: body_rows,
-            message: if quiet {
-                0
-            } else {
-                message_rows(&sentence, width)
-            },
-            help: help_rows(help, width),
-            actions: packed_button_rows(width, &action_labels),
-        };
-        let regions = dialog_frame_regions(frame, area, DialogClass::L, &title, &content, theme);
+        // One geometry authority for paint/mouse: visible buttons come from the
+        // shared plan. Overflow beyond two stable rows (only the 20x6 floor
+        // with all 8 verbs) stays keyboard-reachable via mnemonics; a More
+        // menu is follow-up work.
+        // Shared frame so geometry and paint share one definition; compactness
+        // comes from the geometry, never recomputed from the frame.
+        render_responsive_frame(frame, &geometry, &title, ctx.active, theme);
         let surface = Surface {
-            popup: regions.popup,
-            interior: regions.interior,
+            popup: geometry.frontmost,
+            interior: geometry.interior,
             caret: None,
             scrollable: true,
             // Fields takes no text, so `q` dismisses it (§1).
             text_focus: false,
         };
-        let body = regions.body;
+        let body = geometry.body.viewport;
         if body.width == 0 || body.height == 0 {
             return self.record(rows_hit, controls_hit, surface);
         }
-
-        // Split the body into the list pane and the Value pane.
-        let (list_area, value_area) = if value_rows == 0 {
+        let side_by_side = geometry.content.width >= SIDE_BY_SIDE_WIDTH;
+        let has_value = !fields.is_empty();
+        // Split the shared body viewport into the tree pane and the fixed
+        // Value pane. Hand-rolled splitting here is presentation-only folding,
+        // never query membership (AGENTS.md).
+        let (list_area, value_area) = if !has_value {
             (body, Rect::new(body.x, body.y, 0, 0))
         } else if side_by_side {
             let list_width = body.width.saturating_sub(2) / 2;
@@ -1345,10 +1394,11 @@ impl Component for FieldsDialog {
                     body.x + list_width + 2,
                     body.y,
                     body.width.saturating_sub(list_width + 2),
-                    body.height.min(value_rows),
+                    body.height.min(VALUE_PANE_LINES + 1),
                 ),
             )
         } else {
+            let value_rows = VALUE_PANE_LINES + 1;
             let list_height = body.height.saturating_sub(value_rows + 1).max(2);
             (
                 Rect::new(body.x, body.y, body.width, list_height),
@@ -1366,18 +1416,29 @@ impl Component for FieldsDialog {
             fields.len(),
             if fields.len() == 1 { "" } else { "s" }
         );
-        let rects = pane(
+        let count_w = u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0);
+        // One authoritative list plan: heading/count/viewport/scrollbar plus
+        // the selected window and painted row rects. The same rects drive
+        // paint, selection, scrollbar and mouse hit-testing.
+        let list = plan_list(
             list_area,
-            u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
+            count_w,
             fields.len(),
+            if fields.is_empty() {
+                None
+            } else {
+                Some(selected)
+            },
+            self.top,
         );
-        if rects.heading.height > 0 {
+        self.top = list.first_row;
+        if list.heading.height > 0 {
             // §4.4: the heading names the two columns the rows line up under.
             frame.render_widget(
                 Paragraph::new("Field").style(styles.label.add_modifier(Modifier::BOLD)),
-                rects.heading,
+                list.heading,
             );
-            let value_x = rects
+            let value_x = list
                 .heading
                 .x
                 .saturating_add(crate::dialog_layout::PANE_INDENT)
@@ -1385,29 +1446,24 @@ impl Component for FieldsDialog {
                 .saturating_add(FIELD_CHECKBOX_WIDTH + 2)
                 .saturating_add(FIELD_NAME_WIDTH)
                 .saturating_add(FIELD_GUTTER);
-            if value_x < rects.count.x.max(rects.heading.right()) {
+            if value_x < list.count.x.max(list.heading.right()) {
                 frame.render_widget(
                     Paragraph::new("Value").style(styles.label.add_modifier(Modifier::BOLD)),
                     Rect::new(
                         value_x,
-                        rects.heading.y,
-                        rects.heading.right().saturating_sub(value_x),
+                        list.heading.y,
+                        list.heading.right().saturating_sub(value_x),
                         1,
                     ),
                 );
             }
-            if rects.count.width > 0 {
-                frame.render_widget(Paragraph::new(count).style(styles.description), rects.count);
+            if list.count.width > 0 {
+                frame.render_widget(Paragraph::new(count).style(styles.description), list.count);
             }
         }
 
-        let visible = usize::from(rects.viewport.height);
-        // Keeping the selection inside the list is geometry, so the offset is the
-        // component's (§5.1/§7.3); `open` resets it exactly as before.
-        self.top = reveal(self.top, selected, visible);
-        let top = self.top;
         if fields.is_empty() {
-            if rects.viewport.height > 0 {
+            if list.viewport.height > 0 {
                 frame.render_widget(
                     Paragraph::new(truncated(
                         match (row.is_some(), has_anchor) {
@@ -1418,22 +1474,23 @@ impl Component for FieldsDialog {
                             (false, true) => "",
                             (false, false) => "No record selected",
                         },
-                        usize::from(rects.viewport.width),
+                        usize::from(list.viewport.width),
                     ))
                     .style(styles.unavailable),
-                    Rect::new(rects.viewport.x, rects.viewport.y, rects.viewport.width, 1),
+                    Rect::new(
+                        list.viewport.x,
+                        list.viewport.y,
+                        list.viewport.width,
+                        1.min(list.viewport.height),
+                    ),
                 );
             }
         } else {
-            for (offset, (index, field)) in fields
-                .iter()
-                .enumerate()
-                .skip(top)
-                .take(visible)
-                .enumerate()
-            {
-                let y = rects.viewport.y.saturating_add(offset as u16);
-                let row_rect = Rect::new(rects.viewport.x, y, rects.viewport.width, 1);
+            for (offset, row_rect) in list.row_rects.iter().enumerate() {
+                let index = list.first_row.saturating_add(offset);
+                let Some(field) = fields.get(index) else {
+                    continue;
+                };
                 let focused = index == selected;
                 let list_focus = focused && control == C::List;
                 let style = if list_focus {
@@ -1470,14 +1527,14 @@ impl Component for FieldsDialog {
                 let lead_width = (FIELD_CHECKBOX_WIDTH + 2).min(row_rect.width);
                 frame.render_widget(
                     Paragraph::new(truncated(&lead, usize::from(lead_width))).style(style),
-                    Rect::new(row_rect.x, y, lead_width, 1),
+                    Rect::new(row_rect.x, row_rect.y, lead_width, 1),
                 );
                 let name_x = row_rect.x.saturating_add(lead_width);
                 let name_width = FIELD_NAME_WIDTH.min(row_rect.right().saturating_sub(name_x));
                 let name = format!("{}{}", "  ".repeat(field.depth), field.label);
                 frame.render_widget(
                     Paragraph::new(truncated(&name, usize::from(name_width))).style(style),
-                    Rect::new(name_x, y, name_width, 1),
+                    Rect::new(name_x, row_rect.y, name_width, 1),
                 );
                 let value_x = name_x
                     .saturating_add(name_width)
@@ -1508,24 +1565,27 @@ impl Component for FieldsDialog {
                     frame.render_widget(
                         Paragraph::new(truncated(&shown, usize::from(value_width)))
                             .style(value_style),
-                        Rect::new(value_x, y, value_width, 1),
+                        Rect::new(value_x, row_rect.y, value_width, 1),
                     );
                 }
-                rows_hit.push((row_rect, index));
+                rows_hit.push((*row_rect, index));
             }
         }
-        if let Some(bar) = rects.scrollbar {
+        if let Some(bar) = list.scrollbar {
             render_scrollbar(
                 frame,
                 bar,
-                top,
-                fields.len().saturating_sub(visible),
+                list.first_row,
+                fields.len().saturating_sub(list.row_rects.len()),
                 theme,
                 ascii,
             );
         }
 
-        // §8.12: the Value pane, a fixed-height region.
+        // §8.12: the Value pane, a fixed-height region via the same shared
+        // list geometry so heading/count/viewport/scrollbar share one
+        // authority. It never scrolls (8 lines in an 8-line viewport); the
+        // shared scrollbar alone would communicate overflow.
         if value_area.width > 0 && value_area.height > 0 {
             let heading = selected_row
                 .as_ref()
@@ -1545,29 +1605,27 @@ impl Component for FieldsDialog {
                 ),
                 (None, false) => format!("first {} records", thousands(MAX_STATS_ROWS)),
             };
-            let value_rects = pane(
-                value_area,
-                u16::try_from(UnicodeWidthStr::width(sample_note.as_str())).unwrap_or(0),
-                usize::from(VALUE_PANE_LINES),
-            );
-            if value_rects.heading.height > 0 {
+            let sample_w = u16::try_from(UnicodeWidthStr::width(sample_note.as_str())).unwrap_or(0);
+            let value_list =
+                plan_list(value_area, sample_w, usize::from(VALUE_PANE_LINES), None, 0);
+            if value_list.heading.height > 0 {
                 frame.render_widget(
                     Paragraph::new(truncated(
                         &heading,
                         usize::from(
-                            value_rects
+                            value_list
                                 .heading
                                 .width
-                                .saturating_sub(value_rects.count.width + 1),
+                                .saturating_sub(value_list.count.width + 1),
                         ),
                     ))
                     .style(styles.label.add_modifier(Modifier::BOLD)),
-                    value_rects.heading,
+                    value_list.heading,
                 );
-                if value_rects.count.width > 0 {
+                if value_list.count.width > 0 {
                     frame.render_widget(
                         Paragraph::new(sample_note).style(styles.description),
-                        value_rects.count,
+                        value_list.count,
                     );
                 }
             }
@@ -1577,29 +1635,50 @@ impl Component for FieldsDialog {
                 selected_row.as_ref(),
                 theme,
             );
-            frame.render_widget(Paragraph::new(lines), value_rects.viewport);
+            // Paint the 8 fixed lines into the shared viewport rows so paint
+            // and geometry cannot drift; the viewport always holds all 8.
+            for (offset, row_rect) in value_list.row_rects.iter().enumerate() {
+                let Some(line) = lines.get(offset) else {
+                    continue;
+                };
+                frame.render_widget(Paragraph::new(line.clone()), *row_rect);
+            }
+            if let Some(bar) = value_list.scrollbar {
+                render_scrollbar(
+                    frame,
+                    bar,
+                    value_list.first_row,
+                    usize::from(VALUE_PANE_LINES).saturating_sub(value_list.row_rects.len()),
+                    theme,
+                    ascii,
+                );
+            }
         }
 
         if !quiet {
-            render_message(frame, regions.message, state_word, &sentence, theme, ascii);
+            render_message(frame, geometry.message, state_word, &sentence, theme, ascii);
         }
-        render_help_text(frame, regions.help, help, theme);
+        render_help_text(frame, geometry.help, help, theme);
         let focused = actions
             .iter()
             .position(|(_, candidate)| *candidate == control);
-        // §8.9: Pin is the default; it is first in the row.
-        for (index, rect) in render_actions(
-            frame,
-            regions.actions,
-            ActionRow {
-                labels: &action_labels,
-                default: Some(0),
-                destructive: &[],
-                focused,
-            },
-            theme,
-        ) {
-            controls_hit.push((rect, actions[index].1));
+        // §8.9: Pin is the default; it is first in the row. One shared plan
+        // drives paint and mouse so the fill and the Enter arm cannot disagree.
+        for (index, rect) in geometry.actions.buttons.iter() {
+            let (label, control_kind) = actions[*index];
+            crate::dialog_controls::render_role_button(
+                frame,
+                *rect,
+                label,
+                if geometry.actions.default == Some(*index) {
+                    ButtonRole::Default
+                } else {
+                    ButtonRole::Normal
+                },
+                focused == Some(*index),
+                theme,
+            );
+            controls_hit.push((*rect, control_kind));
         }
         self.record(rows_hit, controls_hit, surface)
     }
