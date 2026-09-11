@@ -37,11 +37,13 @@ def run(binary: pathlib.Path) -> None:
         # That scroll comes *out of* the sixteen rows below, not on top of
         # them: the next assertion wants the window that holds `g / G`, which
         # is sixteen rows from the top of the document, and twenty rows down is
-        # already past it.
-        conventions_scroll = 4
+        # already past it. The responsive LongContent frame at 72x16 shows two
+        # fewer body rows than the old class-L frame, so the `Alt + letter`
+        # row needs two more Downs to reach the bottom of the viewport.
+        conventions_scroll = 6
         app.send(b"\x1b[B" * conventions_scroll)
-        conventions = app.wait_for("underlines")
-        assert "Alt + letter" in conventions, conventions
+        conventions = app.wait_for("Alt + letter")
+        assert "underlines" in conventions, conventions
 
         # Repeated Down reaches later help sections.
         app.send(b"\x1b[B" * (16 - conventions_scroll))

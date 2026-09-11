@@ -142,6 +142,91 @@ fn the_shell_bounds_selection_and_the_mouse_by_the_published_surface() {
 }
 
 #[test]
+fn responsive_frame_is_policy_stable_with_body_owning_surplus_and_no_actions() {
+    use lvu::dialog_layout::{PresentationKind, policy_size};
+
+    // LongContent policy owns the frame at every size; Help has no header/
+    // message/help/actions bands, so the body owns all surplus and scrolls.
+    // Frame is identical at the top and bottom of the document.
+    for (width, height) in [(240u16, 80u16), (140, 40), (80, 24), (54, 16), (20, 6)] {
+        let (provider, mut app) = demo();
+        app.handle(Action::Open(Open::Help), &provider);
+        let top_buffer = draw(&provider, &mut app, width, height);
+        let top = screen(&top_buffer);
+        let surface = app.layers.help.surface();
+        let (want_w, want_h) = policy_size(
+            ratatui::layout::Rect::new(0, 0, width, height),
+            PresentationKind::LongContent,
+        );
+        assert_eq!(
+            (surface.popup.width, surface.popup.height),
+            (want_w, want_h),
+            "{width}x{height} frame must be policy"
+        );
+        if (width, height) != (20, 6) {
+            assert!(
+                surface.popup.width < width || surface.popup.height < height,
+                "{width}x{height} became full frame"
+            );
+        }
+        assert!(top.contains("Help"), "{top}");
+        // No action row: Enter is inert, no default button is drawn. Help body
+        // itself documents keys like "[ / ]", so assert the absence of action
+        // verbs rather than brackets.
+        assert!(
+            !top.contains("[ Open ]") && !top.contains("[ Apply ]"),
+            "{width}x{height} must draw no action buttons:\n{top}"
+        );
+        // Scroll to the bottom: frame identical, content moved, selection bound
+        // still the published interior, wheel and keys share it.
+        for _ in 0..app.layers.help.scroll_limit() + 5 {
+            key(&mut app, &provider, KeyCode::Down);
+        }
+        let bottom_buffer = draw(&provider, &mut app, width, height);
+        let bottom = screen(&bottom_buffer);
+        assert_eq!(
+            app.layers.help.surface().popup,
+            surface.popup,
+            "{width}x{height} frame must not move with scroll"
+        );
+        assert_eq!(
+            app.hit_regions.selection_modal,
+            Some(app.layers.help.surface().interior)
+        );
+        // Wide/combining text never breaks columns: two-column layout only at
+        // content width >= 88, single column otherwise, both scroll.
+        if (width, height) == (80, 24) {
+            assert_ne!(top, bottom, "80x24 help must scroll");
+        }
+        // The wheel is wanted exactly when the reference overflows: roomy
+        // 240x80 fits it, 80x24 does not.
+        if (width, height) == (240, 80) {
+            assert!(
+                !surface.scrollable,
+                "240x80 fits the reference and must not want the wheel"
+            );
+        } else if (width, height) == (80, 24) {
+            assert!(
+                surface.scrollable,
+                "80x24 overflows the reference and must want the wheel"
+            );
+        }
+    }
+
+    // Below the floor the tiny fallback owns the frame.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Help), &provider);
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+
+    // At the floor Help still renders with a scrollbar when overflowing.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Help), &provider);
+    let floor = screen(&draw(&provider, &mut app, 20, 6));
+    assert!(floor.contains("Help"), "{floor}");
+}
+
+#[test]
 fn every_dismissal_returns_to_the_focus_underneath() {
     let (provider, mut app) = demo();
     for (code, opened_from) in [

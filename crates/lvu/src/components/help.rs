@@ -21,8 +21,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::component::{Component, Ctx, Event, Outcome, RenderCtx, Surface};
 use crate::dialog_controls::DialogStyles;
+use crate::dialog_layout::{DialogSpec, PresentationKind};
 use crate::theme::Theme;
-use crate::ui::{dialog_frame_regions, render_scrollbar, wrap_sentence};
+use crate::ui::{render_scrollbar, wrap_sentence};
 
 /// §12.15: two columns once the *content* is this wide. Measured on the content,
 /// not the body, so a 100-column terminal is not excluded by its own padding.
@@ -35,6 +36,16 @@ const HELP_COLUMN_GAP: u16 = 2;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HelpHit {
     Body,
+}
+
+/// Stable responsive budgets for Help.
+///
+/// Outer size is `LongContent` policy plus stable maxima only. Help is
+/// read-only with no message and no action row, so the body owns all surplus
+/// and scrolls. Hand-rolled line counts here are presentation-only folding
+/// (AGENTS.md).
+pub fn help_spec() -> DialogSpec {
+    DialogSpec::new(PresentationKind::LongContent, 0, 1, 0, 0, 0)
 }
 
 #[derive(Debug, Default)]
@@ -143,40 +154,91 @@ impl Component for HelpDialog {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
-        use crate::dialog_layout::{DialogClass, DialogContent, content_width};
+        use crate::dialog_layout::resolve_dialog;
+
         let theme = ctx.theme;
         let ascii = ctx.ascii;
         let agent = if ascii { "Agent" } else { "🧠" };
         let sections = help_sections(agent);
-        let width = content_width(area, DialogClass::L);
-        // §12.15: nothing here is actionable — `?` and Escape close it — so there
-        // is no action row and no message row to carry a state it does not have.
-        let content = DialogContent {
-            header: 0,
-            body: u16::MAX,
-            message: 0,
-            help: 0,
-            actions: 0,
+        // Responsive frame: LongContent policy plus stable budgets only. No
+        // header/message/help/actions, so the body owns all surplus. Below the
+        // 20x6 floor the shell's tiny fallback owns the frame and this layer
+        // draws nothing (stays open).
+        let spec = help_spec();
+        // Body rows size only the scroll extent; estimate with a roomy width so
+        // the frame stays policy-only even before measuring. The real content
+        // rows are computed below from the resolved content width.
+        let Ok(prelim) = resolve_dialog(area, &spec, 1, &[], None, None) else {
+            self.body = Rect::default();
+            self.scroll_limit = 0;
+            self.surface = Surface::default();
+            return self.surface;
         };
-        let regions = dialog_frame_regions(frame, area, DialogClass::L, "Help", &content, theme);
+        // Measure content rows at the resolved content width (two-column aware
+        // below uses the same width, so frame and measurement agree).
+        let content_width = prelim.content.width;
+        let two_columns_probe = content_width >= HELP_TWO_COLUMN_WIDTH;
+        // Probe layout at content width to size the scroll extent without
+        // affecting the outer frame (policy-only).
+        let probe_text_width = content_width.saturating_sub(1).max(1);
+        let probe_columns: Vec<u16> = if two_columns_probe {
+            let each = probe_text_width.saturating_sub(HELP_COLUMN_GAP) / 2;
+            vec![
+                each,
+                probe_text_width
+                    .saturating_sub(each)
+                    .saturating_sub(HELP_COLUMN_GAP),
+            ]
+        } else {
+            vec![probe_text_width]
+        };
+        let probe_groups: Vec<&[HelpSection<'_>]> = if two_columns_probe {
+            let split = 3.min(sections.len());
+            vec![&sections[..split], &sections[split..]]
+        } else {
+            vec![&sections[..]]
+        };
+        let mut probe_tallest = 1usize;
+        for (group, width) in probe_groups.iter().zip(probe_columns.iter()) {
+            let lines = help_lines(group, *width, theme);
+            probe_tallest = probe_tallest.max(lines.len().max(1));
+        }
+        let Ok(geometry) = resolve_dialog(area, &spec, probe_tallest, &[], None, None) else {
+            self.body = Rect::default();
+            self.scroll_limit = 0;
+            self.surface = Surface::default();
+            return self.surface;
+        };
+        crate::ui::render_responsive_frame(frame, &geometry, "Help", ctx.active, theme);
         // Nothing here is a text field, so `q` dismisses the layer (§1); the whole
         // body scrolls, so the wheel is wanted anywhere over the popup.
+        // One shared body viewport drives paint, scroll, scrollbar, selection
+        // bounds and mouse.
+        let body_view = crate::dialog_layout::ScrollViewport::new(
+            geometry.body.viewport,
+            probe_tallest,
+            self.scroll,
+        );
+        self.scroll = body_view.first_row;
+        self.scroll_limit = body_view.overflow();
         let surface = Surface {
-            popup: regions.popup,
-            interior: regions.interior,
+            popup: geometry.frontmost,
+            interior: geometry.interior,
             caret: None,
-            scrollable: true,
+            // Derived from content rows versus the body viewport: roomy frames
+            // that fit the whole reference want no wheel, overflowing ones do.
+            scrollable: body_view.overflow() > 0,
             text_focus: false,
         };
-        let body = regions.body;
+        let body = body_view.viewport;
         self.body = body;
         self.surface = surface;
         if body.width == 0 || body.height == 0 {
-            self.scroll_limit = 0;
+            self.scroll_limit = body_view.overflow();
             return surface;
         }
 
-        let two_columns = width >= HELP_TWO_COLUMN_WIDTH;
+        let two_columns = content_width >= HELP_TWO_COLUMN_WIDTH;
         // §9: the scrollbar lives in the last body column, so the text never runs
         // into the border.
         let text = Rect::new(body.x, body.y, body.width.saturating_sub(1), body.height);
@@ -228,15 +290,23 @@ impl Component for HelpDialog {
                 *column,
             );
         }
-        if self.scroll_limit > 0 {
-            render_scrollbar(
-                frame,
-                Rect::new(body.right().saturating_sub(1), body.y, 1, body.height),
-                scroll,
-                self.scroll_limit,
-                theme,
-                ascii,
-            );
+        // One shared scrollbar authority: the body viewport's overflow drives
+        // the same rect paint and mouse share. Manual rect matches the shared
+        // primitive (last body column on real overflow).
+        let scrollbar = if body_view.scrollbar.is_some() {
+            body_view.scrollbar
+        } else if self.scroll_limit > 0 {
+            Some(Rect::new(
+                body.right().saturating_sub(1),
+                body.y,
+                1,
+                body.height,
+            ))
+        } else {
+            None
+        };
+        if let Some(bar) = scrollbar {
+            render_scrollbar(frame, bar, scroll, self.scroll_limit, theme, ascii);
         }
         surface
     }
