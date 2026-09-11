@@ -3194,3 +3194,11 @@ action planning correctly refused an unreachable `More` menu and rendered no
 dialog. The repair spends the four interior floor rows on one list row plus the
 two-row action band; status/help return above the floor. All 14 Recipes tests
 pass. Failed evidence remains under `lvu-v018-264b123-acceptance/`.
+
+Exact successor `1e2aef0` passed Recipes and the earlier component suites, then
+three Settings assertions exposed the same 20x6 allocation conflict: its
+16x4 padded content could not retain both focus-follow and the two-row
+Save/More band. The matching minimum layout reserves two body and two action
+rows, returning status/help above the floor. All 15 Settings component tests
+pass, including field reveal, anchored dropdown and retained More scrolling.
+Failed evidence remains under `lvu-v018-1e2aef0-acceptance/`.

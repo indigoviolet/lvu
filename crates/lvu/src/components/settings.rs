@@ -753,6 +753,12 @@ fn settings_spec_for(area: Rect, save_label: &str, with_more: bool) -> DialogSpe
     let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
     let estimate = policy_w.saturating_sub(4).max(1);
     let action_rows = stable_action_rows(estimate, &labels).clamp(1, 2);
+    // At 20x6 the padded content is only 16x4. Keep two body rows for
+    // focus-follow and two action rows so Save and More remain reachable;
+    // status/help return immediately above the terminal floor.
+    if area.height == 6 {
+        return DialogSpec::new(PresentationKind::LongContent, 0, 2, 0, 0, action_rows);
+    }
     DialogSpec::new(PresentationKind::LongContent, 0, 3, 2, 2, action_rows)
 }
 
