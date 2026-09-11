@@ -42,8 +42,10 @@ classifier fields, so older readers retain legacy rules but omit classifiers
 when saving. Union colour rules use the dedup-winning input's accepted output
 authority; unauthorized raw namesakes are excluded before typed concatenation.
 Focused terminal coverage verifies rule order, row colours and restart.
-Combined v0.1.6 release acceptance passed. Automatic shared capture across
-application windows remains separate implementation work.
+Combined v0.1.6 release acceptance passed. The integration branch now also
+contains automatic shared capture across application windows; its focused
+two-window, sequential-reopen and remote-union proofs pass, while combined
+release acceptance remains pending.
 
 | Component | Responsibility and starting points |
 | --- | --- |
@@ -187,7 +189,7 @@ preempt a running Polars evaluation or kernel filesystem read.
 | `$XDG_CONFIG_HOME/lvu/settings.toml` | Global model, theme, motion and cache preferences; fallback `~/.config/lvu/settings.toml`. |
 | `$XDG_DATA_HOME/lvu` | Default durable capture root; fallback `~/.local/share/lvu`. `--capture-dir` overrides it. Existing legacy `.lvu-captures` can be selected with a notice when the XDG data root does not yet exist; nothing is moved automatically. |
 | `<capture-root>/workspace` | SQLite accepted state, independent drafts, navigation, presentation, sources and recipe metadata; canonical recipes under its `recipes/` directory. |
-| `<capture-root>/workspace/session.json` | The sources of the most recent session in this capture root, in sidebar order, including ones that could not be acquired. Read at startup to re-acquire the set; rewritten whenever the set changes. Additive and unversioned against the workspace schema: an older binary ignores it and an unreadable one degrades to no previous session. |
+| `<capture-root>/workspace/session.json` | The sources of the most recent session in this capture root, in sidebar order, including ones that could not be acquired. The shared worker is the sole writer. It records explicit remote starts/stops and never rewrites while workspace persistence is incompatible; attached apps do not race it. Files resume from durable cursors. Remembered commands and HTTP endpoints stay visible but do not launch/contact automatically. Additive and unversioned against the workspace schema: an older binary ignores unknown fields, and unsafe/unreadable persistence is refused rather than reset. |
 | `$XDG_CACHE_HOME/lvu` | Disposable derived-index storage; fallback `~/.cache/lvu`. |
 | Investigation directories | Fixed datasets, manifests and session metadata retained with the capture workspace. Not cache cleanup targets. |
 

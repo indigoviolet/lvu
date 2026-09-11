@@ -3027,3 +3027,54 @@ remain combined-candidate risks. Review logs are under
 `terra-view-tabs-review/` on the build volume. The primary integrates the final
 tree with the authoritative View dialog documentation; no full matrix or
 release acceptance is claimed by this focused baseline.
+
+
+### Shared-capture controller and restore fixes integrated — 2026-09-11
+
+Fresh Terra xhigh review held `06446aa` on two real defects: an incompatible
+workspace still lost unknown `session.json` metadata, and worker union
+attestation used unpinned progress snapshots before settlement. The final
+successor stack through `60648d27d466d48e3db400f4362fea3fcbcab6e3`, tree
+`92294079635624b897cfd47137f575018281b4c6`, fixes both and was independently
+cleared. It also retains checked-in draining sequential reopen coverage.
+
+The shared worker is now the sole manifest writer. Attached applications never
+rewrite `session.json`; the worker preserves database/manifest bytes while its
+store is unavailable, refuses unsafe start/stop persistence loudly, and keeps
+raw acquisition browsable. Remembered commands and HTTP endpoints no longer
+launch/contact automatically; explicit restart remains. A real future-database
+plus readable schema-1/unknown-field app probe preserved both durable hashes.
+
+Remote union attestation sorts source handles, holds every `lock_progress`
+guard across `CommitTable::settle` with no await, and has a real contending
+publication/stale/fresh negative control. Application recovery never cancels
+an in-progress client exchange: only mutex acquisition is deadline-cancellable,
+so stale/in-flight cleanup completes before the absolute deadline is checked
+again. All seven transport tests passed once, including a 25-second silent-peer
+discriminator followed by a successful same-client status request. Actual
+framed `WorkerService` happy/status/foreign dispatch, guard pinning, degraded
+single-writer behavior and the sequential no-replay PTY also passed. Final
+Terra evidence is under `lvu-terra-controller-review-scratch/` with
+`timeout-final-*60648d2.log` names.
+
+Primary merged the exact stack as `cc744cb`, then cherry-picked only independently
+cleared restore fix `1e32fdb` as `b02639c`; the tagged v0.1.7 parent was not
+merged. The one source conflict was two test blocks added at the same module
+boundary, both retained. Focused integration first failed to compile because
+the restored-union test still passed a local handle through the new
+`AnySourceHandle` boundary; `8cd343c` wraps that test handle explicitly.
+The next run passed the three restore tests, the real production deferral test,
+both worker union tests and all seven app transport tests, but exposed an
+unused result in cleanup. `5fddf2e` asserts the result. Exact final app Clippy
+with warnings denied and the production deferral test pass at primary tree
+`1e2fefab08203d5510959a18066da3d9a26ed657`. Logs:
+`primary-sol-scratch/controller-restore-focused-b02639c.log` (preserved compile
+failure), `controller-restore-focused-8cd343c.log` (green tests, warning), and
+`integration-cleanup-5fddf2e.log` (green test/Clippy). This is focused combined
+integration evidence, not full workspace/bridge/PTY or release acceptance.
+
+Fresh restore review separately cleared `1e32fdb`: three union-restore tests,
+the production `union_submit_defers` regression, fmt and targeted Clippy pass.
+Its retained command-enrichment repetition failed once at the immediate `/proc`
+descendant-state assertion; zero candidate code touches that module. The race
+remains explicit combined-gate risk, not a waived green result.

@@ -4,6 +4,35 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## Unreleased
+
+### Features
+
+- Share one capture worker and original journal across application windows in
+  the same capture root. Each window retains independent views and derived
+  indexes while record identities and durable cursors remain common.
+- Present New blank, Clone, Rename and Sources as modes in the View dialog's
+  segmented header; Apply / Apply membership is the sole action and default.
+
+### Fixes
+
+- Preserve exact records and journal prefixes across the final window closing,
+  an append while detached and a later reopen, without replaying captured rows.
+- Keep incompatible workspace databases and session manifests byte-identical;
+  raw browsing remains available while unsafe persistence refuses loudly.
+- Keep remembered commands and HTTP endpoints visible without launching or
+  contacting them during session restore. Explicit restart remains available.
+- Pin remote-union source progress guards through settlement and recover
+  ambiguous/lost replies with the original session, view, generation, nonce and
+  digest under one absolute deadline. Foreign identities fail closed.
+- Preserve restored union definitions, enrichment-backed colours and last-good
+  state while input restoration is pending or a retryable union attempt fails.
+
+### Breaking changes
+
+- Restoring a session no longer automatically starts remembered command or HTTP
+  sources; restart them explicitly from the source controls.
+
 ## v0.1.6 — 2026-09-10
 
 Published with all four native archives; exact-source and installed-archive acceptance passed.

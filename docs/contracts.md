@@ -32,6 +32,15 @@ http(url, framing, reconnect policy). Credentials are not printed in diagnostics
 Status transitions: starting, running, paused/backpressured, exited/disconnected,
 storage_blocked, error, stopped. Capturing and UI follow mode are independent.
 
+One capture-root worker owns shared acquisition and workspace/session writes;
+application windows attach to it and never duplicate original capture. Writable
+derived row indexes may be per-window, but original journal bytes, source IDs,
+record IDs and durable cursors are shared. Incompatible workspace persistence
+leaves database and session bytes untouched and refuses unsafe writes loudly
+while raw browsing continues. Restoring a session may resume files from their
+durable cursors; remembered commands and HTTP endpoints require an explicit
+restart and are never launched or contacted as a restore side effect.
+
 ViewDefinition: id, name, source_ids, recipe stage revisions, filter definition,
 time window, presentation (pins/color rules), navigation settings. Applied
 revision and editor draft are distinct. A new query generation cancels or fences
