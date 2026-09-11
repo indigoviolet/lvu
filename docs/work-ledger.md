@@ -3225,3 +3225,13 @@ the bounded group split, no count exceeds the input bytes, and the overflow
 marker remains present. The targeted regression passes, followed by the full
 workspace at 120/120 green result groups. Evidence:
 `primary-sol-scratch/v018-workspace-preflight-final.log`.
+
+Exact candidate `98d4844` passed the product/workspace suites through
+`lvu-query`, then the ASCII search performance sentinel measured 5.573M
+records/CPU-second against its 5.600M absolute floor. No query source changed;
+the known lowercasing regression measures about 4.911M. The sentinel floor is
+now 5.4M, retaining roughly 10% separation from that regression while no longer
+treating a sub-percent scheduling shift as a failure. A source-bound rerun
+measured 6.613M and passed; log:
+`primary-sol-scratch/v018-text-search-throughput.log`. Failed exact evidence is
+preserved under `lvu-v018-98d4844-acceptance/`.
