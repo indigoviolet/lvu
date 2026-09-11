@@ -2863,4 +2863,194 @@ mod tests {
             "a confused peer earns no further trust, saw: {seen:?}"
         );
     }
+
+    /// Delayed reply: the worker admits and answers, but its receipt
+    /// arrives after the 10s attempt bound (12s). The attempt times out
+    /// ambiguous, status recovery settles from the worker's table, and the
+    /// returned receipt is synthesized from the ORIGINAL request identity
+    /// — the late bytes never substitute for it. One absolute deadline
+    /// bounds the whole submission; the late receipt lands harmlessly in
+    /// the tolerant exchange (drained as stale by later traffic, never
+    /// matched). Slow peer, same verdict as a lost one, well inside the
+    /// deadline.
+    #[tokio::test]
+    async fn union_transport_delayed_reply_settles_within_one_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        lvu_shared::election::WorkerPaths::new(root.path())
+            .ensure_directories()
+            .expect("viewer directories");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_peer = std::sync::Arc::clone(&seen);
+        // Custom peer: async sleeps only (a blocking sleep would freeze
+        // this single-threaded test runtime). The commit reply is parked
+        // past the attempt bound; status polls answer at once.
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (stream, _) = listener.accept().await.expect("peer accepts");
+            let (reader, writer) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+            let mut decoder = lvu_shared::FrameDecoder::new();
+            let mut buffer = vec![0u8; lvu_shared::READ_CHUNK_BYTES];
+            loop {
+                let count = reader.read(&mut buffer).await.expect("peer reads");
+                if count == 0 {
+                    return;
+                }
+                let values = decoder.push_bytes(&buffer[..count]).expect("peer decodes");
+                for value in values {
+                    let kind = value
+                        .get("method")
+                        .and_then(|kind| kind.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let id = value
+                        .get("request_id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    seen_peer.lock().expect("seen poisoned").push(kind.clone());
+                    let writer = std::sync::Arc::clone(&writer);
+                    match kind.as_str() {
+                        "hello" => {
+                            let reply = lvu_shared::WorkerEvent::Welcome {
+                                request_id: id,
+                                worker_pid: 1,
+                                protocol: lvu_shared::PROTOCOL_VERSION,
+                                worker_session: "session-u".into(),
+                                sources: Vec::new(),
+                            };
+                            let wire = lvu_shared::encode_frame(
+                                &serde_json::to_value(&reply).expect("peer encodes"),
+                            )
+                            .expect("peer frames");
+                            writer
+                                .lock()
+                                .await
+                                .write_all(&wire)
+                                .await
+                                .expect("peer writes");
+                        }
+                        // Admitted but slow: the receipt arrives at ~12s,
+                        // past the 10s attempt bound, on its own task so
+                        // status polls are answered meanwhile.
+                        "union_commit" => {
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(12)).await;
+                                let reply = lvu_shared::WorkerEvent::Store(
+                                    lvu_shared::StoreEvent::UnionCommitted {
+                                        request_id: id,
+                                        receipt: lvu_shared::union_commit::CommitReceipt::answer(
+                                            "session-u",
+                                            &union_test_commit("window-u"),
+                                            lvu_shared::union_commit::CommitOutcome::Committed {
+                                                current: vec![],
+                                            },
+                                        ),
+                                    },
+                                );
+                                let wire = lvu_shared::encode_frame(
+                                    &serde_json::to_value(&reply).expect("peer encodes"),
+                                )
+                                .expect("peer frames");
+                                writer
+                                    .lock()
+                                    .await
+                                    .write_all(&wire)
+                                    .await
+                                    .expect("peer writes");
+                            });
+                        }
+                        "union_status" => {
+                            let reply = lvu_shared::WorkerEvent::Store(
+                                lvu_shared::StoreEvent::UnionStatus {
+                                    request_id: id,
+                                    status: lvu_shared::protocol::UnionCommitStatus::Settled(
+                                        lvu_shared::union_commit::CommitOutcome::Committed {
+                                            current: vec![],
+                                        },
+                                    ),
+                                },
+                            );
+                            let wire = lvu_shared::encode_frame(
+                                &serde_json::to_value(&reply).expect("peer encodes"),
+                            )
+                            .expect("peer frames");
+                            writer
+                                .lock()
+                                .await
+                                .write_all(&wire)
+                                .await
+                                .expect("peer writes");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        let (client, _) = WorkerClient::connect(root.path(), &socket, "window-u", 6215)
+            .await
+            .expect("connect");
+        let store = SharedStore::from_client(client);
+        let transport = store
+            .union_transport("window-u".into())
+            .expect("transport builds on a live session");
+        // Outer deadline for the whole test read: `await_submit` already
+        // blocks off-runtime, so this read can never freeze the peer or
+        // the recovery task it waits for.
+        let started = std::time::Instant::now();
+        let receiver = <UnionCommitTransport as lvu_view::RemoteUnionCommitTransport>::submit(
+            &transport,
+            "session-u",
+            union_test_commit("window-u"),
+            std::time::Instant::now() + Duration::from_secs(45),
+        )
+        .expect("submit accepts a live deadline");
+        let receipt = await_submit(receiver, Duration::from_secs(40))
+            .await
+            .expect("delayed reply still settles");
+        let elapsed = started.elapsed();
+        // The attempt bound really elapsed (this was ambiguity, not an
+        // instant answer), yet one absolute deadline still bounded
+        // everything end to end.
+        assert!(
+            elapsed >= Duration::from_secs(10),
+            "slow peer must outlast the attempt bound first: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(45),
+            "one absolute deadline bounds the submission: {elapsed:?}"
+        );
+        // Synthesized from the original request: session, view,
+        // generation, nonce and digest are the attempt's own, not bytes
+        // the late reply carried.
+        assert_eq!(receipt.worker_session, "session-u");
+        assert_eq!(receipt.union_view_id, "union-view-u");
+        assert_eq!(receipt.candidate_generation, 11);
+        assert_eq!(receipt.nonce, "nonce-11");
+        assert_eq!(
+            receipt.digest,
+            [0xB7; lvu_shared::union_commit::COMMIT_DIGEST_BYTES]
+        );
+        assert!(
+            matches!(
+                receipt.outcome,
+                lvu_shared::union_commit::CommitOutcome::Committed { .. }
+            ),
+            "unexpected outcome: {:?}",
+            receipt.outcome
+        );
+        let seen = seen.lock().expect("seen poisoned");
+        assert_eq!(
+            seen.iter().filter(|kind| *kind == "union_commit").count(),
+            1,
+            "recovery must not replay a possibly-settled commit, saw: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|kind| kind == "union_status"),
+            "recovery must poll status, saw: {seen:?}"
+        );
+    }
 }

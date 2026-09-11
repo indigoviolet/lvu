@@ -489,6 +489,21 @@ impl Drop for LifecyclePermit {
     }
 }
 
+/// Bound on the worker's verify-rendezvous park: a missed release
+/// proceeds instead of wedging the suite; the test then fails its own
+/// verdict (wrong outcome, not WouldBlock) rather than hanging.
+#[cfg(test)]
+const UNION_VERIFY_PARK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One-shot verify rendezvous ends: arrival notification plus a bounded
+/// release wait. Neither end is shareable by accident — the worker takes
+/// the whole hook under its lock.
+#[cfg(test)]
+struct UnionVerifyHook {
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 /// The executable worker: manager, store, viewers, session set, and stdin
 /// bindings. All shared mutation sits behind short-held mutexes; blocking
 /// store calls run in `spawn_blocking` so the async executors never stall.
@@ -534,6 +549,19 @@ pub struct WorkerService {
     #[cfg(test)]
     stop_side_effect_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    /// Test-only rendezvous inside union verification, entered with every
+    /// publication read guard held and left before settle (see
+    /// `mediated_union_commit`). Channel-based with a bounded worker-side
+    /// wait: arrival is a non-blocking send and the release parks up to
+    /// [`UNION_VERIFY_PARK_TIMEOUT`] before proceeding regardless, so a
+    /// dead or late test fails its own verdict instead of wedging the
+    /// worker. Synchronous throughout — the serving future is `Send`, so
+    /// no async wait may run while the guards live — and compiled out of
+    /// production builds entirely. (A barrier version of this hook hung
+    /// the suite: barriers have no timeout, and an un-awaited release
+    /// future parked the worker forever.)
+    #[cfg(test)]
+    union_verify_pause: std::sync::Mutex<Option<UnionVerifyHook>>,
     #[cfg(test)]
     incomplete_stop_reports: std::sync::Mutex<std::collections::HashSet<SourceId>>,
     shutdown_flag: std::sync::atomic::AtomicBool,
@@ -617,6 +645,8 @@ impl WorkerService {
                 #[cfg(test)]
                 stop_side_effect_pause: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                union_verify_pause: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 incomplete_stop_reports: std::sync::Mutex::new(std::collections::HashSet::new()),
                 shutdown_flag: std::sync::atomic::AtomicBool::new(false),
                 commits,
@@ -688,6 +718,34 @@ impl WorkerService {
             .stop_side_effect_pause
             .lock()
             .expect("test stop pause poisoned") = pause;
+    }
+
+    #[cfg(test)]
+    fn set_union_verify_pause(&self, hook: Option<UnionVerifyHook>) {
+        *self
+            .union_verify_pause
+            .lock()
+            .expect("test union verify pause poisoned") = hook;
+    }
+
+    /// Synchronous rendezvous: arrival never blocks and the release wait
+    /// is bounded by [`UNION_VERIFY_PARK_TIMEOUT`], so this is safe to
+    /// run armed on any thread (the pinning test drives verification from
+    /// a plain driver thread, never an executor). Unarmed it returns
+    /// immediately and every other caller behaves exactly as production.
+    /// The hook is one-shot: it is taken under the lock before waiting so
+    /// a second commit can never meet a stale rendezvous.
+    #[cfg(test)]
+    fn pause_before_union_settle(&self) {
+        let hook = self
+            .union_verify_pause
+            .lock()
+            .expect("test union verify pause poisoned")
+            .take();
+        if let Some(hook) = hook {
+            let _ = hook.reached.try_send(());
+            let _ = hook.release.recv_timeout(UNION_VERIFY_PARK_TIMEOUT);
+        }
     }
 
     #[cfg(test)]
@@ -913,7 +971,8 @@ impl WorkerService {
     /// capture ends); only truly unknown ids are refused. Notably this
     /// offers NO publication fencing: it is a point sample, not a
     /// `lock_progress` equivalent, and must never be presented as one
-    /// (remote unions stay refused until the cross-process fence exists).
+    /// (union attestation goes through `mediated_union_commit`, which
+    /// holds the guards).
     fn poll_source_progress(&self, source_id: &str) -> Result<lvu_ingest::SourceProgress, String> {
         let id = uuid::Uuid::parse_str(source_id)
             .map(SourceId)
@@ -1847,11 +1906,11 @@ impl WorkerService {
 
     /// Admit one union commit attempt and settle it against live fences:
     /// `commit` decides (immediate answer or a verify epoch), a `Verify`
-    /// observes current fences and settles under the table lock, and the
-    /// receipt binds the outcome to the requesting attempt and session.
-    /// Verification reads point snapshots; concurrent advance is caught
-    /// later by the window's refresh check (receipt `current` vs fresh
-    /// observation), exactly like the local path's two-phase check.
+    /// observes current fences under held publication guards and settles
+    /// under the table lock, and the receipt binds the outcome to the
+    /// requesting attempt and session. Verification never reads unpinned
+    /// point snapshots: the attested set coexisted under the guards, like
+    /// the local path's guarded final check.
     pub async fn mediated_union_commit(
         &self,
         request_id: String,
@@ -1860,28 +1919,51 @@ impl WorkerService {
         let outcome = match self.commits.commit(&request) {
             crate::union_commit::CommitAdmission::Answer(outcome) => outcome,
             crate::union_commit::CommitAdmission::Verify { attempt_epoch } => {
-                // Retain the source handles across the copy and the settle
-                // call so a stop between observation and write-back still
-                // resolves explicitly (missing fence) rather than against
-                // dropped state.
-                let mut retained = Vec::new();
-                let mut current = Vec::new();
+                // Guard-pinned attestation, mirroring the local union path
+                // (`union_worker` sorts raw handles, then holds every
+                // `lock_progress` guard across the final check): handles
+                // are collected in source-id order so concurrent commits
+                // can never ABBA-deadlock, every publication read guard is
+                // acquired before any sample is taken, and the guards stay
+                // alive across `settle`. A concurrent advance then blocks
+                // at publication instead of landing between two point
+                // samples and forging a fence set that never coexisted.
+                // Handles are retained (not just their fences) so a stop
+                // between observation and write-back still resolves
+                // explicitly (missing fence) rather than against dropped
+                // state.
+                let mut ordered: Vec<(String, SourceId, lvu_ingest::SourceHandle)> = Vec::new();
                 for fence in &request.frozen {
-                    let id = match uuid::Uuid::parse_str(&fence.source_id).map(SourceId) {
-                        Ok(id) => id,
-                        Err(_) => continue,
+                    let Ok(id) = uuid::Uuid::parse_str(&fence.source_id).map(SourceId) else {
+                        continue;
                     };
                     let Some(handle) = self.manager.source(id) else {
                         continue;
                     };
-                    let progress = handle.progress();
-                    current.push(crate::union_commit::UnionSourceFence {
-                        source_id: fence.source_id.clone(),
-                        generation: progress.generation,
-                        high_watermark: progress.high_watermark.map(|record| record.sequence),
-                    });
-                    retained.push(handle);
+                    ordered.push((fence.source_id.clone(), id, handle));
                 }
+                ordered.sort_by_key(|(_, id, _)| id.0);
+                // Inferred `SourceProgressGuard`s: every publication read
+                // guard is held from here across the settle below.
+                let guards: Vec<_> = ordered
+                    .iter()
+                    .map(|(_, _, handle)| handle.lock_progress())
+                    .collect();
+                let current: Vec<crate::union_commit::UnionSourceFence> = ordered
+                    .iter()
+                    .zip(guards.iter())
+                    .map(
+                        |((source_id, _, _), guard)| crate::union_commit::UnionSourceFence {
+                            source_id: source_id.clone(),
+                            generation: guard.generation(),
+                            high_watermark: guard.high_watermark().map(|record| record.sequence),
+                        },
+                    )
+                    .collect();
+                // Test rendezvous: with guards held, before the settle the
+                // attempt authorizes. Production builds compile this out.
+                #[cfg(test)]
+                self.pause_before_union_settle();
                 let outcome = self.commits.settle(
                     &request.window_id,
                     &request.union_view_id,
@@ -1889,7 +1971,7 @@ impl WorkerService {
                     &request,
                     current,
                 );
-                drop(retained);
+                drop(guards);
                 outcome
             }
         };
@@ -4507,6 +4589,292 @@ mod tests {
         assert_eq!(service.snapshot_definitions().await.len(), 1);
         service.request_shutdown();
         service.shutdown().await;
+    }
+
+    /// Remote union attestation holds every source publication guard from
+    /// sampling across settle. A writer that publishes mid-verify must
+    /// contend (`WouldBlock`), never slip between point samples — and the
+    /// settlement authorizes the pinned sample while the interleaved
+    /// advance stays invisible until released. The stale/fresh controls
+    /// prove the fence still discriminates afterwards.
+    #[tokio::test]
+    async fn union_commit_fences_pin_publication_across_settle() {
+        use crate::union_commit::{CommitRequest, UnionSourceFence};
+        use lvu_ingest::publish_probe::{ExpectedPublish, PrePublishObservation, arm_filtered};
+
+        /// Poll worker progress until at least `min_records` are published.
+        async fn wait_progress(
+            service: &WorkerService,
+            id: SourceId,
+            min_records: u64,
+        ) -> lvu_ingest::SourceProgress {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let progress = service
+                    .poll_source_progress(&id.0.to_string())
+                    .expect("progress polls while pinning");
+                if progress.records >= min_records {
+                    return progress;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("waited 10s for {min_records} published records");
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        /// Bounded channel wait without parking an executor thread:
+        /// `spawn_blocking` plus an outer timeout, so a missed arrival
+        /// fails loudly instead of hanging the suite.
+        async fn wait_channel<T: Send + 'static>(
+            what: &str,
+            receive: impl FnOnce() -> T + Send + 'static,
+        ) -> T {
+            tokio::time::timeout(Duration::from_secs(25), async move {
+                tokio::task::spawn_blocking(receive)
+                    .await
+                    .expect("channel join")
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+        }
+
+        /// Exactly-once release of the worker's verify rendezvous: a
+        /// non-blocking send the worker may already have stopped waiting
+        /// for (its park is bounded). Safe to call on every path, including
+        /// `Drop`, with no thread ever left behind.
+        struct ReleaseOnDrop {
+            release: Option<std::sync::mpsc::SyncSender<()>>,
+            released: bool,
+        }
+        impl ReleaseOnDrop {
+            fn release(&mut self) {
+                if !self.released {
+                    self.released = true;
+                    if let Some(tx) = self.release.take() {
+                        let _ = tx.try_send(());
+                    }
+                }
+            }
+        }
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let root = tempfile::tempdir().expect("scratch root");
+        let log = root.path().join("pin.log");
+        // Outer deadline over the whole orchestration: every inner wait
+        // is already bounded on both sides, so this fires only on a
+        // missed synchronization — failing loudly instead of wedging the
+        // suite the way the barrier version of this test did. Drops still
+        // run (release is a non-blocking send, the arm disarms, the
+        // writer's park is bounded), so the suite survives the failure.
+        tokio::time::timeout(Duration::from_secs(240), async {
+            std::fs::write(&log, "one\n").expect("seed log");
+            let config = test_config(root.path());
+            let (service, _) =
+                WorkerService::open(config, Arc::new(AdmitAll)).expect("open serves");
+            let definition = file_definition(71, &log);
+            let source_id = match service
+                .request_start(definition.clone())
+                .await
+                .expect("capture starts")
+            {
+                StartedOutcome::Started { source_id, .. } => source_id,
+                other => panic!("expected a live capture, got {other:?}"),
+            };
+            // The seed line is fully published before the attempt is built:
+            // the frozen fence below is exact truth, not a guess.
+            let before = wait_progress(&service, source_id, 1).await;
+            let watermark = before
+                .high_watermark
+                .map(|record| record.sequence)
+                .expect("seed watermark");
+            let frozen = vec![UnionSourceFence {
+                source_id: source_id.0.to_string(),
+                generation: before.generation,
+                high_watermark: Some(watermark),
+            }];
+            let commit_request =
+                |generation: u64, nonce: &str, fences: Vec<UnionSourceFence>| CommitRequest {
+                    window_id: "w-pin".into(),
+                    union_view_id: "u-pin".into(),
+                    candidate_generation: generation,
+                    nonce: nonce.into(),
+                    digest: [0xC1; crate::union_commit::COMMIT_DIGEST_BYTES],
+                    frozen: fences,
+                };
+
+            // Freeze the worker inside verification with its publication
+            // guards held. The commit runs on a plain driver thread under a
+            // private runtime — never on an executor — so the synchronous
+            // channel rendezvous parks no shared thread, and a missed
+            // handshake fails (bounded waits) instead of wedging the suite.
+            let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            service.set_union_verify_pause(Some(UnionVerifyHook {
+                reached: reached_tx,
+                release: release_rx,
+            }));
+            let driver = Arc::clone(&service);
+            let first = commit_request(1, "n-pin-1", frozen.clone());
+            let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("driver runtime");
+                let event =
+                    runtime.block_on(driver.mediated_union_commit("req-pin-1".into(), first));
+                let _ = result_tx.send(event);
+            });
+            wait_channel("verify window with guards held", move || {
+                reached_rx.recv_timeout(Duration::from_secs(20))
+            })
+            .await
+            .expect("worker must reach the verify window");
+            let mut releaser = ReleaseOnDrop {
+                release: Some(release_tx),
+                released: false,
+            };
+
+            // The interleaved advance, aimed exactly at the pinned window: a
+            // filtered arm admits only the post-append publish, so an older
+            // periodic publish can pass through without stealing (or faking)
+            // this rendezvous.
+            let arm = arm_filtered(
+                source_id,
+                ExpectedPublish {
+                    generation: before.generation,
+                    high_watermark: Some(watermark + 1),
+                    records: before.records + 1,
+                },
+            )
+            .expect("arm publish probe");
+            // Append-only: a truncate-rewrite would exercise follower rotation
+            // handling instead of the steady-state publish this pins against.
+            {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log)
+                    .expect("open log for append");
+                file.write_all(b"two\n").expect("append while pinned");
+            }
+            let (attempt_result, mut arm) = wait_channel("appended publish attempt", move || {
+                let attempt = arm.await_attempt(Duration::from_secs(15));
+                (attempt, arm)
+            })
+            .await;
+            let attempt = attempt_result.expect("publish attempt observed");
+            // The advance contended with held guards instead of landing
+            // between two point samples: a forged fence set that never
+            // coexisted is structurally impossible here.
+            assert_eq!(
+                attempt.observation,
+                PrePublishObservation::WouldBlock,
+                "pinned verify must contend the interleaved publish: {attempt:?}"
+            );
+            assert_eq!(
+                (attempt.generation, attempt.high_watermark, attempt.records),
+                (before.generation, Some(watermark + 1), before.records + 1),
+                "hooked the appended publish, not a stray: {attempt:?}"
+            );
+            // Still invisible: the writer is parked at publication, so the
+            // pinned sample below cannot have seen the append.
+            let parked = service
+                .poll_source_progress(&source_id.0.to_string())
+                .expect("progress polls while pinned");
+            assert_eq!(
+                (parked.generation, parked.records),
+                (before.generation, before.records),
+                "parked publish must stay unpublished until released"
+            );
+
+            // Settle authorizes the pinned pre-append set, not the interleaved
+            // append the guards held out. The release is a non-blocking send:
+            // forgetting it cannot wedge anything (the worker's park is
+            // bounded), it can only fail the verdict below.
+            releaser.release();
+            let receipt = wait_channel("commit receipt", move || {
+                result_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("commit receipt arrives")
+            })
+            .await;
+            let receipt = match receipt {
+                StoreEvent::UnionCommitted { receipt, .. } => receipt,
+                other => panic!("expected a committed receipt, got {other:?}"),
+            };
+            assert!(
+                matches!(
+                    receipt.outcome,
+                    crate::union_commit::CommitOutcome::Committed { .. }
+                ),
+                "pinned fences must commit, got {:?}",
+                receipt.outcome
+            );
+            assert_eq!(
+                receipt.outcome,
+                crate::union_commit::CommitOutcome::Committed {
+                    current: frozen.clone()
+                },
+                "settlement attests the pinned sample, not the append"
+            );
+
+            // Negative control, same worker, unpaused: the old fences are now
+            // stale (the released publish advanced the source), and fresh
+            // fences commit — the fence still discriminates after pinning.
+            service.set_union_verify_pause(None);
+            // Let the parked writer publish before asserting the advance: the
+            // probe release is advisory and the writer's own park is bounded,
+            // so progress must land without any wedge.
+            arm.release();
+            let after = wait_progress(&service, source_id, before.records + 1).await;
+            assert!(
+                after.records > before.records,
+                "parked publish landed, no wedge"
+            );
+            let stale = commit_request(2, "n-pin-2", frozen);
+            match service
+                .mediated_union_commit("req-pin-2".into(), stale)
+                .await
+            {
+                StoreEvent::UnionCommitted { receipt, .. } => assert!(
+                    matches!(
+                        receipt.outcome,
+                        crate::union_commit::CommitOutcome::Stale { .. }
+                    ),
+                    "superseded fences must go stale, got {:?}",
+                    receipt.outcome
+                ),
+                other => panic!("expected a stale receipt, got {other:?}"),
+            }
+            let fresh = vec![UnionSourceFence {
+                source_id: source_id.0.to_string(),
+                generation: after.generation,
+                high_watermark: after.high_watermark.map(|record| record.sequence),
+            }];
+            match service
+                .mediated_union_commit("req-pin-3".into(), commit_request(3, "n-pin-3", fresh))
+                .await
+            {
+                StoreEvent::UnionCommitted { receipt, .. } => assert!(
+                    matches!(
+                        receipt.outcome,
+                        crate::union_commit::CommitOutcome::Committed { .. }
+                    ),
+                    "fresh fences must commit, got {:?}",
+                    receipt.outcome
+                ),
+                other => panic!("expected a committed receipt, got {other:?}"),
+            }
+            service.request_shutdown();
+            service.shutdown().await;
+        })
+        .await
+        .expect("outer pin-test deadline exceeded: failing instead of hanging");
     }
 
     /// Degraded workspace: a database the store cannot open still yields a
