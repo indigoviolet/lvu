@@ -11,6 +11,7 @@ use lvu::{
     Action, App, RowProvider, StorageCategory, StorageEntry, StorageRequestKind, StorageSnapshot,
     component::{Component, LayerId, Open, RawEvent},
     components::storage::StorageHit,
+    dialog_controls::{ButtonRole, DialogStyles, role_style},
     fixture::FixtureProvider,
     theme::Theme,
     ui,
@@ -599,4 +600,141 @@ fn tiny_pressure_keeps_selection_diagnostics_and_actions_reachable() {
     empty.handle(Action::Open(Open::Storage), &provider);
     complete_with(&provider, &mut empty, snapshot(0, 0));
     draw(&provider, &mut empty, 54, 16);
+}
+
+fn draw_themed<P: RowProvider>(
+    provider: &P,
+    app: &mut App,
+    width: u16,
+    height: u16,
+    theme: Theme,
+) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| ui::render_with_theme(frame, app, provider, theme, None))
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn assert_role(actual: ratatui::style::Style, expected: ratatui::style::Style) {
+    assert_eq!(actual.fg, expected.fg);
+    assert_eq!(actual.add_modifier, expected.add_modifier);
+}
+
+/// Negative control for truncated-then-no-overflow diagnostics: the same long
+/// diagnostic Terra caught reporting zero scroll extent must produce nonzero
+/// shared overflow, scroll to its limit via Tab+Down with matching
+/// scrollbar/hitboxes, keep the sticky Refresh default filled and the
+/// selection role intact.
+#[test]
+fn long_diagnostic_reports_real_shared_overflow_and_scrolls() {
+    let theme = Theme::LOVE_LIGHT;
+    let styles = DialogStyles::new(theme);
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Storage), &provider);
+    let generation = app.layers.storage.outbox.take()[0].generation;
+    let entries = (0..8)
+        .map(|index| StorageEntry {
+            category: StorageCategory::Derived,
+            label: format!("derived-{index}"),
+            bytes: 1024,
+            reclaimable: 1024,
+            status: "unused, recomputable".into(),
+        })
+        .collect();
+    assert!(app.layers.storage.complete(
+        generation,
+        StorageSnapshot {
+            entries,
+            total_bytes: 8192,
+            reclaimable_bytes: 8192,
+            row_cache_bytes: 1,
+            row_cache_limit: 2,
+            query_index_bytes: 3,
+            query_index_limit: 4,
+            derived_index_limit_per_source: 5,
+            derived_index_limit_total: 6,
+            truncated: false,
+            errors: vec!["bounded storage diagnostic ".repeat(16)],
+        },
+        "scan complete".into(),
+        true,
+    ));
+    let storage = draw_themed(&provider, &mut app, 72, 16, theme);
+    // Selection role on the selected list row.
+    let selected = app.layers.storage.row_rects()[0].0;
+    assert_role(storage[(selected.x, selected.y)].style(), styles.selection);
+    assert_eq!(
+        Some(storage[(selected.x, selected.y)].bg),
+        styles.selection.bg
+    );
+    // Sticky default: Refresh carries the accent fill.
+    let refresh_cell = (0..storage.area.height)
+        .find_map(|y| {
+            let line: String = (0..storage.area.width)
+                .map(|x| storage[(x, y)].symbol())
+                .collect();
+            line.find("[ Refresh ]").map(|byte| {
+                use unicode_width::UnicodeWidthStr;
+                let column = UnicodeWidthStr::width(&line[..byte]) as u16;
+                storage[(column, y)].style()
+            })
+        })
+        .expect("Refresh action must be painted");
+    assert_role(refresh_cell, role_style(theme, ButtonRole::Default, false));
+    assert_eq!(refresh_cell.bg, Some(theme.accent));
+    // The HOLD regression: zero scroll extent for content that exists.
+    let limit = app.layers.storage.scroll_limit();
+    assert!(limit > 0, "long diagnostic must really overflow");
+    let refresh_before = app
+        .layers
+        .storage
+        .action_rects()
+        .iter()
+        .find(|(slot, _)| *slot == 0)
+        .map(|(_, r)| *r);
+    // Tab hands the arrows to the diagnostics pane; scrolling reaches the limit.
+    key(&mut app, &provider, KeyCode::Tab);
+    for _ in 0..limit {
+        key(&mut app, &provider, KeyCode::Down);
+    }
+    assert_eq!(app.layers.storage.scroll(), limit);
+    // Sticky tail: the action band never moved under the scroll.
+    // Re-draw to refresh painted hitboxes, then compare origins.
+    let scrolled = draw_themed(&provider, &mut app, 72, 16, theme);
+    let refresh_after = app
+        .layers
+        .storage
+        .action_rects()
+        .iter()
+        .find(|(slot, _)| *slot == 0)
+        .map(|(_, r)| *r);
+    assert_eq!(
+        refresh_before, refresh_after,
+        "scrolling diagnostics must not move the sticky tail"
+    );
+    // Scrollbar/hitbox agreement on the painted rows.
+    let surface = app.layers.storage.surface();
+    assert!(surface.scrollable, "overflowing diagnostics must scroll");
+    for (rect, index) in app.layers.storage.row_rects() {
+        assert_eq!(
+            app.layers.storage.hit((rect.x, rect.y)),
+            Some(StorageHit::Row(*index)),
+            "row paint/hit disagree after diagnostics scroll"
+        );
+    }
+    // The scrolled diagnostic text is really painted in the error role.
+    let diagnostic_cell = (0..scrolled.area.height)
+        .find_map(|y| {
+            let line: String = (0..scrolled.area.width)
+                .map(|x| scrolled[(x, y)].symbol())
+                .collect();
+            line.find("diagnostic").map(|byte| {
+                use unicode_width::UnicodeWidthStr;
+                let column = UnicodeWidthStr::width(&line[..byte]) as u16;
+                scrolled[(column, y)].style()
+            })
+        })
+        .expect("scrolled diagnostic text must be painted");
+    assert_role(diagnostic_cell, styles.error);
 }

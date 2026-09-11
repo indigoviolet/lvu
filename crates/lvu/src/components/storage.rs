@@ -685,6 +685,13 @@ impl Component for StorageDialog {
         let gap = u16::from(roomy);
         let spare = body.height;
         let diag_wanted: u16 = if diagnostics.is_empty() { 0 } else { 4 };
+        // Diagnostics are a bounded secondary pane, never truncated silently:
+        // shrink to fit beside the summary and one list row before hiding.
+        // The shared ScrollViewport always spans the full wrapped extent, so
+        // the stored limit and scrollability come from geometry even when the
+        // pane is out of view at the floor (retained, not reset).
+        const LIST_MIN: u16 = 1;
+        const DIAG_MIN: u16 = 2; // heading + one viewport row
         let full_need = summary_rows
             .saturating_add(1)
             .saturating_add(diag_wanted)
@@ -701,6 +708,34 @@ impl Component for StorageDialog {
                     .saturating_sub(gap.saturating_mul(2))
                     .max(1),
                 diag_wanted,
+            )
+        } else if diag_wanted > 0
+            && spare
+                .saturating_sub(summary_rows)
+                .saturating_sub(1)
+                .saturating_sub(LIST_MIN)
+                .saturating_sub(gap.saturating_mul(2))
+                >= DIAG_MIN.min(diag_wanted)
+        {
+            // Pressure but room for summary + one list row + shrunk pane,
+            // mirroring the full-path arithmetic with LIST_MIN in place of
+            // the Fill list and the shrunk pane in place of the full one.
+            let shrunk = diag_wanted.min(
+                spare
+                    .saturating_sub(summary_rows)
+                    .saturating_sub(1)
+                    .saturating_sub(LIST_MIN)
+                    .saturating_sub(gap.saturating_mul(2)),
+            );
+            (
+                true,
+                spare
+                    .saturating_sub(summary_rows)
+                    .saturating_sub(1)
+                    .saturating_sub(shrunk)
+                    .saturating_sub(gap.saturating_mul(2))
+                    .max(LIST_MIN.min(spare)),
+                shrunk,
             )
         } else if self.scroll_focused && diag_wanted > 0 {
             (false, 0, spare)
@@ -946,6 +981,24 @@ impl Component for StorageDialog {
             }
             scroll = scrolled.first_row;
             diagnostics_rect = Some(area);
+        } else if diag_wanted > 0 {
+            // Focused-only floor path hid the pane, but its full wrapped
+            // extent stays claimed: retain (never reset) the shared limit so
+            // focusing the pane restores real scroll instead of reporting
+            // no overflow for content that exists.
+            let nominal_width = body
+                .width
+                .saturating_sub(crate::dialog_layout::PANE_INDENT.min(body.width))
+                .saturating_sub(1)
+                .max(1);
+            let probe = Paragraph::new(diagnostics.clone()).wrap(Wrap { trim: false });
+            let wrapped = probe.line_count(nominal_width);
+            // Nominal viewport is what the pane would own focused: the whole
+            // spare body minus its heading row.
+            let nominal_viewport_h = spare.saturating_sub(1);
+            let limit = wrapped.saturating_sub(usize::from(nominal_viewport_h));
+            scroll_limit = limit;
+            scroll = scroll.min(limit);
         }
 
         render_message(frame, message_rect, state, &sentence, theme, ascii);
