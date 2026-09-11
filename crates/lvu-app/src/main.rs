@@ -12979,7 +12979,9 @@ root = \"/tmp/elsewhere\"\n",
             (&handle_a, "a", "A events", sid_a.clone()),
             (&handle_b, "b", "B events", sid_b.clone()),
         ] {
-            adapter.register_source(handle.clone()).unwrap();
+            adapter
+                .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
+                .unwrap();
             adapter
                 .register_view(view, vec![handle.source_id()])
                 .unwrap();
