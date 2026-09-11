@@ -1343,54 +1343,6 @@ pub struct WorkspaceStore {
 /// position with that entry's version or error.
 type BatchSaveOutcomes = Vec<(usize, Result<u64, MemoryError>)>;
 
-/// Header-only compatibility probe for callers that must decide BEFORE
-/// touching workspace-adjacent bytes — notably the session manifest, which
-/// shares the workspace root but is not a database table. Reports whether
-/// this build could open the workspace store, without opening, locking, or
-/// migrating anything: a missing database reads as compatible (fresh
-/// workspace grants nothing to clobber), while a present-but-unreadable one
-/// (truncated file, bad magic, newer `user_version`) refuses with the
-/// reason. Callers gate durable writes on this so future-schema operation
-/// leaves bytes and mtimes untouched instead of lossy-rewriting them.
-/// (Interface note for primary review: this is the first app-reachable
-/// consumer of `DB_SCHEMA_VERSION` outside `open`/migration; it reads the
-/// header only and changes no existing path.)
-pub fn workspace_store_compatible(root: &Path) -> Result<(), String> {
-    let db = root.join("workspace.sqlite3");
-    let bytes = match fs::read(&db) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(format!(
-                "workspace database unreadable at {}: {error}",
-                db.display()
-            ));
-        }
-    };
-    if bytes.len() < 100 {
-        return Err(format!(
-            "workspace database at {} is truncated ({} bytes)",
-            db.display(),
-            bytes.len()
-        ));
-    }
-    if &bytes[..16] != b"SQLite format 3\x00" {
-        return Err(format!(
-            "workspace database at {} is not a SQLite file",
-            db.display()
-        ));
-    }
-    let version = i64::from(u32::from_be_bytes([
-        bytes[60], bytes[61], bytes[62], bytes[63],
-    ]));
-    if version > DB_SCHEMA_VERSION {
-        return Err(format!(
-            "workspace database schema version {version} is newer than this build supports ({DB_SCHEMA_VERSION})"
-        ));
-    }
-    Ok(())
-}
-
 impl WorkspaceStore {
     pub fn import_legacy_snapshot(
         seed: &LegacyWorkspaceSeed,
@@ -3672,51 +3624,4 @@ fn decode_recipe_revision(
         return Err(MemoryError::Conflict);
     }
     Ok(recipe)
-}
-
-#[cfg(test)]
-mod compatibility_probe_tests {
-    use super::*;
-
-    fn header_with_version(version: u32) -> Vec<u8> {
-        let mut header = vec![0u8; 100];
-        header[..16].copy_from_slice(b"SQLite format 3\x00");
-        header[60..64].copy_from_slice(&version.to_be_bytes());
-        header
-    }
-
-    #[test]
-    fn probe_agrees_with_open_on_missing_current_and_future_databases() {
-        let root = tempfile::tempdir().expect("scratch root");
-        // Missing database: fresh workspace, nothing to clobber.
-        assert!(workspace_store_compatible(root.path()).is_ok());
-        // A database this build creates opens clean: probe and open agree.
-        WorkspaceStore::open(root.path()).expect("open fresh database");
-        assert!(workspace_store_compatible(root.path()).is_ok());
-        // Future version: open refuses and the probe refuses first, naming
-        // the version skew rather than a generic I/O failure.
-        std::fs::write(
-            root.path().join("workspace.sqlite3"),
-            header_with_version((DB_SCHEMA_VERSION + 1) as u32),
-        )
-        .expect("plant future database");
-        assert!(WorkspaceStore::open(root.path()).is_err());
-        let refused =
-            workspace_store_compatible(root.path()).expect_err("future database must refuse");
-        assert!(
-            refused.contains("newer than this build supports"),
-            "refusal names the skew: {refused}"
-        );
-    }
-
-    #[test]
-    fn probe_refuses_truncated_and_foreign_files_without_opening() {
-        let root = tempfile::tempdir().expect("scratch root");
-        std::fs::write(root.path().join("workspace.sqlite3"), b"short").expect("plant short");
-        assert!(workspace_store_compatible(root.path()).is_err());
-        std::fs::write(root.path().join("workspace.sqlite3"), vec![0x7fu8; 100])
-            .expect("plant foreign");
-        let refused = workspace_store_compatible(root.path()).expect_err("bad magic must refuse");
-        assert!(refused.contains("not a SQLite file"), "{refused}");
-    }
 }

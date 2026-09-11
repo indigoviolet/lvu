@@ -4409,11 +4409,25 @@ impl Composition {
     /// Writes down the sources this session holds, so the next launch in this
     /// capture root resumes the set rather than guessing it from what the
     /// workspace saw most recently. Written whenever the set changes, not only
-    /// at shutdown, so a session that is killed still resumes. Refuses loudly
-    /// when the existing manifest is unreadable by this build (newer schema,
-    /// corruption): storing would lossy-rewrite bytes it cannot parse, so
-    /// the durable file keeps its bytes and mtime instead.
+    /// at shutdown, so a session that is killed still resumes.
+    ///
+    /// Single writer: with a shared session the worker owns
+    /// workspace/session persistence — it records every remote file/command
+    /// start and stop, keeps unresumed entries it loaded, and refuses while
+    /// degraded — so a local rewrite here would race it and could clobber
+    /// bytes this build cannot parse (a header probe cannot prove the
+    /// actual worker store is available: interior corruption, open or
+    /// permission failure, and concurrent state all look current from the
+    /// outside). The app therefore never writes while shared; stdin is
+    /// non-restorable and needs no record, and degraded loudness already
+    /// travels through the shared store/recent/start warnings. The local
+    /// path below serves explicit non-shared compositions (tests,
+    /// compatibility) only, where it still refuses an unreadable manifest
+    /// instead of lossy-rewriting it.
     fn record_session(&mut self, app: &mut App) {
+        if self.shared.is_some() {
+            return;
+        }
         let workspace = self.capture_root.join("workspace");
         if let Err(error) = session::recordable(&workspace) {
             app.action_notice = Some(format!("session not recorded: {error}"));
@@ -12676,20 +12690,82 @@ root = \"/tmp/elsewhere\"\n",
         assert_eq!(stored[0].id, composition.session_sources[0].id);
     }
 
-    /// The skew the manifest-only gate missed: a future database beside a
-    /// readable schema-1 manifest with an unknown additive field. The
-    /// manifest parses, but the workspace generation is not ours — storing
-    /// would silently drop the unknown field — so recording refuses and
-    /// both files keep bytes and mtime.
+    /// Shared-session fixture: a live in-process worker serving a real
+    /// Unix socket plus the composition-side store attached to it — the
+    /// same serve/handshake/dispatch path production uses, without child
+    /// processes. The caller owns shutdown.
+    async fn shared_fixture(
+        workspace: &std::path::Path,
+        capture: &std::path::Path,
+        pid: u32,
+    ) -> (
+        std::sync::Arc<lvu_shared::WorkerService>,
+        super::shared_capture::SharedStore,
+    ) {
+        struct AdmitAll;
+        impl lvu_shared::AdmissionHook for AdmitAll {
+            fn admit(
+                &self,
+                _definition: &lvu_core::SourceDefinition,
+            ) -> lvu_shared::AdmissionVerdict {
+                lvu_shared::AdmissionVerdict::Admit
+            }
+        }
+        let config = lvu_shared::WorkerConfig {
+            capture_root: capture.to_path_buf(),
+            workspace_root: workspace.to_path_buf(),
+            socket_path: capture.join("shared-worker/control.sock"),
+            viewer_grace: std::time::Duration::from_millis(100),
+            request_timeout: std::time::Duration::from_secs(10),
+        };
+        let socket_path = config.socket_path.clone();
+        let (service, _) = lvu_shared::WorkerService::open(config, std::sync::Arc::new(AdmitAll))
+            .expect("worker opens");
+        std::fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("socket dir");
+        // Direct attach takes the viewer lock itself, unlike the election
+        // path that creates directories first.
+        lvu_shared::election::WorkerPaths::new(capture)
+            .ensure_directories()
+            .expect("viewer directories");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
+        let server = std::sync::Arc::clone(&service);
+        tokio::spawn(async move {
+            server.serve(listener).await;
+        });
+        let (client, _) =
+            lvu_shared::client::WorkerClient::connect(capture, &socket_path, "window-test", pid)
+                .await
+                .expect("connect");
+        let store = super::shared_capture::SharedStore::from_client(client);
+        (service, store)
+    }
+
+    fn mtime_of(path: &std::path::Path) -> std::time::SystemTime {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime")
+    }
+
+    /// With a shared session the app never rewrites the manifest — even a
+    /// future database beside a readable schema-1 manifest with unknown
+    /// fields stays byte- and mtime-identical, with no notice of its own:
+    /// the worker owns session persistence (and refuses while degraded),
+    /// so a local rewrite would race it and clobber what this build
+    /// cannot parse. Delegation is silent; degraded loudness travels
+    /// through the shared store/recent/start warnings.
     #[tokio::test]
-    async fn record_session_refuses_future_database_despite_readable_manifest() {
+    async fn record_session_skips_when_shared_despite_future_database() {
         let BatchFixture {
             directory: _directory,
             mut app,
             mut composition,
             manager: _manager,
         } = batch_fixture();
-        let workspace = composition.capture_root.join("workspace");
+        // One shared tree like production: app and worker use the same
+        // capture root and workspace.
+        let capture = composition.capture_root.clone();
+        let workspace = capture.join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
         let mut header = vec![0u8; 100];
         header[..16].copy_from_slice(b"SQLite format 3\x00");
@@ -12702,42 +12778,103 @@ root = \"/tmp/elsewhere\"\n",
         )
         .expect("plant forward manifest");
         let before = std::fs::read(&manifest).expect("manifest bytes");
-        let mtime_before = std::fs::metadata(&manifest)
-            .expect("manifest metadata")
-            .modified()
-            .expect("manifest mtime");
-        composition.session_sources = vec![batch_definition(915, "fresh")];
+        let mtime_before = mtime_of(&manifest);
+        let (service, store) = shared_fixture(&workspace, &capture, 7701).await;
+        composition.shared = Some(std::sync::Arc::new(store));
+        // Something the app would record if it still wrote: its absence
+        // afterwards proves the skip (not a vacuous no-op).
+        composition.session_sources = vec![batch_definition(915, "app-only")];
         composition.record_session(&mut app);
         assert_eq!(
             std::fs::read(&manifest).expect("manifest bytes after"),
             before,
-            "readable manifest beside a future database must not be rewritten"
+            "shared record_session must not rewrite the manifest"
         );
         assert_eq!(
-            std::fs::metadata(&manifest)
-                .expect("metadata after")
-                .modified()
-                .expect("mtime after"),
+            mtime_of(&manifest),
             mtime_before,
-            "refused record must not touch the manifest"
+            "shared record_session must not touch the manifest"
         );
         assert_eq!(
             std::fs::read(workspace.join("workspace.sqlite3")).expect("db bytes after"),
             header,
             "the future database itself is untouched"
         );
-        let notice = app.action_notice.as_deref().unwrap_or("");
         assert!(
-            notice.contains("session not recorded")
-                && notice.contains("workspace persistence unavailable"),
-            "refusal must name the unavailable persistence: {notice}"
+            !std::fs::read_to_string(&manifest)
+                .expect("read back")
+                .contains("app-only"),
+            "the app-only entry must not land in worker-owned bytes"
         );
         assert!(
             std::fs::read_to_string(&manifest)
                 .expect("read back")
                 .contains("future_additive"),
-            "unknown additive field survives the refused record"
+            "unknown additive field survives"
         );
+        assert!(
+            app.action_notice.is_none(),
+            "delegation is silent by design; worker paths stay loud"
+        );
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    /// Positive control for the delegation: a healthy shared start lands
+    /// in the worker manifest, and the app record leaves those exact bytes
+    /// (and mtime) alone while keeping an app-only entry out.
+    #[tokio::test]
+    async fn shared_start_records_worker_side_while_app_record_skips() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager: _manager,
+        } = batch_fixture();
+        let capture = composition.capture_root.clone();
+        let workspace = capture.join("workspace");
+        let (service, store) = shared_fixture(&workspace, &capture, 7702).await;
+        let input = capture.join("shared-live.log");
+        std::fs::write(&input, "one\n").expect("seed log");
+        let mut definition = batch_definition(916, "shared-live");
+        definition.acquisition = lvu_core::Acquisition::File {
+            path: input.clone(),
+            follow: true,
+        };
+        store
+            .start_source(&definition, Some(&capture))
+            .await
+            .expect("shared start serves");
+        let remembered =
+            lvu_shared::load_session_set(&workspace).expect("worker manifest readable");
+        assert!(
+            remembered.iter().any(|entry| entry.id == definition.id),
+            "worker owns the shared start"
+        );
+        let manifest = workspace.join("session.json");
+        let worker_bytes = std::fs::read(&manifest).expect("worker manifest bytes");
+        let worker_mtime = mtime_of(&manifest);
+        composition.shared = Some(std::sync::Arc::new(store));
+        composition.session_sources = vec![batch_definition(917, "app-only")];
+        composition.record_session(&mut app);
+        assert_eq!(
+            std::fs::read(&manifest).expect("manifest bytes after"),
+            worker_bytes,
+            "app record must leave worker-owned bytes alone"
+        );
+        assert_eq!(
+            mtime_of(&manifest),
+            worker_mtime,
+            "app record must not touch the manifest"
+        );
+        assert!(
+            !std::fs::read_to_string(&manifest)
+                .expect("read back")
+                .contains("app-only"),
+            "no second writer may interleave"
+        );
+        service.request_shutdown();
+        service.shutdown().await;
     }
 }
 
