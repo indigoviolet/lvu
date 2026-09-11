@@ -3235,3 +3235,19 @@ treating a sub-percent scheduling shift as a failure. A source-bound rerun
 measured 6.613M and passed; log:
 `primary-sol-scratch/v018-text-search-throughput.log`. Failed exact evidence is
 preserved under `lvu-v018-98d4844-acceptance/`.
+
+Exact candidate `7a73eca` then passed the full Rust workspace, Clippy, bridge
+install/check and final binary builds (`lvu-app` SHA-256 `63cda61e…`, `lvu`
+`83d8745a…`). Its PTY matrix was 50/82. Inspection and isolated reproduction
+showed a common integration-test assumption: searches were accepted with exact
+matched/range status, but the intentionally larger responsive dialog covered
+the row the test simultaneously required. Some workflows also sent the opener
+and first character without waiting for the dialog, and several asserted
+retired labels/class widths. No `accepted.json` was created. Evidence is under
+`lvu-v018-7a73eca-r2-acceptance/`.
+
+The shared PTY cleanup helper now dismisses any text-taking layer before sending
+`q`, so a failing story cannot turn quit into draft text and mask the original
+assertion as an exit timeout. It allows the documented ten-second final-window
+settlement bound plus two seconds for PTY observation. The 32 failed PTYs are
+being repaired by behavior cluster before another complete matrix.

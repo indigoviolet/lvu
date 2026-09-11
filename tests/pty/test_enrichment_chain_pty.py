@@ -39,8 +39,17 @@ def open_step_editor(app):
 
 def stop(app):
     if app.process.poll() is None:
+        # A failing story can reach cleanup with a text-taking dialog still
+        # open; dismiss it so `q` cannot become draft text and mask the real
+        # assertion with a false exit timeout.
+        for _ in range(3):
+            app.send(b"\x1b")
+            app.drain()
         app.send(b"q")
-        code = app.wait_exit(timeout=8)
+        # Shared capture gives the final window one bounded grace period to
+        # settle durable work and reap owned children; the product bound is
+        # ten seconds, so the harness allows two seconds for PTY observation.
+        code = app.wait_exit(timeout=12)
         assert code == 0, (code, app.text(), bytes(app.transcript[-8000:]))
     app.assert_restored()
     app.close()
