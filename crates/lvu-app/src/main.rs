@@ -1080,14 +1080,28 @@ impl Composition {
                         health.push_str(&counters);
                     }
                 }
-                if let Ok(id) = Uuid::parse_str(&view.source_id)
-                    && let Some(handle) = self.manager.source(SourceId(id))
-                {
-                    let progress = handle.progress();
-                    app.update_source_health(
-                        &view.source_id,
-                        format!("{:?}: {} records", progress.state, progress.records),
-                    );
+                if let Ok(id) = Uuid::parse_str(&view.source_id) {
+                    let source_id = SourceId(id);
+                    if let Some(handle) = self.manager.source(source_id) {
+                        let progress = handle.progress();
+                        app.update_source_health(
+                            &view.source_id,
+                            format!("{:?}: {} records", progress.state, progress.records),
+                        );
+                    } else if let Some(shared) = self.shared.as_ref() {
+                        // Worker-owned captures publish health from the
+                        // remote handle's feeder-kept progress cache: same
+                        // shape as local, so Running/Stopped/errored shared
+                        // captures read exactly like local ones instead of
+                        // "starting/indexing" forever. Terminal snapshots
+                        // published by stops flow through the same slot.
+                        if let Some(progress) = shared.source_progress(source_id) {
+                            app.update_source_health(
+                                &view.source_id,
+                                format!("{:?}: {} records", progress.state, progress.records),
+                            );
+                        }
+                    }
                 }
                 app.update_view_runtime_status(&view.id, health);
             }
@@ -4396,10 +4410,30 @@ impl Composition {
     /// capture root resumes the set rather than guessing it from what the
     /// workspace saw most recently. Written whenever the set changes, not only
     /// at shutdown, so a session that is killed still resumes.
+    ///
+    /// Single writer: with a shared session the worker owns
+    /// workspace/session persistence — it records every remote file/command
+    /// start and stop, keeps unresumed entries it loaded, and refuses while
+    /// degraded — so a local rewrite here would race it and could clobber
+    /// bytes this build cannot parse (a header probe cannot prove the
+    /// actual worker store is available: interior corruption, open or
+    /// permission failure, and concurrent state all look current from the
+    /// outside). The app therefore never writes while shared; stdin is
+    /// non-restorable and needs no record, and degraded loudness already
+    /// travels through the shared store/recent/start warnings. The local
+    /// path below serves explicit non-shared compositions (tests,
+    /// compatibility) only, where it still refuses an unreadable manifest
+    /// instead of lossy-rewriting it.
     fn record_session(&mut self, app: &mut App) {
-        if let Err(error) =
-            session::store(&self.capture_root.join("workspace"), &self.session_sources)
-        {
+        if self.shared.is_some() {
+            return;
+        }
+        let workspace = self.capture_root.join("workspace");
+        if let Err(error) = session::recordable(&workspace) {
+            app.action_notice = Some(format!("session not recorded: {error}"));
+            return;
+        }
+        if let Err(error) = session::store(&workspace, &self.session_sources) {
             app.action_notice = Some(format!("session not recorded: {error}"));
         }
     }
@@ -7774,6 +7808,24 @@ async fn run() -> Result<(), String> {
             ));
         }
     };
+    // Window-side union commit transport: remote unions over this shared
+    // session commit through the worker with same-identity recovery. A
+    // transport that cannot exist (no runtime — impossible on this path,
+    // but honest anyway) leaves remote unions loudly unavailable instead
+    // of half-wired.
+    let mut transport_notice: Option<String> = None;
+    match shared_session.union_transport(window_id.clone()) {
+        Ok(transport) => {
+            if let Err(error) =
+                adapter.set_remote_union_commit_transport(window_id.clone(), Arc::new(transport))
+            {
+                transport_notice = Some(format!("union commit transport: {error}"));
+            }
+        }
+        Err(error) => {
+            transport_notice = Some(format!("union commit transport unavailable: {error}"));
+        }
+    };
     let mut app = App::new(Vec::new(), Vec::new(), false);
     app.title = "lvu live sources".into();
     app.configure_ai(
@@ -7801,7 +7853,9 @@ async fn run() -> Result<(), String> {
         &capture_dir,
         &loaded_settings.validated,
     ));
-    app.source_notice = legacy_notice.or_else(|| helper_resource.diagnostic());
+    app.source_notice = transport_notice
+        .or(legacy_notice)
+        .or_else(|| helper_resource.diagnostic());
     let workspace_root = capture_dir.join("workspace");
     // Resuming is the default, so an unreadable manifest may not stop lvu from
     // opening: it degrades to an empty previous session and says so.
@@ -8273,16 +8327,34 @@ fn prepend_notice(app: &mut App, notice: Option<String>) {
     });
 }
 
-/// Re-acquires a remembered source through the sidebar's Restart, so a resumed
-/// command is launched exactly the way an explicit restart launches it — with
-/// the recorded program, working directory and environment of its definition.
+/// Re-acquires a remembered file source through the sidebar's Restart, so a
+/// resumed file is relaunched exactly the way an explicit restart relaunches
+/// it. A remembered command is never executed and a remembered endpoint is
+/// never contacted on this path (mirroring the manager's restore refusal):
+/// both are refused with a distinct error so the startup loop lists them as
+/// not acquiring and an explicit sidebar Restart remains the only launcher.
 async fn resume_definition(
     manager: &Arc<SourceManager>,
     shared: Option<Arc<shared_capture::SharedStore>>,
     definition: SourceDefinition,
 ) -> Result<StartedSource, String> {
-    let view_id = view_id(definition.id);
     let name = definition.name.clone();
+    match &definition.acquisition {
+        Acquisition::Command { .. } => {
+            return Err(format!(
+                "resume {name}: remembered commands never start automatically; \
+                 use Restart for an explicit launch"
+            ));
+        }
+        Acquisition::Http { .. } => {
+            return Err(format!(
+                "resume {name}: remembered endpoints are never contacted automatically; \
+                 use Restart for an explicit launch"
+            ));
+        }
+        _ => {}
+    }
+    let view_id = view_id(definition.id);
     if shared_capture::worker_route(shared.is_some(), &definition) {
         // Worker-owned resume: the worker dedups against live captures
         // (Present), so resume-after-crash and second-window attach take
@@ -12557,6 +12629,253 @@ root = \"/tmp/elsewhere\"\n",
         assert_eq!(candidate.source.id, authoritative_id);
         assert!(discovery_status(&result).contains("1 candidates"));
     }
+
+    /// `record_session` refuses loudly when the existing manifest is
+    /// unreadable by this build: the file keeps its bytes, mtime and
+    /// unknown fields instead of suffering a lossy rewrite. A missing
+    /// manifest still records normally (positive control). Async only
+    /// because the shared fixture starts runtime-backed workers.
+    #[tokio::test]
+    async fn record_session_leaves_unreadable_manifests_untouched() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager: _manager,
+        } = batch_fixture();
+        let workspace = composition.capture_root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let manifest = workspace.join("session.json");
+        std::fs::write(
+            &manifest,
+            "{\"schema_version\":2,\"sources\":[],\"future_field\":\"keep-me\"}\n",
+        )
+        .expect("plant newer manifest");
+        let before = std::fs::read(&manifest).expect("manifest bytes");
+        let mtime_before = std::fs::metadata(&manifest)
+            .expect("manifest metadata")
+            .modified()
+            .expect("manifest mtime");
+        composition.session_sources = vec![batch_definition(914, "fresh")];
+        composition.record_session(&mut app);
+        assert_eq!(
+            std::fs::read(&manifest).expect("manifest bytes after"),
+            before,
+            "record_session must not rewrite an unreadable manifest"
+        );
+        assert_eq!(
+            std::fs::metadata(&manifest)
+                .expect("metadata after")
+                .modified()
+                .expect("mtime after"),
+            mtime_before,
+            "record_session must not touch the manifest"
+        );
+        let notice = app.action_notice.as_deref().unwrap_or("");
+        assert!(
+            notice.contains("session not recorded")
+                && notice.contains("leaving durable bytes unchanged"),
+            "refusal must be loud and name the guarantee: {notice}"
+        );
+        assert!(
+            std::fs::read_to_string(&manifest)
+                .expect("read back")
+                .contains("future_field"),
+            "unknown future field survives the refused record"
+        );
+        std::fs::remove_file(&manifest).expect("clear manifest");
+        composition.record_session(&mut app);
+        let stored = super::session::load(&workspace).expect("fresh record loads");
+        assert_eq!(stored.len(), 1, "a missing manifest still records normally");
+        assert_eq!(stored[0].id, composition.session_sources[0].id);
+    }
+
+    /// Shared-session fixture: a live in-process worker serving a real
+    /// Unix socket plus the composition-side store attached to it — the
+    /// same serve/handshake/dispatch path production uses, without child
+    /// processes. The caller owns shutdown.
+    async fn shared_fixture(
+        workspace: &std::path::Path,
+        capture: &std::path::Path,
+        pid: u32,
+    ) -> (
+        std::sync::Arc<lvu_shared::WorkerService>,
+        super::shared_capture::SharedStore,
+    ) {
+        struct AdmitAll;
+        impl lvu_shared::AdmissionHook for AdmitAll {
+            fn admit(
+                &self,
+                _definition: &lvu_core::SourceDefinition,
+            ) -> lvu_shared::AdmissionVerdict {
+                lvu_shared::AdmissionVerdict::Admit
+            }
+        }
+        let config = lvu_shared::WorkerConfig {
+            capture_root: capture.to_path_buf(),
+            workspace_root: workspace.to_path_buf(),
+            socket_path: capture.join("shared-worker/control.sock"),
+            viewer_grace: std::time::Duration::from_millis(100),
+            request_timeout: std::time::Duration::from_secs(10),
+        };
+        let socket_path = config.socket_path.clone();
+        let (service, _) = lvu_shared::WorkerService::open(config, std::sync::Arc::new(AdmitAll))
+            .expect("worker opens");
+        std::fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("socket dir");
+        // Direct attach takes the viewer lock itself, unlike the election
+        // path that creates directories first.
+        lvu_shared::election::WorkerPaths::new(capture)
+            .ensure_directories()
+            .expect("viewer directories");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
+        let server = std::sync::Arc::clone(&service);
+        tokio::spawn(async move {
+            server.serve(listener).await;
+        });
+        let (client, _) =
+            lvu_shared::client::WorkerClient::connect(capture, &socket_path, "window-test", pid)
+                .await
+                .expect("connect");
+        let store = super::shared_capture::SharedStore::from_client(client);
+        (service, store)
+    }
+
+    fn mtime_of(path: &std::path::Path) -> std::time::SystemTime {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime")
+    }
+
+    /// With a shared session the app never rewrites the manifest — even a
+    /// future database beside a readable schema-1 manifest with unknown
+    /// fields stays byte- and mtime-identical, with no notice of its own:
+    /// the worker owns session persistence (and refuses while degraded),
+    /// so a local rewrite would race it and clobber what this build
+    /// cannot parse. Delegation is silent; degraded loudness travels
+    /// through the shared store/recent/start warnings.
+    #[tokio::test]
+    async fn record_session_skips_when_shared_despite_future_database() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager: _manager,
+        } = batch_fixture();
+        // One shared tree like production: app and worker use the same
+        // capture root and workspace.
+        let capture = composition.capture_root.clone();
+        let workspace = capture.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\x00");
+        header[60..64].copy_from_slice(&9999u32.to_be_bytes());
+        std::fs::write(workspace.join("workspace.sqlite3"), &header).expect("plant future db");
+        let manifest = workspace.join("session.json");
+        std::fs::write(
+            &manifest,
+            "{\"schema_version\":1,\"sources\":[],\"future_additive\":\"keep-me\"}\n",
+        )
+        .expect("plant forward manifest");
+        let before = std::fs::read(&manifest).expect("manifest bytes");
+        let mtime_before = mtime_of(&manifest);
+        let (service, store) = shared_fixture(&workspace, &capture, 7701).await;
+        composition.shared = Some(std::sync::Arc::new(store));
+        // Something the app would record if it still wrote: its absence
+        // afterwards proves the skip (not a vacuous no-op).
+        composition.session_sources = vec![batch_definition(915, "app-only")];
+        composition.record_session(&mut app);
+        assert_eq!(
+            std::fs::read(&manifest).expect("manifest bytes after"),
+            before,
+            "shared record_session must not rewrite the manifest"
+        );
+        assert_eq!(
+            mtime_of(&manifest),
+            mtime_before,
+            "shared record_session must not touch the manifest"
+        );
+        assert_eq!(
+            std::fs::read(workspace.join("workspace.sqlite3")).expect("db bytes after"),
+            header,
+            "the future database itself is untouched"
+        );
+        assert!(
+            !std::fs::read_to_string(&manifest)
+                .expect("read back")
+                .contains("app-only"),
+            "the app-only entry must not land in worker-owned bytes"
+        );
+        assert!(
+            std::fs::read_to_string(&manifest)
+                .expect("read back")
+                .contains("future_additive"),
+            "unknown additive field survives"
+        );
+        assert!(
+            app.action_notice.is_none(),
+            "delegation is silent by design; worker paths stay loud"
+        );
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    /// Positive control for the delegation: a healthy shared start lands
+    /// in the worker manifest, and the app record leaves those exact bytes
+    /// (and mtime) alone while keeping an app-only entry out.
+    #[tokio::test]
+    async fn shared_start_records_worker_side_while_app_record_skips() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager: _manager,
+        } = batch_fixture();
+        let capture = composition.capture_root.clone();
+        let workspace = capture.join("workspace");
+        let (service, store) = shared_fixture(&workspace, &capture, 7702).await;
+        let input = capture.join("shared-live.log");
+        std::fs::write(&input, "one\n").expect("seed log");
+        let mut definition = batch_definition(916, "shared-live");
+        definition.acquisition = lvu_core::Acquisition::File {
+            path: input.clone(),
+            follow: true,
+        };
+        store
+            .start_source(&definition, Some(&capture))
+            .await
+            .expect("shared start serves");
+        let remembered =
+            lvu_shared::load_session_set(&workspace).expect("worker manifest readable");
+        assert!(
+            remembered.iter().any(|entry| entry.id == definition.id),
+            "worker owns the shared start"
+        );
+        let manifest = workspace.join("session.json");
+        let worker_bytes = std::fs::read(&manifest).expect("worker manifest bytes");
+        let worker_mtime = mtime_of(&manifest);
+        composition.shared = Some(std::sync::Arc::new(store));
+        composition.session_sources = vec![batch_definition(917, "app-only")];
+        composition.record_session(&mut app);
+        assert_eq!(
+            std::fs::read(&manifest).expect("manifest bytes after"),
+            worker_bytes,
+            "app record must leave worker-owned bytes alone"
+        );
+        assert_eq!(
+            mtime_of(&manifest),
+            worker_mtime,
+            "app record must not touch the manifest"
+        );
+        assert!(
+            !std::fs::read_to_string(&manifest)
+                .expect("read back")
+                .contains("app-only"),
+            "no second writer may interleave"
+        );
+        service.request_shutdown();
+        service.shutdown().await;
+    }
 }
 
 #[cfg(test)]
@@ -12721,6 +13040,72 @@ mod source_control_tests {
             "resumed command lost its recorded environment: {text}"
         );
         for (_, stopped) in next.shutdown().await {
+            assert!(stopped.unwrap().complete);
+        }
+    }
+
+    /// Startup resume refuses remembered commands and endpoints distinctly
+    /// instead of launching them: files re-acquire, but a recorded program
+    /// is never executed and a recorded URL is never contacted without an
+    /// explicit sidebar Restart (which keeps working through
+    /// `control_source`). Nothing is left running behind the refusal.
+    #[tokio::test]
+    async fn resume_refuses_remembered_commands_and_endpoints() {
+        let root = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(
+            SourceManager::new(root.path().join("capture"), RuntimeConfig::default()).unwrap(),
+        );
+        let input = root.path().join("resume.log");
+        std::fs::write(&input, "one\n").expect("seed log");
+        let file =
+            definition(SourceArgument::File(input.clone()), root.path()).expect("file definition");
+        resume_definition(&manager, None, file.clone())
+            .await
+            .expect("remembered files still resume");
+        let command = definition(
+            SourceArgument::Command(r#"printf should-never-appear"#.into()),
+            root.path(),
+        )
+        .expect("command definition");
+        let refused = match resume_definition(&manager, None, command.clone()).await {
+            Ok(_) => panic!("remembered command must not launch"),
+            Err(reason) => reason,
+        };
+        assert!(
+            refused.contains("never start automatically"),
+            "command refusal names the rule: {refused}"
+        );
+        assert!(
+            manager.source(command.id).is_none(),
+            "refused resume must leave nothing running"
+        );
+        let endpoint = lvu_core::SourceDefinition {
+            schema_version: 1,
+            id: lvu_core::SourceId(uuid::Uuid::from_u128(913)),
+            name: "remembered-http".into(),
+            acquisition: lvu_core::Acquisition::Http {
+                url: "http://127.0.0.1:9/no-contact".into(),
+                framing: lvu_core::HttpFraming::Newline,
+                reconnect: Default::default(),
+                headers: Vec::new(),
+                limits: Default::default(),
+            },
+            identity_hints: Default::default(),
+            retention: None,
+        };
+        let refused = match resume_definition(&manager, None, endpoint.clone()).await {
+            Ok(_) => panic!("remembered endpoint must not be contacted"),
+            Err(reason) => reason,
+        };
+        assert!(
+            refused.contains("never contacted automatically"),
+            "endpoint refusal names the rule: {refused}"
+        );
+        assert!(
+            manager.source(endpoint.id).is_none(),
+            "refused resume must leave nothing running"
+        );
+        for (_, stopped) in manager.shutdown().await {
             assert!(stopped.unwrap().complete);
         }
     }

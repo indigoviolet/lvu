@@ -49,6 +49,7 @@ use crate::{
     frame::{FrameDecoder, FrameError, encode_frame},
     lifetime::ViewerSet,
     protocol::*,
+    union_commit::CommitTable,
 };
 
 /// Bounded per-request dispatch: an unresponsive store call fails the
@@ -488,13 +489,40 @@ impl Drop for LifecyclePermit {
     }
 }
 
+/// Bound on the worker's verify-rendezvous park: a missed release
+/// proceeds instead of wedging the suite; the test then fails its own
+/// verdict (wrong outcome, not WouldBlock) rather than hanging.
+#[cfg(test)]
+const UNION_VERIFY_PARK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One-shot verify rendezvous ends: arrival notification plus a bounded
+/// release wait. Neither end is shareable by accident — the worker takes
+/// the whole hook under its lock.
+#[cfg(test)]
+struct UnionVerifyHook {
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 /// The executable worker: manager, store, viewers, session set, and stdin
 /// bindings. All shared mutation sits behind short-held mutexes; blocking
 /// store calls run in `spawn_blocking` so the async executors never stall.
 pub struct WorkerService {
     config: WorkerConfig,
     manager: Arc<SourceManager>,
-    store: Arc<std::sync::Mutex<WorkspaceStore>>,
+    /// Durable view/recipe persistence, or `None` when the workspace
+    /// database could not be opened (unknown future schema, corruption,
+    /// unreadable directory). Degraded mode keeps capture, progress,
+    /// presence and session alive — raw browsing works — while every
+    /// mediated store op fails loudly through `with_store` below. The
+    /// database file itself is never touched in this mode: no migration,
+    /// no reset, no journal-mode flip (see `open`). Exactly one of this
+    /// and `store_unavailable` is `Some`.
+    store: Option<Arc<std::sync::Mutex<WorkspaceStore>>>,
+    /// Why persistence is unavailable (set iff `store` is `None`). Surfaced
+    /// in the open warning (worker log) and in every mediated failure so a
+    /// degraded window always names its cause instead of failing silently.
+    store_unavailable: Option<String>,
     viewers: Mutex<ViewerSet>,
     admission: Arc<dyn AdmissionHook>,
     stdin_bindings: Mutex<HashMap<SourceId, StdinBinding>>,
@@ -521,9 +549,29 @@ pub struct WorkerService {
     #[cfg(test)]
     stop_side_effect_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    /// Test-only rendezvous inside union verification, entered with every
+    /// publication read guard held and left before settle (see
+    /// `mediated_union_commit`). Channel-based with a bounded worker-side
+    /// wait: arrival is a non-blocking send and the release parks up to
+    /// [`UNION_VERIFY_PARK_TIMEOUT`] before proceeding regardless, so a
+    /// dead or late test fails its own verdict instead of wedging the
+    /// worker. Synchronous throughout — the serving future is `Send`, so
+    /// no async wait may run while the guards live — and compiled out of
+    /// production builds entirely. (A barrier version of this hook hung
+    /// the suite: barriers have no timeout, and an un-awaited release
+    /// future parked the worker forever.)
+    #[cfg(test)]
+    union_verify_pause: std::sync::Mutex<Option<UnionVerifyHook>>,
     #[cfg(test)]
     incomplete_stop_reports: std::sync::Mutex<std::collections::HashSet<SourceId>>,
     shutdown_flag: std::sync::atomic::AtomicBool,
+    /// Bounded receipt table for remote union commits, namespaced by the
+    /// worker session above: a new session starts a new table and old
+    /// receipts never alias into it. Interior mutability throughout
+    /// (`CommitTable` methods take `&self`), so dispatch needs no extra
+    /// locking around it. Created eagerly: an admitted commit needs it
+    /// whether or not any union is currently registered.
+    commits: CommitTable,
     /// Worker lifetime nonce, minted once per `open` and published in
     /// `Welcome` and every progress answer. Windows key remote epoch on
     /// `(worker_session, generation)` so a replacement worker never reads
@@ -542,8 +590,16 @@ impl WorkerService {
         let viewer_grace = config.viewer_grace;
         let manager = SourceManager::new(config.capture_root.clone(), RuntimeConfig::default())
             .map_err(|error| format!("open source manager: {error}"))?;
-        let store = WorkspaceStore::open(config.workspace_root.clone())
-            .map_err(|error| format!("open workspace store: {error}"))?;
+        // Persistence is optional for capture: an unreadable workspace
+        // database (future schema, corruption, permissions) degrades to
+        // loud per-operation failures while capture, progress, presence
+        // and session keep working. The file itself is never opened here,
+        // so no migration or reset can touch it; local (non-worker) open
+        // paths keep their strict behavior unchanged.
+        let (store, store_unavailable) = match WorkspaceStore::open(config.workspace_root.clone()) {
+            Ok(store) => (Some(Arc::new(std::sync::Mutex::new(store))), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         // A corrupt or oversize manifest degrades to an empty session with
         // a reported diagnostic, mirroring session load discipline: it must
         // never block capture startup, and nothing is silently discarded
@@ -552,11 +608,28 @@ impl WorkerService {
             Ok(session) => (session, None),
             Err(error) => (Vec::new(), Some(error)),
         };
+        // Both diagnostics travel: degraded persistence first (it governs
+        // every mediated write below), then the session note. Either way
+        // the child logs the combined warning and serves.
+        let warning = match (store_unavailable.clone(), session_warning) {
+            (Some(degraded), Some(session)) => Some(format!(
+                "workspace store unavailable ({degraded}); capture and raw browsing continue, saves and loads will fail loudly; {session}"
+            )),
+            (Some(degraded), None) => Some(format!(
+                "workspace store unavailable ({degraded}); capture and raw browsing continue, saves and loads will fail loudly"
+            )),
+            (None, session) => session,
+        };
+        // Minted before construction so the commit table below is
+        // namespaced by the same session the handshake publishes.
+        let worker_session = uuid::Uuid::new_v4().to_string();
+        let commits = CommitTable::new(worker_session.clone());
         Ok((
             Arc::new(Self {
                 config,
                 manager: Arc::new(manager),
-                store: Arc::new(std::sync::Mutex::new(store)),
+                store,
+                store_unavailable,
                 viewers: Mutex::new(ViewerSet::new(std::time::Instant::now(), viewer_grace)),
                 admission,
                 stdin_bindings: Mutex::new(HashMap::new()),
@@ -572,11 +645,14 @@ impl WorkerService {
                 #[cfg(test)]
                 stop_side_effect_pause: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                union_verify_pause: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 incomplete_stop_reports: std::sync::Mutex::new(std::collections::HashSet::new()),
                 shutdown_flag: std::sync::atomic::AtomicBool::new(false),
-                worker_session: uuid::Uuid::new_v4().to_string(),
+                commits,
+                worker_session,
             }),
-            session_warning,
+            warning,
         ))
     }
 
@@ -642,6 +718,34 @@ impl WorkerService {
             .stop_side_effect_pause
             .lock()
             .expect("test stop pause poisoned") = pause;
+    }
+
+    #[cfg(test)]
+    fn set_union_verify_pause(&self, hook: Option<UnionVerifyHook>) {
+        *self
+            .union_verify_pause
+            .lock()
+            .expect("test union verify pause poisoned") = hook;
+    }
+
+    /// Synchronous rendezvous: arrival never blocks and the release wait
+    /// is bounded by [`UNION_VERIFY_PARK_TIMEOUT`], so this is safe to
+    /// run armed on any thread (the pinning test drives verification from
+    /// a plain driver thread, never an executor). Unarmed it returns
+    /// immediately and every other caller behaves exactly as production.
+    /// The hook is one-shot: it is taken under the lock before waiting so
+    /// a second commit can never meet a stale rendezvous.
+    #[cfg(test)]
+    fn pause_before_union_settle(&self) {
+        let hook = self
+            .union_verify_pause
+            .lock()
+            .expect("test union verify pause poisoned")
+            .take();
+        if let Some(hook) = hook {
+            let _ = hook.reached.try_send(());
+            let _ = hook.release.recv_timeout(UNION_VERIFY_PARK_TIMEOUT);
+        }
     }
 
     #[cfg(test)]
@@ -723,6 +827,14 @@ impl WorkerService {
     /// the durable write there is no cancellation point. Thus shutdown may
     /// abort a pre-publication settlement safely, or drain a wholly published
     /// one, but can never leave only half of bindings/definitions/session.
+    ///
+    /// Degraded persistence (see `store_unavailable`) never reaches the
+    /// durable write: the in-memory session still updates so progress,
+    /// presence and resume-in-memory keep working, but the manifest file
+    /// is left byte-identical and the returned warning says so loudly.
+    /// Rewriting it through the lossy `SessionSet` projection while the
+    /// workspace is incompatible would silently discard fields this build
+    /// cannot read back.
     async fn publish_started(
         &self,
         definition: &SourceDefinition,
@@ -738,11 +850,29 @@ impl WorkerService {
         if !session.iter().any(|value| value.id == definition.id) {
             session.push(definition.clone());
         }
+        if let Some(reason) = self.store_unavailable.as_deref() {
+            return Some(format!(
+                "workspace store unavailable ({reason}); capture started but the \
+                 session manifest was not rewritten — durable bytes unchanged"
+            ));
+        }
         let snapshot = session.clone();
         store_session_set(&self.config.workspace_root, &snapshot).err()
     }
 
+    /// Drop one source from the in-memory session and persist the note.
+    /// Degraded persistence refuses loudly instead (second net behind the
+    /// `stop_inner` gate, which refuses before anything stops): the
+    /// manifest note is a durable write, and rewriting it while the
+    /// workspace is incompatible is unsafe.
     async fn note_session_stopped(&self, id: SourceId) -> Result<(), String> {
+        if let Some(reason) = self.store_unavailable.as_deref() {
+            return Err(format!(
+                "workspace store unavailable ({reason}); refusing to rewrite the \
+                 session manifest — stop refused, capture still running, \
+                 durable bytes unchanged"
+            ));
+        }
         let mut session = self.session.lock().await;
         session.retain(|definition| definition.id != id);
         let snapshot = session.clone();
@@ -841,7 +971,8 @@ impl WorkerService {
     /// capture ends); only truly unknown ids are refused. Notably this
     /// offers NO publication fencing: it is a point sample, not a
     /// `lock_progress` equivalent, and must never be presented as one
-    /// (remote unions stay refused until the cross-process fence exists).
+    /// (union attestation goes through `mediated_union_commit`, which
+    /// holds the guards).
     fn poll_source_progress(&self, source_id: &str) -> Result<lvu_ingest::SourceProgress, String> {
         let id = uuid::Uuid::parse_str(source_id)
             .map(SourceId)
@@ -1252,6 +1383,20 @@ impl WorkerService {
     }
 
     async fn stop_inner(&self, id: SourceId) -> Result<(), String> {
+        // Degraded persistence refuses before anything stops: the session
+        // note below is a durable write, and rewriting the manifest while
+        // the workspace is incompatible is unsafe. Refusing up front keeps
+        // capture running (raw browsing proceeds) with the session and the
+        // manifest still agreeing; refusing after the manager stop would
+        // leave a half-applied stop. Detach and shutdown never take this
+        // path, so last-window drain and the shutdown bound are unaffected.
+        if let Some(reason) = self.store_unavailable.as_deref() {
+            return Err(format!(
+                "workspace store unavailable ({reason}); refusing to rewrite the \
+                 session manifest — stop refused, capture still running, \
+                 durable bytes unchanged"
+            ));
+        }
         self.stdin_bindings.lock().await.remove(&id);
         if let Some(handle) = self.manager.source(id)
             && !handle.progress().state.is_terminal()
@@ -1424,6 +1569,7 @@ impl WorkerService {
                     .ensure_canonical_view(
                         definition.id,
                         canonical_view_id(definition.id),
+                        Some(legacy_canonical_view_id(definition.id)),
                         "All events",
                     )
                     .map_err(|error| error.to_string())?;
@@ -1758,6 +1904,115 @@ impl WorkerService {
         }
     }
 
+    /// Admit one union commit attempt and settle it against live fences:
+    /// `commit` decides (immediate answer or a verify epoch), a `Verify`
+    /// observes current fences under held publication guards and settles
+    /// under the table lock, and the receipt binds the outcome to the
+    /// requesting attempt and session. Verification never reads unpinned
+    /// point snapshots: the attested set coexisted under the guards, like
+    /// the local path's guarded final check.
+    pub async fn mediated_union_commit(
+        &self,
+        request_id: String,
+        request: crate::union_commit::CommitRequest,
+    ) -> StoreEvent {
+        let outcome = match self.commits.commit(&request) {
+            crate::union_commit::CommitAdmission::Answer(outcome) => outcome,
+            crate::union_commit::CommitAdmission::Verify { attempt_epoch } => {
+                // Guard-pinned attestation, mirroring the local union path
+                // (`union_worker` sorts raw handles, then holds every
+                // `lock_progress` guard across the final check): handles
+                // are collected in source-id order so concurrent commits
+                // can never ABBA-deadlock, every publication read guard is
+                // acquired before any sample is taken, and the guards stay
+                // alive across `settle`. A concurrent advance then blocks
+                // at publication instead of landing between two point
+                // samples and forging a fence set that never coexisted.
+                // Handles are retained (not just their fences) so a stop
+                // between observation and write-back still resolves
+                // explicitly (missing fence) rather than against dropped
+                // state.
+                let mut ordered: Vec<(String, SourceId, lvu_ingest::SourceHandle)> = Vec::new();
+                for fence in &request.frozen {
+                    let Ok(id) = uuid::Uuid::parse_str(&fence.source_id).map(SourceId) else {
+                        continue;
+                    };
+                    let Some(handle) = self.manager.source(id) else {
+                        continue;
+                    };
+                    ordered.push((fence.source_id.clone(), id, handle));
+                }
+                ordered.sort_by_key(|(_, id, _)| id.0);
+                // Inferred `SourceProgressGuard`s: every publication read
+                // guard is held from here across the settle below.
+                let guards: Vec<_> = ordered
+                    .iter()
+                    .map(|(_, _, handle)| handle.lock_progress())
+                    .collect();
+                let current: Vec<crate::union_commit::UnionSourceFence> = ordered
+                    .iter()
+                    .zip(guards.iter())
+                    .map(
+                        |((source_id, _, _), guard)| crate::union_commit::UnionSourceFence {
+                            source_id: source_id.clone(),
+                            generation: guard.generation(),
+                            high_watermark: guard.high_watermark().map(|record| record.sequence),
+                        },
+                    )
+                    .collect();
+                // Test rendezvous: with guards held, before the settle the
+                // attempt authorizes. Production builds compile this out.
+                #[cfg(test)]
+                self.pause_before_union_settle();
+                let outcome = self.commits.settle(
+                    &request.window_id,
+                    &request.union_view_id,
+                    attempt_epoch,
+                    &request,
+                    current,
+                );
+                drop(guards);
+                outcome
+            }
+        };
+        let receipt =
+            crate::union_commit::CommitReceipt::answer(&self.worker_session, &request, outcome);
+        StoreEvent::UnionCommitted {
+            request_id,
+            receipt,
+        }
+    }
+
+    /// Read-only status for one exact attempt. Never mutates; unknown
+    /// attempts (never admitted, retired table, higher generation) report
+    /// `Unknown` so the window replays the identical request rather than
+    /// minting a fresh identity.
+    pub async fn mediated_union_status(
+        &self,
+        request_id: String,
+        window_id: String,
+        union_view_id: String,
+        candidate_generation: u64,
+        nonce: String,
+        digest: crate::union_commit::CommitDigest,
+    ) -> StoreEvent {
+        let answer = self.commits.status(
+            &window_id,
+            &union_view_id,
+            candidate_generation,
+            &nonce,
+            &digest,
+        );
+        let status = match answer {
+            crate::union_commit::StatusAnswer::Unknown => UnionCommitStatus::Unknown,
+            crate::union_commit::StatusAnswer::Pending => UnionCommitStatus::Pending,
+            crate::union_commit::StatusAnswer::Settled(outcome) => {
+                UnionCommitStatus::Settled(outcome)
+            }
+        };
+        StoreEvent::UnionStatus { request_id, status }
+    }
+
     /// Route one parsed store method: window check, size-check at the real
     /// boundary (the frame cap bounds the wire, this bounds the decoded
     /// value before any store work), then the matching mediated call under
@@ -1771,6 +2026,7 @@ impl WorkerService {
             return store_failure(
                 method,
                 format!("window identity mismatch: attached as '{attached}'"),
+                &self.worker_session,
             );
         }
         // Fixed-size methods (two short strings at most) skip the payload
@@ -1781,7 +2037,7 @@ impl WorkerService {
             StoreMethod::Recent { .. } | StoreMethod::Flush { .. } => {}
             _ => {
                 if let Err(error) = check_store_size(&method) {
-                    return store_failure(method, error.to_string());
+                    return store_failure(method, error.to_string(), &self.worker_session);
                 }
             }
         }
@@ -1891,6 +2147,29 @@ impl WorkerService {
                 // per-request transactions here replace.)
                 StoreEvent::Flushed { request_id }
             }
+            StoreMethod::UnionCommit {
+                request_id,
+                window_id: _,
+                request,
+            } => self.mediated_union_commit(request_id, request).await,
+            StoreMethod::UnionStatus {
+                request_id,
+                window_id,
+                union_view_id,
+                candidate_generation,
+                nonce,
+                digest,
+            } => {
+                self.mediated_union_status(
+                    request_id,
+                    window_id,
+                    union_view_id,
+                    candidate_generation,
+                    nonce,
+                    digest,
+                )
+                .await
+            }
         }
     }
 }
@@ -1898,8 +2177,11 @@ impl WorkerService {
 /// A refused store command, mapped explicitly per method so the caller
 /// learns which request died and why. Takes the method by value because the
 /// failure shapes need its correlation ids; covers both oversize refusals
-/// and pre-dispatch rejections like window-identity mismatches.
-fn store_failure(method: StoreMethod, reason: String) -> StoreEvent {
+/// and pre-dispatch rejections like window-identity mismatches. A refused
+/// union commit answers terminally (nothing was admitted, so a Refused
+/// receipt bound to this worker session is honest and preserves the
+/// reason); a refused status reads `Unknown` (also honest: nothing ran).
+fn store_failure(method: StoreMethod, reason: String, worker_session: &str) -> StoreEvent {
     match method {
         StoreMethod::Load {
             request_id,
@@ -1959,6 +2241,27 @@ fn store_failure(method: StoreMethod, reason: String) -> StoreEvent {
         // Only pre-store rejections (window mismatch) reach here: oversize
         // checks skip fixed-size methods, and flush commits nothing.
         StoreMethod::Flush { request_id, .. } => StoreEvent::FlushFailed { request_id, reason },
+        StoreMethod::UnionCommit {
+            request_id,
+            request,
+            ..
+        } => {
+            let receipt = crate::union_commit::CommitReceipt::answer(
+                worker_session,
+                &request,
+                crate::union_commit::CommitOutcome::Refused {
+                    reason: reason.clone(),
+                },
+            );
+            StoreEvent::UnionCommitted {
+                request_id,
+                receipt,
+            }
+        }
+        StoreMethod::UnionStatus { request_id, .. } => StoreEvent::UnionStatus {
+            request_id,
+            status: UnionCommitStatus::Unknown,
+        },
     }
 }
 
@@ -2034,6 +2337,16 @@ fn store_timeout(method: &StoreMethod, timeout: std::time::Duration) -> StoreEve
             request_id: request_id.clone(),
             reason,
         },
+        // A timed-out commit or status has no honest receipt: the attempt
+        // may still settle late. Answering `Unknown` re-derives truth
+        // through the recovery protocol instead of inventing an outcome —
+        // replaying the identical nonce joins a live attempt or re-admits
+        // a lost one, never double-admitting.
+        StoreMethod::UnionCommit { request_id, .. }
+        | StoreMethod::UnionStatus { request_id, .. } => StoreEvent::UnionStatus {
+            request_id: request_id.clone(),
+            status: UnionCommitStatus::Unknown,
+        },
     }
 }
 
@@ -2094,12 +2407,28 @@ fn source_metadata(definition: SourceDefinition) -> lvu_memory::SourceMetadata {
 /// (`lvu-app/src/memory.rs`): deterministic per-source canonical view
 /// identity. Copied rather than imported for the same cycle reason as
 /// above; it is a frozen namespace constant, and any change must update
-/// both sites together (flagged for union review).
+/// all three sites together — this constant, `canonical_view_id` below,
+/// and the application copy (flagged for union review).
 const CANONICAL_VIEW_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
     0x6c, 0x76, 0x75, 0x00, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x00, 0x6e, 0x73, 0x00, 0x00, 0x01,
 ]);
 
+/// Preferred identity for a source's canonical view. Byte-identical to the
+/// application's `lvu-app/src/memory.rs::canonical_view_id` by contract:
+/// `UUIDv5(namespace, "all-events-view:<source uuid>")`. Both sides must
+/// name the same view or restores register a duplicate "All events".
 fn canonical_view_id(source_id: SourceId) -> lvu_core::ViewId {
+    lvu_core::ViewId(uuid::Uuid::new_v5(
+        &CANONICAL_VIEW_NAMESPACE,
+        format!("all-events-view:{}", source_id.0).as_bytes(),
+    ))
+}
+
+/// Pre-parity worker scheme (`UUIDv5(namespace, raw source UUID bytes)`),
+/// kept solely so `ensure_canonical_view` can recognize and migrate rows
+/// persisted before unification. Never minted for new rows. Any change
+/// must update the application copy noted above together with this one.
+pub fn legacy_canonical_view_id(source_id: SourceId) -> lvu_core::ViewId {
     lvu_core::ViewId(uuid::Uuid::new_v5(
         &CANONICAL_VIEW_NAMESPACE,
         source_id.0.as_bytes(),
@@ -2117,7 +2446,20 @@ impl WorkerService {
         E: std::fmt::Display + Send + 'static,
         F: FnOnce(&mut WorkspaceStore) -> Result<T, E> + Send + 'static,
     {
-        let store = Arc::clone(&self.store);
+        // Degraded mode short-circuits every mediated path with the open
+        // failure as the reason: capture never needed the store, and a
+        // persistence failure must stay loud rather than become a silent
+        // empty/success. No store lock is taken on this path.
+        if let Some(reason) = self.store_unavailable.as_deref() {
+            return Err(format!(
+                "workspace store unavailable ({reason}); capture continues, persistence refused"
+            ));
+        }
+        let Some(store) = self.store.as_ref() else {
+            // Unreachable: exactly one of `store`/`store_unavailable` is set.
+            return Err("workspace store unavailable: unknown".into());
+        };
+        let store = Arc::clone(store);
         tokio::task::spawn_blocking(move || {
             let mut store = store.lock().expect("workspace store poisoned");
             operation(&mut store)
@@ -3182,7 +3524,9 @@ mod tests {
                 | StoreMethod::ImportRecipe { request_id, .. }
                 | StoreMethod::ExportRecipe { request_id, .. }
                 | StoreMethod::RecordSuggestion { request_id, .. }
-                | StoreMethod::Flush { request_id, .. } => request_id.clone(),
+                | StoreMethod::Flush { request_id, .. }
+                | StoreMethod::UnionCommit { request_id, .. }
+                | StoreMethod::UnionStatus { request_id, .. } => request_id.clone(),
             };
             let wire = encode_frame(&serde_json::to_value(&method).unwrap()).unwrap();
             client.write_all(&wire).await.unwrap();
@@ -4245,5 +4589,632 @@ mod tests {
         assert_eq!(service.snapshot_definitions().await.len(), 1);
         service.request_shutdown();
         service.shutdown().await;
+    }
+
+    /// Remote union attestation holds every source publication guard from
+    /// sampling across settle. A writer that publishes mid-verify must
+    /// contend (`WouldBlock`), never slip between point samples — and the
+    /// settlement authorizes the pinned sample while the interleaved
+    /// advance stays invisible until released. The stale/fresh controls
+    /// prove the fence still discriminates afterwards.
+    #[tokio::test]
+    async fn union_commit_fences_pin_publication_across_settle() {
+        use crate::union_commit::{CommitRequest, UnionSourceFence};
+        use lvu_ingest::publish_probe::{ExpectedPublish, PrePublishObservation, arm_filtered};
+
+        /// Poll worker progress until at least `min_records` are published.
+        async fn wait_progress(
+            service: &WorkerService,
+            id: SourceId,
+            min_records: u64,
+        ) -> lvu_ingest::SourceProgress {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let progress = service
+                    .poll_source_progress(&id.0.to_string())
+                    .expect("progress polls while pinning");
+                if progress.records >= min_records {
+                    return progress;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("waited 10s for {min_records} published records");
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        /// Bounded channel wait without parking an executor thread:
+        /// `spawn_blocking` plus an outer timeout, so a missed arrival
+        /// fails loudly instead of hanging the suite.
+        async fn wait_channel<T: Send + 'static>(
+            what: &str,
+            receive: impl FnOnce() -> T + Send + 'static,
+        ) -> T {
+            tokio::time::timeout(Duration::from_secs(25), async move {
+                tokio::task::spawn_blocking(receive)
+                    .await
+                    .expect("channel join")
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+        }
+
+        /// Exactly-once release of the worker's verify rendezvous: a
+        /// non-blocking send the worker may already have stopped waiting
+        /// for (its park is bounded). Safe to call on every path, including
+        /// `Drop`, with no thread ever left behind.
+        struct ReleaseOnDrop {
+            release: Option<std::sync::mpsc::SyncSender<()>>,
+            released: bool,
+        }
+        impl ReleaseOnDrop {
+            fn release(&mut self) {
+                if !self.released {
+                    self.released = true;
+                    if let Some(tx) = self.release.take() {
+                        let _ = tx.try_send(());
+                    }
+                }
+            }
+        }
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let root = tempfile::tempdir().expect("scratch root");
+        let log = root.path().join("pin.log");
+        // Outer deadline over the whole orchestration: every inner wait
+        // is already bounded on both sides, so this fires only on a
+        // missed synchronization — failing loudly instead of wedging the
+        // suite the way the barrier version of this test did. Drops still
+        // run (release is a non-blocking send, the arm disarms, the
+        // writer's park is bounded), so the suite survives the failure.
+        tokio::time::timeout(Duration::from_secs(240), async {
+            std::fs::write(&log, "one\n").expect("seed log");
+            let config = test_config(root.path());
+            let (service, _) =
+                WorkerService::open(config, Arc::new(AdmitAll)).expect("open serves");
+            let definition = file_definition(71, &log);
+            let source_id = match service
+                .request_start(definition.clone())
+                .await
+                .expect("capture starts")
+            {
+                StartedOutcome::Started { source_id, .. } => source_id,
+                other => panic!("expected a live capture, got {other:?}"),
+            };
+            // The seed line is fully published before the attempt is built:
+            // the frozen fence below is exact truth, not a guess.
+            let before = wait_progress(&service, source_id, 1).await;
+            let watermark = before
+                .high_watermark
+                .map(|record| record.sequence)
+                .expect("seed watermark");
+            let frozen = vec![UnionSourceFence {
+                source_id: source_id.0.to_string(),
+                generation: before.generation,
+                high_watermark: Some(watermark),
+            }];
+            let commit_request =
+                |generation: u64, nonce: &str, fences: Vec<UnionSourceFence>| CommitRequest {
+                    window_id: "w-pin".into(),
+                    union_view_id: "u-pin".into(),
+                    candidate_generation: generation,
+                    nonce: nonce.into(),
+                    digest: [0xC1; crate::union_commit::COMMIT_DIGEST_BYTES],
+                    frozen: fences,
+                };
+
+            // Freeze the worker inside verification with its publication
+            // guards held. The commit runs on a plain driver thread under a
+            // private runtime — never on an executor — so the synchronous
+            // channel rendezvous parks no shared thread, and a missed
+            // handshake fails (bounded waits) instead of wedging the suite.
+            let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            service.set_union_verify_pause(Some(UnionVerifyHook {
+                reached: reached_tx,
+                release: release_rx,
+            }));
+            let driver = Arc::clone(&service);
+            let first = commit_request(1, "n-pin-1", frozen.clone());
+            let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("driver runtime");
+                let event =
+                    runtime.block_on(driver.mediated_union_commit("req-pin-1".into(), first));
+                let _ = result_tx.send(event);
+            });
+            wait_channel("verify window with guards held", move || {
+                reached_rx.recv_timeout(Duration::from_secs(20))
+            })
+            .await
+            .expect("worker must reach the verify window");
+            let mut releaser = ReleaseOnDrop {
+                release: Some(release_tx),
+                released: false,
+            };
+
+            // The interleaved advance, aimed exactly at the pinned window: a
+            // filtered arm admits only the post-append publish, so an older
+            // periodic publish can pass through without stealing (or faking)
+            // this rendezvous.
+            let arm = arm_filtered(
+                source_id,
+                ExpectedPublish {
+                    generation: before.generation,
+                    high_watermark: Some(watermark + 1),
+                    records: before.records + 1,
+                },
+            )
+            .expect("arm publish probe");
+            // Append-only: a truncate-rewrite would exercise follower rotation
+            // handling instead of the steady-state publish this pins against.
+            {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log)
+                    .expect("open log for append");
+                file.write_all(b"two\n").expect("append while pinned");
+            }
+            let (attempt_result, mut arm) = wait_channel("appended publish attempt", move || {
+                let attempt = arm.await_attempt(Duration::from_secs(15));
+                (attempt, arm)
+            })
+            .await;
+            let attempt = attempt_result.expect("publish attempt observed");
+            // The advance contended with held guards instead of landing
+            // between two point samples: a forged fence set that never
+            // coexisted is structurally impossible here.
+            assert_eq!(
+                attempt.observation,
+                PrePublishObservation::WouldBlock,
+                "pinned verify must contend the interleaved publish: {attempt:?}"
+            );
+            assert_eq!(
+                (attempt.generation, attempt.high_watermark, attempt.records),
+                (before.generation, Some(watermark + 1), before.records + 1),
+                "hooked the appended publish, not a stray: {attempt:?}"
+            );
+            // Still invisible: the writer is parked at publication, so the
+            // pinned sample below cannot have seen the append.
+            let parked = service
+                .poll_source_progress(&source_id.0.to_string())
+                .expect("progress polls while pinned");
+            assert_eq!(
+                (parked.generation, parked.records),
+                (before.generation, before.records),
+                "parked publish must stay unpublished until released"
+            );
+
+            // Settle authorizes the pinned pre-append set, not the interleaved
+            // append the guards held out. The release is a non-blocking send:
+            // forgetting it cannot wedge anything (the worker's park is
+            // bounded), it can only fail the verdict below.
+            releaser.release();
+            let receipt = wait_channel("commit receipt", move || {
+                result_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("commit receipt arrives")
+            })
+            .await;
+            let receipt = match receipt {
+                StoreEvent::UnionCommitted { receipt, .. } => receipt,
+                other => panic!("expected a committed receipt, got {other:?}"),
+            };
+            assert!(
+                matches!(
+                    receipt.outcome,
+                    crate::union_commit::CommitOutcome::Committed { .. }
+                ),
+                "pinned fences must commit, got {:?}",
+                receipt.outcome
+            );
+            assert_eq!(
+                receipt.outcome,
+                crate::union_commit::CommitOutcome::Committed {
+                    current: frozen.clone()
+                },
+                "settlement attests the pinned sample, not the append"
+            );
+
+            // Negative control, same worker, unpaused: the old fences are now
+            // stale (the released publish advanced the source), and fresh
+            // fences commit — the fence still discriminates after pinning.
+            service.set_union_verify_pause(None);
+            // Let the parked writer publish before asserting the advance: the
+            // probe release is advisory and the writer's own park is bounded,
+            // so progress must land without any wedge.
+            arm.release();
+            let after = wait_progress(&service, source_id, before.records + 1).await;
+            assert!(
+                after.records > before.records,
+                "parked publish landed, no wedge"
+            );
+            let stale = commit_request(2, "n-pin-2", frozen);
+            match service
+                .mediated_union_commit("req-pin-2".into(), stale)
+                .await
+            {
+                StoreEvent::UnionCommitted { receipt, .. } => assert!(
+                    matches!(
+                        receipt.outcome,
+                        crate::union_commit::CommitOutcome::Stale { .. }
+                    ),
+                    "superseded fences must go stale, got {:?}",
+                    receipt.outcome
+                ),
+                other => panic!("expected a stale receipt, got {other:?}"),
+            }
+            let fresh = vec![UnionSourceFence {
+                source_id: source_id.0.to_string(),
+                generation: after.generation,
+                high_watermark: after.high_watermark.map(|record| record.sequence),
+            }];
+            match service
+                .mediated_union_commit("req-pin-3".into(), commit_request(3, "n-pin-3", fresh))
+                .await
+            {
+                StoreEvent::UnionCommitted { receipt, .. } => assert!(
+                    matches!(
+                        receipt.outcome,
+                        crate::union_commit::CommitOutcome::Committed { .. }
+                    ),
+                    "fresh fences must commit, got {:?}",
+                    receipt.outcome
+                ),
+                other => panic!("expected a committed receipt, got {other:?}"),
+            }
+            service.request_shutdown();
+            service.shutdown().await;
+        })
+        .await
+        .expect("outer pin-test deadline exceeded: failing instead of hanging");
+    }
+
+    /// Real-socket union dispatch: actual framed UnionCommit/UnionStatus
+    /// through serve/attach on this service, proving protocol wiring end
+    /// to end — bound happy receipt, original-identity status recovery,
+    /// foreign-identity refusal. Timing and deadline behavior belong to
+    /// the scripted-peer transport suite, not here: every RPC below is
+    /// answered at once by a live worker, and the harness bounds each
+    /// read. Strict store semantics hold throughout (foreign window ids
+    /// still fail at dispatch), and shutdown is clean.
+    #[tokio::test]
+    async fn real_socket_union_commit_recovery() {
+        use crate::union_commit::{CommitRequest, UnionSourceFence};
+
+        let root = tempfile::tempdir().expect("scratch root");
+        let log = root.path().join("sock.log");
+        std::fs::write(&log, "one\n").expect("seed log");
+        let config = test_config(root.path());
+        let (service, warning) =
+            WorkerService::open(config, Arc::new(AdmitAll)).expect("open serves");
+        assert!(warning.is_none());
+        let (mut client, mut decoder) = attach(&service, 203).await;
+        let window = "window-203";
+
+        // Start through the wire so the source is worker-known.
+        let definition = file_definition(87, &log);
+        let start = serde_json::to_value(WorkerRequest::RequestStart {
+            request_id: "sock-start".into(),
+            definition: serde_json::to_value(&definition).unwrap(),
+        })
+        .unwrap();
+        match rpc(&mut client, &mut decoder, start).await.as_slice() {
+            [WorkerEvent::Started { source_id, .. }] => {
+                assert_eq!(*source_id, definition.id.0.to_string())
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+        // Settle the seed through the worker's own progress before
+        // freezing the fence: exact truth, never a guess.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let progress = loop {
+            let progress = service
+                .poll_source_progress(&definition.id.0.to_string())
+                .expect("progress polls");
+            if progress.records >= 1 {
+                break progress;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("seed never published");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let watermark = progress
+            .high_watermark
+            .map(|record| record.sequence)
+            .expect("seed watermark");
+        let fence = UnionSourceFence {
+            source_id: definition.id.0.to_string(),
+            generation: progress.generation,
+            high_watermark: Some(watermark),
+        };
+        let commit_value = |request_id: &str,
+                            generation: u64,
+                            nonce: &str,
+                            digest: crate::union_commit::CommitDigest,
+                            fences: Vec<UnionSourceFence>| {
+            serde_json::to_value(StoreMethod::UnionCommit {
+                request_id: request_id.into(),
+                window_id: window.into(),
+                request: CommitRequest {
+                    window_id: window.into(),
+                    union_view_id: "u-sock".into(),
+                    candidate_generation: generation,
+                    nonce: nonce.into(),
+                    digest,
+                    frozen: fences,
+                },
+            })
+            .unwrap()
+        };
+
+        // Bound happy receipt over the wire: the receipt binds the exact
+        // attempt identity and authorizes the frozen set verbatim.
+        let events = rpc(
+            &mut client,
+            &mut decoder,
+            commit_value(
+                "sock-commit-1",
+                1,
+                "n-sock-1",
+                [0xD1; crate::union_commit::COMMIT_DIGEST_BYTES],
+                vec![fence.clone()],
+            ),
+        )
+        .await;
+        let receipt = match events.as_slice() {
+            [WorkerEvent::Store(StoreEvent::UnionCommitted { receipt, .. })] => receipt.clone(),
+            other => panic!("expected a committed receipt, got {other:?}"),
+        };
+        assert_eq!(receipt.worker_session, service.worker_session());
+        assert_eq!(receipt.window_id, window);
+        assert_eq!(receipt.union_view_id, "u-sock");
+        assert_eq!(receipt.candidate_generation, 1);
+        assert_eq!(receipt.nonce, "n-sock-1");
+        assert_eq!(
+            receipt.digest,
+            [0xD1; crate::union_commit::COMMIT_DIGEST_BYTES]
+        );
+        match receipt.outcome {
+            crate::union_commit::CommitOutcome::Committed { current } => assert_eq!(
+                current,
+                vec![fence.clone()],
+                "happy receipt authorizes the frozen set verbatim"
+            ),
+            other => panic!("expected Committed, got {other:?}"),
+        }
+
+        // Original-identity status recovery: the exact attempt re-derives
+        // its settled outcome through a status frame.
+        let status = serde_json::to_value(StoreMethod::UnionStatus {
+            request_id: "sock-status-1".into(),
+            window_id: window.into(),
+            union_view_id: "u-sock".into(),
+            candidate_generation: 1,
+            nonce: "n-sock-1".into(),
+            digest: [0xD1; crate::union_commit::COMMIT_DIGEST_BYTES],
+        })
+        .unwrap();
+        match rpc(&mut client, &mut decoder, status).await.as_slice() {
+            [WorkerEvent::Store(StoreEvent::UnionStatus { status, .. })] => assert!(
+                matches!(
+                    status,
+                    UnionCommitStatus::Settled(
+                        crate::union_commit::CommitOutcome::Committed { .. }
+                    )
+                ),
+                "original identity must re-derive its settlement: {status:?}"
+            ),
+            other => panic!("expected settled status, got {other:?}"),
+        }
+
+        // Foreign identity: same window, view and generation, but another
+        // nonce and digest — refused as a conflict without verifying or
+        // settling anything.
+        let events = rpc(
+            &mut client,
+            &mut decoder,
+            commit_value(
+                "sock-commit-2",
+                1,
+                "n-foreign",
+                [0x00; crate::union_commit::COMMIT_DIGEST_BYTES],
+                vec![fence],
+            ),
+        )
+        .await;
+        match events.as_slice() {
+            [WorkerEvent::Store(StoreEvent::UnionCommitted { receipt, .. })] => assert!(
+                matches!(
+                    receipt.outcome,
+                    crate::union_commit::CommitOutcome::NonceConflict
+                ),
+                "foreign identity must be refused, got {:?}",
+                receipt.outcome
+            ),
+            other => panic!("expected a conflict receipt, got {other:?}"),
+        }
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    /// Degraded workspace: a database the store cannot open still yields a
+    /// serving worker. Capture, progress and presence work (raw browsing);
+    /// every mediated store op fails loudly naming the cause; the database
+    /// bytes are never modified (no migration, no reset).
+    #[tokio::test]
+    async fn degraded_workspace_serves_capture_and_refuses_persistence_loudly() {
+        // Minimal SQLite header (100 bytes) with a future user_version at
+        // offset 60: new enough to parse, too new to migrate. Crafted byte
+        // by byte so the test needs no database dependency.
+        let root = tempfile::tempdir().expect("scratch root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let db = workspace.join("workspace.sqlite3");
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\x00");
+        header[60..64].copy_from_slice(&9999u32.to_be_bytes());
+        std::fs::write(&db, &header).expect("fixture database");
+        let before = std::fs::read(&db).expect("fixture bytes");
+        // A manifest carrying a field this build never emits: the lossy
+        // `SessionSet` projection would drop it on any rewrite, so its
+        // survival proves no rewrite happened — not merely an equal shape.
+        let manifest = workspace.join("session.json");
+        std::fs::write(
+            &manifest,
+            "{\"schema_version\":1,\"sources\":[],\"future_field\":\"keep-me\"}\n",
+        )
+        .expect("fixture manifest");
+        let manifest_before = std::fs::read(&manifest).expect("manifest bytes");
+        let manifest_mtime_before = std::fs::metadata(&manifest)
+            .expect("manifest metadata")
+            .modified()
+            .expect("manifest mtime");
+
+        let mut config = test_config(root.path());
+        config.workspace_root = workspace.clone();
+        let (service, warning) =
+            WorkerService::open(config, Arc::new(AdmitAll)).expect("degraded open still serves");
+        let warning = warning.expect("degraded open warns loudly");
+        assert!(
+            warning.contains("workspace store unavailable"),
+            "warning names the outage: {warning}"
+        );
+        assert!(
+            warning.contains("raw browsing continue"),
+            "warning states what still works: {warning}"
+        );
+
+        // Capture works: fresh admission through the manager.
+        let log = root.path().join("app.log");
+        std::fs::write(&log, "one\n").expect("seed log");
+        let definition = file_definition(61, &log);
+        let source_id = match service
+            .request_start(definition.clone())
+            .await
+            .expect("capture starts degraded")
+        {
+            StartedOutcome::Started {
+                source_id, warning, ..
+            } => {
+                let warning = warning.expect("degraded start warns about the manifest");
+                assert!(
+                    warning.contains("session manifest was not rewritten"),
+                    "start warning names the skipped rewrite: {warning}"
+                );
+                source_id
+            }
+            other => panic!("expected a live capture, got {other:?}"),
+        };
+        assert_eq!(source_id, definition.id);
+        // Progress works (verbatim snapshot, no store involved).
+        let progress = service
+            .poll_source_progress(&source_id.0.to_string())
+            .expect("progress polls degraded");
+        assert_eq!(progress.source_id, source_id);
+        // The manifest is byte-identical with its mtime untouched: the
+        // start above updated only the in-memory session, and the unknown
+        // future field survives, proving no lossy rewrite — not just an
+        // equal re-serialization.
+        assert_eq!(
+            std::fs::read(&manifest).expect("manifest bytes after start"),
+            manifest_before,
+            "degraded start never rewrites the session manifest"
+        );
+        assert_eq!(
+            std::fs::metadata(&manifest)
+                .expect("manifest metadata after start")
+                .modified()
+                .expect("manifest mtime after start"),
+            manifest_mtime_before,
+            "degraded start never touches the manifest"
+        );
+        // Stop is refused loudly instead of persisting an unsafe note:
+        // capture keeps running (raw browsing proceeds) and the manifest
+        // stays byte-identical.
+        let refused = service
+            .request_stop(source_id)
+            .await
+            .expect_err("degraded stop must refuse, not persist");
+        assert!(
+            refused.contains("refusing to rewrite the session manifest"),
+            "stop refusal names the hazard: {refused}"
+        );
+        let progress = service
+            .poll_source_progress(&source_id.0.to_string())
+            .expect("capture still runs after refused stop");
+        assert_eq!(progress.source_id, source_id);
+        assert_eq!(
+            std::fs::read(&manifest).expect("manifest bytes after refused stop"),
+            manifest_before,
+            "refused stop leaves durable bytes unchanged"
+        );
+
+        // Every mediated store op fails loudly naming the cause — never a
+        // silent empty, never a fake success.
+        match service.mediated_recent("r1".into()).await {
+            StoreEvent::RecentFailed { reason, .. } => assert!(
+                reason.contains("workspace store unavailable"),
+                "recent names the outage: {reason}"
+            ),
+            other => panic!("recent must fail loudly, got {other:?}"),
+        }
+        // The database file is byte-identical: no migration attempted, no
+        // reset, no journal-mode flip — degraded mode never opens it.
+        assert_eq!(
+            std::fs::read(&db).expect("fixture bytes after"),
+            before,
+            "degraded mode never modifies the database"
+        );
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod canonical_parity_tests {
+    use super::{canonical_view_id, legacy_canonical_view_id};
+
+    /// The worker's canonical view identity must be byte-identical to the
+    /// application's `lvu-app/src/memory.rs::canonical_view_id`:
+    /// `UUIDv5(namespace, "all-events-view:<source uuid>")`. Goldens below
+    /// are computed independently (Python uuid module); any drift reopens
+    /// the duplicate-"All events" split this parity closed.
+    #[test]
+    fn canonical_view_id_matches_app_scheme_exactly() {
+        let cases = [
+            (
+                "00000000-0000-0000-0000-000000000001",
+                "6d2f8ced-63b8-5ee8-a5b0-d91adae2d561",
+            ),
+            (
+                "00000000-0000-0000-0000-00000000002a",
+                "b93b2297-006e-5ce7-bc45-1178614b72ae",
+            ),
+        ];
+        for (source, expected) in cases {
+            let source_id =
+                lvu_core::SourceId(uuid::Uuid::parse_str(source).expect("fixture uuid"));
+            let expected_id =
+                lvu_core::ViewId(uuid::Uuid::parse_str(expected).expect("fixture uuid"));
+            assert_eq!(
+                canonical_view_id(source_id),
+                expected_id,
+                "worker canonical id must equal the app scheme for {source}"
+            );
+            assert_ne!(
+                legacy_canonical_view_id(source_id),
+                expected_id,
+                "legacy scheme must differ (it is only a migration key)"
+            );
+        }
     }
 }

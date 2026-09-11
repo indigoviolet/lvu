@@ -266,6 +266,26 @@ pub enum StoreMethod {
         request_id: String,
         window_id: String,
     },
+    /// Union commit attempt: carries the window's fully materialized
+    /// candidate (routing scalars + frozen fences + nonce + digest, never
+    /// rows). The worker admits or answers immediately, then the caller
+    /// verifies fences and settles; see `union_commit::CommitTable`.
+    UnionCommit {
+        request_id: String,
+        window_id: String,
+        request: crate::union_commit::CommitRequest,
+    },
+    /// Read-only status for one exact attempt: needs the attempt identity
+    /// (generation, nonce, digest) but not the frozen fences — the digest
+    /// binds them. Never mutates worker state.
+    UnionStatus {
+        request_id: String,
+        window_id: String,
+        union_view_id: String,
+        candidate_generation: u64,
+        nonce: String,
+        digest: crate::union_commit::CommitDigest,
+    },
 }
 
 /// Field-identical to `lvu::RecipeRequestMeta`; collapses to it when union
@@ -311,7 +331,9 @@ impl StoreMethod {
             | StoreMethod::ImportRecipe { window_id, .. }
             | StoreMethod::ExportRecipe { window_id, .. }
             | StoreMethod::RecordSuggestion { window_id, .. }
-            | StoreMethod::Flush { window_id, .. } => window_id,
+            | StoreMethod::Flush { window_id, .. }
+            | StoreMethod::UnionCommit { window_id, .. }
+            | StoreMethod::UnionStatus { window_id, .. } => window_id,
         }
     }
 
@@ -331,7 +353,9 @@ impl StoreMethod {
             | StoreMethod::ImportRecipe { request_id, .. }
             | StoreMethod::ExportRecipe { request_id, .. }
             | StoreMethod::RecordSuggestion { request_id, .. }
-            | StoreMethod::Flush { request_id, .. } => request_id,
+            | StoreMethod::Flush { request_id, .. }
+            | StoreMethod::UnionCommit { request_id, .. }
+            | StoreMethod::UnionStatus { request_id, .. } => request_id,
         }
     }
 }
@@ -431,9 +455,34 @@ pub enum StoreEvent {
         request_id: String,
         reason: String,
     },
+    /// Terminal-or-pending answer to one commit attempt. `Pending` means
+    /// admitted and verifying (replay the same nonce to observe
+    /// settlement); every other outcome is terminal for the attempt.
+    UnionCommitted {
+        request_id: String,
+        receipt: crate::union_commit::CommitReceipt,
+    },
+    /// Read-only status for one exact attempt, mirroring
+    /// `union_commit::StatusAnswer` 1:1. The table type stays worker-side
+    /// (its internals are not wire); this DTO crosses instead.
+    UnionStatus {
+        request_id: String,
+        status: UnionCommitStatus,
+    },
     Fatal {
         reason: String,
     },
+}
+
+/// Field-identical to `union_commit::StatusAnswer`; collapses to it if that
+/// type ever gains wire derives. `Unknown` names a never-admitted attempt
+/// (replay the identical request); `Pending` keeps polling; `Settled`
+/// carries the terminal outcome the receipt is then synthesized from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnionCommitStatus {
+    Unknown,
+    Pending,
+    Settled(crate::union_commit::CommitOutcome),
 }
 
 /// Enforce the transport byte budget on an encoded store method, on send

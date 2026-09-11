@@ -2479,7 +2479,7 @@ fn canonical_view_is_created_beside_existing_views_and_never_adopts_them() {
 
     let preferred = ViewId::new();
     let canonical = store
-        .ensure_canonical_view(source_id, preferred, "All events")
+        .ensure_canonical_view(source_id, preferred, None, "All events")
         .unwrap();
     assert_eq!(canonical.id, preferred);
     assert_eq!(canonical.role, ViewRole::Canonical);
@@ -2498,7 +2498,7 @@ fn canonical_view_is_created_beside_existing_views_and_never_adopts_them() {
 
     // Idempotent: a second call adopts the role metadata, not a fresh row.
     let again = store
-        .ensure_canonical_view(source_id, ViewId::new(), "All events")
+        .ensure_canonical_view(source_id, ViewId::new(), None, "All events")
         .unwrap();
     assert_eq!(again.id, canonical.id);
     assert_eq!(
@@ -2549,7 +2549,7 @@ fn an_occupied_canonical_identity_yields_a_new_one_rather_than_a_takeover() {
         .unwrap();
 
     let canonical = store
-        .ensure_canonical_view(source_id, occupied, "All events")
+        .ensure_canonical_view(source_id, occupied, None, "All events")
         .unwrap();
     assert_ne!(canonical.id, occupied);
     assert_eq!(canonical.role, ViewRole::Canonical);
@@ -3201,4 +3201,118 @@ fn a_revision_carries_its_saved_date_and_an_older_one_reads_as_undated() {
         listed[0].0.schema_version,
         lvu_memory::RECIPE_SCHEMA_VERSION
     );
+}
+
+/// A legacy (pre-parity worker-scheme) canonical row folds into the
+/// preferred identity by rename: version and state travel with the row,
+/// so save CAS chains continue uninterrupted and exactly one canonical
+/// row remains. Seeded through `ensure` itself: `save_source_and_view`
+/// does not persist roles, so only `ensure`/`create_view` can mint a
+/// canonical row in tests.
+#[test]
+fn legacy_canonical_row_migrates_by_rename_preserving_version() {
+    let root = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let source_id = SourceId::new();
+    let legacy = ViewId::new();
+    let preferred = ViewId::new();
+    let dummy = private_view(ViewId::new(), source_id, "dummy", 0);
+    store
+        .save_source_and_view(&metadata(source_id, "p", "c", 1, &[]), &dummy, None)
+        .unwrap();
+    let seeded = store
+        .ensure_canonical_view(source_id, legacy, None, "All events")
+        .unwrap();
+    assert_eq!(seeded.id, legacy);
+    // Advance the version chain twice so the rename has something real
+    // to carry.
+    for expected in 0..2u64 {
+        let mut current = store.get_view(legacy).unwrap().unwrap();
+        current.applied_search = "kept".into();
+        store.update_view(&current, expected).unwrap();
+    }
+
+    let canonical = store
+        .ensure_canonical_view(source_id, preferred, Some(legacy), "All events")
+        .unwrap();
+    assert_eq!(canonical.id, preferred);
+    assert_eq!(canonical.version, 2, "rename preserves the version chain");
+    assert_eq!(canonical.applied_search, "kept", "rename preserves state");
+    assert_eq!(canonical.role, ViewRole::Canonical);
+    let rows = store.working_views_for_source(source_id, 16).unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|view| view.role == ViewRole::Canonical)
+            .count(),
+        1,
+        "exactly one canonical row remains"
+    );
+}
+
+/// Both schemes present (controller-saved preferred plus legacy worker
+/// row): the legacy row drops in favor of the survivor — never two
+/// canonical views for one source, never a destroyed survivor. Order
+/// independent: whichever row the lookup returns first, the outcome is
+/// one preferred row.
+#[test]
+fn legacy_and_preferred_canonical_rows_fold_without_duplication() {
+    let root = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let source_id = SourceId::new();
+    let legacy = ViewId::new();
+    let preferred = ViewId::new();
+    let dummy = private_view(ViewId::new(), source_id, "dummy", 0);
+    store
+        .save_source_and_view(&metadata(source_id, "p", "c", 1, &[]), &dummy, None)
+        .unwrap();
+    store
+        .ensure_canonical_view(source_id, legacy, None, "All events")
+        .unwrap();
+    let mut survivor = private_view(preferred, source_id, "All events", 2);
+    survivor.role = ViewRole::Canonical;
+    store.create_view(&survivor).unwrap();
+    let mut survivor = store.get_view(preferred).unwrap().unwrap();
+    survivor.applied_search = "survivor-state".into();
+    store.update_view(&survivor, 0).unwrap();
+
+    let canonical = store
+        .ensure_canonical_view(source_id, preferred, Some(legacy), "All events")
+        .unwrap();
+    assert_eq!(canonical.id, preferred);
+    assert_eq!(canonical.version, 1, "survivor keeps its version");
+    assert_eq!(canonical.applied_search, "survivor-state");
+    let rows = store.working_views_for_source(source_id, 16).unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|view| view.role == ViewRole::Canonical)
+            .count(),
+        1,
+        "no silent duplication"
+    );
+}
+
+/// An unrecognized existing canonical row is preserved untouched: only a
+/// positively identified legacy row migrates, never a working definition
+/// the migrator cannot classify.
+#[test]
+fn unrecognized_canonical_row_is_preserved_not_folded() {
+    let root = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let source_id = SourceId::new();
+    let foreign = ViewId::new();
+    let preferred = ViewId::new();
+    let unrelated = ViewId::new();
+    let dummy = private_view(ViewId::new(), source_id, "dummy", 0);
+    store
+        .save_source_and_view(&metadata(source_id, "p", "c", 1, &[]), &dummy, None)
+        .unwrap();
+    store
+        .ensure_canonical_view(source_id, foreign, None, "All events")
+        .unwrap();
+
+    let canonical = store
+        .ensure_canonical_view(source_id, preferred, Some(unrelated), "All events")
+        .unwrap();
+    assert_eq!(canonical.id, foreign, "unclassified row preserved");
+    assert!(store.get_view(preferred).unwrap().is_none());
 }

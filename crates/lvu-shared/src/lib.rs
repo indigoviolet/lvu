@@ -53,7 +53,7 @@ pub use spawn::{SpawnSpec, WORKER_CHILD_FLAG, exit};
 pub use tail::{Continuity, FileIdentity, FileJournalTail, RecordAnchor, TailStatus, classify};
 pub use worker::{
     AdmissionHook, AdmissionVerdict, SessionSet, StartedOutcome, StdinNoteError, WorkerConfig,
-    WorkerService, load_session_set, store_session_set,
+    WorkerService, legacy_canonical_view_id, load_session_set, store_session_set,
 };
 
 /// Largest single control-channel message, including framing. Bulk data
