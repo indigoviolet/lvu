@@ -32,12 +32,12 @@ use crate::app::{
 };
 use crate::command_palette::CommandId;
 use crate::component::{Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface};
-use crate::dialog_controls::DialogStyles;
+use crate::dialog_controls::{ActionRow, DialogStyles, render_role_button, stable_action_rows};
+use crate::dialog_layout::{DialogSpec, PresentationKind, plan_list, policy_size, resolve_dialog};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit};
 use crate::ui::{
-    InputSurface, MessageState, dialog_frame_regions, help_rows, message_rows, packed_button_rows,
-    render_action_row, render_help_text, render_message, render_scrollbar,
-    render_segmented_control, truncated, wrap_sentence,
+    InputSurface, MessageState, render_help_text, render_message, render_responsive_frame,
+    render_scrollbar, render_segmented_control, truncated, wrap_sentence,
 };
 
 /// The legacy `MAX_INVESTIGATION_REQUESTS`.
@@ -805,24 +805,62 @@ fn pane_content(
     )
 }
 
-/// A transcript line is prose and wraps; a saved row is a row and does not.
-fn pane_rows(lines: &[String], saved_mode: bool, width: u16) -> usize {
-    if saved_mode {
-        return lines.len();
-    }
-    lines
-        .iter()
-        .map(|line| wrap_sentence(line, usize::from(width), usize::MAX).len())
-        .sum()
+/// Stable LongContent budgets for Investigation (see `draw`). The header
+/// band is always reserved so the arrival of saved sessions never moves the
+/// frame; the message keeps its two-row maximum and the actions keep the
+/// stable width budget across Start/Resume/Send/Open/New-snapshot states.
+fn investigation_spec_for(area: Rect) -> DialogSpec {
+    // Stable maximum action labels across stages so the band never moves as
+    // the primary relabels or Open/New-snapshot appear. Display width via
+    // button_width, capped at two rows.
+    let max_labels = ["New snapshot", "Resume", "Open"];
+    let (policy_w, _) = policy_size(area, PresentationKind::LongContent);
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let action_rows = stable_action_rows(estimate, &max_labels).clamp(1, 2);
+    // The help budget covers the longer of the two help sentences so a
+    // session binding never moves the tail. The body minimum holds the
+    // compacted question, provenance and a two-row transcript viewport, so
+    // height pressure sheds the help band (first in the degradation order)
+    // before it can starve the pane.
+    let help_rows = [
+        "Follow-ups reuse the fixed snapshot this session started from.",
+        "Start an investigation on a fixed snapshot of this view; follow-ups reuse it.",
+    ]
+    .iter()
+    .map(|sentence| {
+        wrap_sentence(sentence, usize::from(estimate), 2)
+            .len()
+            .min(2) as u16
+    })
+    .max()
+    .unwrap_or(0);
+    DialogSpec::new(
+        PresentationKind::LongContent,
+        1,
+        5,
+        2,
+        help_rows,
+        action_rows,
+    )
 }
 
-/// §12.18 Investigation 🧠 — class L on the shared anatomy: title, the
-/// `New │ Saved` segmented header, the Question field with provenance and the
-/// transcript pane, one message row, help, and the actions last.
+fn title_for(ascii: bool) -> String {
+    if ascii {
+        "Investigation Agent".to_owned()
+    } else {
+        "Investigation 🧠".to_owned()
+    }
+}
+
+/// §12.18 Investigation 🧠 on the shared anatomy: title, the `New │ Saved`
+/// segmented header, the Question field with provenance and the transcript
+/// pane, one message row, help, and the actions last.
 ///
-/// The body is the pre-conversion `ui::render_investigation` unchanged; only
-/// its boundary moved. Geometry it used to publish into the global
-/// `HitRegions` is handed back to the component instead (§5.1).
+/// New/Saved, provenance, transcript and saved list share one responsive
+/// geometry that never resizes as content grows: the frame is policy-only
+/// and the transcript/saved list scroll inside their pane. Geometry the
+/// dialog used to publish into the global `HitRegions` is handed back to the
+/// component instead (§5.1).
 fn draw(
     state: &mut InvestigationDialogState,
     frame: &mut Frame<'_>,
@@ -834,14 +872,12 @@ fn draw(
 ) -> Surface {
     use crate::app::InvestigationControl as C;
     use crate::app::InvestigationStage as Stage;
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let theme = ctx.theme;
     let styles = DialogStyles::new(theme);
     let ascii = ctx.ascii;
     let mut caret = None;
     let dialog = state.clone();
 
-    let width = content_width(area, DialogClass::L);
     let editable = matches!(
         dialog.stage,
         Stage::Input | Stage::Conversation | Stage::Error
@@ -897,34 +933,51 @@ fn draw(
     }
     let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
 
+    // Stable LongContent budgets: outer size is policy-only, never transcript
+    // length or saved-list size. The header band is always reserved so
+    // New/Saved arrival never moves the frame; the message keeps its two-row
+    // maximum and the actions keep the stable width budget. Hand-rolled row
+    // assignment below is presentation-only folding, never query membership
+    // (AGENTS.md).
+    let spec = investigation_spec_for(area);
+    let Ok(resolved) = resolve_dialog(area, &spec, 1, &action_labels, Some(0), None) else {
+        // Below the floor the tiny fallback owns the frame; stay open with
+        // nothing drawn, as the palette does. The transcript is not
+        // focusable with no viewport to scroll.
+        state.review_scroll_limit = 0;
+        if state.focus == C::More {
+            state.focus = if editable { C::Submit } else { C::Prompt };
+        }
+        return Surface {
+            popup: Rect::default(),
+            interior: Rect::default(),
+            caret: None,
+            scrollable: false,
+            text_focus: false,
+        };
+    };
+    // Shared frame so geometry and paint share one definition; compactness
+    // comes from the geometry, never recomputed from the frame.
+    render_responsive_frame(frame, &resolved, &title_for(ascii), ctx.active, theme);
+    let mut surface = Surface {
+        popup: resolved.frame,
+        interior: resolved.interior,
+        caret: None,
+        // Derived below from real pane overflow, never blanket true.
+        scrollable: false,
+        text_focus: editable && dialog.focus == C::Prompt,
+    };
+    let body = resolved.body.viewport;
+    if body.width == 0 || body.height == 0 {
+        return surface;
+    }
+    let message_rect = resolved.message;
+    let help_rect = resolved.help;
+    let action_geom = resolved.actions.clone();
+    let roomy = !resolved.compact;
+
     let segmented = !dialog.items.is_empty();
-    let (heading, count, lines) = pane_content(&dialog, saved_mode, help, ascii);
-    // Measure the pane at the width it will get, so the dialog asks for the
-    // rows it will actually use rather than for the class maximum (§5.2).
-    let pane_width = width
-        .saturating_sub(crate::dialog_layout::PANE_INDENT)
-        .max(1);
-    let measured = pane_rows(&lines, saved_mode, pane_width);
-    let provenance_rows = u16::from(provenance.is_some());
-    let content = DialogContent {
-        header: u16::from(segmented),
-        // Question, provenance, a blank row, the pane heading, its rows.
-        body: QUESTION_ROWS
-            .saturating_add(provenance_rows)
-            .saturating_add(2)
-            .saturating_add(u16::try_from(measured).unwrap_or(u16::MAX)),
-        message: message_rows(&sentence, width).max(1),
-        help: help_rows(help_row, width),
-        actions: packed_button_rows(width, &action_labels),
-    };
-    let title = if ascii {
-        "Investigation Agent"
-    } else {
-        "Investigation 🧠"
-    };
-    let regions = dialog_frame_regions(frame, area, DialogClass::L, title, &content, theme);
-    let popup = regions.popup;
-    if segmented && regions.header.height > 0 {
+    if segmented && resolved.header.height > 0 {
         let labels = ["New", "Saved"];
         let active = usize::from(saved_mode);
         let focused = match dialog.focus {
@@ -933,7 +986,7 @@ fn draw(
             _ => None,
         };
         for (index, rect) in
-            render_segmented_control(frame, regions.header, &labels, active, focused, theme)
+            render_segmented_control(frame, resolved.header, &labels, active, focused, theme)
                 .into_iter()
                 .enumerate()
         {
@@ -941,17 +994,37 @@ fn draw(
         }
     }
 
-    let body = regions.body;
-    if body.width == 0 || body.height == 0 {
-        return Surface {
-            popup,
-            interior: regions.interior,
-            caret: None,
-            scrollable: false,
-            text_focus: false,
-        };
-    }
-    let question_rows = QUESTION_ROWS.min(body.height);
+    // The Question field and provenance stay fixed at the top of the body
+    // while the transcript/saved pane scrolls beneath them, so the input and
+    // every action stay reachable however long the conversation grows. The
+    // pane keeps at least its heading and two viewport rows while there is
+    // a body to split — a one-row scrollbar never shows its `▼` — and the
+    // question field compacts first (its caret line stays visible through
+    // its own scroll), so review content stays reachable at compact sizes.
+    const PANE_MIN: u16 = 3;
+    let provenance_rows = u16::from(provenance.is_some()).min(body.height.saturating_sub(1));
+    let question_rows = QUESTION_ROWS.min(body.height).min(
+        body.height
+            .saturating_sub(provenance_rows)
+            .saturating_sub(PANE_MIN)
+            .max(1),
+    );
+    let gap = u16::from(roomy).min(
+        body.height
+            .saturating_sub(question_rows)
+            .saturating_sub(provenance_rows)
+            .saturating_sub(PANE_MIN),
+    );
+    let fixed_end = question_rows
+        .saturating_add(provenance_rows)
+        .saturating_add(gap);
+    let pane_area = Rect::new(
+        body.x,
+        body.y.saturating_add(fixed_end),
+        body.width,
+        body.height.saturating_sub(fixed_end),
+    );
+
     let question = Rect::new(
         body.x.saturating_add(LABEL_WIDTH),
         body.y,
@@ -1006,32 +1079,60 @@ fn draw(
         caret = Some((x, y));
     }
 
-    let mut cursor_y = body.y.saturating_add(question_rows);
-    if let Some(provenance) = &provenance
-        && cursor_y < body.bottom()
-    {
-        frame.render_widget(
-            Paragraph::new(truncated(provenance, usize::from(body.width)))
-                .style(styles.description),
-            Rect::new(body.x, cursor_y, body.width, 1),
-        );
-        cursor_y = cursor_y.saturating_add(1);
-    }
-    // One blank row before the pane (§4.1), when there is one to spare.
-    if cursor_y.saturating_add(2) < body.bottom() {
-        cursor_y = cursor_y.saturating_add(1);
+    if let Some(provenance) = &provenance {
+        let y = body.y.saturating_add(question_rows);
+        if provenance_rows > 0 {
+            frame.render_widget(
+                Paragraph::new(truncated(provenance, usize::from(body.width)))
+                    .style(styles.description),
+                Rect::new(body.x, y, body.width, 1),
+            );
+        }
     }
 
-    let pane_area = Rect::new(
-        body.x,
-        cursor_y,
-        body.width,
-        body.bottom().saturating_sub(cursor_y),
-    );
-    let rects = pane(
+    let (heading, count, lines) = pane_content(&dialog, saved_mode, help, ascii);
+    // One authoritative list plan over the pane rows: the same rects drive
+    // paint, selection, scrollbar and mouse. A transcript line is prose and
+    // wraps; a saved row is a row and does not. The wrap accounts for the
+    // scrollbar column the plan takes on overflow, measured again once it is
+    // known, so paint never truncates a line the measure claimed fits.
+    let viewport_h = pane_area
+        .height
+        .saturating_sub(u16::from(pane_area.height > 1));
+    let wrap_pane = |text_width: usize| -> Vec<(String, bool)> {
+        lines
+            .iter()
+            .enumerate()
+            .flat_map(|(index, line)| {
+                let selected = saved_mode && index == dialog.selected;
+                if saved_mode {
+                    vec![(line.clone(), selected)]
+                } else {
+                    wrap_sentence(line, text_width.max(1), usize::MAX)
+                        .into_iter()
+                        .map(|part| (part, false))
+                        .collect()
+                }
+            })
+            .collect()
+    };
+    let pane_probe_width = usize::from(
+        pane_area
+            .width
+            .saturating_sub(crate::dialog_layout::PANE_INDENT),
+    )
+    .max(1);
+    let mut wrapped_lines = wrap_pane(pane_probe_width);
+    if wrapped_lines.len() > usize::from(viewport_h) && pane_probe_width > 1 {
+        wrapped_lines = wrap_pane(pane_probe_width.saturating_sub(1).max(1));
+    }
+    let total = wrapped_lines.len().max(1);
+    let rects = plan_list(
         pane_area,
         u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
-        lines.len(),
+        total,
+        None,
+        usize::from(dialog.review_scroll),
     );
     if rects.heading.height > 0 {
         frame.render_widget(
@@ -1046,43 +1147,33 @@ fn draw(
             frame.render_widget(Paragraph::new(count).style(styles.description), rects.count);
         }
     }
-    let wrapped_lines: Vec<(String, bool)> = lines
+    let limit = total.saturating_sub(rects.row_rects.len());
+    let scroll = rects.first_row.min(limit);
+    for (offset, (line, selected)) in wrapped_lines
         .iter()
+        .skip(scroll)
+        .take(rects.row_rects.len().max(1))
         .enumerate()
-        .flat_map(|(index, line)| {
-            let selected = saved_mode && index == dialog.selected;
-            if saved_mode {
-                vec![(truncated(line, usize::from(rects.viewport.width)), selected)]
-            } else {
-                wrap_sentence(line, usize::from(rects.viewport.width.max(1)), usize::MAX)
-                    .into_iter()
-                    .map(|part| (part, false))
-                    .collect()
-            }
-        })
-        .collect();
-    let visible = usize::from(rects.viewport.height);
-    let limit = wrapped_lines.len().saturating_sub(visible);
-    let scroll = usize::from(dialog.review_scroll).min(limit);
-    for (offset, (line, selected)) in wrapped_lines.iter().skip(scroll).take(visible).enumerate() {
+    {
+        let Some(row) = rects.row_rects.get(offset).copied() else {
+            continue;
+        };
         frame.render_widget(
-            Paragraph::new(line.clone()).style(if *selected {
+            Paragraph::new(truncated(line, usize::from(row.width))).style(if *selected {
                 styles.selection
             } else {
                 styles.description
             }),
-            Rect::new(
-                rects.viewport.x,
-                rects.viewport.y.saturating_add(offset as u16),
-                rects.viewport.width,
-                1,
-            ),
+            row,
         );
     }
     if let Some(bar) = rects.scrollbar {
         render_scrollbar(frame, bar, scroll, limit, theme, ascii);
+        surface.scrollable = true;
     }
-    *body_hit = Some(rects.viewport);
+    if pane_area.height > 0 {
+        *body_hit = Some(rects.viewport);
+    }
 
     // Geometry settled during the draw is state: the scroll limit, and the
     // focus the render normalised.
@@ -1092,28 +1183,39 @@ fn draw(
         state.focus = if editable { C::Submit } else { C::Prompt };
     }
 
-    render_message(
-        frame,
-        regions.message,
-        message_state,
-        &sentence,
-        theme,
-        ascii,
-    );
-    render_help_text(frame, regions.help, help_row, theme);
+    render_message(frame, message_rect, message_state, &sentence, theme, ascii);
+    render_help_text(frame, help_rect, help_row, theme);
+    // §3: the actions come last, after every field they act on. Painted from
+    // the shared band plan so paint and mouse share rects; one filled
+    // default, never a destructive one.
     let focused = actions
         .iter()
         .position(|(_, control)| *control == dialog.focus);
-    for (index, rect) in
-        render_action_row(frame, regions.actions, &action_labels, focused, &[], theme)
-    {
-        controls_hit.push((rect, actions[index].1));
+    let action_row = ActionRow {
+        labels: &action_labels,
+        default: Some(0),
+        destructive: &[],
+        focused,
+    };
+    for (index, rect) in action_geom.buttons.iter().copied() {
+        let role = action_row.role(index);
+        render_role_button(
+            frame,
+            rect,
+            action_labels[index],
+            role,
+            focused == Some(index),
+            theme,
+        );
+        if let Some((_, control)) = actions.get(index) {
+            controls_hit.push((rect, *control));
+        }
     }
     Surface {
-        popup,
-        interior: regions.interior,
+        popup: surface.popup,
+        interior: surface.interior,
         caret,
-        scrollable: limit > 0,
+        scrollable: surface.scrollable,
         text_focus: editable && dialog.focus == C::Prompt,
     }
 }
