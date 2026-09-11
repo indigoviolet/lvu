@@ -126,13 +126,21 @@ def union_record_id_and_pins(app, marker, expected_pins, restored_markers):
     app.send(b"/")
     app.wait_for("Filter")
     app.send(b"\x7f" * len(marker))
+    # Wait for the dialog's own accepted-empty status: the restored rows sit
+    # behind the open dialog until it closes, so asserting them here flakes
+    # with the responsive frame covering the log.
+    app.wait_until(
+        lambda text: "No filter" in text,
+        "pin inspection search cleared and accepted",
+        timeout=15,
+    )
+    app.send(b"\x1b")
+    wait_closed(app, "┌ Filter", "cleared pin inspection search closed")
     app.wait_until(
         lambda text: all(value in text for value in restored_markers),
         "pin inspection search restored exact-key membership",
         timeout=15,
     )
-    app.send(b"\x1b")
-    wait_closed(app, "┌ Filter", "cleared pin inspection search closed")
     return stable_id
 
 
@@ -150,6 +158,8 @@ def run(binary):
         args = [str(api), str(worker), "--capture-dir", str(root / "capture")]
         app = PtyApp(binary, args, width=160, height=36, cwd=root, environment=env)
         try:
+            # Never switch views before capture lands: the switch loop cannot
+            # find rows the app has not read yet.
             app.wait_for("api accepted")
 
             # Each differently named raw key becomes the same structural,
@@ -224,6 +234,7 @@ def run(binary):
 
             stop(app)
             app = PtyApp(binary, args, width=160, height=36, cwd=root, environment=env)
+            app.wait_for("worker queued")
             switch_to_union(app, "worker queued")
             restored = app.wait_until(
                 lambda text: "› Union of" in text

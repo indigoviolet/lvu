@@ -124,26 +124,33 @@ def run(binary):
                 timeout=10,
             )
             app.send(b"\x1b")
+            wait_closed(app, "┌ Filter", "filter closed after search")
             narrowed = app.wait_until(
                 lambda text: '"svc":"worker"' in text,
                 "worker rows remain",
                 timeout=10,
             )
             assert '"svc":"api"' not in narrowed, ("api rows filtered out", narrowed)
-            # The line-120 Esc already closed the editor: Esc at the base
+            # The Esc above already closed the editor: Esc at the base
             # screen quits by design, so no dismissal keypress belongs here.
-            wait_closed(app, "┌ Filter", "filter closed after search")
             # Clear back to the full merge for the grouping step.
             app.send(b"/")
             app.wait_for("Filter")
             app.send(b"\x7f" * len("worker"))
+            # Wait for the dialog's own accepted-empty status: the restored
+            # rows sit behind the open dialog until it closes.
+            app.wait_until(
+                lambda text: "No filter" in text,
+                "clear applied back to the full merge",
+                timeout=10,
+            )
+            app.send(b"\x1b")
+            wait_closed(app, "┌ Filter", "filter editor closed")
             app.wait_until(
                 lambda text: '"svc":"api"' in text and '"svc":"worker"' in text,
                 "clear restores the merge",
                 timeout=10,
             )
-            app.send(b"\x1b")
-            wait_closed(app, "┌ Filter", "filter editor closed")
 
             # --- File-follow progress refreshes the accepted union itself. -
             # No view edit or keypress occurs between the append and this
@@ -193,6 +200,14 @@ def run(binary):
             stop(app)
             app = PtyApp(binary, args, width=150, height=32, cwd=root, environment=env)
             app.wait_for('"svc":"api"')
+            # Wait for the restored view list to name the union before
+            # cycling: membership fills asynchronously after the item exists,
+            # and blind cycling can lap past it while it is still restoring.
+            app.wait_until(
+                lambda text: "Union of" in text,
+                "restored sidebar names the union",
+                timeout=20,
+            )
             found = False
             for _ in range(8):
                 app.drain()

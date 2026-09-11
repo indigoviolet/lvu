@@ -177,6 +177,9 @@ def run(binary: pathlib.Path) -> None:
         args = [str(api), str(worker), "--capture-dir", str(root / "capture")]
         app = PtyApp(binary, args, width=150, height=32, cwd=root, environment=env)
         try:
+            # Never switch views before capture lands: the switch loop cannot
+            # find rows the app has not read yet.
+            app.wait_for(API_DERIVED)
             switch_to(app, API_DERIVED, "All events")
             add_severity_enrichment(app)
             switch_to(app, API_DERIVED, "Enriched")
@@ -221,6 +224,7 @@ def run(binary: pathlib.Path) -> None:
 
             stop(app)
             app = PtyApp(binary, args, width=150, height=32, cwd=root, environment=env)
+            app.wait_for(API_DERIVED)
             switch_to(app, API_DERIVED, "Union of")
             app.wait_until(
                 lambda text: API_DERIVED in text
