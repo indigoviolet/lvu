@@ -52,9 +52,24 @@ def run(binary: pathlib.Path) -> None:
         )
         try:
             app.wait_for(f"request {RECORDS - 1:03d} done")
+            # Readiness: the full raw count must be indexed before `g` can
+            # mean the top. The status range only settles once all records
+            # are in; sending `g` earlier races ingest and the top assertion
+            # below can miss a still-growing view.
+            app.wait_until(lambda text: "/300" in text,
+                           "the full raw count", timeout=20.0)
+            # A single keypress can be lost to input stalls under load, and a
+            # late batch can re-tail a FOLLOW view after it lands: one bounded
+            # resend inside the same total budget distinguishes either flake
+            # from a viewport that truly never reaches the top.
             app.send(b"g")
-            app.wait_until(lambda text: "1-25/300" in text or "1-2" in text,
-                           "viewport at the top", timeout=20.0)
+            try:
+                app.wait_until(lambda text: "1-25/300" in text,
+                               "viewport at the top", timeout=10.0)
+            except AssertionError:
+                app.send(b"g")
+                app.wait_until(lambda text: "1-25/300" in text,
+                               "viewport at the top after resend", timeout=10.0)
             app.send(b"i")
             try:
                 app.wait_for("Value · ", timeout=20.0)

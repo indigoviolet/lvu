@@ -12,6 +12,7 @@ the declaration survives a restart.
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
 import tempfile
 import time
@@ -44,17 +45,6 @@ def launch(binary: pathlib.Path, root: pathlib.Path) -> PtyApp:
     )
 
 
-def click_text(app: PtyApp, text: str) -> None:
-    app.drain()
-    for y, row in enumerate(app.screen.display):
-        if text in row:
-            x = row.index(text)
-            app.send(f"\x1b[<0;{x + 2};{y + 1}M".encode())
-            app.send(f"\x1b[<0;{x + 2};{y + 1}m".encode())
-            return
-    raise AssertionError(f"missing clickable text {text!r}\n{app.text()}")
-
-
 def open_basis_menu(app: PtyApp) -> str:
     app.send(b"t")
     app.wait_for("Time basis", timeout=8)
@@ -78,10 +68,45 @@ def run(binary: pathlib.Path) -> None:
         # default basis every record matches. This is the control.
         app.send(b"t")
         app.wait_for("Time basis", timeout=8)
+        # Readiness: the seeded bounds must be painted and settled before the
+        # dialog is driven. Record them now: choosing Absolute clears the
+        # bound/zone drafts (current behavior seeds nothing for it), so the
+        # seeded capture-time bounds are typed back explicitly below.
+        ready = app.wait_until(
+            lambda text: "Applied" in text and "Updating" not in text,
+            "seeded dialog ready",
+            timeout=8,
+        )
+        start_match = re.search(r"Start\s+(\S+)\s+(\S+)", ready)
+        end_match = re.search(r"End\s+(\S+)\s+(\S+)", ready)
+        assert start_match and end_match, f"seeded bounds readable:\n{ready}"
+        start_bound = f"{start_match.group(1)}T{start_match.group(2).split('.')[0]}Z"
+        end_bound = f"{end_match.group(1)}T{end_match.group(2).split('.')[0]}Z"
         app.send(b"\t\r")  # Window dropdown.
         app.wait_until(lambda text: "Absolute" in text, "window choices", timeout=5)
-        app.send(b"\x1b[B\r")
-        app.wait_until(lambda text: "Absolute" in text, "absolute window", timeout=5)
+        # Verified navigation: Enter must commit Absolute rather than
+        # re-commit All time, so the highlight has to arrive first. Never
+        # commit blind: without the highlight Enter would keep All time and
+        # every later step would fail far from the cause.
+        highlight_deadline = time.time() + 4.0
+        while "> Absolute" not in app.text():
+            if time.time() > highlight_deadline:
+                break
+            app.send(b"\x1b[B")
+            time.sleep(0.2)
+        assert "> Absolute" in app.text(), (
+            "window highlight never reached Absolute; not committing:\n" + app.text()
+        )
+        app.send(b"\r")
+        app.wait_until(
+            lambda text: any(
+                "Window" in line and "Absolute" in line and "▾" in line
+                for line in text.splitlines()
+            )
+            and "Last 5m by clock" not in text,
+            "absolute window",
+            timeout=5,
+        )
         app.send(b"\x1b")
         app.wait_until(lambda text: "Time basis" not in text, "time dialog closed")
 
@@ -91,9 +116,21 @@ def run(binary: pathlib.Path) -> None:
         assert "ts · " in offered, offered
         assert "needs an assumption" in offered, offered
 
-        # Walk to the zone-less `ts` candidate and choose it.
-        for _ in range(4):
+        # Walk to the zone-less `ts` candidate and choose it. Verify the
+        # landing instead of counting steps: the candidate count varies, so a
+        # blind count can overshoot (or wrap) and commit the wrong row, and a
+        # dead highlight must fail here rather than cascade.
+        walk_deadline = time.time() + 4.0
+        for _ in range(8):
+            if "> ts" in app.text():
+                break
+            if time.time() > walk_deadline:
+                break
             app.send(b"\x1b[B")
+            time.sleep(0.2)
+        assert "> ts" in app.text(), (
+            "candidate highlight never reached ts; not committing:\n" + app.text()
+        )
         app.send(b"\r")
         pending = app.wait_until(
             lambda text: "Accept assumption" in text,
@@ -117,10 +154,69 @@ def run(binary: pathlib.Path) -> None:
         )
         assert "Accept assumption" not in accepted, accepted
 
+        # Choosing Absolute left empty bound/zone drafts, which Apply rejects,
+        # so type the seeded capture-time bounds back explicitly. A whole-bound
+        # paste replaces the focused Start or End row outright, zones included
+        # (Z is a valid UTC zone); after Accept the focus is on Basis, which is
+        # not an End row, so the first paste lands on Start.
+        def paste(text: str) -> None:
+            app.send(("\x1b[200~" + text + "\x1b[201~").encode())
+
+        def dialog_line(text: str, label: str) -> str:
+            for line in text.splitlines():
+                if re.search(rf"\b{label}\b", line):
+                    return line
+            return ""
+
+        start_clock = start_bound.split("T")[1].rstrip("Z")
+        end_clock = end_bound.split("T")[1].rstrip("Z")
+        paste(start_bound)
+        app.wait_until(
+            lambda text: start_clock in dialog_line(text, "Start"),
+            "start bound typed",
+            timeout=5,
+        )
+        # Walk Tab stops until the caret reaches the End row, then paste once:
+        # pasting earlier would rewrite Start and reset focus onto it.
+        end_rows = [
+            index
+            for index, row in enumerate(app.screen.display)
+            if re.search(r"\bEnd\b", row)
+        ]
+        assert end_rows, f"End row visible:\n{app.text()}"
+        end_row = end_rows[0]
+        for _ in range(8):
+            app.drain()
+            if app.screen.cursor.y == end_row:
+                break
+            app.send(b"\t")
+            time.sleep(0.2)
+        paste(end_bound)
+        app.wait_until(
+            lambda text: end_clock in dialog_line(text, "End"),
+            "end bound typed",
+            timeout=5,
+        )
+
         # Applying it must actually change which records the window matches:
         # the same absolute window that held every record under capture time
-        # holds none under a March event time.
-        click_text(app, "[ Apply ]")
+        # holds none under a March event time. Enter on the End segment runs
+        # the default Apply; the larger dialog can hide the base rows, so wait
+        # for the applied status, close, and assert on the base screen.
+        app.send(b"\r")
+        applied = app.wait_until(
+            lambda text: "Time basis" not in text
+            or (
+                "Applied" in text
+                and "all times" not in text
+                and "Error" not in text
+            ),
+            "the typed window applies",
+            timeout=8,
+        )
+        if "Time basis" in applied:
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Time basis" not in text, "time dialog closed")
         app.wait_until(
             lambda text: "event-19" not in text,
             "the chosen field to drive the window",
