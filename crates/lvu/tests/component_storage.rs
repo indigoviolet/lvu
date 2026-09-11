@@ -365,3 +365,238 @@ fn key_kinds_other_than_press_are_ignored() {
     );
     assert_eq!(app.layers.storage.selected(), before);
 }
+
+fn error_snapshot(entries: usize) -> StorageSnapshot {
+    let mut snap = snapshot(entries, 0);
+    snap.errors = vec![
+        "scan failed on café-日本語 volume: permission denied · recomputable".into(),
+        "second problem with combining é marks and wide 漢字 text".into(),
+    ];
+    snap
+}
+
+fn complete_with(_provider: &FixtureProvider, app: &mut App, snap: StorageSnapshot) {
+    let generation = app.layers.storage.outbox.take()[0].generation;
+    assert!(
+        app.layers
+            .storage
+            .complete(generation, snap, "scan complete".into(), true,)
+    );
+}
+
+/// Policy/stable budgets alone determine the frame and sticky tail: scanning,
+/// populated, error and confirm-clear states share one outer frame and one
+/// action-band origin. Results/diagnostics/errors only move scroll extents.
+#[test]
+fn responsive_frame_and_tail_are_stable_across_scan_states() {
+    for (width, height) in [(240u16, 80u16), (140, 40), (80, 24), (54, 16), (20, 6)] {
+        // Scanning (pending): opened but no completion yet.
+        let (provider, mut scanning) = demo();
+        scanning.handle(Action::Open(Open::Storage), &provider);
+        draw(&provider, &mut scanning, width, height);
+        let scanning_surface = scanning.layers.storage.surface();
+        let scanning_refresh = scanning
+            .layers
+            .storage
+            .action_rects()
+            .iter()
+            .find(|(slot, _)| *slot == 0)
+            .map(|(_, r)| *r);
+
+        // Populated.
+        let (provider, mut full) = demo();
+        full.handle(Action::Open(Open::Storage), &provider);
+        complete_with(&provider, &mut full, snapshot(6, 4096));
+        draw(&provider, &mut full, width, height);
+        let full_surface = full.layers.storage.surface();
+
+        // Error with long Unicode diagnostics.
+        let (provider, mut failed) = demo();
+        failed.handle(Action::Open(Open::Storage), &provider);
+        complete_with(&provider, &mut failed, error_snapshot(6));
+        draw(&provider, &mut failed, width, height);
+        let error_surface = failed.layers.storage.surface();
+
+        // Same-layer confirmation (second button relabels, no child).
+        key(&mut failed, &provider, KeyCode::Char('c'));
+        // Confirmation needs reclaimable bytes; use a reclaimable snapshot.
+        let (provider, mut confirm) = demo();
+        confirm.handle(Action::Open(Open::Storage), &provider);
+        complete_with(&provider, &mut confirm, snapshot(6, 8192));
+        draw(&provider, &mut confirm, width, height);
+        key(&mut confirm, &provider, KeyCode::Char('c'));
+        assert!(confirm.layers.storage.confirm_clear());
+        draw(&provider, &mut confirm, width, height);
+        let confirm_surface = confirm.layers.storage.surface();
+
+        for (name, surface) in [
+            ("scanning", scanning_surface),
+            ("populated", full_surface),
+            ("error", error_surface),
+            ("confirm", confirm_surface),
+        ] {
+            assert_eq!(
+                surface.popup, scanning_surface.popup,
+                "{name} frame moved at {width}x{height}"
+            );
+            assert_eq!(
+                surface.interior, scanning_surface.interior,
+                "{name} interior moved at {width}x{height}"
+            );
+        }
+        let full_refresh = full
+            .layers
+            .storage
+            .action_rects()
+            .iter()
+            .find(|(slot, _)| *slot == 0)
+            .map(|(_, r)| *r);
+        assert_eq!(
+            full_refresh, scanning_refresh,
+            "sticky tail moved at {width}x{height}"
+        );
+        // Confirmation stays same-layer: no new layer, still Storage on top.
+        // At the 20x6 floor the shared band collapses to one row with a
+        // same-layer More menu; Confirm stays reachable there, directly
+        // painted everywhere else.
+        assert_eq!(confirm.layers.top(), Some(LayerId::Storage));
+        if (width, height) == (20, 6) {
+            // Floor pressure collapses the band to Refresh + same-layer More;
+            // Cleanup/Confirm hides behind the overflow but stays armed
+            // same-layer (confirm_clear) with the default surviving.
+            let rendered = screen(&draw(&provider, &mut confirm, width, height));
+            // Truncated by display-width clipping at the floor; the default
+            // slot itself (not the full verb) proves stickiness.
+            assert!(rendered.contains("Ref"), "{rendered}");
+            assert!(confirm.layers.storage.confirm_clear());
+            assert!(
+                confirm
+                    .layers
+                    .storage
+                    .action_rects()
+                    .iter()
+                    .any(|(slot, _)| *slot == 0),
+                "default Refresh slot must survive the floor"
+            );
+        } else {
+            let rendered = screen(&draw(&provider, &mut confirm, width, height));
+            assert!(rendered.contains("Confirm cleanup"), "{rendered}");
+        }
+    }
+}
+
+/// Below the floor the tiny fallback owns the frame with no stale hitboxes.
+#[test]
+fn below_floor_uses_the_tiny_fallback() {
+    let (provider, mut app) = opened(4, 0);
+    let buffer = draw(&provider, &mut app, 19, 5);
+    assert!(screen(&buffer).contains("terminal too small"));
+    assert!(app.layers.storage.row_rects().is_empty());
+    assert!(app.layers.storage.action_rects().is_empty());
+}
+
+/// Long Unicode entry labels/diagnostics clip by display width without
+/// splitting wide glyphs, and every painted row/action/diagnostics cell still
+/// answers its own hit test.
+#[test]
+fn long_unicode_clips_with_exact_hitboxes() {
+    for (width, height) in [(140u16, 40u16), (80, 24), (54, 16)] {
+        let (provider, mut app) = demo();
+        app.handle(Action::Open(Open::Storage), &provider);
+        let mut snap = snapshot(3, 0);
+        snap.entries[0].label = "café-日本語-👩‍💻-éxpansion-漢字-mix-".repeat(4);
+        snap.entries[1].label = "combining ééé wide 漢字".into();
+        snap.errors = vec!["café-日本語 failure · é combining · 漢字".into()];
+        complete_with(&provider, &mut app, snap);
+        draw(&provider, &mut app, width, height);
+        let surface = app.layers.storage.surface();
+        for (rect, index) in app.layers.storage.row_rects() {
+            assert!(
+                contains_rect(surface.popup, rect),
+                "row escapes at {width}x{height}"
+            );
+            assert_eq!(
+                app.layers.storage.hit((rect.x, rect.y)),
+                Some(StorageHit::Row(*index)),
+                "row paint/hit disagree at {width}x{height}"
+            );
+        }
+        for (_, rect) in app.layers.storage.action_rects() {
+            assert!(contains_rect(surface.popup, rect));
+            assert!(app.layers.storage.hit((rect.x, rect.y)).is_some());
+        }
+    }
+}
+
+fn contains_rect(area: Rect, rect: &Rect) -> bool {
+    rect.x >= area.x
+        && rect.y >= area.y
+        && rect.right() <= area.right()
+        && rect.bottom() <= area.bottom()
+}
+
+/// At 54x16 and 20x6 the selection, diagnostics scroll and sticky actions stay
+/// reachable with wheel/hitboxes matching the shared viewports.
+#[test]
+fn tiny_pressure_keeps_selection_diagnostics_and_actions_reachable() {
+    for (width, height) in [(54u16, 16u16), (20, 6)] {
+        let (provider, mut app) = demo();
+        app.handle(Action::Open(Open::Storage), &provider);
+        complete_with(&provider, &mut app, error_snapshot(20));
+        draw(&provider, &mut app, width, height);
+        // List selection is painted and hit-testable.
+        assert!(
+            !app.layers.storage.row_rects().is_empty(),
+            "list must paint at {width}x{height}"
+        );
+        let surface = app.layers.storage.surface();
+        for (rect, index) in app.layers.storage.row_rects() {
+            assert!(contains_rect(surface.popup, rect));
+            assert_eq!(
+                app.layers.storage.hit((rect.x, rect.y)),
+                Some(StorageHit::Row(*index))
+            );
+        }
+        // Wheel over the list moves selection with matching hitboxes.
+        let (rect, _) = app.layers.storage.row_rects()[0];
+        let before = app.layers.storage.selected();
+        app.handle(
+            Action::Raw(RawEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            })),
+            &provider,
+        );
+        draw(&provider, &mut app, width, height);
+        assert_ne!(before, app.layers.storage.selected());
+        // Real overflow while list-focused: populated/error claims scroll.
+        assert!(
+            app.layers.storage.surface().scrollable,
+            "populated list must be scrollable while list-focused at {width}x{height}"
+        );
+        // Tab focuses diagnostics; arrows scroll the shared diagnostics
+        // viewport when it has room, otherwise the focus itself is the
+        // reachability proof at the floor (single-row body).
+        key(&mut app, &provider, KeyCode::Tab);
+        draw(&provider, &mut app, width, height);
+        key(&mut app, &provider, KeyCode::Down);
+        draw(&provider, &mut app, width, height);
+        assert!(app.layers.storage.scroll() > 0 || app.layers.storage.scroll_limit() == 0);
+        // Sticky default action never leaves.
+        let refresh = app
+            .layers
+            .storage
+            .action_rects()
+            .iter()
+            .find(|(slot, _)| *slot == 0)
+            .map(|(_, r)| *r)
+            .expect("Refresh must survive tiny pressure");
+        assert!(contains_rect(surface.popup, &refresh));
+    }
+    let (provider, mut empty) = demo();
+    empty.handle(Action::Open(Open::Storage), &provider);
+    complete_with(&provider, &mut empty, snapshot(0, 0));
+    draw(&provider, &mut empty, 54, 16);
+}

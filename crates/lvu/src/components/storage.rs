@@ -21,11 +21,11 @@ use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface,
 };
-use crate::dialog_controls::DialogStyles;
-use crate::dialog_layout::DialogRegions;
+use crate::dialog_controls::{ActionRow, DialogStyles, render_role_button, stable_action_rows};
+use crate::dialog_layout::{DialogSpec, PresentationKind, ScrollViewport, plan_list};
 use crate::ui::{
-    ELLIPSIS, FIELD_GUTTER, MessageState, clipped_width, dialog_frame_regions, message_rows,
-    packed_button_rows, render_action_row, render_message, render_scrollbar, truncated,
+    ELLIPSIS, FIELD_GUTTER, MessageState, clipped_width, render_message, render_scrollbar,
+    truncated,
 };
 
 /// Two scans plus their cancels can never be outstanding at once; the cap only
@@ -56,6 +56,11 @@ pub const CLEANUP_COMMAND: CommandSpec = CommandSpec {
 /// Everything Storage draws that can be clicked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageHit {
+    /// A row of the generic overflow `More ▾` menu (20x6 floor only).
+    /// Hit-tested first: §10 puts it on top.
+    Menu(usize),
+    /// The generic overflow `More ▾` button itself (20x6 floor only).
+    More,
     Row(usize),
     Refresh,
     Cleanup,
@@ -73,6 +78,8 @@ struct StorageGeometry {
     /// Index 0 refreshes, index 1 previews or confirms cleanup.
     actions: Vec<(usize, Rect)>,
     diagnostics: Option<Rect>,
+    menu: Vec<(Rect, usize)>,
+    more: Vec<(Rect, ())>,
 }
 
 #[derive(Debug)]
@@ -91,6 +98,11 @@ pub struct StorageDialog {
     scroll: usize,
     scroll_limit: usize,
     scroll_focused: bool,
+    /// Generic overflow `More ▾` menu (20x6 floor only, same-layer anchored
+    /// popup, not a child). Preserves the two-step confirmation when the
+    /// shared band collapses to one row.
+    menu_open: bool,
+    menu_selected: usize,
     geometry: StorageGeometry,
     surface: Surface,
     pub outbox: Outbox<StorageRequest>,
@@ -109,6 +121,8 @@ impl Default for StorageDialog {
             scroll: 0,
             scroll_limit: 0,
             scroll_focused: false,
+            menu_open: false,
+            menu_selected: 0,
             geometry: StorageGeometry::default(),
             surface: Surface::default(),
             outbox: Outbox::new(STORAGE_OUTBOX_CAP),
@@ -146,6 +160,12 @@ impl StorageDialog {
 
     pub fn action_rects(&self) -> &[(usize, Rect)] {
         &self.geometry.actions
+    }
+
+    /// Geometry recorded by the last `render` for the generic overflow menu
+    /// (20x6 floor only). Same-layer anchored popup, not a child.
+    pub fn menu_rects(&self) -> &[(Rect, usize)] {
+        &self.geometry.menu
     }
 
     pub fn scroll(&self) -> usize {
@@ -249,12 +269,31 @@ impl StorageDialog {
     }
 
     fn move_selection(&mut self, delta: i32) {
+        if self.menu_open {
+            // Generic overflow menu has at most the hidden actions (Refresh /
+            // Cleanup); same-layer, not a child. Length comes from the last
+            // painted menu so wheel/keys never disagree with paint.
+            let len = self.geometry.menu.len().max(1);
+            self.menu_selected =
+                (self.menu_selected as i32 + delta).rem_euclid(len as i32) as usize;
+            return;
+        }
         if self.snapshot.entries.is_empty() {
             return;
         }
         self.selected =
             (self.selected as i32 + delta).rem_euclid(self.snapshot.entries.len() as i32) as usize;
         self.confirm_clear = false;
+    }
+
+    fn choose_menu(&mut self, _index: usize) -> Outcome {
+        // Same-layer overflow menu holds only the hidden Cleanup/Confirm:
+        // Refresh (the default) always survives in the band, so the menu
+        // never needs to distinguish rows. No child, no Replace.
+        self.menu_open = false;
+        self.menu_selected = 0;
+        self.clear();
+        Outcome::Consumed
     }
 
     fn scroll_body(&mut self, delta: i32) {
@@ -274,6 +313,23 @@ impl StorageDialog {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Outcome::Ignored;
         }
+        // §10: an open anchored menu owns arrows and Enter.
+        if self.menu_open {
+            match key.code {
+                KeyCode::Up => self.move_selection(-1),
+                KeyCode::Down => self.move_selection(1),
+                KeyCode::Enter => {
+                    let index = self.menu_selected;
+                    return self.choose_menu(index);
+                }
+                KeyCode::Esc => {
+                    self.menu_open = false;
+                    self.menu_selected = 0;
+                    return Outcome::Consumed;
+                }
+                _ => return Outcome::Consumed,
+            }
+        }
         match key.code {
             KeyCode::Tab => self.scroll_focused = !self.scroll_focused,
             KeyCode::Up | KeyCode::Down => {
@@ -291,7 +347,15 @@ impl StorageDialog {
             // buttons and the shell resolves them before this point; they used
             // to be spelled out here, which is the duplication that let a
             // dialog's underline and its keymap drift apart.
-            KeyCode::Enter => self.refresh(),
+            // When the shared band overflows (20x6 floor), Enter still runs the
+            // default; hidden Cleanup is reached via the same-layer More menu.
+            KeyCode::Enter => {
+                if self.menu_open {
+                    let index = self.menu_selected;
+                    return self.choose_menu(index);
+                }
+                self.refresh()
+            }
             _ => return Outcome::Ignored,
         }
         Outcome::Consumed
@@ -304,6 +368,18 @@ impl StorageDialog {
     ) -> Outcome {
         use crossterm::event::{MouseButton, MouseEventKind};
         let pressed = matches!(kind, MouseEventKind::Down(MouseButton::Left));
+        // §10: the open menu takes the click first (same-layer, not a child).
+        if pressed && let Some(StorageHit::Menu(index)) = hit {
+            return self.choose_menu(index);
+        }
+        if matches!(kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) && self.menu_open {
+            self.move_selection(if matches!(kind, MouseEventKind::ScrollUp) {
+                -1
+            } else {
+                1
+            });
+            return Outcome::Consumed;
+        }
         // The diagnostics pane takes the event before the list does, so a long
         // scan report stays scrollable even over the entry rows' column.
         if hit == Some(StorageHit::Diagnostics) {
@@ -325,6 +401,11 @@ impl StorageDialog {
             }
             (true, Some(StorageHit::Cleanup)) => {
                 self.clear();
+                return Outcome::Consumed;
+            }
+            (true, Some(StorageHit::More)) => {
+                self.menu_open = !self.menu_open;
+                self.menu_selected = 0;
                 return Outcome::Consumed;
             }
             (true, Some(StorageHit::Row(index))) => self.select_row(index),
@@ -370,15 +451,16 @@ fn elide_middle(value: &str, maximum: usize) -> String {
     format!("{prefix}{ELLIPSIS}{suffix}")
 }
 
-fn surface_of(regions: &DialogRegions) -> Surface {
-    Surface {
-        popup: regions.popup,
-        interior: regions.interior,
-        caret: None,
-        scrollable: true,
-        // Storage has no text field, so `q` dismisses it (§1).
-        text_focus: false,
-    }
+/// Stable LongContent budgets: outer size is policy-only, never scan counts.
+/// Header 0, body minimum 3, message 2 stable max, no help, actions from the
+/// stable width budget so pending/scanning/populated/error frames share one
+/// frame and sticky tail. Hand-rolled layout here is presentation-only
+/// folding, never query membership (AGENTS.md).
+fn storage_spec_for(area: Rect, buttons: &[&str]) -> DialogSpec {
+    let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let action_rows = stable_action_rows(estimate, buttons).clamp(1, 2);
+    DialogSpec::new(PresentationKind::LongContent, 0, 3, 2, 0, action_rows)
 }
 
 impl Component for StorageDialog {
@@ -392,6 +474,8 @@ impl Component for StorageDialog {
         self.scroll = 0;
         self.scroll_limit = 0;
         self.scroll_focused = false;
+        self.menu_open = false;
+        self.menu_selected = 0;
         self.geometry = StorageGeometry::default();
         self.start_scan("scanning application-owned storage…");
     }
@@ -401,6 +485,12 @@ impl Component for StorageDialog {
             Event::Key(key) => self.key(key),
             Event::Mouse { kind, hit, .. } => self.mouse(kind, hit),
             Event::Dismiss => {
+                // §10: the open menu absorbs dismissal rather than the layer.
+                if self.menu_open {
+                    self.menu_open = false;
+                    self.menu_selected = 0;
+                    return Outcome::Consumed;
+                }
                 // Cleanup that needs the worker happens before `Close`.
                 self.cancel_in_flight();
                 self.open = false;
@@ -448,6 +538,13 @@ impl Component for StorageDialog {
 
     fn hit(&self, point: (u16, u16)) -> Option<StorageHit> {
         let g = &self.geometry;
+        // §10: the open menu is drawn last and takes the point first.
+        if let Some((_, index)) = g.menu.iter().find(|(rect, _)| contains(*rect, point)) {
+            return Some(StorageHit::Menu(*index));
+        }
+        if let Some((_, _)) = g.more.iter().find(|(rect, _)| contains(*rect, point)) {
+            return Some(StorageHit::More);
+        }
         if g.diagnostics.is_some_and(|area| contains(area, point)) {
             return Some(StorageHit::Diagnostics);
         }
@@ -469,8 +566,6 @@ impl Component for StorageDialog {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
-        use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
-
         let theme = ctx.theme;
         let ascii = ctx.ascii;
         let styles = DialogStyles::new(theme);
@@ -479,8 +574,46 @@ impl Component for StorageDialog {
         let mut scroll = self.scroll;
         let mut scroll_limit = 0usize;
 
-        let snapshot = &self.snapshot;
-        let width = content_width(area, DialogClass::L);
+        let snapshot = self.snapshot.clone();
+        let action_labels = self.buttons();
+        // Stable budgets: outer frame is policy-only; scan counts, diagnostics
+        // length and errors size only scroll extents, never the frame.
+        let spec = storage_spec_for(area, &action_labels);
+        let Ok(resolved) =
+            crate::dialog_layout::resolve_dialog(area, &spec, 1, &action_labels, Some(0), None)
+        else {
+            // Below the 20x6 floor the tiny fallback owns the frame.
+            self.geometry = StorageGeometry::default();
+            self.scroll_limit = 0;
+            self.surface = Surface {
+                popup: Rect::default(),
+                interior: Rect::default(),
+                caret: None,
+                scrollable: false,
+                text_focus: false,
+            };
+            return self.surface;
+        };
+        crate::ui::render_responsive_frame(frame, &resolved, "Storage", ctx.active, theme);
+        let mut surface = Surface {
+            popup: resolved.frame,
+            interior: resolved.interior,
+            caret: None,
+            scrollable: false,
+            // Storage has no text field, so `q` dismisses it (§1).
+            text_focus: false,
+        };
+        let body = resolved.body.viewport;
+        if body.width == 0 || body.height == 0 {
+            self.geometry = StorageGeometry::default();
+            self.scroll_limit = 0;
+            self.surface = surface;
+            return surface;
+        }
+        let message_rect = resolved.message;
+        let action_geom = resolved.actions.clone();
+        let roomy = !resolved.compact;
+        let width = resolved.content.width;
 
         // §12.13: the totals move out of the title into labelled summary rows.
         let summary = [
@@ -518,7 +651,7 @@ impl Component for StorageDialog {
         ];
         // Two pairs per row when there is room, otherwise one per row (§4.2).
         let paired = width >= 72;
-        let summary_rows = if paired { 2 } else { 4 } + 1;
+        let summary_rows: u16 = (if paired { 2 } else { 4 }) + 1;
 
         // A scan diagnostic can be far longer than the two rows §7.4 allows, so
         // the message states the outcome and the full text lives in a
@@ -543,93 +676,103 @@ impl Component for StorageDialog {
             (MessageState::Scanned, self.status.clone())
         };
 
-        let action_labels = self.buttons();
         let entries = snapshot.entries.len();
-        let diagnostic_rows = if diagnostics.is_empty() { 0 } else { 4 };
-        let content = DialogContent {
-            header: 0,
-            body: summary_rows
-                + 1
-                + u16::try_from(entries.clamp(1, 12)).unwrap_or(1)
-                + 1
-                + diagnostic_rows,
-            message: message_rows(&sentence, width),
-            help: 0,
-            actions: packed_button_rows(width, &action_labels),
+        // Body owns surplus: summary fixed, list Fill, diagnostics bounded with
+        // roomy gaps and compact zero gaps. At tiny pressure the focused pane
+        // wins (list vs diagnostics) so paint, wheel and hitboxes never
+        // disagree; summary hides at the floor but list/diagnostics/actions
+        // stay reachable. Hand-rolled here is presentation-only folding.
+        let gap = u16::from(roomy);
+        let spare = body.height;
+        let diag_wanted: u16 = if diagnostics.is_empty() { 0 } else { 4 };
+        let full_need = summary_rows
+            .saturating_add(1)
+            .saturating_add(diag_wanted)
+            .saturating_add(gap.saturating_mul(2));
+        let (show_summary, list_h, diag_h) = if spare == 0 {
+            (false, 0, 0)
+        } else if full_need <= spare {
+            (
+                true,
+                spare
+                    .saturating_sub(summary_rows)
+                    .saturating_sub(1)
+                    .saturating_sub(diag_wanted)
+                    .saturating_sub(gap.saturating_mul(2))
+                    .max(1),
+                diag_wanted,
+            )
+        } else if self.scroll_focused && diag_wanted > 0 {
+            (false, 0, spare)
+        } else {
+            (false, spare, 0)
         };
-        let regions = dialog_frame_regions(frame, area, DialogClass::L, "Storage", &content, theme);
-        let surface = surface_of(&regions);
-        let body = regions.body;
-        if body.width == 0 || body.height == 0 {
-            self.geometry = StorageGeometry::default();
-            self.scroll_limit = 0;
-            self.surface = surface;
-            return surface;
-        }
-
         let label_width = u16::try_from(UnicodeWidthStr::width("Derived disk")).unwrap_or(12);
         let column = body.width / 2;
-        for (index, (label, value)) in summary.iter().enumerate() {
-            let (row, x, cell_width) = if paired {
-                (
-                    index / 2,
-                    body.x
-                        .saturating_add(if index % 2 == 0 { 0 } else { column }),
-                    column,
-                )
-            } else {
-                (index, body.x, body.width)
-            };
-            let Some(y) = u16::try_from(row)
-                .ok()
-                .map(|row| body.y.saturating_add(row))
-                .filter(|y| *y < body.bottom())
-            else {
-                continue;
-            };
-            frame.render_widget(
-                Paragraph::new(*label).style(styles.label),
-                Rect::new(x, y, label_width.min(cell_width), 1),
-            );
-            let value_x = x.saturating_add(label_width).saturating_add(FIELD_GUTTER);
-            if value_x < x.saturating_add(cell_width) {
+        if show_summary {
+            for (index, (label, value)) in summary.iter().enumerate() {
+                let (row, x, cell_width) = if paired {
+                    (
+                        index / 2,
+                        body.x
+                            .saturating_add(if index % 2 == 0 { 0 } else { column }),
+                        column,
+                    )
+                } else {
+                    (index, body.x, body.width)
+                };
+                let Some(y) = u16::try_from(row)
+                    .ok()
+                    .map(|row| body.y.saturating_add(row))
+                    .filter(|y| *y < body.bottom())
+                else {
+                    continue;
+                };
                 frame.render_widget(
-                    Paragraph::new(truncated(
-                        value,
-                        usize::from(x.saturating_add(cell_width).saturating_sub(value_x)),
-                    ))
-                    .style(styles.description),
-                    Rect::new(
-                        value_x,
-                        y,
-                        x.saturating_add(cell_width).saturating_sub(value_x),
-                        1,
-                    ),
+                    Paragraph::new(*label).style(styles.label),
+                    Rect::new(x, y, label_width.min(cell_width), 1),
+                );
+                let value_x = x.saturating_add(label_width).saturating_add(FIELD_GUTTER);
+                if value_x < x.saturating_add(cell_width) {
+                    frame.render_widget(
+                        Paragraph::new(truncated(
+                            value,
+                            usize::from(x.saturating_add(cell_width).saturating_sub(value_x)),
+                        ))
+                        .style(styles.description),
+                        Rect::new(
+                            value_x,
+                            y,
+                            x.saturating_add(cell_width).saturating_sub(value_x),
+                            1,
+                        ),
+                    );
+                }
+            }
+            if let Some(y) = Some(body.y.saturating_add(summary_rows.saturating_sub(1)))
+                .filter(|y| *y < body.bottom())
+            {
+                frame.render_widget(
+                    Paragraph::new(truncated(STORAGE_CAPTION, usize::from(body.width)))
+                        .style(styles.description),
+                    Rect::new(body.x, y, body.width, 1),
                 );
             }
         }
-
-        let available = body.height.saturating_sub(summary_rows).saturating_sub(1);
-        let diagnostic_height = if diagnostics.is_empty() {
-            0
+        // Gaps only between shown sections (roomy 1, compact 0).
+        let list_y = if show_summary {
+            body.y
+                .saturating_add(summary_rows)
+                .saturating_add(1)
+                .saturating_add(gap)
         } else {
-            diagnostic_rows.min(available.saturating_sub(2))
+            body.y
         };
-        if let Some(y) = Some(body.y.saturating_add(summary_rows.saturating_sub(1)))
-            .filter(|y| *y < body.bottom())
-        {
-            frame.render_widget(
-                Paragraph::new(truncated(STORAGE_CAPTION, usize::from(body.width)))
-                    .style(styles.description),
-                Rect::new(body.x, y, body.width, 1),
-            );
-        }
-
         let list_area = Rect::new(
             body.x,
-            body.y.saturating_add(summary_rows).saturating_add(1),
+            list_y,
             body.width,
-            available.saturating_sub(diagnostic_height),
+            list_h.min(body.bottom().saturating_sub(list_y)),
         );
         if list_area.height > 0 {
             let count = format!(
@@ -639,10 +782,13 @@ impl Component for StorageDialog {
                 format_storage_bytes(snapshot.reclaimable_bytes)
             );
             let count = truncated(&count, usize::from(list_area.width / 2));
-            let rects = pane(
+            let selected_init = self.selected.min(entries.saturating_sub(1));
+            let rects = plan_list(
                 list_area,
                 u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
                 entries,
+                (!snapshot.entries.is_empty()).then_some(selected_init),
+                0,
             );
             frame.render_widget(
                 Paragraph::new("Entries").style(styles.label.add_modifier(Modifier::BOLD)),
@@ -671,17 +817,14 @@ impl Component for StorageDialog {
             } else {
                 (columns, 0)
             };
-            let visible = usize::from(viewport.height);
+            let visible = rects.row_rects.len();
             let selected = self.selected.min(entries.saturating_sub(1));
-            let top = selected.saturating_sub(visible.saturating_sub(1));
-            for (offset, (index, entry)) in snapshot
-                .entries
-                .iter()
-                .enumerate()
-                .skip(top)
-                .take(visible)
-                .enumerate()
-            {
+            let top = rects.first_row;
+            for (offset, row) in rects.row_rects.iter().copied().enumerate() {
+                let index = top.saturating_add(offset);
+                let Some(entry) = snapshot.entries.get(index) else {
+                    continue;
+                };
                 let kind = match entry.category {
                     StorageCategory::Capture => "capture",
                     StorageCategory::Derived => "derived",
@@ -713,12 +856,6 @@ impl Component for StorageDialog {
                         usize::from(status_width),
                     ));
                 }
-                let row = Rect::new(
-                    viewport.x,
-                    viewport.y.saturating_add(offset as u16),
-                    viewport.width,
-                    1,
-                );
                 frame.render_widget(
                     Paragraph::new(truncated(&text, usize::from(row.width))).style(if chosen {
                         styles.selection
@@ -734,28 +871,50 @@ impl Component for StorageDialog {
                     frame,
                     bar,
                     top,
-                    entries.saturating_sub(visible),
+                    entries.saturating_sub(visible.max(1)),
                     theme,
                     ascii,
                 );
+                surface.scrollable = true;
             }
         }
 
-        // The diagnostics pane owns the body scroll, which is the target Tab
-        // hands the arrow keys to, so a long scan report stays reachable.
-        if diagnostic_height > 0 {
+        // Scan/result diagnostics scroll inside the body (shared viewport)
+        // and keep actions sticky; confirmation stays same-layer, not a child.
+        // Hand-rolled wrapping here is presentation-only folding.
+        if diag_h > 0 {
             let area = Rect::new(
                 body.x,
-                list_area.bottom(),
+                list_area
+                    .bottom()
+                    .saturating_add(gap.min(body.bottom().saturating_sub(list_area.bottom()))),
                 body.width,
-                body.bottom().saturating_sub(list_area.bottom()),
+                diag_h.min(body.bottom().saturating_sub(list_area.bottom())),
+            );
+            // Heading 1 row + viewport below, indent shared with list panes.
+            let heading = Rect::new(area.x, area.y, area.width, 1.min(area.height));
+            let viewport_probe = Rect::new(
+                area.x
+                    .saturating_add(crate::dialog_layout::PANE_INDENT.min(area.width)),
+                area.y.saturating_add(1),
+                area.width
+                    .saturating_sub(crate::dialog_layout::PANE_INDENT.min(area.width)),
+                area.height.saturating_sub(1),
             );
             let text = Paragraph::new(diagnostics.clone())
                 .wrap(Wrap { trim: false })
                 .style(styles.error);
-            let probe = pane(area, 0, usize::MAX);
-            let wrapped = text.line_count(probe.viewport.width.max(1));
-            let rects = pane(area, 0, wrapped);
+            let wrapped = text.line_count(viewport_probe.width.max(1));
+            let viewport = ScrollViewport::new(viewport_probe, wrapped, scroll);
+            let rects_viewport = viewport.viewport;
+            let rects = crate::dialog_layout::ListGeometry {
+                heading,
+                count: Rect::new(area.right(), area.y, 0, 0),
+                viewport: rects_viewport,
+                scrollbar: viewport.scrollbar,
+                first_row: viewport.first_row,
+                row_rects: Vec::new(),
+            };
             frame.render_widget(
                 Paragraph::new("Diagnostics").style(if self.scroll_focused {
                     styles.shortcut.add_modifier(Modifier::BOLD)
@@ -767,39 +926,153 @@ impl Component for StorageDialog {
             let limit = wrapped.saturating_sub(usize::from(rects.viewport.height));
             scroll_limit = limit;
             scroll = scroll.min(limit);
-            frame.render_widget(
-                text.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
-                rects.viewport,
+            // Reveal the stored offset via the shared viewport; same rects
+            // drive paint, scrollbar and mouse.
+            let scrolled = ScrollViewport::new(viewport_probe, wrapped, scroll);
+            let bar_w = u16::from(scrolled.scrollbar.is_some());
+            let text_area = Rect::new(
+                scrolled.viewport.x,
+                scrolled.viewport.y,
+                scrolled.viewport.width.saturating_sub(bar_w),
+                scrolled.viewport.height,
             );
-            if let Some(bar) = rects.scrollbar {
-                render_scrollbar(frame, bar, scroll, limit, theme, ascii);
+            frame.render_widget(
+                text.scroll((scrolled.first_row.min(u16::MAX as usize) as u16, 0)),
+                text_area,
+            );
+            if let Some(bar) = scrolled.scrollbar {
+                render_scrollbar(frame, bar, scrolled.first_row, limit, theme, ascii);
+                surface.scrollable = true;
             }
+            scroll = scrolled.first_row;
             diagnostics_rect = Some(area);
         }
 
-        render_message(frame, regions.message, state, &sentence, theme, ascii);
+        render_message(frame, message_rect, state, &sentence, theme, ascii);
         // §8.2: cleanup is destructive once it is the confirming action.
+        // Default is Refresh even while Confirm shows; destructive never default.
         let destructive = if self.confirm_clear {
             vec![1]
         } else {
             Vec::new()
         };
-        let actions = render_action_row(
-            frame,
-            regions.actions,
-            &action_labels,
-            None,
-            &destructive,
-            theme,
-        );
+        let action_row = ActionRow {
+            labels: &action_labels,
+            default: Some(0),
+            destructive: &destructive,
+            focused: None,
+        };
+        let mut action_hit: Vec<(usize, Rect)> = Vec::new();
+        let mut more_hit: Vec<(Rect, ())> = Vec::new();
+        let mut menu_anchor: Option<Rect> = None;
+        for (orig, rect) in action_geom.buttons.iter().copied() {
+            let role = action_row.role(orig);
+            render_role_button(frame, rect, action_labels[orig], role, false, theme);
+            action_hit.push((orig, rect));
+        }
+        // Pressure order: wrap to two rows first; beyond that collapse to one
+        // row with a same-layer More ▾ (never a child). The hidden Cleanup
+        // stays reachable via the anchored menu, preserving the two-step.
+        if !action_geom.overflow.is_empty()
+            && let Some(more_rect) = action_geom.more
+        {
+            let more_label = if ascii { "More v" } else { "More \u{25be}" };
+            render_role_button(
+                frame,
+                more_rect,
+                more_label,
+                crate::dialog_controls::ButtonRole::Normal,
+                false,
+                theme,
+            );
+            menu_anchor = Some(more_rect);
+            more_hit.push((more_rect, ()));
+        }
+        // Same-layer anchored overflow menu for the hidden Cleanup/Confirm.
+        // Frame-bounded to the terminal frame, exact union into the popup.
+        let mut menu_hit: Vec<(Rect, usize)> = Vec::new();
+        if self.menu_open
+            && let Some(anchor) = menu_anchor
+            && !action_geom.overflow.is_empty()
+        {
+            let hidden: Vec<usize> = action_geom.overflow.clone();
+            let longest = hidden
+                .iter()
+                .filter_map(|idx| action_labels.get(*idx))
+                .map(|label| UnicodeWidthStr::width(*label))
+                .max()
+                .unwrap_or(8);
+            let preferred = u16::try_from(longest.saturating_add(4))
+                .unwrap_or(12)
+                .max(12);
+            let spec = crate::dialog_layout::AnchoredSpec::new(hidden.len(), None, preferred, 0);
+            let selected = self.menu_selected.min(hidden.len().saturating_sub(1));
+            let pop = crate::dialog_layout::anchored_geometry(area, anchor, &spec, selected, 0);
+            surface.popup = surface.popup.union(pop.popup);
+            crate::ui::clear_themed(frame, pop.popup, theme);
+            frame.render_widget(
+                ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(styles.label),
+                pop.popup,
+            );
+            let bar_w = u16::from(pop.scrollbar.is_some());
+            for (offset, orig) in hidden
+                .iter()
+                .copied()
+                .skip(pop.first_item)
+                .take(usize::from(pop.viewport.height))
+                .enumerate()
+            {
+                let idx = pop.first_item.saturating_add(offset);
+                let Some(label) = action_labels.get(orig) else {
+                    continue;
+                };
+                let row = Rect::new(
+                    pop.viewport.x,
+                    pop.viewport.y.saturating_add(offset as u16),
+                    pop.viewport.width.saturating_sub(bar_w),
+                    1,
+                );
+                let style = if idx == selected {
+                    styles.selection
+                } else {
+                    crate::dialog_controls::button_style(theme, false, false)
+                };
+                frame.render_widget(Paragraph::new((*label).to_owned()).style(style), row);
+                // Store the original action index so choosing runs Refresh (0)
+                // or Cleanup/Confirm (1) directly, same-layer.
+                menu_hit.push((row, orig));
+            }
+            if let Some(bar) = pop.scrollbar {
+                render_scrollbar(
+                    frame,
+                    bar,
+                    pop.first_item,
+                    hidden
+                        .len()
+                        .saturating_sub(usize::from(pop.viewport.height)),
+                    theme,
+                    ascii,
+                );
+                surface.scrollable = true;
+            }
+        }
 
         self.scroll = scroll;
         self.scroll_limit = scroll_limit;
+        // Clamp the overflow selection to the last painted menu so keys and
+        // mouse never disagree after a resize.
+        if !menu_hit.is_empty() {
+            self.menu_selected = self.menu_selected.min(menu_hit.len().saturating_sub(1));
+        }
         self.geometry = StorageGeometry {
             body,
             rows,
-            actions,
+            actions: action_hit,
             diagnostics: diagnostics_rect,
+            menu: menu_hit,
+            more: more_hit,
         };
         self.surface = surface;
         surface
