@@ -1090,6 +1090,13 @@ fn recipes_spec_for(area: Rect, ascii: bool) -> DialogSpec {
     let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
     let estimate = policy_w.saturating_sub(4).max(1);
     let action_rows = stable_action_rows(estimate, &max_labels).clamp(1, 2);
+    // At the supported 20x6 floor, spend the four interior rows on a list
+    // heading + item and the two-row action band. The status/help prose is
+    // recoverable at the next size up; keeping it here would collapse the
+    // action band to one row, making More and its hidden verbs unreachable.
+    if area.height == 6 {
+        return DialogSpec::new(PresentationKind::LongContent, 0, 2, 0, 0, action_rows);
+    }
     DialogSpec::new(PresentationKind::LongContent, 0, 3, 2, 2, action_rows)
 }
 

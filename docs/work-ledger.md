@@ -3186,3 +3186,11 @@ End through the real focused body viewport, and deletes the compatibility UI
 render helpers left unused after the final migrations. The focused Time test
 and all-target `lvu` Clippy with warnings denied pass. Failed evidence remains
 under `lvu-v018-325befc-acceptance/`; the successor receives a new exact run.
+
+The next exact candidate at `264b123` compiled and progressed through the
+component suites before both Recipes 20x6 tests exposed an integration defect:
+preserving two status rows squeezed its two-row action band to one, so shared
+action planning correctly refused an unreachable `More` menu and rendered no
+dialog. The repair spends the four interior floor rows on one list row plus the
+two-row action band; status/help return above the floor. All 14 Recipes tests
+pass. Failed evidence remains under `lvu-v018-264b123-acceptance/`.
