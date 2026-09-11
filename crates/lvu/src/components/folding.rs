@@ -72,9 +72,8 @@ const FOLD_PICKER_ROWS: u16 = 8;
 /// but its checkmarks. `anchored_geometry` with a reserved `AnchoredSpec` keeps
 /// the popup rect identical from one frame to the next instead of sizing from
 /// the live item count, which would move the list's rows under the cursor when
-/// that happens. An overlong list scrolls behind a trailing `+N more`, which is
-/// the §5.2.1 affordance for a region with no pane heading; a short one leaves
-/// the remaining rows blank.
+/// that happens. An overlong list scrolls inside the reserved viewport behind
+/// the shared scrollbar; a short one leaves the remaining rows blank.
 ///
 /// This is not `dialog_layout::live_rows`, whose spare-row arithmetic is for a
 /// region *inside* a body the dialog has to fit. An anchored popup is bounded
@@ -1169,22 +1168,16 @@ impl Component for FoldingDialog {
                 // default background instead of the dialog surface.
                 crate::ui::clear_themed(frame, box_area, theme);
                 // Viewport rows share one authority: the shared first_item
-                // window drives paint, scrollbar and hitboxes alike.
+                // window drives paint, scrollbar and hitboxes alike. The whole
+                // viewport paints choices — no row is stolen for a `+N more`
+                // summary, which is what used to hide the highlighted last
+                // item behind the revealed window's end. The shared scrollbar
+                // alone communicates overflow.
                 let viewport = popup.viewport;
                 let cell_width = usize::from(viewport.width);
                 let first = popup.first_item.min(choices.len());
-                // §5.2.1 overflow: the last reserved row says how much is not
-                // shown, because a bare popup has no §8.7 heading to carry a
-                // count. The shared scrollbar renders as well when the live
-                // total exceeds the reserved viewport.
-                let rows_available = usize::from(viewport.height);
-                let overflowing = choices.len() > rows_available;
-                let visible = if overflowing {
-                    rows_available.saturating_sub(1)
-                } else {
-                    rows_available
-                };
-                let mut items: Vec<ListItem> = choices
+                let visible = usize::from(viewport.height);
+                let items: Vec<ListItem> = choices
                     .iter()
                     .enumerate()
                     .skip(first)
@@ -1199,16 +1192,6 @@ impl Component for FoldingDialog {
                         )
                     })
                     .collect();
-                if overflowing {
-                    let hidden = choices.len().saturating_sub(visible);
-                    items.push(
-                        ListItem::new(Line::from(truncated(
-                            &format!("+{hidden} more"),
-                            cell_width,
-                        )))
-                        .style(styles.description),
-                    );
-                }
                 frame.render_widget(
                     List::new(items).block(
                         Block::default()

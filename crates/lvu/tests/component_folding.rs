@@ -43,14 +43,14 @@ fn screen(buffer: &Buffer) -> String {
         .join("\n")
 }
 
-fn key(app: &mut App, provider: &FixtureProvider, code: KeyCode) {
+fn key(app: &mut App, provider: &impl RowProvider, code: KeyCode) {
     app.handle(
         Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))),
         provider,
     );
 }
 
-fn click(app: &mut App, provider: &FixtureProvider, point: (u16, u16)) {
+fn click(app: &mut App, provider: &impl RowProvider, point: (u16, u16)) {
     app.handle(
         Action::Raw(RawEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -62,7 +62,7 @@ fn click(app: &mut App, provider: &FixtureProvider, point: (u16, u16)) {
     );
 }
 
-fn open_folding(app: &mut App, provider: &FixtureProvider) {
+fn open_folding(app: &mut App, provider: &impl RowProvider) {
     app.handle(Action::Open(Open::Folding), provider);
     assert_eq!(app.layers.stack, vec![LayerId::Folding]);
 }
@@ -340,6 +340,119 @@ fn anchored_picker_paints_themed_background_with_contained_glyphs() {
             );
         }
     }
+}
+
+/// A provider whose rows carry twelve columns, so the key-column picker holds
+/// thirteen rows (plus `[ New column… ]`) against eight reserved viewport rows.
+struct FatFieldProvider;
+
+impl lvu::RowProvider for FatFieldProvider {
+    fn page(&self, _view_id: &str, _request: lvu::ViewportRequest) -> lvu::RowPage {
+        lvu::RowPage {
+            total: 0,
+            rows: Vec::new(),
+        }
+    }
+
+    fn row_by_id(&self, _view_id: &str, _id: &lvu::RowId) -> Option<lvu::DisplayRow> {
+        None
+    }
+
+    fn index_of_id(&self, _view_id: &str, _id: &lvu::RowId) -> Option<usize> {
+        Some(0)
+    }
+
+    fn revision(&self, _view_id: &str) -> u64 {
+        0
+    }
+
+    fn unfolded_page(&self, _view_id: &str, _request: lvu::ViewportRequest) -> lvu::RowPage {
+        lvu::RowPage {
+            total: 1,
+            rows: vec![lvu::DisplayRow {
+                id: lvu::RowId::new("api", 1),
+                timestamp: "12:00:01.000Z".into(),
+                captured_at_unix_nanos: None,
+                level: "INFO".into(),
+                text: "fat".into(),
+                details: Vec::new(),
+                fields: (0..12)
+                    .map(|index| (format!("field{index:02}"), "v".into()))
+                    .collect(),
+            }],
+        }
+    }
+}
+
+#[test]
+fn long_picker_paints_and_hits_first_and_last_without_stealing_a_row() {
+    let (_, sources, views) = FixtureProvider::demo();
+    let provider = FatFieldProvider;
+    let mut app = App::new(sources, views, true);
+    open_folding(&mut app, &provider);
+    // Thirteen rows against eight reserved: the popup keeps its reserved
+    // height and the shared scrollbar — not an ad-hoc `+N more` row —
+    // communicates the overflow.
+    key(&mut app, &provider, KeyCode::Enter);
+    let buffer = draw(&provider, &mut app, 80, 24);
+    let rendered = screen(&buffer);
+    assert!(rendered.contains("field00"), "{rendered}");
+    // ("3 or more" is the Minimum-run value, not the old affordance: thirteen
+    // items minus seven visible rows used to steal the last row for this.)
+    assert!(!rendered.contains("+6 more"), "{rendered}");
+    // The whole reserved viewport paints choices: eight hitboxes, one per row.
+    assert_eq!(app.layers.folding.choice_rects().len(), 8);
+    for (rect, index) in app.layers.folding.choice_rects().to_vec() {
+        assert_eq!(
+            app.layers.folding.hit((rect.x, rect.y)),
+            Some(lvu::components::folding::FoldingHit::Choice(index))
+        );
+    }
+    // Bottom highlight: the last item is revealed, painted and hittable —
+    // the old summary-row reservation used to hide exactly this row.
+    for _ in 0..12 {
+        key(&mut app, &provider, KeyCode::Down);
+    }
+    assert_eq!(app.layers.folding.highlighted(), 12);
+    let buffer = draw(&provider, &mut app, 80, 24);
+    let rendered = screen(&buffer);
+    assert!(rendered.contains("New column"), "{rendered}");
+    let last = app
+        .layers
+        .folding
+        .choice_rects()
+        .last()
+        .copied()
+        .expect("revealed window paints eight rows");
+    assert_eq!(last.1, 12);
+    assert_eq!(
+        app.layers.folding.hit((last.0.x, last.0.y)),
+        Some(lvu::components::folding::FoldingHit::Choice(12))
+    );
+    // Wheel scrolls the open picker…
+    key(&mut app, &provider, KeyCode::Up);
+    assert_eq!(app.layers.folding.highlighted(), 11);
+    app.handle(
+        Action::Raw(RawEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 40,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        })),
+        &provider,
+    );
+    assert_eq!(app.layers.folding.highlighted(), 12);
+    // …and a click on a visible row picks exactly that column and closes the
+    // picker.
+    let middle = app.layers.folding.choice_rects()[2];
+    let want = format!("field{:02}", middle.1);
+    click(&mut app, &provider, (middle.0.x, middle.0.y));
+    assert_eq!(app.view_state().unwrap().fold_key_column, Some(want));
+    draw(&provider, &mut app, 80, 24);
+    assert!(
+        app.layers.folding.choice_rects().is_empty(),
+        "choosing a column closes the picker"
+    );
 }
 
 #[test]

@@ -373,7 +373,8 @@ impl Component for UnionDialogComponent {
             popup: geometry.frontmost,
             interior: geometry.interior,
             caret: None,
-            scrollable: candidates.len() > usize::from(geometry.body.viewport.height.max(1)),
+            // Derived from the actual list overflow below, never asserted.
+            scrollable: false,
             text_focus: false,
         };
         self.geometry = UnionGeometry {
@@ -456,6 +457,10 @@ impl Component for UnionDialogComponent {
                     ascii,
                 );
             }
+            // The wheel is wanted exactly when the candidate list overflows
+            // its shared viewport. The heading row counts: a list exactly as
+            // long as the body still overflows once the heading takes its row.
+            surface.scrollable = list.scrollbar.is_some();
         }
         render_message(
             frame,
@@ -499,8 +504,11 @@ impl Component for UnionDialogComponent {
         self.geometry.inputs = inputs_hit;
         self.geometry.buttons = buttons_hit;
         // Surface popup stays the frame: no anchored overlay is wired here, so
-        // frontmost == frame and containment matches paint.
+        // frontmost == frame and containment matches paint. Publish the final
+        // surface (including the derived scrollable flag): `surface()` must
+        // answer what this frame painted, not the pre-list provisional.
         surface.popup = geometry.frontmost;
+        self.surface = surface;
         surface
     }
 

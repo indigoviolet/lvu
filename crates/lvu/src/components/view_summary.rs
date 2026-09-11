@@ -467,7 +467,7 @@ impl ViewSummaryDialog {
             SummaryRow::Search => Open::Search,
             SummaryRow::Filter => Open::Advanced,
             SummaryRow::Grouping => Open::Grouping,
-            SummaryRow::Fold => Open::Grouping,
+            SummaryRow::Fold => Open::Folding,
             SummaryRow::Columns => match state.pinned_columns.first() {
                 Some(column) => Open::FieldColumn {
                     column: column.clone(),

@@ -263,7 +263,7 @@ fn enter_on_each_row_replaces_the_summary_with_the_owning_layer_and_its_item() {
         (SummaryRow::Search, LayerId::Filter),
         (SummaryRow::Filter, LayerId::Filter),
         (SummaryRow::Grouping, LayerId::Grouping),
-        (SummaryRow::Fold, LayerId::Grouping),
+        (SummaryRow::Fold, LayerId::Folding),
         (SummaryRow::Columns, LayerId::Fields),
         (SummaryRow::Colour, LayerId::ColorRules),
         (SummaryRow::Readiness, LayerId::Enrichment),
@@ -309,6 +309,13 @@ fn enter_on_each_row_replaces_the_summary_with_the_owning_layer_and_its_item() {
                 assert_eq!(fields[selected].path, "level", "{row:?}");
             }
             SummaryRow::Colour => assert!(app.layers.color_rules.is_open()),
+            // The Fold row is owned by the Folding dialog: Enter replaces the
+            // summary with it, on the key column the summary names.
+            SummaryRow::Fold => {
+                assert!(app.layers.folding.is_open());
+                let rendered = screen(&draw(&provider, &mut app, 100, 30));
+                assert!(rendered.contains("Folding"), "{rendered}");
+            }
             _ => {}
         }
         // Back to the base screen for the next row.
@@ -318,6 +325,32 @@ fn enter_on_each_row_replaces_the_summary_with_the_owning_layer_and_its_item() {
             "{row:?}: Escape closes the owner"
         );
     }
+}
+
+#[test]
+fn the_fold_row_routes_to_folding_and_escape_returns_to_base() {
+    let (provider, mut app) = demo();
+    apply_everything(&mut app);
+    open_summary(&mut app, &provider);
+    draw(&provider, &mut app, 100, 30);
+    // Fold is row index 7 in evaluation order; the Grouping row stays the
+    // Multiline grouping dialog's (covered per-row above).
+    for _ in 0..7 {
+        key(&mut app, &provider, KeyCode::Down, KeyModifiers::NONE);
+    }
+    assert_eq!(app.layers.view_summary.selected_row(), SummaryRow::Fold);
+    key(&mut app, &provider, KeyCode::Enter, KeyModifiers::NONE);
+    // A Replace, not a child: the summary is gone and Folding owns the stack.
+    assert_eq!(app.layers.stack, vec![LayerId::Folding]);
+    assert!(!app.layers.view_summary.is_open());
+    assert!(app.layers.folding.is_open());
+    let rendered = screen(&draw(&provider, &mut app, 100, 30));
+    assert!(rendered.contains("Folding · "), "{rendered}");
+    assert!(!rendered.contains("View summary"), "{rendered}");
+    // Escape closes Folding back to the base screen, not to the summary.
+    key(&mut app, &provider, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(app.layers.stack.is_empty());
+    assert!(!app.layers.folding.is_open());
 }
 
 #[test]
@@ -380,7 +413,9 @@ fn the_button_its_mnemonic_and_the_mouse_open_the_selected_row_too() {
         Some(SummaryHit::Control(SummaryControl::Open))
     );
     click(&mut app, &provider, (button_x + 2, button_y));
-    assert_eq!(app.layers.stack, vec![LayerId::Grouping]);
+    // The clicked row is Fold, which the Folding dialog owns — not Grouping.
+    assert_eq!(app.layers.stack, vec![LayerId::Folding]);
+    assert!(app.layers.folding.is_open());
 }
 
 #[test]

@@ -468,6 +468,18 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
 /// header underlines.
 const VIEW_TAB_LABELS: [&str; 4] = ["New &blank", "&Clone", "&Rename", "&Sources"];
 
+/// Compact header segments for narrow headers (the 20x6 floor): the full set
+/// needs 30 cells with separators, so below that the same four modes render
+/// abbreviated. Same order, same underlined mnemonics (`b`/`c`/`r`/`s`), same
+/// `ViewDialogMode::ALL` mapping — only the drawn text is shorter. Exact-fit
+/// budget: 2 + 5 + 3 + 3 label cells plus 3 one-cell separators = 16, the
+/// narrowest content width an ordinary dialog resolves at.
+const VIEW_TAB_LABELS_COMPACT: [&str; 4] = ["&Bl", "&Clone", "&Ren", "&Src"];
+
+/// Content width below which the full segment set cannot fit and the compact
+/// set takes over: full labels plus separators measure 9 + 5 + 6 + 7 + 3.
+const VIEW_TABS_FULL_WIDTH: u16 = 30;
+
 /// The one action-row verb (§8.9). It is the only button the dialog draws.
 fn view_apply_label(mode: ViewDialogMode) -> &'static str {
     if mode == ViewDialogMode::Sources {
@@ -740,17 +752,21 @@ impl Component for ViewDialog {
             .position(|mode| *mode == self.mode)
             .unwrap_or(0);
         let focused = (self.control == ViewDialogControl::Tabs).then_some(active);
-        let tabs: Vec<(Rect, ViewDialogMode)> = render_segmented_control(
-            frame,
-            geometry.header,
-            &VIEW_TAB_LABELS,
-            active,
-            focused,
-            theme,
-        )
-        .into_iter()
-        .zip(ViewDialogMode::ALL)
-        .collect();
+        // Narrow headers cannot fit the full segment set without clipping
+        // segments outside the popup; the compact set keeps every mode
+        // painted, disjoint, inside the header and mouse-selectable.
+        // Mnemonic resolution still reads the full labels (same letters, same
+        // order), so keys and clicks agree on every size.
+        let tab_labels = if geometry.header.width < VIEW_TABS_FULL_WIDTH {
+            &VIEW_TAB_LABELS_COMPACT
+        } else {
+            &VIEW_TAB_LABELS
+        };
+        let tabs: Vec<(Rect, ViewDialogMode)> =
+            render_segmented_control(frame, geometry.header, tab_labels, active, focused, theme)
+                .into_iter()
+                .zip(ViewDialogMode::ALL)
+                .collect();
 
         // Recorded before the early return so a dialog too narrow to draw a
         // body still hit-tests its header rather than last frame's body.

@@ -500,8 +500,26 @@ fn responsive_frame_is_policy_stable_across_modes_lists_and_sizes() {
                 );
             }
             // Segmented header is the only mode control; sole Apply default.
+            // At the 20x6 floor the header is 16 cells, so the explicit
+            // compact set (Bl/Clone/Ren/Src) renders instead of the full one —
+            // same four modes, same mnemonics, still one segment per mode.
             assert_eq!(app.layers.view.tab_rects().len(), 4, "{width}x{height}");
             assert_eq!(app.layers.view.control_rects().len(), 1, "{width}x{height}");
+            if (width, height) == (20, 6) {
+                for compact in ["Bl", "Clone", "Ren", "Src"] {
+                    assert!(
+                        rendered.contains(compact),
+                        "{width}x{height} missing compact segment {compact}:\n{rendered}"
+                    );
+                }
+            } else {
+                for segment in ["New blank", "Clone", "Rename", "Sources"] {
+                    assert!(
+                        rendered.contains(segment),
+                        "{width}x{height} missing header segment {segment}:\n{rendered}"
+                    );
+                }
+            }
             if mode == ViewDialogMode::Sources {
                 // At the 20x6 floor the 20-cell "Apply membership" button clips
                 // to its 16-cell band; the default still survives as "Apply".
@@ -541,16 +559,35 @@ fn responsive_frame_is_policy_stable_across_modes_lists_and_sizes() {
                     );
                 }
             }
-            // Every drawn rect hit-tests to what it drew (shared projection).
-            // At the 20x6 floor the four segments overflow their 16-cell header
-            // and clip; the frame and default still survive, but exact tab
-            // hitboxes cannot all be distinct there.
-            if (width, height) != (20, 6) {
-                for (rect, m) in app.layers.view.tab_rects().to_vec() {
+            // Every segment rect is nonempty, disjoint, fully inside the
+            // header and the popup, painted, and hit-tests to its own mode —
+            // at the floor exactly as at roomy sizes (no waiver: the compact
+            // set tiles the 16-cell header exactly).
+            {
+                let tabs = app.layers.view.tab_rects().to_vec();
+                assert_eq!(tabs.len(), 4, "{width}x{height}");
+                for (rect, m) in &tabs {
+                    assert_eq!(rect.height, 1, "{width}x{height} {m:?}");
+                    assert!(rect.width > 0, "{width}x{height} {m:?} segment is empty");
+                    assert!(
+                        rect.x >= surface.popup.x
+                            && rect.right() <= surface.popup.right()
+                            && rect.y >= surface.popup.y
+                            && rect.bottom() <= surface.popup.bottom(),
+                        "{width}x{height} {m:?} {rect:?} escapes popup {:?}",
+                        surface.popup
+                    );
                     assert_eq!(
                         app.layers.view.hit((rect.x, rect.y)),
-                        Some(ViewHit::Tab(m)),
+                        Some(ViewHit::Tab(*m)),
                         "{width}x{height}"
+                    );
+                }
+                for pair in tabs.windows(2) {
+                    assert!(
+                        pair[0].0.right() <= pair[1].0.x,
+                        "{width}x{height} segments overlap: {:?}",
+                        pair
                     );
                 }
             }
@@ -567,6 +604,52 @@ fn responsive_frame_is_policy_stable_across_modes_lists_and_sizes() {
                     Some(ViewHit::Source(index)),
                     "{width}x{height}"
                 );
+            }
+            // Floor reachability: every compact segment is mouse-selectable
+            // and Left/Right/Enter all work there. Click each tab in turn;
+            // each switch lands in the arriving mode's body without
+            // submitting, and the header keeps Left/Right afterwards.
+            if (width, height) == (20, 6) {
+                for want in ViewDialogMode::ALL {
+                    draw(&provider, &mut app, width, height);
+                    let point = app
+                        .layers
+                        .view
+                        .tab_rects()
+                        .iter()
+                        .find(|(_, m)| *m == want)
+                        .map(|(rect, _)| (rect.x, rect.y))
+                        .expect("every mode has a floor segment");
+                    click(&mut app, &provider, point);
+                    assert_eq!(app.layers.view.mode(), want, "floor click");
+                    assert!(
+                        app.layers.view.outbox.take().is_empty(),
+                        "choosing a mode is not submitting"
+                    );
+                }
+                // Header traversal from the floor: Tab to Tabs, Left/Right
+                // cycle all four modes, Enter selects without submitting.
+                key(&mut app, &provider, KeyCode::Tab);
+                key(&mut app, &provider, KeyCode::Tab);
+                assert_eq!(app.layers.view.control(), ViewDialogControl::Tabs);
+                let start = app.layers.view.mode();
+                for _ in 0..ViewDialogMode::ALL.len() {
+                    key(&mut app, &provider, KeyCode::Right);
+                }
+                assert_eq!(app.layers.view.mode(), start, "Right must wrap");
+                assert_eq!(app.layers.view.control(), ViewDialogControl::Tabs);
+                key(&mut app, &provider, KeyCode::Enter);
+                assert!(app.layers.view.outbox.take().is_empty());
+                // Bare mnemonics resolve through the full labels (same
+                // letters, same order) even where the compact set is drawn.
+                // Redraw first, as the real loop does: dismissal routing reads
+                // the last render's text focus, and the clicks above left a
+                // text-field focus published.
+                draw(&provider, &mut app, width, height);
+                key(&mut app, &provider, KeyCode::Char('s'));
+                assert_eq!(app.layers.view.mode(), ViewDialogMode::Sources);
+                key(&mut app, &provider, KeyCode::Char('b'));
+                assert_eq!(app.layers.view.mode(), ViewDialogMode::Blank);
             }
             // Keyboard: Tab cycles Tabs→body→Apply; mouse: header click switches
             // mode without submitting, Apply click submits via outbox.

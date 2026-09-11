@@ -262,3 +262,30 @@ fn responsive_frame_is_policy_stable_for_short_and_long_lists() {
     assert!(floor.contains("Cancel"), "{floor}");
     assert!(!floor.contains("More"), "{floor}");
 }
+
+#[test]
+fn scrollable_comes_from_list_overflow_including_the_exact_boundary() {
+    // At 80x12 the LongContent body viewport is exactly 3 rows: the pane
+    // heading takes one, so a 3-row list already overflows even though its
+    // length equals the body height. Scrollability must come from the shared
+    // list geometry (scrollbar present), not from comparing the raw lengths.
+    for (extra, want_scrollable) in [(0usize, false), (1usize, true)] {
+        let (provider, mut app) = demo();
+        let source_id = app.views()[0].source_id.clone();
+        for index in 0..extra {
+            app.add_view(lvu::ViewItem {
+                id: format!("extra-{index}"),
+                source_id: source_id.clone(),
+                name: format!("Extra view {index}"),
+            });
+        }
+        app.handle(Action::Open(Open::Union(lvu::UnionOpen::Plain)), &provider);
+        let rendered = screen(&draw(&provider, &mut app, 80, 12));
+        assert!(rendered.contains("Union views"), "{rendered}");
+        assert_eq!(
+            app.layers.union.surface().scrollable,
+            want_scrollable,
+            "extra={extra}: 2 candidates fit the 2-row viewport, 3 overflow it:\n{rendered}"
+        );
+    }
+}
