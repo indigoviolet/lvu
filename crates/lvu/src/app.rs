@@ -3621,6 +3621,16 @@ pub struct Shell {
     pub cursors: CursorBank,
     pub size: (u16, u16),
     pub clock_now_unix_nanos: i64,
+    /// Frozen opening-row anchor for the layer stack (phase B shared core).
+    ///
+    /// Captured from the same last-rendered base geometry/hit regions when the
+    /// first layer opens, retained across async frames, child push and
+    /// `Replace`, never chasing live row movement, cleared when the stack
+    /// returns to base (and on resize, whose coordinates it would otherwise
+    /// misname). Exposed read-only through `RenderCtx::context_anchor` for
+    /// later Contextual Inspector/Prompt `resolve_dialog` calls; no new
+    /// independently computed row rectangle and no widened global hit regions.
+    pub context_anchor: Option<crate::dialog_layout::ContextAnchor>,
 }
 
 impl Shell {
@@ -6846,6 +6856,38 @@ impl App {
     // destructures `App` once so that the shell's shared state and the
     // component are provably different fields (§2.5).
 
+    /// Frozen opening-row anchor for the layer stack (phase B).
+    ///
+    /// Both rects come from the same last-rendered base geometry/hit regions:
+    /// the log viewport plus the painted rect of the selected log row when one
+    /// is selected *and* painted, otherwise an empty row with the log viewport
+    /// as fallback. Hand-rolled rect search here is presentation-only folding:
+    /// it reuses the painted hit regions, never query membership (AGENTS.md:
+    /// the query engine computes, the app names/presents).
+    fn capture_context_anchor<P: RowProvider>(
+        &self,
+        provider: &P,
+    ) -> crate::dialog_layout::ContextAnchor {
+        let log = self
+            .hit_regions
+            .log_rows
+            .or(self.hit_regions.log)
+            .unwrap_or_default();
+        let row = self
+            .active_view_id()
+            .zip(self.view_state().and_then(|state| state.selected.clone()))
+            .and_then(|(view_id, selected)| provider.index_of_id(view_id, &selected))
+            .and_then(|selected_index| {
+                self.hit_regions
+                    .log_row_indices
+                    .iter()
+                    .find(|(_, index)| *index == selected_index)
+                    .map(|(rect, _)| *rect)
+            })
+            .unwrap_or_default();
+        crate::dialog_layout::ContextAnchor::new(row, log)
+    }
+
     fn push_layer<P: RowProvider>(&mut self, open: Open, provider: &P) {
         // Settings has nothing to show without the effective-settings snapshot
         // `lvu-app` supplies. A component cannot decline its own `open`, so the
@@ -6865,6 +6907,13 @@ impl App {
         // layer leaves exactly the same state behind as it used to.
         self.dialog_scroll = 0;
         self.dialog_scroll_focused = false;
+        // Phase B: freeze the opening-row anchor when the first layer opens
+        // from the base screen. Child pushes and `Replace` retain the held
+        // value (see `apply_outcome`); live row movement never updates it.
+        if self.layers.stack.is_empty() && self.shell.context_anchor.is_none() {
+            let frozen = self.capture_context_anchor(provider);
+            self.shell.context_anchor = Some(frozen);
+        }
         let layer = open.layer();
         let App {
             shell,
@@ -6953,6 +7002,9 @@ impl App {
         self.layers.stack.pop();
         if self.layers.stack.is_empty() {
             self.focus = self.layer_return_focus;
+            // Phase B: the stack returned to base, so the frozen opening-row
+            // anchor no longer names anything on screen.
+            self.shell.context_anchor = None;
         }
     }
 
@@ -6961,8 +7013,21 @@ impl App {
             Outcome::Ignored | Outcome::Consumed => {}
             Outcome::Close => self.pop_layer(),
             Outcome::Replace(open) => {
-                self.pop_layer();
+                // Phase B: `Replace` preserves the held anchor exactly across
+                // the pop/push pair — including None. A plain pop would clear
+                // it when the stack empties and the push would recapture; a
+                // resize may have invalidated the anchor, and recapturing from
+                // stale pre-resize hit regions with no intervening redraw
+                // would silently serve old geometry once the next component
+                // wave consumes `RenderCtx::context_anchor`. Save and restore
+                // unconditionally instead.
+                let held = self.shell.context_anchor;
+                self.layers.stack.pop();
+                if self.layers.stack.is_empty() {
+                    self.focus = self.layer_return_focus;
+                }
                 self.push_layer(open, provider);
+                self.shell.context_anchor = held;
             }
             Outcome::OpenChild(open) => self.push_layer(open, provider),
             Outcome::Legacy(action) => {
@@ -7303,8 +7368,19 @@ impl App {
     /// that are not on top. `pop_layer` is the top-of-stack case.
     fn close_layer(&mut self, id: LayerId) {
         self.layers.stack.retain(|open| *open != id);
-        if self.layers.stack.is_empty() && self.focus == Focus::Layer {
-            self.focus = self.layer_return_focus;
+        if self.layers.stack.is_empty() {
+            // Phase B: the stack returned to base, so the frozen opening-row
+            // anchor no longer names anything on screen. Clear regardless of
+            // focus: async completions (Source success, discovery, agent
+            // launch) select the new view — Focus::Logs — before closing the
+            // layer, and a focus-gated clear would leak the stale anchor into
+            // the next first-layer open, which retains a held anchor instead
+            // of capturing fresh. Base focus itself is still restored only
+            // when a layer held it.
+            self.shell.context_anchor = None;
+            if self.focus == Focus::Layer {
+                self.focus = self.layer_return_focus;
+            }
         }
     }
 
@@ -7893,7 +7969,16 @@ impl App {
                 self.focus = Focus::Logs;
             }
             Action::OpenSource => self.handle(Action::Open(Open::Source), provider),
-            Action::Resize(width, height) => self.shell.size = (width, height),
+            Action::Resize(width, height) => {
+                // Phase B: a resize invalidates the frozen anchor's coordinates.
+                // The next render recaptures nothing while the stack is up; the
+                // inspector falls back to centered/top-biased placement instead
+                // of misnaming a row from the old viewport.
+                if (width, height) != self.shell.size {
+                    self.shell.context_anchor = None;
+                }
+                self.shell.size = (width, height);
+            }
             Action::Mouse(event) => self.handle_mouse(event, provider),
             // Reachable only while their dialog holds focus; the guarded arms
             // above handle them there.

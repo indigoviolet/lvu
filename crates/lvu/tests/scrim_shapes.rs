@@ -195,6 +195,170 @@ fn the_corner_art_keeps_its_anchor_when_a_layer_opens() {
     }
 }
 
+/// Phase B: the palette applies exactly one scrim over whatever base/layer
+/// stack is underneath, through the existing helper so block-art shape and
+/// background rules hold. A child keeps its own scrim count; opening the
+/// palette adds one, not zero or two.
+#[test]
+fn palette_scrims_exactly_once_in_dark_light_and_terminal() {
+    use lvu::command_palette::{Palette, PaletteContext};
+    use lvu::dialog_layout::scrim;
+    for id in [ThemeId::LoveDark, ThemeId::LoveLight, ThemeId::Terminal] {
+        let theme = id.theme();
+        // Base without palette: no scrim (plain art).
+        let plain = draw(theme, false, false);
+        // Base + palette (no dialog): palette.render scrims once over the base.
+        let (provider, sources, views) = lvu::fixture::FixtureProvider::demo();
+        let mut app = lvu::App::new(sources, views, true);
+        let config =
+            lvu::delight::DelightConfig::new(true, false, false, std::time::Duration::from_secs(1));
+        let mut palette = Palette::new();
+        palette.open(PaletteContext::new(lvu::Focus::Logs, true));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(SIZE.0, SIZE.1)).unwrap();
+        terminal
+            .draw(|frame| {
+                lvu::ui::render_with_theme(
+                    frame,
+                    &mut app,
+                    &provider,
+                    theme,
+                    Some((
+                        std::time::Duration::ZERO,
+                        config,
+                        lvu::delight::ActivityState::Idle,
+                    )),
+                );
+                palette.render_with_theme(frame, frame.area(), theme);
+            })
+            .unwrap();
+        let paletted = terminal.backend().buffer().clone();
+        // Outside the palette frame the backdrop must be scrimmed once: symbols
+        // untouched, block shape preserved (fg != bg), background preserved for
+        // text (bg unchanged) and art dimmed toward the backdrop (not muted).
+        let frame = palette.geometry().expect("palette resolves").frame;
+        let before = art_cells(&plain);
+        // Manual single scrim over the plain base for comparison (no popup).
+        let mut manual = plain.clone();
+        let manual_area = manual.area;
+        scrim(&mut manual, manual_area, theme);
+        for (index, ((symbol, fg, bg), (_, man_fg, man_bg))) in
+            before.iter().zip(art_cells(&manual).iter()).enumerate()
+        {
+            if !is_block(symbol) {
+                continue;
+            }
+            // Art cells live in the sidebar corner, far from the centered
+            // palette frame at 80x24, so they are backdrop (scrimmed, not
+            // covered). If a future frame covers them, this test must pick a
+            // different backdrop cell rather than asserting covered pixels.
+            let (columns, rows) = ART;
+            let x = columns.clone().nth(index % columns.len()).unwrap();
+            let y = rows.clone().nth(index / columns.len()).unwrap();
+            if frame.contains((x, y).into()) {
+                continue;
+            }
+            let pal_cell = &paletted[(x, y)];
+            assert_eq!(
+                pal_cell.symbol(),
+                *symbol,
+                "{id:?}: palette scrim moved a glyph"
+            );
+            assert_ne!(
+                pal_cell.fg, pal_cell.bg,
+                "{id:?}: palette scrim flattened block shape"
+            );
+            // Exactly once: matches one manual scrim, not zero and not two.
+            // Where lvu cannot measure a colour (Reset/ANSI on a remappable
+            // terminal, e.g. Terminal theme with Reset backdrop) the rule is
+            // to leave the picture alone: plain == single == double, still
+            // exactly-once in the sense of "no extra repaint".
+            assert_eq!(
+                (pal_cell.fg, pal_cell.bg),
+                (*man_fg, *man_bg),
+                "{id:?}: palette scrim is not exactly one pass"
+            );
+            let measurable = lvu::theme::resolved_rgb(*fg).is_some()
+                && lvu::theme::resolved_rgb(*bg).is_some()
+                && lvu::theme::resolved_rgb(theme.base_bg).is_some();
+            if measurable {
+                // Not zero: did something.
+                assert_ne!(
+                    (*fg, *bg),
+                    (pal_cell.fg, pal_cell.bg),
+                    "{id:?}: palette added no scrim"
+                );
+                // Not two: a second manual pass moves further toward the
+                // backdrop.
+                let mut twice = manual.clone();
+                let twice_area = twice.area;
+                scrim(&mut twice, twice_area, theme);
+                let twice_cell = &twice[(x, y)];
+                assert_ne!(
+                    (pal_cell.fg, pal_cell.bg),
+                    (twice_cell.fg, twice_cell.bg),
+                    "{id:?}: single vs double scrim indistinguishable"
+                );
+            } else {
+                // Unmeasurable: left alone, which is the shape-preserving rule.
+                assert_eq!(
+                    (*fg, *bg),
+                    (pal_cell.fg, pal_cell.bg),
+                    "{id:?}: unmeasurable art must be left alone, not muted"
+                );
+            }
+            let _ = (man_fg, man_bg);
+        }
+        // And it *is* dimmer somewhere: at least one backdrop cell moved.
+        assert_ne!(
+            screen(&plain),
+            screen(&paletted),
+            "{id:?}: palette scrim did nothing"
+        );
+    }
+}
+
+/// Phase B: no log click/scroll leaks behind the palette. Clicks outside the
+/// palette's row hitboxes change nothing; scrolls move the palette selection
+/// (consumed) rather than reaching the log behind it.
+#[test]
+fn palette_contains_mouse_and_scroll() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use lvu::command_palette::{Palette, PaletteContext};
+    let mut palette = Palette::new();
+    palette.open(PaletteContext::new(lvu::Focus::Logs, true));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| palette.render(frame, frame.area()))
+        .unwrap();
+    let before = palette.selected_command().unwrap().id;
+    // Click far outside any row hitbox (top-left corner, above the centered
+    // frame at 80x24): selection stays, nothing leaks to a log behind it.
+    palette.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(
+        palette.selected_command().unwrap().id,
+        before,
+        "a click outside the palette reached behind it"
+    );
+    // Scroll is consumed by the palette (moves its selection), not the log.
+    palette.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_ne!(
+        palette.selected_command().unwrap().id,
+        before,
+        "scroll did not move the palette selection"
+    );
+}
+
 /// Sixteen colours and the ASCII fallback: the same rule, and no panic.
 ///
 /// The art is decoded from checked-in SGR assets, so its pixels are `Rgb` at

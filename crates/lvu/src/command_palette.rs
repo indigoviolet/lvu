@@ -6,13 +6,16 @@ use crate::component::{CommandEntry, LayerId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Paragraph, Wrap},
 };
 
 use crate::dialog_controls::DialogStyles;
+use crate::dialog_layout::{
+    DialogGeometry, DialogSpec, GeometryError, PresentationKind, ScrollViewport,
+};
 use crate::text_edit::{
     EditCommand, EditPolicy, TextCursor, cursor_line_prefix, edit, reset_cursor_to_end,
 };
@@ -21,6 +24,33 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const MAX_QUERY_BYTES: usize = 256;
 pub const MAX_RESULTS: usize = 128;
+
+/// Stable palette budgets (phase B shared core).
+///
+/// Outer size comes from `PresentationKind::Palette` policy alone, never from
+/// async result counts, so pending/empty/populated/error frames share one
+/// `frame` and sticky tail origins. The body owns the surplus with selection
+/// scrolling; query (header 1), list minimum (3) and detail (message 2 + help
+/// 2) are stable maxima. Detail underflow stays blank; tiny viewports degrade
+/// help first per §5.4, preserving one body row and (no actions here) no
+/// default to lose. Hand-rolled row assignment here is presentation-only
+/// folding: it maps stable logical rows to painted rects, never query
+/// membership (AGENTS.md).
+pub fn palette_spec() -> DialogSpec {
+    DialogSpec::new(PresentationKind::Palette, 1, 3, 2, 2, 0)
+}
+
+/// One authoritative palette geometry for `viewport` holding
+/// `display_rows` logical rows (matches plus the one `Not available now`
+/// heading when present). Outer size is policy-only; `display_rows` sizes
+/// only the scroll extent. Returns `TooSmall` below the 20x6 floor, where the
+/// caller draws nothing and the palette stays open.
+pub fn palette_geometry(
+    viewport: Rect,
+    display_rows: usize,
+) -> Result<DialogGeometry, GeometryError> {
+    crate::dialog_layout::resolve_dialog(viewport, &palette_spec(), display_rows, &[], None, None)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CommandId {
@@ -292,6 +322,10 @@ pub struct Palette {
     scroll: usize,
     visible_rows: usize,
     rows: Vec<(Rect, usize)>,
+    /// Last resolved shared geometry (phase B). Rendering, row hitboxes,
+    /// scrollbar, cursor and selection bounds all consume this one object, so
+    /// they cannot drift apart. `None` when closed or below the floor.
+    geometry: Option<DialogGeometry>,
 }
 
 impl Default for Palette {
@@ -317,6 +351,7 @@ impl Palette {
             scroll: 0,
             visible_rows: 0,
             rows: Vec::new(),
+            geometry: None,
         };
         palette.replace_catalog();
         palette
@@ -396,12 +431,20 @@ impl Palette {
     }
 
     /// Display row of a match: matches after the group heading sit one row
-    /// lower than their index.
-    fn display_index(&self, result: usize) -> usize {
+    /// lower than their index. Public so shell/palette tests assert hitboxes
+    /// against the true logical index including the heading offset, rather
+    /// than assuming hitbox ordinal == display row.
+    pub fn display_index(&self, result: usize) -> usize {
         match self.unavailable_start {
             Some(start) if result >= start => result + 1,
             _ => result,
         }
+    }
+
+    /// Where the `Not available now` group starts in `matches`, if any.
+    /// Exposes the heading's display row for the same hitbox agreement checks.
+    pub fn unavailable_start(&self) -> Option<usize> {
+        self.unavailable_start
     }
 
     fn display_rows(&self) -> usize {
@@ -509,8 +552,37 @@ impl Palette {
         self.selection_area.filter(|_| self.open)
     }
 
+    /// Last resolved shared geometry, when open and above the floor. Rendering,
+    /// row hitboxes, scrollbar, cursor and selection bounds all consume this
+    /// one object. `None` when closed or below the 20x6 floor.
+    pub fn geometry(&self) -> Option<&DialogGeometry> {
+        self.geometry.as_ref().filter(|_| self.open)
+    }
+
+    /// Row hitboxes from the last render, in display order. Each is a
+    /// `project_row` rect from the stored scroll viewport, so paint and mouse
+    /// share them; the unavailable heading has none.
+    pub fn hitboxes(&self) -> &[(Rect, usize)] {
+        &self.rows
+    }
+
+    /// Stable frame for `viewport` holding the current display rows, for tests
+    /// asserting frame stability across zero/many/disabled results. `None`
+    /// below the floor.
+    pub fn resolved_frame(&self, viewport: Rect) -> Option<Rect> {
+        palette_geometry(viewport, self.display_rows())
+            .ok()
+            .map(|geometry| crate::component::shell_frontmost(&geometry))
+    }
+
     pub fn resize(&mut self, area: Rect) {
-        self.visible_rows = area.height.saturating_sub(4) as usize;
+        // Prefer the shared geometry's body viewport when it resolves; fall
+        // back to the old height-minus-chrome estimate below the floor.
+        if let Ok(geometry) = palette_geometry(area, self.display_rows()) {
+            self.visible_rows = usize::from(geometry.body.viewport.height);
+        } else {
+            self.visible_rows = area.height.saturating_sub(4) as usize;
+        }
         self.keep_selected_visible();
     }
 
@@ -521,51 +593,38 @@ impl Palette {
     pub fn render_with_theme(&mut self, frame: &mut Frame<'_>, area: Rect, theme: Theme) {
         self.rows.clear();
         self.selection_area = None;
+        self.geometry = None;
         if !self.open || area.width < 4 || area.height < 3 {
             return;
         }
-        // §12.16 class P: transient, top-anchored, list-driven. Sharing the
-        // class table is what keeps the palette proportioned like every other
-        // surface instead of stretching a name column across the frame.
-        let class = crate::dialog_layout::DialogClass::P;
-        let width = class.width(area);
-        let height = class.max_height(area).min(area.height);
-        let popup = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y
-                + (area.height.saturating_sub(height) / 6).min(area.height.saturating_sub(height)),
-            width,
-            height,
-        );
-        frame.render_widget(Clear, popup);
-        let block = Block::default()
-            .title(" Command palette ")
-            .borders(Borders::ALL)
-            .style(Style::default().fg(theme.base_fg).bg(theme.dialog_bg))
-            .border_style(Style::default().fg(theme.active_border));
-        let inner = block.inner(popup);
-        self.selection_area = Some(inner);
-        frame.render_widget(block, popup);
-        if inner.height == 0 {
+        // Phase B: outer frame is `PresentationKind::Palette` policy plus
+        // stable budgets, never result counts. `display_rows` sizes only the
+        // scroll extent; the frame and sticky tail origins are identical for
+        // pending/empty/populated/error states.
+        let display_len = self.display_rows();
+        let Ok(geometry) = palette_geometry(area, display_len) else {
+            // Below the 20x6 floor the tiny fallback owns the frame; stay open
+            // with nothing drawn, as before.
+            return;
+        };
+        // Exactly one palette scrim over whatever base/layer stack is
+        // underneath (phase B). Uses the existing scrim helper so block-art
+        // shape/background rules are preserved; a child/layer keeps its own
+        // scrim count and opening the palette adds one, not zero or two.
+        // Hand-rolled style pass here is presentation-only dimming, never query
+        // membership (AGENTS.md).
+        crate::dialog_layout::scrim(frame.buffer_mut(), area, theme);
+        // Shared frame rendering so geometry and paint share one definition:
+        // bordered, titled, padded per the resolved compactness decision.
+        crate::ui::render_responsive_frame(frame, &geometry, "Command palette", true, theme);
+        self.selection_area = Some(geometry.interior);
+        self.geometry = Some(geometry.clone());
+        if geometry.content.is_empty() {
             return;
         }
-        let selected = self.selected_command();
-        let detail_height = palette_detail_height(inner, selected);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(detail_height),
-            ])
-            .split(inner);
         let styles = DialogStyles::new(theme);
-        let input = Rect::new(
-            chunks[0].x.saturating_add(2),
-            chunks[0].y,
-            chunks[0].width.saturating_sub(2),
-            1,
-        );
+        // Query/header: the stable 1-row header band owns the input.
+        let input = geometry.header;
         let (visible_query, column) = palette_input_window(
             &self.query,
             &mut self.query_cursor,
@@ -583,14 +642,37 @@ impl Palette {
         } else {
             frame.render_widget(Paragraph::new(visible_query).style(styles.input), input);
         }
-        if chunks[0].width > 2 {
-            let x = input.x + column as u16;
-            frame.buffer_mut()[(x, chunks[0].y)]
-                .set_style(Style::default().fg(theme.input_fg).bg(theme.cursor));
-            frame.set_cursor_position((x, chunks[0].y));
+        // Cursor and selection bounds consume the same header geometry the
+        // input paints into.
+        if input.width > 0 && input.height > 0 {
+            let x = input
+                .x
+                .saturating_add(column as u16)
+                .min(input.right().saturating_sub(1));
+            if x >= input.x && x < input.right() {
+                frame.buffer_mut()[(x, input.y)]
+                    .set_style(Style::default().fg(theme.input_fg).bg(theme.cursor));
+                frame.set_cursor_position((x, input.y));
+            }
         }
-        self.visible_rows = chunks[1].height as usize;
+        // Body owns the surplus: the list viewport is the shared scroll
+        // viewport, stable across result counts, with selection scrolling.
+        let body_viewport = geometry.body.viewport;
+        self.visible_rows = usize::from(body_viewport.height);
         self.keep_selected_visible();
+        // Refresh the stored geometry's scroll window so hitboxes and paint
+        // share it: the viewport is policy, the first row is the revealed
+        // selection. The scrollbar rect from `resolve_dialog` needs no update:
+        // it depends only on overflow and width, not on the offset.
+        let selected_display = self.display_index(self.selected);
+        if let Some(stored) = self.geometry.as_mut() {
+            stored.body = ScrollViewport::new(body_viewport, display_len, self.scroll);
+            // Reveal the selected display row inside the stored window, keeping
+            // the current window when it already contains it.
+            let revealed = stored.body.reveal(selected_display);
+            stored.body = ScrollViewport::new(body_viewport, display_len, revealed);
+            self.scroll = stored.body.first_row;
+        }
         // Display rows: every match, plus one heading row before the
         // `Not available now` group when a query matched something that
         // cannot run here (§8.10). The heading is not selectable.
@@ -609,11 +691,17 @@ impl Palette {
         // §9: a list longer than its viewport says so in the last column,
         // rather than leaving the user to discover it by pressing Down.
         let overflowing = display.len() > self.visible_rows;
+        let scrollbar_width = u16::from(
+            self.geometry
+                .as_ref()
+                .and_then(|geometry| geometry.body.scrollbar)
+                .is_some(),
+        );
         let list = Rect::new(
-            chunks[1].x,
-            chunks[1].y,
-            chunks[1].width.saturating_sub(u16::from(overflowing)),
-            chunks[1].height,
+            body_viewport.x,
+            body_viewport.y,
+            body_viewport.width.saturating_sub(scrollbar_width),
+            body_viewport.height,
         );
         let name_width = visible
             .iter()
@@ -629,8 +717,21 @@ impl Palette {
             .unwrap_or(0)
             .min(14);
         let columns = palette_columns(list, name_width, shortcut_width);
+        // Single viewport authority: this render path stored the shared
+        // geometry above, so only that exact stored body issues row rects,
+        // for paint and hitboxes alike. No replacement ScrollViewport is
+        // synthesized here; an invalid projection paints nothing and creates
+        // no hitbox.
+        let Some(body_for_rows) = self.geometry.as_ref().map(|geometry| geometry.body) else {
+            // Unreachable: geometry was stored above before any list work.
+            // Paint nothing rather than invent rows from a second authority.
+            return;
+        };
         for (screen_row, entry) in visible_rows.iter().enumerate() {
-            let row = Rect::new(list.x, list.y + screen_row as u16, list.width, 1);
+            let display_index = self.scroll.saturating_add(screen_row);
+            let Some(row) = body_for_rows.project_row(display_index) else {
+                continue;
+            };
             let Some(result_index) = *entry else {
                 // The group heading: a §8.7 pane heading, not a row.
                 frame.render_widget(
@@ -708,18 +809,18 @@ impl Palette {
         if visible.is_empty() {
             frame.render_widget(
                 Paragraph::new("  No matching commands").style(styles.description),
-                chunks[1],
+                body_viewport,
             );
         }
-        if overflowing {
+        if overflowing
+            && let Some(bar) = self
+                .geometry
+                .as_ref()
+                .and_then(|geometry| geometry.body.scrollbar)
+        {
             crate::ui::render_scrollbar(
                 frame,
-                Rect::new(
-                    chunks[1].right().saturating_sub(1),
-                    chunks[1].y,
-                    1,
-                    chunks[1].height,
-                ),
+                bar,
                 self.scroll,
                 self.display_rows().saturating_sub(self.visible_rows),
                 theme,
@@ -728,13 +829,28 @@ impl Palette {
                 false,
             );
         }
-        if detail_height > 0
-            && let Some(command) = self.selected_command()
-        {
+        // Stable detail band: message + help (plus the one roomy gap between
+        // them, used as detail rows so the band stays continuous). Underflow
+        // stays blank; tiny viewports degrade help first per §5.4.
+        let detail_rect = self.geometry.as_ref().map(|geometry| {
+            if geometry.message.height > 0 && geometry.help.height > 0 {
+                Rect::new(
+                    geometry.message.x,
+                    geometry.message.y,
+                    geometry.message.width,
+                    geometry.help.bottom().saturating_sub(geometry.message.y),
+                )
+            } else if geometry.message.height > 0 {
+                geometry.message
+            } else {
+                geometry.help
+            }
+        });
+        if let (Some(detail), Some(command)) = (detail_rect, self.selected_command()) {
             // One row, one sentence: what the selected command does, or why it
             // cannot be run. The name is not repeated — its row is right above,
             // marked.
-            let lines: Vec<Line<'_>> = palette_detail_lines(command, inner.width.saturating_sub(2))
+            let lines: Vec<Line<'_>> = palette_detail_lines(command, detail.width.max(1))
                 .into_iter()
                 .map(|part| match part {
                     DetailPart::Name(name) => Line::styled(name, styles.label),
@@ -751,14 +867,12 @@ impl Palette {
                     DetailPart::Clause(text) => Line::styled(text, styles.unavailable),
                 })
                 .collect();
-            // §4.1: the row lines up with the list above it.
-            let detail = Rect::new(
-                chunks[2].x.saturating_add(2),
-                chunks[2].y,
-                chunks[2].width.saturating_sub(2),
-                chunks[2].height,
-            );
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
+            // §4.1: detail starts at the content column, like the list above
+            // it. The stable band may hold blank rows when the selected
+            // command needs fewer lines; the Paragraph leaves them blank.
+            if !detail.is_empty() {
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
+            }
         }
     }
 
@@ -950,17 +1064,6 @@ fn palette_column_text(value: &str, maximum_width: usize) -> String {
         width = width.saturating_add(character_width);
     }
     output
-}
-
-fn palette_detail_height(area: Rect, command: Option<&Command>) -> u16 {
-    if area.height < 3 || area.width == 0 || command.is_none() {
-        return 0;
-    }
-    let command = command.expect("checked above");
-    let available = area.height.saturating_sub(2);
-    let width = area.width.saturating_sub(2);
-    let lines = palette_detail_lines(command, width).len();
-    u16::try_from(lines).unwrap_or(u16::MAX).min(available)
 }
 
 /// One piece of the detail row. §12.16 puts the selected command's name and
