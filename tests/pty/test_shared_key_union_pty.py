@@ -108,13 +108,21 @@ def union_stable_id(app, marker, restored_markers):
     app.send(b"/")
     app.wait_for("Filter")
     app.send(b"\x7f" * len(marker))
+    # Wait for the dialog's own accepted-empty status: the restored rows sit
+    # behind the open dialog until it closes, so asserting them here flakes
+    # with the responsive frame covering the log.
+    app.wait_until(
+        lambda text: "No filter" in text,
+        "identity search cleared and accepted",
+        timeout=15,
+    )
+    app.send(b"\x1b")
+    wait_closed(app, "┌ Filter", "cleared identity search closed")
     app.wait_until(
         lambda text: all(value in text for value in restored_markers),
         "identity search cleared back to exact-key membership",
         timeout=15,
     )
-    app.send(b"\x1b")
-    wait_closed(app, "┌ Filter", "cleared identity search closed")
     return stable_id
 
 
@@ -190,6 +198,9 @@ def numeric_restart_live_and_namesake(binary):
         args = [str(api), str(worker), "--capture-dir", str(root / "capture")]
         app = PtyApp(binary, args, width=160, height=36, cwd=root, environment=env)
         try:
+            # Never switch views before capture lands: the switch loop cannot
+            # find rows the app has not read yet.
+            app.wait_for("api-selected")
             switch_to(app, "api-selected")
             add_enrichment(app, "request_key = pl.col('api_id').cast(pl.UInt64)")
             switch_to_enriched(app, "api-selected")
@@ -235,6 +246,7 @@ def numeric_restart_live_and_namesake(binary):
             app.send(b"\r")
             app.wait_for("compiler rejected expression", timeout=15)
             app.send(b"\x1b")
+            wait_closed(app, "┌ Filter", "rejected advanced filter closed")
             rollback = app.wait_until(
                 lambda text: "api-selected" in text
                 and "worker-selected" in text
@@ -248,6 +260,7 @@ def numeric_restart_live_and_namesake(binary):
 
             stop(app)
             app = PtyApp(binary, args, width=160, height=36, cwd=root, environment=env)
+            app.wait_for("live-match")
             switch_to_union(app, "live-match")
             restored = app.wait_until(
                 lambda text: "› Union of" in text
@@ -319,6 +332,7 @@ def slash_and_long_same_prefix(binary):
         args = [str(api), str(worker), "--capture-dir", str(root / "capture")]
         app = PtyApp(binary, args, width=160, height=36, cwd=root, environment=env)
         try:
+            app.wait_for("api-selected")
             switch_to(app, "api-selected")
             add_enrichment(app, pattern)
             switch_to_enriched(app, "api-selected")
