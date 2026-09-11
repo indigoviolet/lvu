@@ -49,6 +49,11 @@ def run(binary: pathlib.Path) -> None:
             app.wait_for("line 4", timeout=10.0)
             app.send(b"i")
             fields = app.wait_for("Fields · record", timeout=8.0)
+            # The selected record's fields arrive asynchronously; while they
+            # are pending the dialog offers Inspect context alone, so wait for
+            # a real value action before pressing its mnemonic.
+            app.wait_for("[ Exclude ]", timeout=8.0)
+            fields = app.text()
             for label in ("[ Pin ]", "[ Filter ]", "[ Exclude ]", "[ Fold ]"):
                 assert label in fields, f"{label} missing at 80x24:\n{fields}"
 
@@ -79,6 +84,8 @@ def run(binary: pathlib.Path) -> None:
             close_editor(app)
             app.send(b"i")
             app.wait_for("Fields · record", timeout=8.0)
+            # Same readiness as above: Fold acts on a real value, not Pending.
+            app.wait_for("[ Fold ]", timeout=8.0)
 
             # `d` is Fol&d. On the base screen `d` toggles the Details pane;
             # inside the dialog the dialog's mnemonic wins (§7.5).
