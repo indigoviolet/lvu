@@ -18,7 +18,9 @@ def run(binary):
         app=PtyApp(binary,[str(file),'--capture-dir',str(root/'capture-file')],width=135,height=28,environment=env)
         try:
             app.wait_for('file-first')
-            app.send(b'\x1bs'); app.wait_for('Stopped:')
+            # Shared capture names the outcome per source: stopping reports
+            # `{name}: capture stopped`, restarting `{name}: capture restarted`.
+            app.send(b'\x1bs'); app.wait_for('capture stopped')
             with file.open('a') as output: output.write('after-stop\n')
             app.assert_remains('file-first','after-stop',duration=0.3)
             app.send(b'\x1br'); app.wait_for('after-stop')
@@ -38,7 +40,7 @@ def run(binary):
             app.send(b'\r'); app.wait_for('Applied   command')
             app.send(b'\x1b'); app.wait_until(lambda t:' Search ' not in t,'search closed')
             first_pid=int(pids.read_text().splitlines()[0])
-            app.send(b'\x1bs'); app.wait_for('Stopped:')
+            app.send(b'\x1bs'); app.wait_for('capture stopped')
             try: os.kill(first_pid,0)
             except ProcessLookupError: pass
             else: raise AssertionError('stopped source process is still alive')
@@ -48,7 +50,7 @@ def run(binary):
             app.send(b'\x1b'); app.wait_until(lambda t:' Search ' not in t,'search closed after restart')
             app.wait_for('command-ready')
             assert len(pids.read_text().splitlines()) == 2, 'one startup per explicit launch'
-            app.send(b'\x1bs'); app.wait_for('Stopped:')
+            app.send(b'\x1bs'); app.wait_for('capture stopped')
             stop(app)
         finally:
             if app.process.poll() is None: app.process.kill(); app.process.wait(); app.close()

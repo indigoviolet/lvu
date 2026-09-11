@@ -98,9 +98,11 @@ def click_text(app: PtyApp, text: str) -> None:
 
 
 def preview_first_line(text: str) -> int | None:
+    # The review pane is the shared list pane: its heading row carries the
+    # `lines n–m of t` counter, which is what this scroll polling reads.
     for row in text.splitlines():
-        if "Preview · lines " in row:
-            window = row.split("Preview · lines ", 1)[1].split(" ·", 1)[0]
+        if "lines " in row and " of " in row:
+            window = row.split("lines ", 1)[1].split(" of ", 1)[0]
             return int(window.split("–", 1)[0])
     return None
 

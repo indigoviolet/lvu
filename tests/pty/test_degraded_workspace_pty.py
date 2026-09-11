@@ -52,9 +52,11 @@ def run(binary: pathlib.Path) -> None:
             # left to the exit status to communicate.
             app.wait_for("second degraded event", timeout=20.0)
             # The status line clips the sentence at the pane edge, so assert the
-            # part that is actually legible rather than the full notice.
+            # part that is actually legible rather than the full notice. The
+            # worker reports the save failure it hit (`memory autosave: …`);
+            # the `memory error:` prefix and raw browsing are the contract.
             app.wait_until(
-                lambda text: "memory error: memory unavailable" in text,
+                lambda text: "memory error: memory autosave:" in text,
                 "the unusable workspace is explained on screen",
                 timeout=10.0,
             )

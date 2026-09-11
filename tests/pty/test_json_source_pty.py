@@ -79,8 +79,19 @@ def run(binary):
                      })
         try:
             app.wait_for("EVENT_31", timeout=10)
-            app.send(b"g")
-            app.wait_for("EVENT_00")
+            # The opening view is still settling its totals while the file
+            # indexes, and a navigation key landing in that window is a
+            # silent no-op; retry until the top is actually shown. Bounded,
+            # so a genuinely broken Top still fails loudly below.
+            for _ in range(5):
+                app.send(b"g")
+                try:
+                    app.wait_for("EVENT_00", timeout=3)
+                    break
+                except AssertionError:
+                    continue
+            else:
+                raise AssertionError(f"Top never showed the first record\n{app.text()}")
             app.wait_for("EVENT_02")
             # EVENT_00 is selected; compare two unselected rows instead.
             key_color = foreground(app, escaped)
