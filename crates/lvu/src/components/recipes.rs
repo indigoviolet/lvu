@@ -21,12 +21,7 @@
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::Modifier,
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
-};
+use ratatui::{Frame, layout::Rect, style::Modifier, widgets::Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
@@ -39,12 +34,16 @@ use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Open, Outbox, Outcome, RenderCtx, Surface,
     is_typed_char,
 };
-use crate::dialog_controls::{DialogStyles, button_style};
+use crate::dialog_controls::{
+    ActionRow, DialogStyles, button_style, render_role_button, stable_action_rows,
+};
+use crate::dialog_layout::{
+    AnchoredSpec, DialogSpec, PresentationKind, anchored_geometry, plan_list,
+};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit};
 use crate::ui::{
-    FIELD_GUTTER, MessageState, dialog_frame_regions, help_rows, message_rows, packed_button_rows,
-    render_action_row, render_form_field, render_help_text, render_message, render_scrollbar,
-    truncated, wrap_sentence,
+    FIELD_GUTTER, MessageState, render_form_field, render_help_text, render_message,
+    render_responsive_frame, render_scrollbar, truncated, wrap_sentence,
 };
 
 /// The queue depth every recipe request checked against `App::recipe_requests`.
@@ -683,22 +682,68 @@ impl RecipesDialog {
         self.state.control = RecipeDialogControl::More;
     }
 
-    fn choose_menu(&mut self, index: usize) -> Outcome {
-        let chosen = RECIPE_MORE_ITEMS.get(index).map(|(_, control)| *control);
+    /// Merged More menu: when the shared action band overflows (only at the
+    /// 20x6 floor with seven first-row verbs), trailing first-row verbs move
+    /// into the anchored More menu in their drawn order, followed by the
+    /// standing Import/Export/Refresh entries. Otherwise the menu is exactly
+    /// the standing three. Hand-rolled here is presentation-only folding,
+    /// never query membership (AGENTS.md). History remains Replace, not child.
+    fn more_menu_items(&self, area: Rect, ascii: bool) -> Vec<(String, RecipeDialogControl)> {
+        let actions = self.actions(ascii);
+        let labels: Vec<&str> = actions.iter().map(|(label, _)| *label).collect();
+        let spec = recipes_spec_for(area, ascii);
+        let natural = self.state.items.len().max(1).saturating_add(2);
+        let overflow =
+            crate::dialog_layout::resolve_dialog(area, &spec, natural, &labels, Some(0), None)
+                .map(|g| g.actions.overflow)
+                .unwrap_or_default();
+        if overflow.is_empty() {
+            return RECIPE_MORE_ITEMS
+                .iter()
+                .map(|(label, control)| ((*label).to_owned(), *control))
+                .collect();
+        }
+        let mut merged = Vec::new();
+        for idx in overflow {
+            let Some((label, control)) = actions.get(idx) else {
+                continue;
+            };
+            // The explicit More verb itself is replaced by its standing
+            // entries below; showing "More ▾" as an item would be a menu
+            // inside a menu.
+            if *control == RecipeDialogControl::More {
+                continue;
+            }
+            merged.push((crate::dialog_controls::mnemonic(label).text, *control));
+        }
+        for (label, control) in RECIPE_MORE_ITEMS {
+            merged.push((label.to_owned(), control));
+        }
+        merged
+    }
+
+    fn choose_menu(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        // Recompute the merged menu against the current viewport so a click
+        // and a key choose the same row the shared popup painted.
+        let area = Rect::new(0, 0, ctx.size.0, ctx.size.1);
+        let merged = self.more_menu_items(area, ctx.ascii);
+        let chosen = merged.get(index).map(|(_, control)| *control);
         self.state.menu_open = false;
         self.state.menu_selected = 0;
         match chosen {
             Some(RecipeDialogControl::Mode(mode)) => return self.switch(mode),
             Some(RecipeDialogControl::Refresh) => self.refresh_suggestions(),
-            _ => {}
+            Some(control) => return self.run(control, ctx),
+            None => {}
         }
         Outcome::Consumed
     }
 
-    fn move_selection(&mut self, delta: i32) {
+    fn move_selection(&mut self, delta: i32, ctx: &Ctx<'_>) {
         if self.state.menu_open {
-            self.state.menu_selected =
-                move_index(self.state.menu_selected, RECIPE_MORE_ITEMS.len(), delta);
+            let area = Rect::new(0, 0, ctx.size.0, ctx.size.1);
+            let len = self.more_menu_items(area, ctx.ascii).len().max(1);
+            self.state.menu_selected = move_index(self.state.menu_selected, len, delta);
             return;
         }
         self.state.selected = move_index(self.state.selected, self.state.items.len(), delta);
@@ -814,7 +859,7 @@ impl RecipesDialog {
         // §10: while an anchored menu is open it owns Enter.
         if self.state.menu_open {
             let index = self.state.menu_selected;
-            return self.choose_menu(index);
+            return self.choose_menu(index, ctx);
         }
         match self.state.control {
             RecipeDialogControl::History => return self.switch(RecipeDialogMode::History),
@@ -905,8 +950,8 @@ impl RecipesDialog {
                 let controls = self.controls();
                 self.state.control = move_control(self.state.control, &controls, 1);
             }
-            KeyCode::Up => self.move_selection(-1),
-            KeyCode::Down => self.move_selection(1),
+            KeyCode::Up => self.move_selection(-1, ctx),
+            KeyCode::Down => self.move_selection(1, ctx),
             KeyCode::Enter => return self.activate(ctx),
             KeyCode::Backspace => self.edit_name(EditCommand::Backspace),
             // Recipes' mode chords are the dialog's, not its row's: they switch
@@ -947,7 +992,7 @@ impl RecipesDialog {
     ) -> Outcome {
         match kind {
             MouseEventKind::Down(MouseButton::Left) => match hit {
-                Some(RecipeHit::Menu(index)) => return self.choose_menu(index),
+                Some(RecipeHit::Menu(index)) => return self.choose_menu(index, ctx),
                 Some(RecipeHit::Row(index)) => {
                     self.focus_control(RecipeDialogControl::List);
                     self.select_row(index);
@@ -963,8 +1008,8 @@ impl RecipesDialog {
                 }
                 None => {}
             },
-            MouseEventKind::ScrollUp => self.move_selection(-1),
-            MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::ScrollUp => self.move_selection(-1, ctx),
+            MouseEventKind::ScrollDown => self.move_selection(1, ctx),
             _ => {}
         }
         Outcome::Consumed
@@ -1026,6 +1071,26 @@ fn recipe_summary(config: &RecipeConfig) -> String {
         return "no filters".to_owned();
     }
     parts.join(" · ")
+}
+
+/// Stable LongContent budgets: outer size is policy-only, never async counts.
+/// Header 0 (no segmented control), body minimum 3 useful rows, message 2
+/// and help 2 stable maxima, actions from the stable width budget so the
+/// frame and sticky tail origins are identical across pending/empty/
+/// populated/error states. Hand-rolled row assignment here is
+/// presentation-only folding, never query membership (AGENTS.md).
+fn recipes_spec_for(area: Rect, ascii: bool) -> DialogSpec {
+    // Stable maximum first-row labels (Browse with suggestions) so Browse
+    // and History share one budget across Replace and no async arrival
+    // moves the tail. Display width via button_width, capped at two rows.
+    let more = if ascii { "More v" } else { "More \u{25be}" };
+    let max_labels = [
+        "Apply", "&Adapt", "&Reject", "&Save", "&Update", "&History", more,
+    ];
+    let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let action_rows = stable_action_rows(estimate, &max_labels).clamp(1, 2);
+    DialogSpec::new(PresentationKind::LongContent, 0, 3, 2, 2, action_rows)
 }
 
 impl Component for RecipesDialog {
@@ -1174,7 +1239,6 @@ impl Component for RecipesDialog {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
-        use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
         use RecipeDialogControl as C;
         use RecipeDialogMode as M;
 
@@ -1184,7 +1248,6 @@ impl Component for RecipesDialog {
         let mut geometry = RecipeGeometry::default();
         let mut caret_cell: Option<(u16, u16)> = None;
         let dialog = self.state.clone();
-        let width = content_width(area, DialogClass::M);
         let history = dialog.mode == M::History;
         let title = if history {
             format!("Recipes › {} history", self.recipe_name)
@@ -1274,67 +1337,161 @@ impl Component for RecipesDialog {
         let actions = self.actions(ascii);
         let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
 
-        // A note explains why a recipe was suggested or cannot be applied.
-        // Truncating that to one line loses the reason, so it wraps (§9).
+        // Stable note wrapping at the policy content estimate so loading/
+        // results/errors never resize the frame; only the scroll extent moves.
+        let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
+        let estimate = policy_w.saturating_sub(4).max(1);
         let note_width =
-            usize::from(width.saturating_sub(crate::dialog_layout::PANE_INDENT)).max(1);
+            usize::from(estimate.saturating_sub(crate::dialog_layout::PANE_INDENT)).max(1);
         let note_lines: Vec<(String, bool)> = notes
             .iter()
             .flat_map(|(text, warn)| {
-                wrap_sentence(text, note_width, 2)
+                wrap_sentence(text, note_width, 4)
                     .into_iter()
                     .map(move |line| (line, *warn))
             })
             .collect();
-        let list_rows = dialog.items.len().clamp(1, 12);
-        let body = u16::try_from(list_rows + 1 + note_lines.len())
-            .unwrap_or(u16::MAX)
-            // A blank row, then the name field.
-            .saturating_add(2);
-        let content = DialogContent {
-            header: 0,
-            body,
-            message: message_rows(&sentence, width).max(1),
-            help: help_rows(help, width),
-            actions: packed_button_rows(width, &action_labels),
+        // The body itself does not scroll: the list scrolls via its own shared
+        // plan and the field is a reserved fixed row. Claiming list/note rows
+        // in the body scroll extent would overstate overflow while
+        // resolved.body.first_row is never consumed, so the body extent stays
+        // minimal and scrollability derives from real list/menu overflow below.
+        // The outer frame is policy-only in either case.
+        let natural = 1;
+        let spec = recipes_spec_for(area, ascii);
+        let Ok(resolved) = crate::dialog_layout::resolve_dialog(
+            area,
+            &spec,
+            natural,
+            &action_labels,
+            Some(0),
+            None,
+        ) else {
+            // Below the 20x6 floor the existing tiny fallback owns the frame;
+            // stay open with nothing drawn, as the palette does.
+            return self.record(
+                geometry,
+                None,
+                Surface {
+                    popup: Rect::default(),
+                    interior: Rect::default(),
+                    caret: None,
+                    scrollable: false,
+                    text_focus: self.editing(),
+                },
+            );
         };
-        let regions = dialog_frame_regions(frame, area, DialogClass::M, &title, &content, theme);
+        // Shared frame so geometry and paint share one definition; compactness
+        // comes from the geometry, never recomputed from the frame.
+        render_responsive_frame(frame, &resolved, &title, ctx.active, theme);
         let mut surface = Surface {
-            popup: regions.popup,
-            interior: regions.interior,
+            popup: resolved.frame,
+            interior: resolved.interior,
             caret: None,
-            scrollable: true,
+            // Derived below from real list/menu overflow, never blanket true:
+            // wheel/hitboxes must match a viewport that actually scrolls.
+            scrollable: false,
             text_focus: self.editing(),
         };
-        let inner = regions.body;
+        let inner = resolved.body.viewport;
         if inner.width == 0 || inner.height == 0 {
             return self.record(geometry, caret_cell, surface);
         }
+        // Sticky tail bands from the shared geometry; no independent rects.
+        let message_rect = resolved.message;
+        let help_rect = resolved.help;
+        let action_geom = resolved.actions.clone();
+        let roomy = !resolved.compact;
 
-        // §8.5/§8.7: a list is a pane — heading, count, indented rows, scrollbar.
-        let note_rows = u16::try_from(note_lines.len())
-            .unwrap_or(0)
-            .min(inner.height);
-        let field_rows = 2u16.min(inner.height.saturating_sub(note_rows));
-        let list_area = Rect::new(
-            inner.x,
-            inner.y,
-            inner.width,
-            inner
-                .height
-                .saturating_sub(note_rows)
-                .saturating_sub(field_rows),
+        // Body owns surplus: list Fill, notes + field fixed with roomy 1-row
+        // gaps and compact zero gaps. The list scrolls via its own shared
+        // plan (selection reveal); the field is reserved so it stays
+        // reachable. At tiny pressure the focused section wins so paint,
+        // hitboxes and wheel never disagree: focusing Input reveals the
+        // field, focusing the list reveals the selection. Notes are a
+        // bounded footer (capped to fit with at least one list row); they
+        // are truncated at tiny pressure and deliberately not part of any
+        // scroll extent. Hand-rolled projection here is presentation-only
+        // folding, never query membership (AGENTS.md).
+        let gap = u16::from(roomy);
+        let note_rows = u16::try_from(note_lines.len()).unwrap_or(0);
+        let spare = inner.height;
+        let focus_is_input = dialog.control == C::Input;
+        // Full needs with at least one list row plus gaps between shown sections.
+        let full_notes = note_rows.min(
+            spare
+                .saturating_sub(2)
+                .saturating_sub(gap.saturating_mul(2)),
         );
+        let full_need = 1u16
+            .saturating_add(full_notes)
+            .saturating_add(1)
+            .saturating_add(gap.saturating_mul(2));
+        let (_list_h, notes_kept, field_rows, field_y, notes_y, list_area) = if spare == 0 {
+            (
+                0,
+                0,
+                0,
+                inner.y,
+                inner.y,
+                Rect::new(inner.x, inner.y, inner.width, 0),
+            )
+        } else if spare >= full_need.min(spare) && full_need <= spare {
+            let field_rows = 1u16;
+            let notes_kept = full_notes;
+            let shown_gaps = u16::from(notes_kept > 0).saturating_add(1) * gap;
+            let list_h = spare
+                .saturating_sub(notes_kept)
+                .saturating_sub(field_rows)
+                .saturating_sub(shown_gaps);
+            let field_y = inner.bottom().saturating_sub(field_rows);
+            let notes_y = field_y.saturating_sub(notes_kept).saturating_sub(gap);
+            let list_area = Rect::new(inner.x, inner.y, inner.width, list_h.min(inner.height));
+            (
+                list_h.min(inner.height),
+                notes_kept,
+                field_rows,
+                field_y,
+                notes_y,
+                list_area,
+            )
+        } else if focus_is_input {
+            // Tiny with caret in the field: the field wins; list/notes hide
+            // until focus returns. Reachable via Tab, never overlapped.
+            let field_rows = 1u16.min(spare);
+            let field_y = inner.bottom().saturating_sub(field_rows);
+            (
+                0,
+                0,
+                field_rows,
+                field_y,
+                field_y,
+                Rect::new(inner.x, inner.y, inner.width, 0),
+            )
+        } else {
+            // Tiny with focus on the list: the selection wins; field/notes
+            // hide until Tab. Reachable via Tab, never overlapped.
+            (
+                spare,
+                0,
+                0,
+                inner.bottom(),
+                inner.bottom(),
+                Rect::new(inner.x, inner.y, inner.width, spare),
+            )
+        };
         let count = format!(
             "{} of {}",
             dialog.selected.saturating_add(1).min(dialog.items.len()),
             dialog.items.len()
         );
-        let rects = pane(
-            list_area,
-            u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
-            dialog.items.len(),
-        );
+        let count_w = u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0);
+        // One authoritative list plan: heading/count/viewport/scrollbar plus
+        // the selected window and painted row rects. The same rects drive
+        // paint, selection, scrollbar and mouse hit-testing.
+        let selected = (!dialog.items.is_empty())
+            .then_some(dialog.selected.min(dialog.items.len().saturating_sub(1)));
+        let rects = plan_list(list_area, count_w, dialog.items.len(), selected, 0);
         if rects.heading.height > 0 {
             frame.render_widget(
                 Paragraph::new(heading).style(styles.label.add_modifier(Modifier::BOLD)),
@@ -1347,11 +1504,8 @@ impl Component for RecipesDialog {
                 );
             }
         }
-        let visible = usize::from(rects.viewport.height);
-        let first = dialog
-            .selected
-            .saturating_add(1)
-            .saturating_sub(visible.max(1));
+        let visible = rects.row_rects.len();
+        let first = rects.first_row;
         if dialog.items.is_empty() {
             if rects.viewport.height > 0 {
                 frame.render_widget(
@@ -1368,16 +1522,12 @@ impl Component for RecipesDialog {
                 );
             }
         } else {
-            for (offset, (index, item)) in dialog
-                .items
-                .iter()
-                .enumerate()
-                .skip(first)
-                .take(visible)
-                .enumerate()
-            {
-                let y = rects.viewport.y.saturating_add(offset as u16);
-                let row = Rect::new(rects.viewport.x, y, rects.viewport.width, 1);
+            for (offset, row) in rects.row_rects.iter().copied().enumerate() {
+                let index = first.saturating_add(offset);
+                let Some(item) = dialog.items.get(index) else {
+                    continue;
+                };
+                let y = row.y;
                 let focused = index == dialog.selected;
                 let suggested = dialog
                     .suggestions
@@ -1445,16 +1595,19 @@ impl Component for RecipesDialog {
                 frame,
                 bar,
                 first,
-                dialog.items.len().saturating_sub(visible),
+                dialog.items.len().saturating_sub(visible.max(1)),
                 theme,
                 ascii,
             );
+            // Real overflow only: the wheel must match a viewport that
+            // actually scrolls, never a blanket flag.
+            surface.scrollable = true;
         }
 
-        for (offset, (text, warn)) in note_lines.iter().enumerate() {
-            let y = list_area.bottom().saturating_add(offset as u16);
-            if y >= inner.bottom() {
-                break;
+        for (offset, (text, warn)) in note_lines.iter().enumerate().take(usize::from(notes_kept)) {
+            let y = notes_y.saturating_add(offset as u16);
+            if y >= inner.bottom() || y < inner.y {
+                continue;
             }
             frame.render_widget(
                 Paragraph::new(truncated(
@@ -1481,9 +1634,10 @@ impl Component for RecipesDialog {
             );
         }
 
-        // §4.2: the name shares the dialog's one label column.
-        let field_y = inner.bottom().saturating_sub(1);
-        if field_y >= inner.y && field_rows > 0 {
+        // §4.2: the name shares the dialog's one label column. The field row
+        // comes from the shared body viewport, so paint, cursor and hitboxes
+        // share it; no independent rects.
+        if field_y >= inner.y && field_y < inner.bottom() && field_rows > 0 {
             let focused = dialog.control == C::Input;
             let (input, caret) = render_form_field(
                 frame,
@@ -1504,85 +1658,121 @@ impl Component for RecipesDialog {
             caret_cell = caret;
         }
 
-        render_message(frame, regions.message, state, &sentence, theme, ascii);
-        render_help_text(frame, regions.help, help, theme);
+        render_message(frame, message_rect, state, &sentence, theme, ascii);
+        render_help_text(frame, help_rect, help, theme);
+        // One authoritative action plan: sticky band, filled default, More ▾
+        // overflow with original indices preserved for press_action. The same
+        // rects drive paint, cursor, selection and mouse; no independent rows.
         let focused_action = actions
             .iter()
             .position(|(_, control)| *control == dialog.control);
+        let row = ActionRow {
+            labels: &action_labels,
+            default: Some(0),
+            destructive: &[],
+            focused: focused_action,
+        };
         let mut menu_anchor = None;
-        for (index, rect) in render_action_row(
-            frame,
-            regions.actions,
-            &action_labels,
-            focused_action,
-            &[],
-            theme,
-        ) {
-            let control = actions[index].1;
+        // When the shared band overflows (20x6 floor with seven verbs), the
+        // generic More owns the hidden rows; otherwise the explicit More verb
+        // owns its standing menu. First-row order is preserved either way.
+        let generic_overflow = !action_geom.overflow.is_empty();
+        for (orig, rect) in action_geom.buttons.iter().copied() {
+            let control = actions[orig].1;
+            // Hide the explicit More behind the generic one when both would
+            // show; its Import/Export/Refresh entries live on in the merged
+            // menu below, so nothing becomes unreachable.
+            if generic_overflow && control == C::More {
+                continue;
+            }
+            let role = row.role(orig);
+            let focused = focused_action == Some(orig);
+            render_role_button(frame, rect, actions[orig].0, role, focused, theme);
             if control == C::More {
                 menu_anchor = Some(rect);
             }
             geometry.controls.push((rect, control));
         }
+        if generic_overflow && let Some(more_rect) = action_geom.more {
+            let focused = focused_action.is_some_and(|f| action_geom.overflow.contains(&f));
+            render_role_button(
+                frame,
+                more_rect,
+                if ascii { "More v" } else { "More \u{25be}" },
+                crate::dialog_controls::ButtonRole::Normal,
+                focused,
+                theme,
+            );
+            menu_anchor = Some(more_rect);
+            // The generic More is reachable by mouse as the More control so a
+            // click opens the merged menu rather than pressing a hidden verb.
+            geometry.controls.push((more_rect, C::More));
+        }
 
-        // §10: the menu is an anchored popup, drawn last and bounded by the frame.
+        // §10: More is a shared Anchored popup (below/above/clamped, max eight
+        // rows, display-width sizing, same paint/selection/hitboxes). History
+        // remains Replace, not a child.
         if dialog.menu_open
             && let Some(anchor) = menu_anchor
         {
-            let items = RECIPE_MORE_ITEMS;
-            let box_width = items
+            let merged = self.more_menu_items(area, ascii);
+            let longest = merged
                 .iter()
-                .map(|(label, _)| UnicodeWidthStr::width(*label) as u16)
+                .map(|(label, _)| UnicodeWidthStr::width(label.as_str()))
                 .max()
-                .unwrap_or(8)
-                .saturating_add(4)
-                .min(area.width);
-            let box_height = (items.len() as u16 + 2).min(area.height);
-            let x = anchor.x.min(area.right().saturating_sub(box_width));
-            let above = anchor.y.saturating_sub(box_height);
-            let y = if anchor.y.saturating_add(1).saturating_add(box_height) <= area.bottom() {
-                anchor.y.saturating_add(1)
-            } else {
-                above.max(area.y)
-            };
-            let box_area = Rect::new(x, y, box_width, box_height);
-            if box_area.width >= 3 && box_area.height >= 3 {
-                // §5.2 containment is measured against everything the layer
-                // drew; an anchored popup may extend past the dialog (§5.3).
-                surface.popup = surface.popup.union(box_area);
-                frame.render_widget(Clear, box_area);
-                frame.render_widget(
-                    List::new(
-                        items
-                            .iter()
-                            .enumerate()
-                            .map(|(index, (label, _))| {
-                                ListItem::new(*label).style(if index == dialog.menu_selected {
-                                    styles.selection
-                                } else {
-                                    button_style(theme, false, false)
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(styles.label),
-                    ),
-                    box_area,
+                .unwrap_or(8);
+            let preferred = u16::try_from(longest.saturating_add(4))
+                .unwrap_or(12)
+                .max(12);
+            let spec = AnchoredSpec::new(merged.len(), None, preferred, 0);
+            let selected = dialog.menu_selected.min(merged.len().saturating_sub(1));
+            let pop = anchored_geometry(area, anchor, &spec, selected, 0);
+            // Containment is measured against everything the layer drew; an
+            // anchored popup may extend past the dialog (§5.3).
+            surface.popup = surface.popup.union(pop.popup);
+            crate::ui::clear_themed(frame, pop.popup, theme);
+            frame.render_widget(
+                ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(styles.label),
+                pop.popup,
+            );
+            let bar_w = u16::from(pop.scrollbar.is_some());
+            for (offset, (merged_idx, (label, _))) in merged
+                .iter()
+                .enumerate()
+                .skip(pop.first_item)
+                .take(usize::from(pop.viewport.height))
+                .enumerate()
+            {
+                let idx = pop.first_item.saturating_add(offset);
+                let _ = merged_idx;
+                let row = Rect::new(
+                    pop.viewport.x,
+                    pop.viewport.y.saturating_add(offset as u16),
+                    pop.viewport.width.saturating_sub(bar_w),
+                    1,
                 );
-                for index in 0..items.len() {
-                    geometry.menu.push((
-                        Rect::new(
-                            box_area.x + 1,
-                            box_area.y + 1 + index as u16,
-                            box_area.width.saturating_sub(2),
-                            1,
-                        ),
-                        index,
-                    ));
-                }
+                let style = if idx == selected {
+                    styles.selection
+                } else {
+                    button_style(theme, false, false)
+                };
+                frame.render_widget(Paragraph::new(label.clone()).style(style), row);
+                geometry.menu.push((row, idx));
+            }
+            if let Some(bar) = pop.scrollbar {
+                render_scrollbar(
+                    frame,
+                    bar,
+                    pop.first_item,
+                    merged
+                        .len()
+                        .saturating_sub(usize::from(pop.viewport.height)),
+                    theme,
+                    ascii,
+                );
+                surface.scrollable = true;
             }
         }
 

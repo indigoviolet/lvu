@@ -11,6 +11,7 @@ use lvu::{
     Action, App, RowProvider, StorageCategory, StorageEntry, StorageRequestKind, StorageSnapshot,
     component::{Component, LayerId, Open, RawEvent},
     components::storage::StorageHit,
+    dialog_controls::{ButtonRole, DialogStyles, role_style},
     fixture::FixtureProvider,
     theme::Theme,
     ui,
@@ -364,4 +365,551 @@ fn key_kinds_other_than_press_are_ignored() {
         &provider,
     );
     assert_eq!(app.layers.storage.selected(), before);
+}
+
+fn error_snapshot(entries: usize) -> StorageSnapshot {
+    let mut snap = snapshot(entries, 0);
+    snap.errors = vec![
+        "scan failed on café-日本語 volume: permission denied · recomputable".into(),
+        "second problem with combining é marks and wide 漢字 text".into(),
+    ];
+    snap
+}
+
+fn complete_with(_provider: &FixtureProvider, app: &mut App, snap: StorageSnapshot) {
+    let generation = app.layers.storage.outbox.take()[0].generation;
+    assert!(
+        app.layers
+            .storage
+            .complete(generation, snap, "scan complete".into(), true,)
+    );
+}
+
+/// Policy/stable budgets alone determine the frame and sticky tail: scanning,
+/// populated, error and confirm-clear states share one outer frame and one
+/// action-band origin. Results/diagnostics/errors only move scroll extents.
+#[test]
+fn responsive_frame_and_tail_are_stable_across_scan_states() {
+    for (width, height) in [(240u16, 80u16), (140, 40), (80, 24), (54, 16), (20, 6)] {
+        // Scanning (pending): opened but no completion yet.
+        let (provider, mut scanning) = demo();
+        scanning.handle(Action::Open(Open::Storage), &provider);
+        draw(&provider, &mut scanning, width, height);
+        let scanning_surface = scanning.layers.storage.surface();
+        let scanning_refresh = scanning
+            .layers
+            .storage
+            .action_rects()
+            .iter()
+            .find(|(slot, _)| *slot == 0)
+            .map(|(_, r)| *r);
+
+        // Populated.
+        let (provider, mut full) = demo();
+        full.handle(Action::Open(Open::Storage), &provider);
+        complete_with(&provider, &mut full, snapshot(6, 4096));
+        draw(&provider, &mut full, width, height);
+        let full_surface = full.layers.storage.surface();
+
+        // Error with long Unicode diagnostics.
+        let (provider, mut failed) = demo();
+        failed.handle(Action::Open(Open::Storage), &provider);
+        complete_with(&provider, &mut failed, error_snapshot(6));
+        draw(&provider, &mut failed, width, height);
+        let error_surface = failed.layers.storage.surface();
+
+        // Same-layer confirmation (second button relabels, no child).
+        key(&mut failed, &provider, KeyCode::Char('c'));
+        // Confirmation needs reclaimable bytes; use a reclaimable snapshot.
+        let (provider, mut confirm) = demo();
+        confirm.handle(Action::Open(Open::Storage), &provider);
+        complete_with(&provider, &mut confirm, snapshot(6, 8192));
+        draw(&provider, &mut confirm, width, height);
+        key(&mut confirm, &provider, KeyCode::Char('c'));
+        assert!(confirm.layers.storage.confirm_clear());
+        draw(&provider, &mut confirm, width, height);
+        let confirm_surface = confirm.layers.storage.surface();
+
+        for (name, surface) in [
+            ("scanning", scanning_surface),
+            ("populated", full_surface),
+            ("error", error_surface),
+            ("confirm", confirm_surface),
+        ] {
+            assert_eq!(
+                surface.popup, scanning_surface.popup,
+                "{name} frame moved at {width}x{height}"
+            );
+            assert_eq!(
+                surface.interior, scanning_surface.interior,
+                "{name} interior moved at {width}x{height}"
+            );
+        }
+        let full_refresh = full
+            .layers
+            .storage
+            .action_rects()
+            .iter()
+            .find(|(slot, _)| *slot == 0)
+            .map(|(_, r)| *r);
+        assert_eq!(
+            full_refresh, scanning_refresh,
+            "sticky tail moved at {width}x{height}"
+        );
+        // Confirmation stays same-layer: no new layer, still Storage on top.
+        // At the 20x6 floor the shared band collapses to one row with a
+        // same-layer More menu; Confirm stays reachable there, directly
+        // painted everywhere else.
+        assert_eq!(confirm.layers.top(), Some(LayerId::Storage));
+        if (width, height) == (20, 6) {
+            // Floor pressure collapses the band to Refresh + same-layer More;
+            // Cleanup/Confirm hides behind the overflow but stays armed
+            // same-layer (confirm_clear) with the default surviving.
+            let rendered = screen(&draw(&provider, &mut confirm, width, height));
+            // Truncated by display-width clipping at the floor; the default
+            // slot itself (not the full verb) proves stickiness.
+            assert!(rendered.contains("Ref"), "{rendered}");
+            assert!(confirm.layers.storage.confirm_clear());
+            assert!(
+                confirm
+                    .layers
+                    .storage
+                    .action_rects()
+                    .iter()
+                    .any(|(slot, _)| *slot == 0),
+                "default Refresh slot must survive the floor"
+            );
+        } else {
+            let rendered = screen(&draw(&provider, &mut confirm, width, height));
+            assert!(rendered.contains("Confirm cleanup"), "{rendered}");
+        }
+    }
+}
+
+/// Below the floor the tiny fallback owns the frame with no stale hitboxes.
+#[test]
+fn below_floor_uses_the_tiny_fallback() {
+    let (provider, mut app) = opened(4, 0);
+    let buffer = draw(&provider, &mut app, 19, 5);
+    assert!(screen(&buffer).contains("terminal too small"));
+    assert!(app.layers.storage.row_rects().is_empty());
+    assert!(app.layers.storage.action_rects().is_empty());
+}
+
+/// Long Unicode entry labels/diagnostics clip by display width without
+/// splitting wide glyphs, and every painted row/action/diagnostics cell still
+/// answers its own hit test.
+#[test]
+fn long_unicode_clips_with_exact_hitboxes() {
+    for (width, height) in [(140u16, 40u16), (80, 24), (54, 16)] {
+        let (provider, mut app) = demo();
+        app.handle(Action::Open(Open::Storage), &provider);
+        let mut snap = snapshot(3, 0);
+        snap.entries[0].label = "café-日本語-👩‍💻-éxpansion-漢字-mix-".repeat(4);
+        snap.entries[1].label = "combining ééé wide 漢字".into();
+        snap.errors = vec!["café-日本語 failure · é combining · 漢字".into()];
+        complete_with(&provider, &mut app, snap);
+        draw(&provider, &mut app, width, height);
+        let surface = app.layers.storage.surface();
+        for (rect, index) in app.layers.storage.row_rects() {
+            assert!(
+                contains_rect(surface.popup, rect),
+                "row escapes at {width}x{height}"
+            );
+            assert_eq!(
+                app.layers.storage.hit((rect.x, rect.y)),
+                Some(StorageHit::Row(*index)),
+                "row paint/hit disagree at {width}x{height}"
+            );
+        }
+        for (_, rect) in app.layers.storage.action_rects() {
+            assert!(contains_rect(surface.popup, rect));
+            assert!(app.layers.storage.hit((rect.x, rect.y)).is_some());
+        }
+    }
+}
+
+fn contains_rect(area: Rect, rect: &Rect) -> bool {
+    rect.x >= area.x
+        && rect.y >= area.y
+        && rect.right() <= area.right()
+        && rect.bottom() <= area.bottom()
+}
+
+/// At 54x16 and 20x6 the selection, diagnostics scroll and sticky actions stay
+/// reachable with wheel/hitboxes matching the shared viewports.
+#[test]
+fn tiny_pressure_keeps_selection_diagnostics_and_actions_reachable() {
+    for (width, height) in [(54u16, 16u16), (20, 6)] {
+        let (provider, mut app) = demo();
+        app.handle(Action::Open(Open::Storage), &provider);
+        complete_with(&provider, &mut app, error_snapshot(20));
+        draw(&provider, &mut app, width, height);
+        // List selection is painted and hit-testable.
+        assert!(
+            !app.layers.storage.row_rects().is_empty(),
+            "list must paint at {width}x{height}"
+        );
+        let surface = app.layers.storage.surface();
+        for (rect, index) in app.layers.storage.row_rects() {
+            assert!(contains_rect(surface.popup, rect));
+            assert_eq!(
+                app.layers.storage.hit((rect.x, rect.y)),
+                Some(StorageHit::Row(*index))
+            );
+        }
+        // Wheel over the list moves selection with matching hitboxes.
+        let (rect, _) = app.layers.storage.row_rects()[0];
+        let before = app.layers.storage.selected();
+        app.handle(
+            Action::Raw(RawEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            })),
+            &provider,
+        );
+        draw(&provider, &mut app, width, height);
+        assert_ne!(before, app.layers.storage.selected());
+        // Real overflow while list-focused: populated/error claims scroll.
+        assert!(
+            app.layers.storage.surface().scrollable,
+            "populated list must be scrollable while list-focused at {width}x{height}"
+        );
+        // Tab focuses diagnostics; arrows scroll the shared diagnostics
+        // viewport when it has room, otherwise the focus itself is the
+        // reachability proof at the floor (single-row body).
+        key(&mut app, &provider, KeyCode::Tab);
+        draw(&provider, &mut app, width, height);
+        key(&mut app, &provider, KeyCode::Down);
+        draw(&provider, &mut app, width, height);
+        assert!(app.layers.storage.scroll() > 0 || app.layers.storage.scroll_limit() == 0);
+        // Sticky default action never leaves.
+        let refresh = app
+            .layers
+            .storage
+            .action_rects()
+            .iter()
+            .find(|(slot, _)| *slot == 0)
+            .map(|(_, r)| *r)
+            .expect("Refresh must survive tiny pressure");
+        assert!(contains_rect(surface.popup, &refresh));
+    }
+    let (provider, mut empty) = demo();
+    empty.handle(Action::Open(Open::Storage), &provider);
+    complete_with(&provider, &mut empty, snapshot(0, 0));
+    draw(&provider, &mut empty, 54, 16);
+}
+
+/// Floor coverage for the generic overflow: at exactly 20x6 the shared band
+/// collapses to Refresh + same-layer More, and the hidden Cleanup/Confirm
+/// path stays reachable by keyboard (mnemonic, still two-step) and by mouse
+/// (More menu carrying the original action index), keeping Refresh default,
+/// destructive Confirm styling, Escape order and exact menu hitboxes.
+#[test]
+fn floor_overflow_menu_activates_hidden_cleanup_by_keyboard_and_mouse() {
+    let theme = Theme::LOVE_LIGHT;
+
+    // Keyboard path: mnemonics reach the hidden actions; arming and submitting
+    // stay same-layer with Refresh the filled default throughout.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Storage), &provider);
+    complete_with(&provider, &mut app, snapshot(6, 8192));
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    assert!(
+        app.layers
+            .storage
+            .action_rects()
+            .iter()
+            .any(|(s, _)| *s == 0),
+        "default Refresh slot must survive the floor"
+    );
+    assert!(
+        !app.layers
+            .storage
+            .action_rects()
+            .iter()
+            .any(|(s, _)| *s == 1),
+        "Cleanup hides behind the shared overflow at 20x6"
+    );
+    let more = app
+        .layers
+        .storage
+        .more_rect()
+        .expect("More must paint at 20x6");
+    assert_eq!(
+        app.layers.storage.hit((more.x, more.y)),
+        Some(StorageHit::More)
+    );
+    key(&mut app, &provider, KeyCode::Char('c'));
+    assert!(
+        app.layers.storage.confirm_clear(),
+        "first keyboard step arms same-layer"
+    );
+    assert_eq!(app.layers.top(), Some(LayerId::Storage));
+    key(&mut app, &provider, KeyCode::Char('c'));
+    let requests = app.layers.storage.outbox.take();
+    assert!(
+        matches!(
+            requests.first().map(|request| request.kind),
+            Some(StorageRequestKind::ClearUnusedDerived)
+        ),
+        "second keyboard step submits: {requests:?}"
+    );
+    assert_eq!(app.layers.top(), Some(LayerId::Storage));
+
+    // Destructive Confirm styling with Refresh default, where both fit.
+    let (provider, mut styled) = demo();
+    styled.handle(Action::Open(Open::Storage), &provider);
+    complete_with(&provider, &mut styled, snapshot(6, 8192));
+    key(&mut styled, &provider, KeyCode::Char('c'));
+    let buffer = draw_themed(&provider, &mut styled, 54, 16, theme);
+    let confirm_cell = (0..buffer.area.height)
+        .find_map(|y| {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            line.find("Confirm cleanup").map(|byte| {
+                use unicode_width::UnicodeWidthStr;
+                let column = UnicodeWidthStr::width(&line[..byte]) as u16;
+                buffer[(column, y)].style()
+            })
+        })
+        .expect("Confirm cleanup must be painted at 54x16");
+    assert_role(
+        confirm_cell,
+        role_style(theme, ButtonRole::Destructive, false),
+    );
+    let refresh_rect = styled
+        .layers
+        .storage
+        .action_rects()
+        .iter()
+        .find(|(slot, _)| *slot == 0)
+        .map(|(_, r)| *r)
+        .expect("Refresh must stay painted beside Confirm");
+    assert_role(
+        buffer[(refresh_rect.x, refresh_rect.y)].style(),
+        role_style(theme, ButtonRole::Default, false),
+    );
+
+    // Mouse path on a fresh dialog: More menu carries the original index.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Storage), &provider);
+    complete_with(&provider, &mut app, snapshot(6, 8192));
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    let more = app.layers.storage.more_rect().expect("More must paint");
+    click(&mut app, &provider, (more.x, more.y));
+    let buffer = draw_themed(&provider, &mut app, 20, 6, theme);
+    let _ = buffer;
+    let menu = app.layers.storage.menu_rects().to_vec();
+    assert_eq!(menu.len(), 1, "overflow menu holds the hidden Cleanup");
+    let surface = app.layers.storage.surface();
+    for (rect, index) in &menu {
+        assert_eq!(*index, 1, "menu must carry the original Cleanup index");
+        assert!(
+            contains_rect(surface.popup, rect),
+            "menu row escapes the published popup"
+        );
+        assert_eq!(
+            app.layers.storage.hit((rect.x, rect.y)),
+            Some(StorageHit::Menu(1)),
+            "menu paint/hit disagree"
+        );
+        let line: String = {
+            let buffer = draw_themed(&provider, &mut app, 20, 6, theme);
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect()
+        };
+        assert!(
+            line.contains("Preview cleanup") && !line.contains('&'),
+            "menu shows the stripped verb: {line:?}"
+        );
+    }
+    // First mouse step arms without submitting.
+    let (rect, _) = menu[0];
+    click(&mut app, &provider, (rect.x, rect.y));
+    assert!(app.layers.storage.confirm_clear());
+    assert!(app.layers.storage.outbox.take().is_empty());
+    assert_eq!(app.layers.top(), Some(LayerId::Storage));
+    // Second mouse step submits through the Confirm row.
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    let more = app.layers.storage.more_rect().expect("More must paint");
+    click(&mut app, &provider, (more.x, more.y));
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    let menu = app.layers.storage.menu_rects().to_vec();
+    assert_eq!(menu.len(), 1);
+    let line: String = {
+        let buffer = draw_themed(&provider, &mut app, 20, 6, theme);
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, menu[0].0.y)].symbol())
+            .collect()
+    };
+    assert!(line.contains("Confirm cleanup"), "{line:?}");
+    click(&mut app, &provider, (menu[0].0.x, menu[0].0.y));
+    let requests = app.layers.storage.outbox.take();
+    assert!(
+        matches!(
+            requests.first().map(|request| request.kind),
+            Some(StorageRequestKind::ClearUnusedDerived)
+        ),
+        "menu Confirm submits: {requests:?}"
+    );
+    assert_eq!(app.layers.top(), Some(LayerId::Storage));
+
+    // Escape order: menu first, then the layer — never both at once.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Storage), &provider);
+    complete_with(&provider, &mut app, snapshot(6, 8192));
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    let more = app.layers.storage.more_rect().expect("More must paint");
+    click(&mut app, &provider, (more.x, more.y));
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    assert!(!app.layers.storage.menu_rects().is_empty());
+    key(&mut app, &provider, KeyCode::Esc);
+    draw_themed(&provider, &mut app, 20, 6, theme);
+    assert!(app.layers.storage.menu_rects().is_empty());
+    assert!(app.layers.storage.is_open());
+    key(&mut app, &provider, KeyCode::Esc);
+    assert!(!app.layers.storage.is_open());
+    assert_eq!(app.focus, lvu::Focus::Logs);
+}
+
+fn draw_themed<P: RowProvider>(
+    provider: &P,
+    app: &mut App,
+    width: u16,
+    height: u16,
+    theme: Theme,
+) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| ui::render_with_theme(frame, app, provider, theme, None))
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn assert_role(actual: ratatui::style::Style, expected: ratatui::style::Style) {
+    assert_eq!(actual.fg, expected.fg);
+    assert_eq!(actual.add_modifier, expected.add_modifier);
+}
+
+/// Negative control for truncated-then-no-overflow diagnostics: the same long
+/// diagnostic Terra caught reporting zero scroll extent must produce nonzero
+/// shared overflow, scroll to its limit via Tab+Down with matching
+/// scrollbar/hitboxes, keep the sticky Refresh default filled and the
+/// selection role intact.
+#[test]
+fn long_diagnostic_reports_real_shared_overflow_and_scrolls() {
+    let theme = Theme::LOVE_LIGHT;
+    let styles = DialogStyles::new(theme);
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Storage), &provider);
+    let generation = app.layers.storage.outbox.take()[0].generation;
+    let entries = (0..8)
+        .map(|index| StorageEntry {
+            category: StorageCategory::Derived,
+            label: format!("derived-{index}"),
+            bytes: 1024,
+            reclaimable: 1024,
+            status: "unused, recomputable".into(),
+        })
+        .collect();
+    assert!(app.layers.storage.complete(
+        generation,
+        StorageSnapshot {
+            entries,
+            total_bytes: 8192,
+            reclaimable_bytes: 8192,
+            row_cache_bytes: 1,
+            row_cache_limit: 2,
+            query_index_bytes: 3,
+            query_index_limit: 4,
+            derived_index_limit_per_source: 5,
+            derived_index_limit_total: 6,
+            truncated: false,
+            errors: vec!["bounded storage diagnostic ".repeat(16)],
+        },
+        "scan complete".into(),
+        true,
+    ));
+    let storage = draw_themed(&provider, &mut app, 72, 16, theme);
+    // Selection role on the selected list row.
+    let selected = app.layers.storage.row_rects()[0].0;
+    assert_role(storage[(selected.x, selected.y)].style(), styles.selection);
+    assert_eq!(
+        Some(storage[(selected.x, selected.y)].bg),
+        styles.selection.bg
+    );
+    // Sticky default: Refresh carries the accent fill.
+    let refresh_cell = (0..storage.area.height)
+        .find_map(|y| {
+            let line: String = (0..storage.area.width)
+                .map(|x| storage[(x, y)].symbol())
+                .collect();
+            line.find("[ Refresh ]").map(|byte| {
+                use unicode_width::UnicodeWidthStr;
+                let column = UnicodeWidthStr::width(&line[..byte]) as u16;
+                storage[(column, y)].style()
+            })
+        })
+        .expect("Refresh action must be painted");
+    assert_role(refresh_cell, role_style(theme, ButtonRole::Default, false));
+    assert_eq!(refresh_cell.bg, Some(theme.accent));
+    // The HOLD regression: zero scroll extent for content that exists.
+    let limit = app.layers.storage.scroll_limit();
+    assert!(limit > 0, "long diagnostic must really overflow");
+    let refresh_before = app
+        .layers
+        .storage
+        .action_rects()
+        .iter()
+        .find(|(slot, _)| *slot == 0)
+        .map(|(_, r)| *r);
+    // Tab hands the arrows to the diagnostics pane; scrolling reaches the limit.
+    key(&mut app, &provider, KeyCode::Tab);
+    for _ in 0..limit {
+        key(&mut app, &provider, KeyCode::Down);
+    }
+    assert_eq!(app.layers.storage.scroll(), limit);
+    // Sticky tail: the action band never moved under the scroll.
+    // Re-draw to refresh painted hitboxes, then compare origins.
+    let scrolled = draw_themed(&provider, &mut app, 72, 16, theme);
+    let refresh_after = app
+        .layers
+        .storage
+        .action_rects()
+        .iter()
+        .find(|(slot, _)| *slot == 0)
+        .map(|(_, r)| *r);
+    assert_eq!(
+        refresh_before, refresh_after,
+        "scrolling diagnostics must not move the sticky tail"
+    );
+    // Scrollbar/hitbox agreement on the painted rows.
+    let surface = app.layers.storage.surface();
+    assert!(surface.scrollable, "overflowing diagnostics must scroll");
+    for (rect, index) in app.layers.storage.row_rects() {
+        assert_eq!(
+            app.layers.storage.hit((rect.x, rect.y)),
+            Some(StorageHit::Row(*index)),
+            "row paint/hit disagree after diagnostics scroll"
+        );
+    }
+    // The scrolled diagnostic text is really painted in the error role.
+    let diagnostic_cell = (0..scrolled.area.height)
+        .find_map(|y| {
+            let line: String = (0..scrolled.area.width)
+                .map(|x| scrolled[(x, y)].symbol())
+                .collect();
+            line.find("diagnostic").map(|byte| {
+                use unicode_width::UnicodeWidthStr;
+                let column = UnicodeWidthStr::width(&line[..byte]) as u16;
+                scrolled[(column, y)].style()
+            })
+        })
+        .expect("scrolled diagnostic text must be painted");
+    assert_role(diagnostic_cell, styles.error);
 }
