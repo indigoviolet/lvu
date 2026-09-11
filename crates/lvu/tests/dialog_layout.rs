@@ -2814,3 +2814,262 @@ fn responsive_action_budgets_and_resolve_fallback_at_boundaries() {
     assert!(!geometry.actions.unreachable_overflow());
     assert!(geometry.actions.visible_indices().contains(&5));
 }
+
+// --- Phase B shared-core: frozen context anchor lifecycle ---
+//
+// Capture comes from the same last-rendered base geometry/hit regions when the
+// first layer opens, is retained across async frames, child push and Replace,
+// never chases live row movement, and clears when the stack returns to base
+// (and on resize). An open with no selected/painted row carries the log rect
+// with an empty row. Exposed read-only through `RenderCtx::context_anchor`
+// for later Contextual resolve calls; no new row rectangle and no widened
+// global hit regions.
+
+fn base_geometry(app: &App) -> (Option<Rect>, Vec<(Rect, usize)>) {
+    (
+        app.hit_regions.log_rows.or(app.hit_regions.log),
+        app.hit_regions.log_row_indices.clone(),
+    )
+}
+
+fn selected_index(provider: &FixtureProvider, app: &App) -> Option<usize> {
+    let view_id = app.active_view_id()?;
+    let selected = app.view_state()?.selected.clone()?;
+    provider.index_of_id(view_id, &selected)
+}
+
+#[test]
+fn anchor_captures_the_selected_row_and_log_from_one_base_frame() {
+    let (provider, mut app) = demo();
+    let theme = Theme::TERMINAL;
+    // Base frame first so hit regions exist; select the top row so a painted
+    // selected rect exists.
+    draw(&provider, &mut app, 100, 30, theme);
+    app.handle(Action::Top, &provider);
+    draw(&provider, &mut app, 100, 30, theme);
+    let (log_before, rows_before) = base_geometry(&app);
+    let log_before = log_before.expect("base log viewport");
+    let selected = selected_index(&provider, &app).expect("selected row");
+    let row_before = rows_before
+        .iter()
+        .find(|(_, index)| *index == selected)
+        .map(|(rect, _)| *rect)
+        .expect("selected row is painted");
+    app.handle(Action::Open(Open::Search), &provider);
+    let anchor = app
+        .shell
+        .context_anchor
+        .expect("anchor captured on first open");
+    assert_eq!(
+        anchor.log, log_before,
+        "log viewport must come from the base frame"
+    );
+    assert_eq!(
+        anchor.row, row_before,
+        "row must come from the same base hit regions"
+    );
+    // Retained across async frames (another base+layer render, no new capture).
+    draw(&provider, &mut app, 100, 30, theme);
+    assert_eq!(
+        app.shell.context_anchor,
+        Some(anchor),
+        "async frames must not recapture"
+    );
+}
+
+#[test]
+fn anchor_falls_back_to_log_with_an_empty_row_when_nothing_is_painted() {
+    // Deterministic negative control: the demo "all" view holds 16 rows while
+    // a 100x20 log viewport paints only 15, so moving the selection to the
+    // last row *without re-rendering* leaves a live selection whose index is
+    // absent from the last-rendered hit regions. Capture must reuse those
+    // painted regions (empty row) rather than recomputing a fresh rect from
+    // the provider (which would find the last row).
+    let (provider, mut app) = demo();
+    let theme = Theme::TERMINAL;
+    draw(&provider, &mut app, 100, 20, theme);
+    app.handle(Action::Top, &provider);
+    draw(&provider, &mut app, 100, 20, theme);
+    let (log_before, rows_before) = base_geometry(&app);
+    let log_before = log_before.expect("base log viewport");
+    assert!(
+        rows_before.len() < app.view_state().map(|state| state.last_total).unwrap_or(0),
+        "need more rows than the viewport paints for a real negative control: painted {}, total {}",
+        rows_before.len(),
+        app.view_state().map(|state| state.last_total).unwrap_or(0),
+    );
+    // Move the live selection out of the painted page; do NOT render again so
+    // the hit regions stay stale by construction.
+    app.handle(Action::End, &provider);
+    let selected = selected_index(&provider, &app).expect("live selection exists");
+    assert!(
+        !rows_before.iter().any(|(_, index)| *index == selected),
+        "selected index {selected} must be absent from the last-rendered rows {:?}",
+        rows_before.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+    );
+    // Open the first layer from this state: no painted row matches, so the
+    // anchor carries the exact last-rendered log viewport with an empty row.
+    app.handle(Action::Open(Open::Help), &provider);
+    let anchor = app.shell.context_anchor.expect("anchor captured");
+    assert_eq!(
+        anchor.log, log_before,
+        "log viewport must be the exact last-rendered one"
+    );
+    assert!(
+        anchor.row.is_empty(),
+        "unpainted selection must give an empty row, got {:?}",
+        anchor.row
+    );
+}
+
+#[test]
+fn anchor_does_not_chase_live_row_movement_and_survives_child_and_replace() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use lvu::component::RawEvent;
+    let (provider, mut app) = demo();
+    let theme = Theme::TERMINAL;
+    draw(&provider, &mut app, 100, 30, theme);
+    app.handle(Action::Top, &provider);
+    draw(&provider, &mut app, 100, 30, theme);
+    app.handle(Action::Open(Open::Search), &provider);
+    let held = app.shell.context_anchor.expect("anchor captured");
+    // Live movement: move the base selection while the layer is up. The held
+    // anchor must not follow it.
+    app.handle(Action::End, &provider);
+    draw(&provider, &mut app, 100, 30, theme);
+    assert_eq!(
+        app.shell.context_anchor,
+        Some(held),
+        "live selection movement must not move the held anchor"
+    );
+    // Child push retains.
+    app.handle(Action::Open(Open::Time), &provider);
+    assert_eq!(app.layers.stack.len(), 2, "child pushed");
+    assert_eq!(
+        app.shell.context_anchor,
+        Some(held),
+        "child push must retain"
+    );
+    // Popping the child retains.
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ))),
+        &provider,
+    );
+    assert_eq!(app.layers.stack.len(), 1);
+    assert_eq!(
+        app.shell.context_anchor,
+        Some(held),
+        "child pop must retain"
+    );
+    // Replace retains: ViewSummary Enter replaces with its owning dialog.
+    // Stack is [Search] here; pushing ViewSummary makes [Search, ViewSummary],
+    // and Replace pops ViewSummary then pushes its owner, staying at two.
+    app.handle(Action::Open(Open::ViewSummary), &provider);
+    assert_eq!(app.layers.stack.len(), 2);
+    let before_replace = app.shell.context_anchor.expect("anchor held");
+    assert_eq!(before_replace, held, "second push retains");
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))),
+        &provider,
+    );
+    assert_eq!(app.layers.stack.len(), 2, "Replace keeps the depth");
+    assert_eq!(
+        app.shell.context_anchor,
+        Some(held),
+        "Replace must retain the frozen row"
+    );
+    // Final pop clears.
+    for _ in 0..4 {
+        app.handle(
+            Action::Raw(RawEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))),
+            &provider,
+        );
+        if app.layers.stack.is_empty() {
+            break;
+        }
+    }
+    assert!(app.layers.stack.is_empty(), "stack returned to base");
+    assert_eq!(app.shell.context_anchor, None, "final pop must clear");
+}
+
+#[test]
+fn anchor_invalidates_on_resize_and_captures_compact_logs() {
+    let (provider, mut app) = demo();
+    let theme = Theme::TERMINAL;
+    draw(&provider, &mut app, 100, 30, theme);
+    app.handle(Action::Top, &provider);
+    draw(&provider, &mut app, 100, 30, theme);
+    app.handle(Action::Open(Open::Search), &provider);
+    assert!(app.shell.context_anchor.is_some());
+    // Resize invalidates: coordinates from the old viewport misname rows.
+    app.handle(Action::Resize(54, 16), &provider);
+    assert_eq!(
+        app.shell.context_anchor, None,
+        "resize must invalidate the frozen anchor"
+    );
+    // Rendering at a new size without a resize action invalidates too
+    // (TestBackend draws change size directly).
+    draw(&provider, &mut app, 100, 30, theme);
+    app.handle(Action::Open(Open::Time), &provider);
+    // Stack is non-empty (Search still up? Actually Search was popped? No:
+    // Search still up (we never closed it; Resize cleared anchor but not the
+    // stack). Opening Time is a child push retaining None (no recapture while
+    // up). Close everything, reopen compact for a fresh capture.
+    for _ in 0..4 {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use lvu::component::RawEvent;
+        app.handle(
+            Action::Raw(RawEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))),
+            &provider,
+        );
+        if app.layers.stack.is_empty() {
+            break;
+        }
+    }
+    assert!(app.layers.stack.is_empty());
+    draw(&provider, &mut app, 54, 16, theme);
+    app.handle(Action::Top, &provider);
+    draw(&provider, &mut app, 54, 16, theme);
+    let log_compact = app
+        .hit_regions
+        .log_rows
+        .or(app.hit_regions.log)
+        .expect("compact log viewport");
+    // Base at 54x16 still shows the sidebar (no modal yet), so the log is the
+    // sidebar-narrowed viewport. The frozen anchor carries exactly that base
+    // geometry; after the dialog opens the compact backdrop (§5.5) takes the
+    // full width, but the anchor must not chase it.
+    app.handle(Action::Open(Open::Search), &provider);
+    let anchor = app.shell.context_anchor.expect("compact capture");
+    assert_eq!(
+        anchor.log, log_compact,
+        "compact capture carries its base log"
+    );
+    draw(&provider, &mut app, 54, 16, theme);
+    let log_behind = app
+        .hit_regions
+        .log_rows
+        .or(app.hit_regions.log)
+        .expect("log behind the compact dialog");
+    assert!(
+        log_behind.width >= log_compact.width,
+        "compact backdrop gives the log at least its base width: base {log_compact:?}, behind {log_behind:?}"
+    );
+    assert_eq!(
+        app.shell.context_anchor,
+        Some(anchor),
+        "async frames must not recapture the compact anchor"
+    );
+}

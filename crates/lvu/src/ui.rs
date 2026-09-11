@@ -160,6 +160,15 @@ pub fn render_with_theme<P: RowProvider>(
         Block::default().style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
         geometry.area,
     );
+    // Phase B: a viewport resize invalidates the frozen anchor's coordinates
+    // (same rule as `Action::Resize` in `app.rs`). TestBackend draws change
+    // size without sending a resize action, so the shared shell rendering owns
+    // this too; the inspector falls back instead of misnaming an old row.
+    if (geometry.area.width, geometry.area.height) != app.shell.size
+        && app.shell.context_anchor.is_some()
+    {
+        app.shell.context_anchor = None;
+    }
     app.shell.size = (geometry.area.width, geometry.area.height);
     if geometry.tiny {
         app.hit_regions = Default::default();
@@ -258,6 +267,10 @@ fn render_layers<P: RowProvider>(
         display_zone: &appearance.display_zone,
         size: shell.size,
         clock: shell.clock(),
+        // Phase B: the frozen opening-row anchor for later Contextual
+        // Inspector/Prompt `resolve_dialog` calls. Legacy layers render
+        // through their `DialogClass` adapters unchanged and ignore it.
+        context_anchor: shell.context_anchor,
     };
     let stack = layers.stack.clone();
     let compact = crate::dialog_layout::is_compact(area);

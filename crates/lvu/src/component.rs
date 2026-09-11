@@ -562,6 +562,28 @@ pub struct RenderCtx<'a> {
     pub display_zone: &'a str,
     pub size: (u16, u16),
     pub clock: Clock,
+    /// Frozen opening-row anchor for contextual inspectors/prompts (phase B).
+    ///
+    /// Captured from the same last-rendered base geometry/hit regions when the
+    /// first layer opened, retained across async frames, child push and
+    /// `Replace`, never chasing live row movement, cleared when the stack
+    /// returns to base (and on resize, whose coordinates it would otherwise
+    /// misname). Later Contextual Inspector/Prompt `resolve_dialog` calls read
+    /// this; no layer computes its own row rectangle and no new global
+    /// hit-region geometry was added for it.
+    pub context_anchor: Option<crate::dialog_layout::ContextAnchor>,
+}
+
+/// Shared shell adapter for phase-A frontmost/overlay geometry (phase B).
+///
+/// Phase A resolves `frontmost == frame`: no dialog has an open anchored
+/// overlay wired into `DialogGeometry` yet, so the frame is the whole
+/// frontmost surface. Later anchored menus join this union; component popup
+/// implementations are unchanged in this slice and keep reporting their own
+/// `Surface`. The shell uses this (and `Surface.popup` for legacy layers) for
+/// modal containment, so rendering, hit-testing and selection share one rect.
+pub fn shell_frontmost(geometry: &crate::dialog_layout::DialogGeometry) -> Rect {
+    geometry.frontmost
 }
 
 pub trait Component {
