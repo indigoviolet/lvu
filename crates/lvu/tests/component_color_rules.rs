@@ -826,3 +826,580 @@ fn raw_text_stays_an_explicit_exception_without_outputs() {
         "timeout"
     );
 }
+
+fn tab_to_add(app: &mut App, provider: &FixtureProvider) {
+    for _ in 0..16 {
+        if app.layers.color_rules.control() == ColorRulesControl::Add {
+            return;
+        }
+        key(app, provider, KeyCode::Tab);
+    }
+    panic!("Tab never reached Add");
+}
+
+/// Every planned action/More rect must be full-size (at least its required
+/// button width), inside the band, and pairwise disjoint: Ratatui squeezes
+/// over-wide fixed Length constraints instead of refusing, so anything less
+/// is a clipped label or a dead hitbox masquerading as geometry.
+fn assert_action_rects_valid(
+    band: ratatui::layout::Rect,
+    buttons: &[(usize, ratatui::layout::Rect)],
+    more: Option<ratatui::layout::Rect>,
+    labels: &[&str],
+    tag: &str,
+) {
+    use lvu::dialog_controls::{MORE_LABEL, button_width};
+    let mut seen: Vec<ratatui::layout::Rect> = Vec::new();
+    for (index, rect) in buttons {
+        let required = button_width(labels[*index]);
+        assert!(
+            rect.width >= required,
+            "{tag}: button {} paints {} wide, needs {required}",
+            labels[*index],
+            rect.width,
+        );
+        assert!(
+            rect.x >= band.x
+                && rect.right() <= band.right()
+                && rect.y >= band.y
+                && rect.bottom() <= band.bottom(),
+            "{tag}: button {} at {rect:?} escapes band {band:?}",
+            labels[*index],
+        );
+        assert!(
+            seen.iter().all(|prior: &ratatui::layout::Rect| {
+                prior.x >= rect.right()
+                    || rect.x >= prior.right()
+                    || prior.y >= rect.bottom()
+                    || rect.y >= prior.bottom()
+            }),
+            "{tag}: button {} at {rect:?} overlaps {seen:?}",
+            labels[*index],
+        );
+        seen.push(*rect);
+    }
+    if let Some(rect) = more {
+        let required = button_width(MORE_LABEL);
+        assert!(
+            rect.width >= required,
+            "{tag}: More paints {} wide, needs {required}",
+            rect.width
+        );
+        assert!(
+            rect.x >= band.x
+                && rect.right() <= band.right()
+                && rect.y >= band.y
+                && rect.bottom() <= band.bottom(),
+            "{tag}: More at {rect:?} escapes band {band:?}",
+        );
+        assert!(
+            seen.iter().all(|prior: &ratatui::layout::Rect| {
+                prior.x >= rect.right()
+                    || rect.x >= prior.right()
+                    || prior.y >= rect.bottom()
+                    || rect.y >= prior.bottom()
+            }),
+            "{tag}: More at {rect:?} overlaps {seen:?}",
+        );
+    }
+}
+
+#[test]
+fn overflow_menu_activates_every_hidden_verb_at_the_floor() {
+    // At 20x6 the two-row band holds a full Apply plus a full More; Add and
+    // Remove hide behind the menu. The kept band height equals the requested
+    // budget: degradation sheds nothing.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 20, 6);
+    app.handle(Action::Open(Open::ColorRules), &provider);
+    tab_to_add(&mut app, &provider);
+    key(&mut app, &provider, KeyCode::Enter);
+    type_text(&mut app, &provider, "rx");
+    draw(&provider, &mut app, 20, 6);
+    assert_eq!(app.view_state().unwrap().color_rules_draft.len(), 1);
+    assert_eq!(app.layers.color_rules.action_band().height, 2);
+    let more = app
+        .layers
+        .color_rules
+        .more_button()
+        .expect("More paints at 20x6");
+    // Only Apply paints directly; Add/Remove are hidden but live in overflow.
+    // Every planned rect is full-size, in-band and disjoint: no squeezed
+    // Lengths, no clipped labels.
+    assert_action_rects_valid(
+        app.layers.color_rules.action_band(),
+        &[(
+            2,
+            app.layers
+                .color_rules
+                .control_rects()
+                .iter()
+                .find_map(|(rect, control)| (*control == ColorRulesControl::Apply).then_some(*rect))
+                .expect("Apply paints"),
+        )],
+        Some(more),
+        &["&Add", "&Remove", "A&pply"],
+        "20x6 floor",
+    );
+    let floor_screen = screen(&draw(&provider, &mut app, 20, 6));
+    assert!(floor_screen.contains("[ Apply ]"), "{floor_screen}");
+    assert!(floor_screen.contains("[ More ▾ ]"), "{floor_screen}");
+    assert!(
+        app.layers
+            .color_rules
+            .control_rects()
+            .iter()
+            .any(|(_, painted)| *painted == ColorRulesControl::Apply),
+        "Apply paints directly at 20x6"
+    );
+    assert!(
+        !app.layers
+            .color_rules
+            .control_rects()
+            .iter()
+            .any(|(_, control)| {
+                matches!(control, ColorRulesControl::Add | ColorRulesControl::Remove)
+            })
+    );
+
+    // Hidden-focus Enter opens the menu on that verb instead of running it
+    // blind: the draft is untouched by the first Enter (menu opened on Add),
+    // and only the second Enter runs Add through `press_action`.
+    key(&mut app, &provider, KeyCode::Tab);
+    key(&mut app, &provider, KeyCode::Tab);
+    assert_eq!(app.layers.color_rules.control(), ColorRulesControl::Add);
+    draw(&provider, &mut app, 20, 6);
+    key(&mut app, &provider, KeyCode::Enter);
+    draw(&provider, &mut app, 20, 6);
+    let rows = app.layers.color_rules.more_rows().to_vec();
+    assert!(!rows.is_empty(), "the menu paints");
+    assert_eq!(rows[0].1, 0, "menu opens on the focused verb");
+    for (rect, _) in &rows {
+        assert!(rect.right() <= 20 && rect.bottom() <= 6);
+    }
+    // One-row gap against the More button that anchored the menu.
+    let menu_top = rows[0].0.y.saturating_sub(1);
+    let menu_bottom = rows.last().map(|(rect, _)| rect.y.saturating_add(2));
+    assert!(
+        menu_top == more.bottom().saturating_add(1)
+            || menu_bottom.is_some_and(|bottom| bottom.saturating_add(1) == more.y),
+        "menu keeps its one-row gap to More {more:?}"
+    );
+    assert_eq!(app.view_state().unwrap().color_rules_draft.len(), 1);
+    key(&mut app, &provider, KeyCode::Enter);
+    assert_eq!(app.view_state().unwrap().color_rules_draft.len(), 2);
+    draw(&provider, &mut app, 20, 6);
+    assert!(app.layers.color_rules.more_rows().is_empty());
+
+    // Mouse: the More button opens; a row click activates immediately. Down
+    // first scrolls the one-row menu to Remove, which then removes the
+    // selected rule exactly like its button.
+    let more = app.layers.color_rules.more_button().expect("More paints");
+    click(&mut app, &provider, (more.x, more.y));
+    draw(&provider, &mut app, 20, 6);
+    assert!(!app.layers.color_rules.more_rows().is_empty());
+    key(&mut app, &provider, KeyCode::Down);
+    draw(&provider, &mut app, 20, 6);
+    let rows = app.layers.color_rules.more_rows().to_vec();
+    let remove = rows
+        .iter()
+        .find_map(|(rect, index)| (*index == 1).then_some(*rect))
+        .expect("Remove painted after scroll");
+    click(&mut app, &provider, (remove.x, remove.y));
+    assert_eq!(app.view_state().unwrap().color_rules_draft.len(), 1);
+
+    // Escape closes the menu and keeps the dialog with its draft. Redraw
+    // first: hit-testing always reads the last render, as in the live loop.
+    draw(&provider, &mut app, 20, 6);
+    let more = app.layers.color_rules.more_button().expect("More paints");
+    click(&mut app, &provider, (more.x, more.y));
+    draw(&provider, &mut app, 20, 6);
+    assert!(!app.layers.color_rules.more_rows().is_empty());
+    key(&mut app, &provider, KeyCode::Esc);
+    draw(&provider, &mut app, 20, 6);
+    assert!(app.layers.color_rules.more_rows().is_empty());
+    assert!(app.layers.color_rules.is_open());
+    assert_eq!(app.view_state().unwrap().color_rules_draft.len(), 1);
+
+    // Roomy sizes fit every verb with a one-row band: no overflow invented.
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, width, height);
+        app.handle(Action::Open(Open::ColorRules), &provider);
+        tab_to_add(&mut app, &provider);
+        key(&mut app, &provider, KeyCode::Enter);
+        type_text(&mut app, &provider, "rx");
+        draw(&provider, &mut app, width, height);
+        assert!(
+            app.layers.color_rules.more_button().is_none(),
+            "{width}x{height}: no overflow invented"
+        );
+        assert_eq!(
+            app.layers.color_rules.action_band().height,
+            1,
+            "{width}x{height}: one action row, no dead row"
+        );
+        let mut painted = Vec::new();
+        for control in [
+            ColorRulesControl::Add,
+            ColorRulesControl::Remove,
+            ColorRulesControl::Apply,
+        ] {
+            let rect = app
+                .layers
+                .color_rules
+                .control_rects()
+                .iter()
+                .find_map(|(rect, painted)| (*painted == control).then_some(*rect))
+                .unwrap_or_else(|| panic!("{width}x{height}: {control:?} paints directly"));
+            painted.push((
+                match control {
+                    ColorRulesControl::Add => 0,
+                    ColorRulesControl::Remove => 1,
+                    _ => 2,
+                },
+                rect,
+            ));
+        }
+        assert_action_rects_valid(
+            app.layers.color_rules.action_band(),
+            &painted,
+            None,
+            &["&Add", "&Remove", "A&pply"],
+            &format!("{width}x{height} roomy"),
+        );
+        let rendered = screen(&draw(&provider, &mut app, width, height));
+        assert!(rendered.contains("[ Add ]"), "{rendered}");
+        assert!(rendered.contains("[ Remove ]"), "{rendered}");
+        assert!(rendered.contains("[ Apply ]"), "{rendered}");
+    }
+}
+
+#[test]
+fn inspector_frame_is_stable_across_empty_dirty_error_and_applied_states() {
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 100, 28);
+    app.handle(Action::Open(Open::ColorRules), &provider);
+    draw(&provider, &mut app, 100, 28);
+    let anchor = app.shell.context_anchor.expect("anchor frozen at open");
+    let empty = app.layers.color_rules.surface();
+    assert!(screen(&draw(&provider, &mut app, 100, 28)).contains("no rules"));
+
+    // Dirty: a typed-but-unapplied draft. The message row changes state, the
+    // frame must not.
+    tab_to_add(&mut app, &provider);
+    key(&mut app, &provider, KeyCode::Enter);
+    assert_eq!(
+        app.layers.color_rules.control(),
+        ColorRulesControl::Predicate
+    );
+    type_text(&mut app, &provider, "timeout");
+    draw(&provider, &mut app, 100, 28);
+    assert!(
+        screen(&draw(&provider, &mut app, 100, 28)).contains("edited · Apply"),
+        "dirty state shows"
+    );
+    let dirty = app.layers.color_rules.surface();
+
+    // Error: an invalid regex is refused where it was typed; the draft and
+    // the frame both stay put.
+    for _ in 0.."timeout".len() {
+        key(&mut app, &provider, KeyCode::Backspace);
+    }
+    type_text(&mut app, &provider, "/[/");
+    key(&mut app, &provider, KeyCode::Enter);
+    let errored = screen(&draw(&provider, &mut app, 100, 28));
+    assert!(errored.contains("invalid regex"), "{errored}");
+    let error = app.layers.color_rules.surface();
+    assert_eq!(
+        app.view_state().unwrap().color_rules_draft[0].predicate,
+        "/[/",
+        "a refused draft is kept for correction"
+    );
+
+    // Applied: fix the predicate, apply, and land the engine's answer. The
+    // accepted list repaints in the same frame the empty list used.
+    for _ in 0.."/[/".len() {
+        key(&mut app, &provider, KeyCode::Backspace);
+    }
+    type_text(&mut app, &provider, "timeout");
+    key(&mut app, &provider, KeyCode::Enter);
+    let request = app.take_query_requests().pop().expect("one repaint query");
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    let applied = screen(&draw(&provider, &mut app, 100, 28));
+    assert!(applied.contains("1 rule painting this view"), "{applied}");
+    let settled = app.layers.color_rules.surface();
+
+    for (name, surface) in [("dirty", dirty), ("error", error), ("applied", settled)] {
+        assert_eq!(surface.popup, empty.popup, "{name} state moved the frame");
+        assert_eq!(
+            surface.interior, empty.interior,
+            "{name} state moved the interior"
+        );
+    }
+    assert_eq!(
+        app.shell.context_anchor,
+        Some(anchor),
+        "the anchor is retained across frames, never recaptured"
+    );
+}
+
+#[test]
+fn inspector_avoids_the_frozen_selected_row_with_a_one_row_gap() {
+    for (width, height) in [(240u16, 80u16), (140, 40), (80, 24), (54, 16)] {
+        let tag = format!("{width}x{height}");
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, width, height);
+        app.handle(Action::Open(Open::ColorRules), &provider);
+        let anchor = app.shell.context_anchor.expect("anchor frozen at open");
+        assert!(
+            !anchor.row.is_empty(),
+            "{tag}: the opening selection names a row"
+        );
+        draw(&provider, &mut app, width, height);
+        let frame = app.layers.color_rules.surface().popup;
+        assert!(
+            frame.right() <= width && frame.bottom() <= height,
+            "{tag}: frame {frame:?} escapes the area"
+        );
+        assert!(
+            frame.bottom() <= anchor.row.y || frame.y >= anchor.row.bottom(),
+            "{tag}: frame {frame:?} covers referent row {:?}",
+            anchor.row
+        );
+        let below = frame.y == anchor.row.bottom().saturating_add(1);
+        let above = frame.bottom().saturating_add(1) == anchor.row.y;
+        assert!(
+            below || above,
+            "{tag}: frame {frame:?} keeps no one-row gap to row {:?}",
+            anchor.row
+        );
+        assert_eq!(
+            app.shell.context_anchor,
+            Some(anchor),
+            "{tag}: live frames must not chase the selection"
+        );
+    }
+
+    // The 20x6 safety floor owns the whole frame; avoidance is impossible and
+    // the dialog takes it explicitly rather than drawing a broken inspector.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 20, 6);
+    app.handle(Action::Open(Open::ColorRules), &provider);
+    draw(&provider, &mut app, 20, 6);
+    assert_eq!(
+        app.layers.color_rules.surface().popup,
+        ratatui::layout::Rect::new(0, 0, 20, 6)
+    );
+    assert!(screen(&draw(&provider, &mut app, 20, 6)).contains("Colour rules"));
+
+    // Below the floor the existing tiny fallback owns the screen instead.
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+    assert!(!tiny.contains("Colour rules"), "{tiny}");
+}
+
+#[test]
+fn deep_selection_editor_and_mouse_stay_on_painted_geometry() {
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 100, 28);
+    app.handle(Action::Open(Open::ColorRules), &provider);
+    for i in 0..10 {
+        tab_to_add(&mut app, &provider);
+        key(&mut app, &provider, KeyCode::Enter);
+        type_text(&mut app, &provider, &format!("rule{i}"));
+        key(&mut app, &provider, KeyCode::Tab);
+        key(&mut app, &provider, KeyCode::Tab);
+    }
+    assert_eq!(app.view_state().unwrap().color_rules_draft.len(), 10);
+    assert_eq!(app.layers.color_rules.selected(), 9);
+
+    // The freshly added last rule is revealed, not left below the fold, with
+    // its editor value on screen.
+    draw(&provider, &mut app, 54, 16);
+    let rows: Vec<(u16, usize)> = app
+        .layers
+        .color_rules
+        .row_rects()
+        .iter()
+        .map(|(rect, index)| (rect.y, *index))
+        .collect();
+    assert!(
+        rows.iter().any(|(_, index)| *index == 9),
+        "selected rule 9 is painted: {rows:?}"
+    );
+    assert!(
+        screen(&draw(&provider, &mut app, 54, 16)).contains("rule9"),
+        "the selected rule's value is visible"
+    );
+
+    // Wrapping around reveals the other end through the same shared viewport.
+    key(&mut app, &provider, KeyCode::Down);
+    assert_eq!(app.layers.color_rules.selected(), 0);
+    draw(&provider, &mut app, 54, 16);
+    assert!(
+        app.layers
+            .color_rules
+            .row_rects()
+            .iter()
+            .any(|(_, i)| *i == 0),
+        "wrapped selection repaints at the top"
+    );
+
+    // Every painted row hit-tests back to its own index, and clicking one
+    // selects it exactly like the arrow keys do.
+    for (rect, index) in app.layers.color_rules.row_rects().to_vec() {
+        assert_eq!(
+            app.layers.color_rules.hit((rect.x, rect.y)),
+            Some(ColorRulesHit::Row(index)),
+            "row {rect:?} does not hit-test to rule {index}"
+        );
+    }
+    let (middle, middle_index) =
+        app.layers.color_rules.row_rects()[app.layers.color_rules.row_rects().len() / 2];
+    click(&mut app, &provider, (middle.x, middle.y));
+    assert_eq!(app.layers.color_rules.selected(), middle_index);
+    assert_eq!(app.layers.color_rules.control(), ColorRulesControl::List);
+
+    // The editor row for the clicked rule is one Tab away with a live caret,
+    // however deep the list scrolled to show it.
+    key(&mut app, &provider, KeyCode::Tab);
+    assert_eq!(
+        app.layers.color_rules.control(),
+        ColorRulesControl::Predicate
+    );
+    draw(&provider, &mut app, 54, 16);
+    assert!(
+        app.layers.color_rules.surface().caret.is_some(),
+        "the predicate caret paints once the editor is revealed"
+    );
+
+    // At the 20x6 floor the two-row band holds a full Apply plus a full More
+    // while the message row drops to one: the dialog stays usable, Add and
+    // Remove live in the menu, and the kept band height still equals the
+    // requested budget.
+    draw(&provider, &mut app, 20, 6);
+    assert!(app.layers.color_rules.is_open());
+    assert!(screen(&draw(&provider, &mut app, 20, 6)).contains("Colour rules"));
+    assert_eq!(app.layers.color_rules.action_band().height, 2);
+    assert!(app.layers.color_rules.more_button().is_some());
+    assert_eq!(
+        app.view_state().unwrap().color_rules_draft.len(),
+        10,
+        "the draft survives the floor"
+    );
+    // Every control is Tab-reachable; hidden Add/Remove show the More ring
+    // instead of landing invisibly, and the predicate still shows its caret
+    // once the shared viewport reveals its editor row.
+    let mut visited = vec![app.layers.color_rules.control()];
+    let mut saw_caret = app.layers.color_rules.surface().caret.is_some();
+    for _ in 0..6 {
+        key(&mut app, &provider, KeyCode::Tab);
+        let buffer = draw(&provider, &mut app, 20, 6);
+        visited.push(app.layers.color_rules.control());
+        saw_caret = saw_caret || app.layers.color_rules.surface().caret.is_some();
+        if matches!(
+            app.layers.color_rules.control(),
+            ColorRulesControl::Add | ColorRulesControl::Remove
+        ) && !app
+            .layers
+            .color_rules
+            .control_rects()
+            .iter()
+            .any(|(_, painted)| *painted == app.layers.color_rules.control())
+        {
+            let more = app.layers.color_rules.more_button().expect("More paints");
+            let cell = &buffer[(more.x, more.y)];
+            assert!(
+                cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                "More carries the focus ring for hidden {:?}",
+                app.layers.color_rules.control(),
+            );
+        }
+    }
+    for control in [
+        ColorRulesControl::List,
+        ColorRulesControl::Predicate,
+        ColorRulesControl::Color,
+        ColorRulesControl::Add,
+        ColorRulesControl::Remove,
+        ColorRulesControl::Apply,
+    ] {
+        assert!(
+            visited.contains(&control),
+            "unreachable at 20x6: {control:?}"
+        );
+    }
+    assert!(saw_caret, "no predicate caret at 20x6");
+
+    // Hidden-focus Enter opens the menu on that verb; a second Enter runs it.
+    let mut tabs = 0;
+    while app.layers.color_rules.control() != ColorRulesControl::Add && tabs < 8 {
+        key(&mut app, &provider, KeyCode::Tab);
+        tabs += 1;
+    }
+    assert_eq!(app.layers.color_rules.control(), ColorRulesControl::Add);
+    draw(&provider, &mut app, 20, 6);
+    key(&mut app, &provider, KeyCode::Enter);
+    draw(&provider, &mut app, 20, 6);
+    assert!(!app.layers.color_rules.more_rows().is_empty());
+    assert_eq!(app.view_state().unwrap().color_rules_draft.len(), 10);
+    key(&mut app, &provider, KeyCode::Enter);
+    assert_eq!(app.view_state().unwrap().color_rules_draft.len(), 11);
+
+    // Regrowing restores the full dialog from the kept draft.
+    draw(&provider, &mut app, 54, 16);
+    assert!(
+        !app.layers.color_rules.row_rects().is_empty(),
+        "paint returns on regrow"
+    );
+}
+
+#[test]
+fn wide_and_combining_text_keep_exact_bytes_and_a_display_width_caret() {
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 80, 24);
+    app.handle(Action::Open(Open::ColorRules), &provider);
+    tab_to_add(&mut app, &provider);
+    key(&mut app, &provider, KeyCode::Enter);
+    assert_eq!(
+        app.layers.color_rules.control(),
+        ColorRulesControl::Predicate
+    );
+
+    // A wide CJK character takes two cells, a combining mark takes none: the
+    // caret must advance by display width, never by char count, and the draft
+    // must keep the exact bytes.
+    let mut columns = Vec::new();
+    for character in ['a', '東', 'e', '́', 'x'] {
+        key(&mut app, &provider, KeyCode::Char(character));
+        draw(&provider, &mut app, 80, 24);
+        let caret = app
+            .layers
+            .color_rules
+            .surface()
+            .caret
+            .expect("caret paints");
+        columns.push(caret.0);
+    }
+    assert_eq!(
+        app.view_state().unwrap().color_rules_draft[0].predicate,
+        "a東éx",
+        "combining bytes are preserved, not normalized"
+    );
+    let deltas: Vec<u16> = columns
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .collect();
+    assert_eq!(
+        deltas,
+        vec![2, 1, 0, 1],
+        "caret advances by display width: {columns:?}"
+    );
+}

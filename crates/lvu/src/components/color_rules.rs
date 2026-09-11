@@ -40,12 +40,14 @@ use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface, ViewEvent,
 };
-use crate::dialog_controls::{ActionRow, DialogStyles};
+use crate::components::editors::draw_action_menu;
+use crate::dialog_controls::DialogStyles;
+use crate::dialog_controls::{ButtonRole, render_role_button};
+use crate::dialog_layout::{ContextFootprint, DialogSpec, PresentationKind, ScrollViewport};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit, reset_cursor_to_end};
 use crate::ui::{
-    FIELD_GUTTER, MessageState, clipped_width, dialog_frame_regions, help_rows, message_rows,
-    packed_button_rows, place_input_cursor_at, render_actions, render_help_text, render_message,
-    render_pane_heading, render_scrollbar, truncated,
+    FIELD_GUTTER, MessageState, clipped_width, place_input_cursor_at, render_help_text,
+    render_message, render_responsive_frame, render_scrollbar, truncated,
 };
 
 /// A predicate is a filter expression, not a document.
@@ -75,6 +77,9 @@ pub enum ColorRulesControl {
 pub enum ColorRulesHit {
     Row(usize),
     Swatch(usize),
+    /// The `More ▾` button (`None`) or a row of its open overflow menu, by
+    /// ORIGINAL action index (0 Add, 1 Remove, 2 Apply) for `press_action`.
+    More(Option<usize>),
     Control(ColorRulesControl),
     Body,
 }
@@ -85,6 +90,17 @@ struct ColorRulesGeometry {
     rows: Vec<(Rect, usize)>,
     swatches: Vec<(Rect, usize)>,
     controls: Vec<(Rect, ColorRulesControl)>,
+    /// The painted `More ▾` button rect, if the shared action geometry planned
+    /// one this frame.
+    more_button: Option<Rect>,
+    /// Overflow action indices hidden behind `More ▾` this frame, in display
+    /// order. Event paths read this copy; paint reads the live geometry.
+    more_overflow: Vec<usize>,
+    /// Painted overflow-menu rows with ORIGINAL action indices. Empty unless
+    /// the menu painted.
+    more_rows: Vec<(Rect, usize)>,
+    /// The resolved sticky action band (kept rows after pressure).
+    action_band: Rect,
 }
 
 #[derive(Debug, Default)]
@@ -101,6 +117,12 @@ pub struct ColorRulesDialog {
     /// nothing.
     adding: bool,
     top: usize,
+    /// The action-overflow (`More ▾`) menu: open flag, selection as a position
+    /// within the overflow list, and retained scroll offset. Activation routes
+    /// through `press_action` with original action indices.
+    more_open: bool,
+    more_selected: usize,
+    more_first: usize,
     geometry: ColorRulesGeometry,
     surface: Surface,
 }
@@ -109,6 +131,45 @@ pub struct ColorRulesDialog {
 /// `A`, so `Apply` underlines its `p`; the shell resolves both from these
 /// labels, which is why the dialog keeps no Alt keymap of its own.
 const COLOR_RULES_BUTTONS: [&str; 3] = ["&Add", "&Remove", "A&pply"];
+
+/// Stable responsive budgets for the Colour rules inspector.
+///
+/// `Contextual::Inspector` against the frozen opening-row anchor: the frame
+/// avoids the referent row when possible (above/below with a one-row gap,
+/// log-centered, shrunk into the larger band, top-biased fallback) and never
+/// chases live selection. Outer size comes from the presentation policy plus
+/// these stable maxima alone — never from the rule count or the message
+/// length — so empty/populated/pending/error frames share one `frame` and
+/// sticky tail origins. `body_content_rows` sizes only the shared scroll
+/// extent; the list, every editor row and the caret stay reachable through
+/// shared body projection and focus reveal.
+///
+/// Action/message/help budgets are area-aware (see `responsive_chrome`): one
+/// action row at roomy widths, two where the verbs wrap, with message/help
+/// pre-shed to their floor at short heights so the two-row band survives
+/// degradation with full-width controls.
+///
+/// Hand-rolled budget choice here is presentation-only folding, never query
+/// membership (AGENTS.md).
+fn color_spec(area: Rect) -> DialogSpec {
+    let (message, help, actions) = crate::components::editors::responsive_chrome(
+        area,
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        0,
+        2,
+        2,
+        1,
+        &COLOR_RULES_BUTTONS,
+    );
+    DialogSpec::new(
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        0,
+        1,
+        message,
+        help,
+        actions,
+    )
+}
 
 impl ColorRulesDialog {
     pub fn is_open(&self) -> bool {
@@ -125,6 +186,29 @@ impl ColorRulesDialog {
 
     pub fn row_rects(&self) -> &[(Rect, usize)] {
         &self.geometry.rows
+    }
+
+    /// The painted `More ▾` button rect, if overflow planned one this frame.
+    /// Tests use this to assert no invented overflow at roomy sizes.
+    pub fn more_button(&self) -> Option<Rect> {
+        self.geometry.more_button
+    }
+
+    /// Painted overflow-menu rows with original action indices. Empty unless
+    /// the menu painted.
+    pub fn more_rows(&self) -> &[(Rect, usize)] {
+        &self.geometry.more_rows
+    }
+
+    /// Whether the overflow menu is open (state, independent of paint).
+    pub fn more_open(&self) -> bool {
+        self.more_open
+    }
+
+    /// The resolved sticky action band (kept rows after pressure). Tests
+    /// assert its height equals the requested budget.
+    pub fn action_band(&self) -> Rect {
+        self.geometry.action_band
     }
 
     pub fn control_rects(&self) -> &[(Rect, ColorRulesControl)] {
@@ -248,13 +332,72 @@ impl ColorRulesDialog {
 
     fn move_control(&mut self, delta: i32, ctx: &Ctx<'_>) {
         let controls = self.controls(ctx);
+        if controls.is_empty() {
+            return;
+        }
         let at = controls
             .iter()
             .position(|control| *control == self.control)
             .unwrap_or(0);
+        // Focus may land on an action the last render hid behind `More ▾`;
+        // that is not an invisible stop, because the More button owns the
+        // focus ring then and Enter opens the menu (see `activate`). Hidden
+        // actions stay directly reachable through their mnemonics too.
         self.control = controls[(at as i32 + delta).rem_euclid(controls.len() as i32) as usize];
         if self.editing() {
             self.reset_cursor(ctx);
+        }
+    }
+
+    /// The overflow menu drives while it is active: selection wraps over the
+    /// stored overflow list, activation routes through `press_action` with the
+    /// ORIGINAL action index so a menu item runs exactly what its button
+    /// would.
+    fn more_active(&self) -> bool {
+        self.more_open && !self.geometry.more_overflow.is_empty()
+    }
+
+    fn open_more(&mut self, select: Option<usize>) {
+        if self.geometry.more_overflow.is_empty() {
+            return;
+        }
+        self.more_open = true;
+        let len = self.geometry.more_overflow.len();
+        self.more_selected = select
+            .and_then(|index| {
+                self.geometry
+                    .more_overflow
+                    .iter()
+                    .position(|&item| item == index)
+            })
+            .unwrap_or(0)
+            .min(len - 1);
+        self.more_first = 0;
+    }
+
+    fn move_more(&mut self, delta: i32) {
+        let len = self.geometry.more_overflow.len();
+        if len == 0 {
+            return;
+        }
+        self.more_selected = (self.more_selected as i32 + delta).rem_euclid(len as i32) as usize;
+    }
+
+    fn activate_more(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
+        let selected = self.more_selected;
+        self.more_open = false;
+        match self.geometry.more_overflow.get(selected).copied() {
+            Some(index) => self.press_action(index, ctx),
+            None => Outcome::Consumed,
+        }
+    }
+
+    fn action_index(control: ColorRulesControl) -> Option<usize> {
+        match control {
+            ColorRulesControl::Add => Some(0),
+            ColorRulesControl::Remove => Some(1),
+            ColorRulesControl::Apply => Some(2),
+            _ => None,
         }
     }
 
@@ -480,6 +623,21 @@ impl ColorRulesDialog {
     }
 
     fn activate(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
+        // Enter on an action the last render hid behind `More ▾` opens the
+        // menu on that action instead of running it blind: the More button
+        // owns the focus ring then. Painted actions run directly below.
+        // (An open menu never reaches here: Enter drives it in `key`.)
+        if let Some(index) = Self::action_index(self.control) {
+            let painted = self
+                .geometry
+                .controls
+                .iter()
+                .any(|(_, control)| *control == self.control);
+            if !painted && self.geometry.more_overflow.contains(&index) {
+                self.open_more(Some(index));
+                return Outcome::Consumed;
+            }
+        }
         match self.control {
             // Enter on the column chooser applies, like Enter on the colour
             // chooser: choosing is done with Left/Right.
@@ -524,6 +682,30 @@ impl ColorRulesDialog {
                 KeyCode::Char('k') => self.text(EditCommand::KillToEndOfLine, ctx),
                 _ => Outcome::Ignored,
             };
+        }
+        // The overflow menu is transient: while it is active its own arrows
+        // and Enter drive it, and any other key dismisses it first and then
+        // processes normally, so typing never lands behind an open menu. A
+        // stale open without overflow (cleared geometry) just drops.
+        if self.more_active() {
+            match key.code {
+                KeyCode::Up => {
+                    self.move_more(-1);
+                    return Outcome::Consumed;
+                }
+                KeyCode::Down => {
+                    self.move_more(1);
+                    return Outcome::Consumed;
+                }
+                KeyCode::Enter => {
+                    return self.activate_more(ctx);
+                }
+                _ => {
+                    self.more_open = false;
+                }
+            }
+        } else if self.more_open {
+            self.more_open = false;
         }
         match key.code {
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -584,6 +766,33 @@ impl ColorRulesDialog {
         ctx: &mut Ctx<'_>,
     ) -> Outcome {
         let pressed = matches!(kind, MouseEventKind::Down(MouseButton::Left));
+        // A drawn overflow menu owns its clicks: rows activate through
+        // `press_action`, its button toggles it shut, and anything else
+        // dismisses it — the dialog underneath is not clickable through it.
+        // (`hit` only yields menu rows from a painted menu.)
+        if !self.geometry.more_rows.is_empty() {
+            match (pressed, hit) {
+                (true, Some(ColorRulesHit::More(Some(index)))) => {
+                    self.more_open = false;
+                    return self.press_action(index, ctx);
+                }
+                (true, Some(ColorRulesHit::More(None))) => {
+                    self.more_open = false;
+                    return Outcome::Consumed;
+                }
+                _ if pressed => {
+                    self.more_open = false;
+                    return Outcome::Consumed;
+                }
+                _ => return Outcome::Consumed,
+            }
+        }
+        // The menu button toggles the menu open when overflow exists; with no
+        // overflow the button is never painted and this arm never fires.
+        if pressed && matches!(hit, Some(ColorRulesHit::More(None))) {
+            self.open_more(None);
+            return Outcome::Consumed;
+        }
         match (pressed, hit) {
             (true, Some(ColorRulesHit::Swatch(index))) => {
                 self.selected = index;
@@ -650,6 +859,9 @@ impl Component for ColorRulesDialog {
         self.top = 0;
         self.adding = false;
         self.control = ColorRulesControl::List;
+        self.more_open = false;
+        self.more_selected = 0;
+        self.more_first = 0;
         self.geometry = ColorRulesGeometry::default();
         // The dialog resumes an unfinished edit, and seeds from the accepted
         // rules when there is none: an empty draft beside accepted rules would
@@ -669,11 +881,21 @@ impl Component for ColorRulesDialog {
             Event::Paste(text) => self.text(EditCommand::Insert(&text), ctx),
             Event::Mouse { kind, hit, .. } => self.mouse(kind, hit, ctx),
             Event::Dismiss => {
+                // §10 frontmost-first: the overflow menu closes before the
+                // dialog it hangs from.
+                if self.more_open {
+                    self.more_open = false;
+                    return Outcome::Consumed;
+                }
                 self.commit_empty_addition(ctx);
                 self.open = false;
                 Outcome::Close
             }
-            Event::Command(CommandId::ColorRulesApply) => self.apply(ctx),
+            Event::Command(CommandId::ColorRulesApply) => {
+                // Palette commands act on the dialog, dismissing the transient menu.
+                self.more_open = false;
+                self.apply(ctx)
+            }
             Event::Command(_) | Event::View(ViewEvent::SourcesChanged { .. }) => Outcome::Ignored,
             Event::View(_) | Event::Resize => Outcome::Ignored,
         }
@@ -694,6 +916,10 @@ impl Component for ColorRulesDialog {
     }
 
     fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        // Any press dismisses the transient overflow menu first — including
+        // the menu's own items, which arrive here with original indices (0
+        // Add, 1 Remove, 2 Apply) and run exactly what their buttons would.
+        self.more_open = false;
         match index {
             0 => self.add(ctx),
             1 => self.remove(ctx),
@@ -712,6 +938,28 @@ impl Component for ColorRulesDialog {
 
     fn hit(&self, point: (u16, u16)) -> Option<ColorRulesHit> {
         let g = &self.geometry;
+        // A drawn overflow menu sits above the dialog: its rows first, then
+        // its button, mirroring paint order. The closed menu's button is
+        // hit-tested with the dialog controls below.
+        if !g.more_rows.is_empty() {
+            return g
+                .more_rows
+                .iter()
+                .find_map(|(rect, index)| {
+                    contains(*rect, point).then_some(ColorRulesHit::More(Some(*index)))
+                })
+                .or_else(|| {
+                    g.more_button
+                        .filter(|rect| contains(*rect, point))
+                        .map(|_| ColorRulesHit::More(None))
+                })
+                .or(Some(ColorRulesHit::Body));
+        }
+        if let Some(rect) = g.more_button
+            && contains(rect, point)
+        {
+            return Some(ColorRulesHit::More(None));
+        }
         g.swatches
             .iter()
             .find_map(|(rect, index)| {
@@ -731,8 +979,6 @@ impl Component for ColorRulesDialog {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
-        use crate::dialog_layout::{DialogClass, DialogContent, content_width};
-
         let theme = ctx.theme;
         let ascii = ctx.ascii;
         let styles = DialogStyles::new(theme);
@@ -750,7 +996,6 @@ impl Component for ColorRulesDialog {
         let mut swatches: Vec<(Rect, usize)> = Vec::new();
         let mut caret: Option<(u16, u16)> = None;
 
-        let width = content_width(area, DialogClass::M);
         let dirty = rules != accepted;
         let (state, sentence) = match error.as_deref() {
             Some(error) => (MessageState::Error, error.to_owned()),
@@ -773,89 +1018,122 @@ impl Component for ColorRulesDialog {
         };
         let help = "The first matching rule wins. A rule classifies an enrichment column's exact value; raw text is the explicit exception, and earlier predicates keep working.";
         let labels = COLOR_RULES_BUTTONS;
-        let visible_rules = rules.len().clamp(1, 8);
-        let selected_column = rules
+        let has_column_editor = rules
             .get(self.selected)
-            .filter(|rule| rule.is_column())
-            .and_then(|rule| rule.column.clone());
-        let content = DialogContent {
-            header: 0,
-            // rule pane heading + rows, a blank, then the editor rows: column
-            // plus value plus colour for a column rule, predicate plus colour
-            // for a legacy one.
-            body: 1
-                + u16::try_from(visible_rules).unwrap_or(1)
-                + if selected_column.is_some() { 4 } else { 3 },
-            message: message_rows(&sentence, width),
-            help: help_rows(help, width),
-            actions: packed_button_rows(width, &labels),
+            .is_some_and(|rule| rule.is_column());
+        // Natural body rows for the scroll extent alone (never the frame):
+        // the list heading, one row per rule (or the single empty-state
+        // line), then — when rules exist — a gap row plus the editor rows
+        // (Column/Value/Colour for a column rule, Predicate/Colour otherwise).
+        let rule_rows = rules.len().max(1);
+        let editor_rows = if rules.is_empty() {
+            0
+        } else if has_column_editor {
+            3
+        } else {
+            2
         };
-        let regions =
-            dialog_frame_regions(frame, area, DialogClass::M, "Colour rules", &content, theme);
+        let content_rows = 1usize
+            .saturating_add(rule_rows)
+            .saturating_add(if rules.is_empty() { 0 } else { 1 + editor_rows });
+        // First editor row in logical coordinates (the gap row sits before it).
+        let editor_base = 1usize.saturating_add(rule_rows).saturating_add(1);
+        let spec = color_spec(area);
+        let Ok(geometry) = crate::dialog_layout::resolve_dialog(
+            area,
+            &spec,
+            content_rows,
+            &labels,
+            Some(if rules.is_empty() { 0 } else { 2 }),
+            ctx.context_anchor,
+        ) else {
+            // Below the 20x6 floor the tiny fallback owns the frame; stay open
+            // with nothing drawn, as the palette does.
+            self.geometry = ColorRulesGeometry::default();
+            self.surface = Surface::default();
+            return self.surface;
+        };
+        render_responsive_frame(frame, &geometry, "Colour rules", true, theme);
+        // One authoritative geometry for frame/anatomy/body/actions. The same
+        // projected rects drive paint, caret, scrollbar, selection and mouse;
+        // no independent outer calculation.
         let mut surface = Surface {
-            popup: regions.popup,
-            interior: regions.interior,
+            popup: geometry.frame,
+            interior: geometry.interior,
             caret: None,
-            scrollable: true,
+            scrollable: geometry.body.overflow() > 0,
             text_focus: self.editing(),
         };
-        self.geometry = ColorRulesGeometry {
-            body: regions.body,
-            ..ColorRulesGeometry::default()
-        };
-        self.surface = surface;
-        if regions.body.width == 0 || regions.body.height == 0 {
-            return surface;
+        self.geometry.body = geometry.body.viewport;
+
+        // Shared body projection with focus reveal: the editor row being
+        // edited while an editor control has focus, otherwise the selected
+        // rule — the list always keeps its selection visible, as before, and
+        // the sticky action band needs no reveal.
+        let mut body = ScrollViewport::new(geometry.body.viewport, content_rows, 0);
+        if !rules.is_empty() {
+            let selected_row = 1usize.saturating_add(self.selected.min(rules.len() - 1));
+            let reveal_row = match self.control {
+                ColorRulesControl::Column => editor_base,
+                ColorRulesControl::Predicate => {
+                    editor_base.saturating_add(usize::from(has_column_editor))
+                }
+                ColorRulesControl::Color => {
+                    editor_base.saturating_add(editor_rows.saturating_sub(1))
+                }
+                ColorRulesControl::List
+                | ColorRulesControl::Add
+                | ColorRulesControl::Remove
+                | ColorRulesControl::Apply => selected_row,
+            };
+            body = ScrollViewport::new(
+                geometry.body.viewport,
+                content_rows,
+                body.reveal(reveal_row),
+            );
+        }
+        self.top = body.first_row.saturating_sub(1).min(rules.len());
+        if let Some(bar) = body.scrollbar {
+            render_scrollbar(frame, bar, body.first_row, body.overflow(), theme, ascii);
         }
 
-        let list_height = u16::try_from(visible_rules)
-            .unwrap_or(1)
-            .saturating_add(1)
-            .min(regions.body.height);
-        let list_area = Rect::new(
-            regions.body.x,
-            regions.body.y,
-            regions.body.width,
-            list_height,
-        );
-        let count = format!(
-            "{} of {}",
-            self.selected.saturating_add(1).min(rules.len().max(1)),
-            rules.len()
-        );
-        let rects = render_pane_heading(
-            frame,
-            list_area,
-            "Rules",
-            Some(count),
-            rules.len().max(1),
-            theme,
-        );
-        let visible = usize::from(rects.viewport.height);
-        let first = self
-            .selected
-            .saturating_sub(visible.saturating_sub(1))
-            .min(rules.len().saturating_sub(visible.min(rules.len())));
-        self.top = first;
-        if rules.is_empty() && rects.viewport.height > 0 {
+        let mut controls: Vec<(Rect, ColorRulesControl)> = Vec::new();
+        // §8.7 list heading with right-aligned count, painted in the shared
+        // viewport like every other row.
+        if let Some(heading) = body.project_row(0) {
+            let count = format!(
+                "{} of {}",
+                self.selected.saturating_add(1).min(rules.len().max(1)),
+                rules.len()
+            );
+            let count_width = UnicodeWidthStr::width(count.as_str());
+            let filler = usize::from(heading.width)
+                .saturating_sub(UnicodeWidthStr::width("Rules"))
+                .saturating_sub(count_width);
+            frame.render_widget(
+                Paragraph::new(ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled("Rules", styles.label.add_modifier(Modifier::BOLD)),
+                    ratatui::text::Span::styled(" ".repeat(filler), styles.description),
+                    ratatui::text::Span::styled(count, styles.description),
+                ])),
+                heading,
+            );
+            // Only the heading is a control; the rows underneath are rows.
+            controls.push((heading, ColorRulesControl::List));
+        }
+
+        if rules.is_empty()
+            && let Some(empty) = body.project_row(1)
+        {
             frame.render_widget(
                 Paragraph::new("no rules yet · Add one").style(styles.unavailable),
-                Rect::new(rects.viewport.x, rects.viewport.y, rects.viewport.width, 1),
+                empty,
             );
         }
-        for (offset, (index, rule)) in rules
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take(visible)
-            .enumerate()
-        {
-            let row = Rect::new(
-                rects.viewport.x,
-                rects.viewport.y.saturating_add(offset as u16),
-                rects.viewport.width,
-                1,
-            );
+        for (index, rule) in rules.iter().enumerate() {
+            let Some(row) = body.project_row(1 + index) else {
+                continue;
+            };
             let chosen = index == self.selected;
             let marker = if chosen {
                 if ascii { "> " } else { "› " }
@@ -900,109 +1178,110 @@ impl Component for ColorRulesDialog {
             }
             rows.push((row, index));
         }
-        if let Some(bar) = rects.scrollbar {
-            render_scrollbar(
-                frame,
-                bar,
-                first,
-                rules.len().saturating_sub(visible),
-                theme,
-                ascii,
-            );
-        }
 
         // The editor for the selected rule: column chooser plus value field
         // plus colour chooser for a column rule; predicate field plus colour
-        // chooser for a legacy one.
-        let editor_y = list_area.bottom().saturating_add(1);
+        // chooser for a legacy one. Every row is projected through the same
+        // shared viewport, so caret, selection and mouse agree; rows scrolled
+        // out paint nothing and claim no hitbox.
         let label_width = u16::try_from(UnicodeWidthStr::width("Predicate")).unwrap_or(9);
         // The column chooser's hitbox, registered with the action controls
         // below when a column rule is selected.
         let mut column_rect: Option<Rect> = None;
-        if editor_y < regions.body.bottom() && !rules.is_empty() {
-            let field_x = regions
-                .body
+        if !rules.is_empty() {
+            let field_x = body
+                .viewport
                 .x
                 .saturating_add(label_width)
                 .saturating_add(FIELD_GUTTER);
-            let mut field_y = editor_y;
-            if let Some(column) = selected_column.as_deref() {
-                frame.render_widget(
-                    Paragraph::new("Column").style(if self.control == ColorRulesControl::Column {
-                        styles.shortcut.add_modifier(Modifier::BOLD)
-                    } else {
-                        styles.label
-                    }),
-                    Rect::new(regions.body.x, field_y, label_width, 1),
-                );
-                if field_x < regions.body.right() {
-                    let chooser = Rect::new(field_x, field_y, regions.body.right() - field_x, 1);
+            let mut editor_row = editor_base;
+            if has_column_editor {
+                if let Some(label) = body.project_row(editor_row) {
+                    let column = rules
+                        .get(self.selected)
+                        .and_then(|rule| rule.column.clone())
+                        .unwrap_or_default();
                     frame.render_widget(
-                        Paragraph::new(truncated(
-                            &format!("‹ {column} ›"),
-                            usize::from(regions.body.right() - field_x),
-                        ))
-                        .style(styles.description),
-                        chooser,
+                        Paragraph::new("Column").style(
+                            if self.control == ColorRulesControl::Column {
+                                styles.shortcut.add_modifier(Modifier::BOLD)
+                            } else {
+                                styles.label
+                            },
+                        ),
+                        Rect::new(label.x, label.y, label_width.min(label.width), 1),
                     );
-                    column_rect = Some(chooser);
+                    if field_x < label.right() {
+                        let chooser = Rect::new(field_x, label.y, label.right() - field_x, 1);
+                        frame.render_widget(
+                            Paragraph::new(truncated(
+                                &format!("‹ {column} ›"),
+                                usize::from(label.right() - field_x),
+                            ))
+                            .style(styles.description),
+                            chooser,
+                        );
+                        column_rect = Some(chooser);
+                    }
                 }
-                field_y = field_y.saturating_add(1);
+                editor_row = editor_row.saturating_add(1);
             }
-            let field_label = if selected_column.is_some() {
+            let field_label = if has_column_editor {
                 "Value"
             } else {
                 "Predicate"
             };
-            frame.render_widget(
-                Paragraph::new(field_label).style(if self.editing() {
-                    styles.shortcut.add_modifier(Modifier::BOLD)
-                } else {
-                    styles.label
-                }),
-                Rect::new(regions.body.x, field_y, label_width, 1),
-            );
-            if field_x < regions.body.right() {
-                let field = Rect::new(field_x, field_y, regions.body.right() - field_x, 1);
-                let predicate = rules
-                    .get(self.selected)
-                    .map(|rule| {
-                        if rule.is_column() {
-                            rule.value.clone().unwrap_or_default()
-                        } else {
-                            rule.predicate.clone()
-                        }
-                    })
-                    .unwrap_or_default();
-                if self.editing() {
-                    caret = place_input_cursor_at(
-                        frame,
-                        field,
-                        0,
-                        0,
-                        &predicate,
-                        self.cursor.char_index,
-                        theme,
-                    );
-                } else {
-                    frame.render_widget(
-                        Paragraph::new(truncated(&predicate, usize::from(field.width)))
-                            .style(styles.description),
-                        field,
-                    );
+            if let Some(label) = body.project_row(editor_row) {
+                frame.render_widget(
+                    Paragraph::new(field_label).style(if self.editing() {
+                        styles.shortcut.add_modifier(Modifier::BOLD)
+                    } else {
+                        styles.label
+                    }),
+                    Rect::new(label.x, label.y, label_width.min(label.width), 1),
+                );
+                if field_x < label.right() {
+                    let field = Rect::new(field_x, label.y, label.right() - field_x, 1);
+                    let predicate = rules
+                        .get(self.selected)
+                        .map(|rule| {
+                            if rule.is_column() {
+                                rule.value.clone().unwrap_or_default()
+                            } else {
+                                rule.predicate.clone()
+                            }
+                        })
+                        .unwrap_or_default();
+                    if self.editing() {
+                        caret = place_input_cursor_at(
+                            frame,
+                            field,
+                            0,
+                            0,
+                            &predicate,
+                            self.cursor.char_index,
+                            theme,
+                        );
+                    } else {
+                        frame.render_widget(
+                            Paragraph::new(truncated(&predicate, usize::from(field.width)))
+                                .style(styles.description),
+                            field,
+                        );
+                    }
                 }
             }
-            let color_y = field_y.saturating_add(1);
-            if color_y < regions.body.bottom() {
+            editor_row = editor_row.saturating_add(1);
+            if let Some(label) = body.project_row(editor_row) {
                 frame.render_widget(
                     Paragraph::new("Colour").style(if self.control == ColorRulesControl::Color {
                         styles.shortcut.add_modifier(Modifier::BOLD)
                     } else {
                         styles.label
                     }),
-                    Rect::new(regions.body.x, color_y, label_width, 1),
+                    Rect::new(label.x, label.y, label_width.min(label.width), 1),
                 );
-                if field_x < regions.body.right() {
+                if field_x < label.right() {
                     let color = rules
                         .get(self.selected)
                         .map(|rule| rule.color)
@@ -1010,65 +1289,141 @@ impl Component for ColorRulesDialog {
                     frame.render_widget(
                         Paragraph::new(truncated(
                             &format!("‹ {} ›", color.label()),
-                            usize::from(regions.body.right() - field_x),
+                            usize::from(label.right() - field_x),
                         ))
                         .style(styles.description.fg(theme.rule_color(color))),
-                        Rect::new(field_x, color_y, regions.body.right() - field_x, 1),
+                        Rect::new(field_x, label.y, label.right() - field_x, 1),
                     );
                 }
             }
         }
 
-        render_message(frame, regions.message, state, &sentence, theme, ascii);
-        render_help_text(frame, regions.help, help, theme);
-        let focused = match self.control {
+        render_message(frame, geometry.message, state, &sentence, theme, ascii);
+        render_help_text(frame, geometry.help, help, theme);
+        // §8.9: the verb is the default, and a destructive action never is.
+        // With nothing to apply yet the fill moves to `Add`, the only button
+        // that does anything on an empty list. Roles are presentation only;
+        // the rects come from the one shared action geometry, so click and
+        // paint cannot disagree.
+        let default_idx = if rules.is_empty() { 0 } else { 2 };
+        let focused_idx = match self.control {
             ColorRulesControl::Add => Some(0),
             ColorRulesControl::Remove => Some(1),
             ColorRulesControl::Apply => Some(2),
             _ => None,
         };
-        let mut controls: Vec<(Rect, ColorRulesControl)> =
-            // §8.9: the verb is the default, and a destructive action never
-            // is. With nothing to apply yet the fill moves to `Add`, the only
-            // button that does anything on an empty list.
-            render_actions(
+        // The live overflow list and More button rect flow into the stored
+        // geometry below with the rest of this frame's rects; event paths
+        // between renders read that recorded copy.
+        let live_overflow = geometry.actions.overflow.clone();
+        let live_more_button = geometry.actions.more;
+        // A focused action hidden behind `More ▾` maps its focus ring onto the
+        // More button: Tab never lands invisibly.
+        let hidden_focused = focused_idx.is_some_and(|index| live_overflow.contains(&index));
+        for (index, rect) in &geometry.actions.buttons {
+            let control = match index {
+                0 => ColorRulesControl::Add,
+                1 => ColorRulesControl::Remove,
+                _ => ColorRulesControl::Apply,
+            };
+            if let Some(label) = labels.get(*index) {
+                let role = if *index == 1 {
+                    ButtonRole::Destructive
+                } else if *index == default_idx {
+                    ButtonRole::Default
+                } else {
+                    ButtonRole::Normal
+                };
+                render_role_button(
+                    frame,
+                    *rect,
+                    label,
+                    role,
+                    focused_idx == Some(*index),
+                    theme,
+                );
+            }
+            controls.push((*rect, control));
+        }
+        if let Some(more) = live_more_button {
+            render_role_button(
                 frame,
-                regions.actions,
-                ActionRow {
-                    labels: &labels,
-                    default: Some(if rules.is_empty() { 0 } else { 2 }),
-                    destructive: &[1],
-                    focused,
-                },
+                more,
+                crate::dialog_controls::MORE_LABEL,
+                ButtonRole::Normal,
+                self.more_open || hidden_focused,
                 theme,
-            )
-                .into_iter()
-                .map(|(index, rect)| {
-                    (
-                        rect,
-                        match index {
-                            0 => ColorRulesControl::Add,
-                            1 => ColorRulesControl::Remove,
-                            _ => ColorRulesControl::Apply,
-                        },
-                    )
-                })
-                .collect();
-        // Only the heading is a control; the rows underneath are rows.
-        controls.push((
-            Rect::new(list_area.x, list_area.y, list_area.width, 1),
-            ColorRulesControl::List,
-        ));
+            );
+        }
+        // Action overflow (`More ▾`) menu, painted last so paint order matches
+        // hit-test order (menu rows first). Roles parallel `labels` with the
+        // filled non-destructive default retained; activation routes through
+        // `press_action` with original indices.
+        let mut more_rows = Vec::new();
+        let mut menu_overflows = false;
+        if self.more_open && !live_overflow.is_empty() {
+            if let Some(anchor) = live_more_button {
+                let len = live_overflow.len();
+                let sel = self.more_selected.min(len - 1);
+                let roles = [
+                    if rules.is_empty() {
+                        ButtonRole::Default
+                    } else {
+                        ButtonRole::Normal
+                    },
+                    ButtonRole::Destructive,
+                    if rules.is_empty() {
+                        ButtonRole::Normal
+                    } else {
+                        ButtonRole::Default
+                    },
+                ];
+                let (popup, rows, first, overflows) = draw_action_menu(
+                    frame,
+                    area,
+                    anchor,
+                    &labels,
+                    &roles,
+                    &live_overflow,
+                    sel,
+                    self.more_first,
+                    theme,
+                    ascii,
+                );
+                self.more_selected = sel;
+                self.more_first = first;
+                if !popup.is_empty() {
+                    surface.popup = surface.popup.union(popup);
+                    surface.interior = popup.inner(ratatui::layout::Margin::new(1, 1));
+                    menu_overflows = overflows;
+                    more_rows = rows;
+                } else {
+                    // Refused placement (no gap-honoring bands): the menu
+                    // cannot show, so it is not open.
+                    self.more_open = false;
+                }
+            } else {
+                self.more_open = false;
+            }
+        } else {
+            // Overflow gone (regrew wider) means the menu has nothing to show.
+            self.more_open = false;
+        }
         // The column chooser answers clicks exactly like the colour chooser.
         if let Some(rect) = column_rect {
             controls.push((rect, ColorRulesControl::Column));
         }
         surface.caret = caret;
+        surface.scrollable = body.overflow() > 0 || menu_overflows;
         self.geometry = ColorRulesGeometry {
-            body: regions.body,
+            body: geometry.body.viewport,
             rows,
             swatches,
             controls,
+            more_button: live_more_button,
+            more_overflow: live_overflow,
+            more_rows,
+            action_band: geometry.actions.band,
         };
         self.surface = surface;
         surface
