@@ -153,10 +153,8 @@ fn fields_correlate_routes_to_the_shared_key_union() {
     key(&mut app, &provider, KeyCode::Down);
     key(&mut app, &provider, KeyCode::Char(' '));
     let ready = screen(&draw(&provider, &mut app, 100, 30));
-    assert!(
-        ready.contains("filtered by the selected enriched key"),
-        "{ready}"
-    );
+    assert!(ready.contains("2 of 2 views selected"), "{ready}");
+    assert!(ready.contains("filtered by the"), "{ready}");
     key(&mut app, &provider, KeyCode::Enter);
     let requests = app.layers.union.take_requests();
     let [lvu::UnionDialogRequest::Create { inputs, shared_key }] = requests.as_slice() else {
@@ -636,4 +634,179 @@ fn the_underlined_letters_press_the_buttons_through_the_shells_resolver() {
     key(&mut app, &provider, KeyCode::Char('C'));
     assert!(app.layers.stack.is_empty());
     assert_eq!(app.focus, Focus::Logs);
+}
+
+#[test]
+fn responsive_frame_is_policy_stable_for_inspector_pending_and_mapping() {
+    use lvu::dialog_layout::{ContextFootprint, PresentationKind, policy_size};
+
+    // 80x24 and 54x16 share one Contextual Inspector frame per size; the
+    // pending lookup and the answered mapping share it. The source list
+    // scrolls via the shared plan; paint/mouse/scrollbar share its rects.
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        let (provider, mut app) = demo();
+        let (generation, origin) = start_legacy(&mut app, &provider);
+        app.take_correlation_requests();
+        let pending_text = screen(&draw(&provider, &mut app, width, height));
+        assert!(
+            pending_text.contains("Correlate across sources"),
+            "{pending_text}"
+        );
+        assert!(pending_text.contains("finding records"), "{pending_text}");
+        let pending = app.layers.correlation.surface().popup;
+        let (want_w, want_h) = policy_size(
+            ratatui::layout::Rect::new(0, 0, width, height),
+            PresentationKind::Contextual(ContextFootprint::Inspector),
+        );
+        assert_eq!(
+            (pending.width, pending.height),
+            (want_w, want_h),
+            "{width}x{height} frame must be policy"
+        );
+        assert!(app.open_correlation_dialog(
+            generation,
+            &origin,
+            "request_id".into(),
+            lvu_core::ExactScalar::string("req-7").unwrap(),
+            "\"req-7\"".into(),
+            choices(),
+        ));
+        let answered_text = screen(&draw(&provider, &mut app, width, height));
+        assert_eq!(
+            app.layers.correlation.surface().popup,
+            pending,
+            "{width}x{height} frame must not move when the lookup answers"
+        );
+        assert!(
+            answered_text.contains("request_id = \"req-7\""),
+            "{answered_text}"
+        );
+        assert!(answered_text.contains("Not correlated"), "{answered_text}");
+        assert!(answered_text.contains("[ Correlate ]"), "{answered_text}");
+        assert!(answered_text.contains("[ Cancel ]"), "{answered_text}");
+    }
+
+    // Below the floor the tiny fallback owns the frame.
+    let (provider, mut app) = demo();
+    let (_generation, _origin) = start_legacy(&mut app, &provider);
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+}
+
+#[test]
+fn source_list_scroll_reveals_with_matching_mouse() {
+    // Twelve sources overflow the Inspector body at 80x24; Down scrolls the
+    // shared viewport, the highlighted row stays selected, and a click opens
+    // its field popup (same rects for paint and mouse).
+    let (provider, mut app) = demo();
+    let (generation, origin) = start_legacy(&mut app, &provider);
+    app.take_correlation_requests();
+    let many: Vec<CorrelationSourceChoice> = (0..12)
+        .map(|index| CorrelationSourceChoice {
+            source_id: format!("source-{index}"),
+            name: format!("Source {index}"),
+            fields: vec![format!("field-{index}")],
+            chosen: if index == 0 {
+                Some(format!("field-{index}"))
+            } else {
+                None
+            },
+            incomplete: false,
+        })
+        .collect();
+    assert!(app.open_correlation_dialog(
+        generation,
+        &origin,
+        "request_id".into(),
+        lvu_core::ExactScalar::string("req-7").unwrap(),
+        "\"req-7\"".into(),
+        many,
+    ));
+    let buffer = draw(&provider, &mut app, 80, 24);
+    assert!(screen(&buffer).contains("Correlate across sources"));
+    for _ in 0..11 {
+        key(&mut app, &provider, KeyCode::Down);
+    }
+    let scrolled = draw(&provider, &mut app, 80, 24);
+    let scrolled_text = screen(&scrolled);
+    assert!(scrolled_text.contains("Source 11"), "{scrolled_text}");
+    assert!(
+        !scrolled_text.contains("Source 0"),
+        "viewport did not scroll: {scrolled_text}"
+    );
+    // Clicking the visible row opens its popup (same rects for paint/mouse).
+    let surface = app.layers.correlation.surface();
+    assert!(!surface.popup.is_empty());
+    let row = (0..surface.interior.bottom())
+        .flat_map(|y| (0..surface.interior.right()).map(move |x| (x, y)))
+        .find(|point| {
+            matches!(
+                app.layers.correlation.hit(*point),
+                Some(CorrelationHit::Row(11))
+            )
+        })
+        .expect("scrolled row is hit-testable");
+    click(&mut app, &provider, row);
+    assert_eq!(app.layers.correlation.mapping().unwrap().selected, 11);
+    assert!(app.layers.correlation.mapping().unwrap().popup.is_some());
+}
+
+#[test]
+fn popup_uses_shared_anchored_geometry_and_shows_real_overflow() {
+    // One source with 20 observed fields overflows the 8-row anchored popup;
+    // only the shared viewport window is painted, and a click commits it.
+    let (provider, mut app) = demo();
+    let (generation, origin) = start_legacy(&mut app, &provider);
+    app.take_correlation_requests();
+    let fields: Vec<String> = (0..19).map(|index| format!("field-{index:02}")).collect();
+    assert!(app.open_correlation_dialog(
+        generation,
+        &origin,
+        "request_id".into(),
+        lvu_core::ExactScalar::string("req-7").unwrap(),
+        "\"req-7\"".into(),
+        vec![
+            CorrelationSourceChoice {
+                source_id: "api".into(),
+                name: "API fixture".into(),
+                fields: fields.clone(),
+                chosen: Some(fields[0].clone()),
+                incomplete: false,
+            },
+            CorrelationSourceChoice {
+                source_id: "worker".into(),
+                name: "Worker fixture".into(),
+                fields: vec!["req".into()],
+                chosen: None,
+                incomplete: false,
+            },
+        ],
+    ));
+    draw(&provider, &mut app, 80, 24);
+    // Open the popup for the first source.
+    key(&mut app, &provider, KeyCode::Enter);
+    assert!(app.layers.correlation.mapping().unwrap().popup.is_some());
+    let buffer = draw(&provider, &mut app, 80, 24);
+    let rendered = screen(&buffer);
+    assert!(rendered.contains("Not correlated"), "{rendered}");
+    // Real overflow: the 8-row viewport shows the head, not the tail.
+    assert!(rendered.contains("field-00"), "{rendered}");
+    assert!(
+        !rendered.contains("field-18"),
+        "anchored popup did not window: {rendered}"
+    );
+    // Clicking a visible choice commits it (same rects for paint/mouse).
+    let choice = (0..24)
+        .flat_map(|y| (0..80).map(move |x| (x, y)))
+        .find(|point| {
+            matches!(
+                app.layers.correlation.hit(*point),
+                Some(CorrelationHit::Choice(1))
+            )
+        })
+        .expect("popup choices are hit-testable");
+    click(&mut app, &provider, choice);
+    let state = app.layers.correlation.mapping().unwrap();
+    assert!(state.popup.is_none());
+    assert_eq!(state.sources[0].chosen.as_deref(), Some("field-00"));
 }
