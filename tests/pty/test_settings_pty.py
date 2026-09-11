@@ -178,7 +178,10 @@ def run(binary: pathlib.Path) -> None:
         first.resize(54, 12)
         first.wait_for("[ More ]")
         first.send(b"\t" * 9)
-        first.resize(150, 40)
+        # LongContent frames are policy-sized with stable message/help bands;
+        # the body still overflows at 150x40, so More persists there. Only the
+        # huge frame holds the full form + effective values without scrolling.
+        first.resize(240, 80)
         resized = first.wait_until(
             lambda text: "[ More ]" not in text and "[ Save ]" in text,
             "resize removes inactive overflow control",
@@ -256,7 +259,7 @@ def run(binary: pathlib.Path) -> None:
         assert not (keyboard_root / "config" / "lvu" / "settings.toml").exists()
 
         save_start = len(keyboard.transcript)
-        keyboard.resize(150, 40)
+        keyboard.resize(240, 80)
         resized = wait_focused_frame(keyboard, "[ Save ]", save_start)
         assert "[ More ]" not in resized
         keyboard.send(b"\r")

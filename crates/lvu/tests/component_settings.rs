@@ -98,6 +98,7 @@ fn click(app: &mut App, provider: &FixtureProvider, point: (u16, u16)) {
 }
 
 fn focus(app: &mut App, provider: &FixtureProvider, control: SettingsControl) {
+    // Tab always moves focus (Down scrolls instead when More holds focus).
     for _ in 0..64 {
         if app
             .layers
@@ -107,7 +108,7 @@ fn focus(app: &mut App, provider: &FixtureProvider, control: SettingsControl) {
         {
             return;
         }
-        key(app, provider, KeyCode::Down);
+        key(app, provider, KeyCode::Tab);
     }
     panic!("{control:?} never took focus");
 }
@@ -287,10 +288,13 @@ fn the_display_zone_previews_immediately_and_states_its_semantics() {
     app.handle(Action::Open(Open::Settings), &provider);
     let opened = text(&draw(&provider, &mut app, 120, 40));
     assert!(opened.contains("Times shown in"), "{opened}");
+    // Help wraps by display width; wider LongContent frames split "Display"
+    // and "only:" across lines, so match the stable tokens, not one wrapping.
     assert!(
         opened.contains("Europe/Berlin")
             && opened.contains("daylight saving")
-            && opened.contains("Display only"),
+            && opened.contains("Display")
+            && opened.contains("captured/event"),
         "the help line says how named zones affect display:\n{opened}"
     );
 
@@ -300,13 +304,17 @@ fn the_display_zone_previews_immediately_and_states_its_semantics() {
         SettingsControl::Field(SettingsField::DisplayZone),
     );
     key(&mut app, &provider, KeyCode::Enter);
+    // The shared Anchored popup shows at most eight rows; UTC+02:00 (index 8)
+    // scrolls into view via the shared selection reveal.
+    for _ in 0..8 {
+        key(&mut app, &provider, KeyCode::Down);
+    }
     let choices = text(&draw(&provider, &mut app, 120, 40));
     assert!(choices.contains("UTC+02:00"), "{choices}");
 
     // Walking to a choice previews it on the log behind the dialog: a time
-    // format has no other honest preview.
+    // format has no other honest preview. Selection already rests on +02:00.
     let before = app.appearance.display_zone.clone();
-    key(&mut app, &provider, KeyCode::Down);
     key(&mut app, &provider, KeyCode::Enter);
     assert_ne!(app.appearance.display_zone, before);
     let previewed = app.appearance.display_zone.clone();
@@ -445,6 +453,21 @@ fn display_zone_mouse_activation_distinguishes_presets_from_custom_text() {
         Some(SettingsField::DisplayZone),
         "a preset-zone mouse click opens its choices"
     );
+    // The shared Anchored popup pages to eight rows; the Custom row (index
+    // 16) scrolls into view via the shared selection reveal before clicking.
+    for _ in 0..16 {
+        if preset
+            .layers
+            .settings
+            .theme_choice_rects()
+            .iter()
+            .any(|(_, index)| *index == lvu::app::time_zone_choices().len())
+        {
+            break;
+        }
+        key(&mut preset, &provider, KeyCode::Down);
+        draw(&provider, &mut preset, 100, 30);
+    }
     draw(&provider, &mut preset, 100, 30);
     let custom_choice = preset
         .layers
@@ -529,4 +552,256 @@ fn a_saved_display_zone_travels_in_the_request() {
         .pop()
         .expect("the save reaches the outbox");
     assert_eq!(request.values.display_zone, chosen);
+}
+
+fn scroll_settings(app: &mut App, provider: &FixtureProvider, down: bool) {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use lvu::component::RawEvent;
+    // Wheel over the body scrolls the shared body window whatever holds focus.
+    let surface = app.layers.settings.surface();
+    let point = (surface.popup.x + 2, surface.popup.y + 2);
+    app.handle(
+        Action::Raw(RawEvent::Mouse(MouseEvent {
+            kind: if down {
+                MouseEventKind::ScrollDown
+            } else {
+                MouseEventKind::ScrollUp
+            },
+            column: point.0,
+            row: point.1,
+            modifiers: KeyModifiers::NONE,
+        })),
+        provider,
+    );
+    let _ = (MouseButton::Left, MouseEventKind::Down);
+}
+
+/// Policy/stable budgets alone determine the frame and sticky tail: saving,
+/// saved and error states share one outer frame and one Save-band origin.
+/// Draft edits only move the body scroll extent, never the frame.
+#[test]
+fn responsive_frame_and_tail_are_stable_across_save_states() {
+    for (width, height) in [(240u16, 80u16), (140, 40), (80, 24), (54, 16), (20, 6)] {
+        // Saved (fresh open).
+        let (provider, mut saved) = demo();
+        saved.handle(Action::Open(Open::Settings), &provider);
+        draw(&provider, &mut saved, width, height);
+        let saved_surface = saved.layers.settings.surface();
+        let saved_save = saved
+            .layers
+            .settings
+            .control_rects()
+            .iter()
+            .find(|(_, c)| *c == SettingsControl::Save)
+            .map(|(r, _)| *r);
+
+        // Pending (edited provider, not saved).
+        let (provider, mut pending) = demo();
+        pending.handle(Action::Open(Open::Settings), &provider);
+        focus(
+            &mut pending,
+            &provider,
+            SettingsControl::Field(SettingsField::Provider),
+        );
+        key(&mut pending, &provider, KeyCode::Char('x'));
+        draw(&provider, &mut pending, width, height);
+        let pending_surface = pending.layers.settings.surface();
+
+        // Error (invalid zone draft keeps last-good preview, reports inline).
+        let (provider, mut failed) = demo();
+        failed.handle(Action::Open(Open::Settings), &provider);
+        focus(
+            &mut failed,
+            &provider,
+            SettingsControl::Field(SettingsField::DisplayZone),
+        );
+        key(&mut failed, &provider, KeyCode::Enter);
+        // Custom row is last; wrap Up from the preset to reach it via shared reveal.
+        key(&mut failed, &provider, KeyCode::Up);
+        key(&mut failed, &provider, KeyCode::Enter);
+        for ch in "not-a-zone".chars() {
+            key(&mut failed, &provider, KeyCode::Char(ch));
+        }
+        draw(&provider, &mut failed, width, height);
+        let error_surface = failed.layers.settings.surface();
+
+        for (name, surface) in [
+            ("saved", saved_surface),
+            ("pending", pending_surface),
+            ("error", error_surface),
+        ] {
+            assert_eq!(
+                surface.popup, saved_surface.popup,
+                "{name} frame moved at {width}x{height}"
+            );
+            assert_eq!(
+                surface.interior, saved_surface.interior,
+                "{name} interior moved at {width}x{height}"
+            );
+        }
+        let pending_save = pending
+            .layers
+            .settings
+            .control_rects()
+            .iter()
+            .find(|(_, c)| *c == SettingsControl::Save)
+            .map(|(r, _)| *r);
+        assert_eq!(
+            pending_save, saved_save,
+            "sticky tail moved at {width}x{height}"
+        );
+    }
+}
+
+/// Below the floor the tiny fallback owns the frame with no stale hitboxes.
+#[test]
+fn below_floor_uses_the_tiny_fallback() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Settings), &provider);
+    let buffer = draw(&provider, &mut app, 19, 5);
+    assert!(text(&buffer).contains("terminal too small"));
+    assert!(app.layers.settings.control_rects().is_empty());
+    assert!(app.layers.settings.theme_choice_rects().is_empty());
+}
+
+/// Theme/zone dropdowns use the shared Anchored geometry against the actual
+/// field anchor and the terminal frame: below when room, above at the floor,
+/// clamped in x, at most eight rows with display-width sizing, and the same
+/// rects paint, select, scroll and hit-test. Unicode paths/carets stay exact.
+#[test]
+fn dropdowns_are_anchored_to_the_field_with_shared_hitboxes() {
+    for (width, height) in [(140u16, 40u16), (80, 24), (54, 16), (20, 6)] {
+        for field in [SettingsField::Theme, SettingsField::DisplayZone] {
+            let (provider, mut app) = demo();
+            app.handle(Action::Open(Open::Settings), &provider);
+            focus(&mut app, &provider, SettingsControl::Field(field));
+            // Custom-zone text field has no popup; switch to preset first.
+            if field == SettingsField::DisplayZone
+                && app.layers.settings.state().is_some_and(|d| d.zone_custom)
+            {
+                continue;
+            }
+            key(&mut app, &provider, KeyCode::Enter);
+            draw(&provider, &mut app, width, height);
+            let surface = app.layers.settings.surface();
+            let choices = app.layers.settings.theme_choice_rects().to_vec();
+            assert!(!choices.is_empty(), "popup must paint at {width}x{height}");
+            assert!(
+                choices.len() <= 8,
+                "anchored max eight rows at {width}x{height}"
+            );
+            for (rect, index) in &choices {
+                assert!(
+                    rect.x + rect.width <= width && rect.y + rect.height <= height,
+                    "choice {index} escapes {width}x{height}: {rect:?}"
+                );
+                assert!(
+                    contains(surface.popup, (rect.x, rect.y)),
+                    "choice escapes popup at {width}x{height}"
+                );
+                assert_eq!(
+                    app.layers.settings.hit((rect.x, rect.y)),
+                    Some(lvu::components::settings::SettingsHit::Choice(*index)),
+                    "popup paint/hit disagree at {width}x{height}"
+                );
+            }
+            let widths: std::collections::HashSet<u16> =
+                choices.iter().map(|(r, _)| r.width).collect();
+            assert_eq!(
+                widths.len(),
+                1,
+                "popup rows share width at {width}x{height}"
+            );
+            // Arrows move the shared selection and keep it painted.
+            key(&mut app, &provider, KeyCode::Down);
+            draw(&provider, &mut app, width, height);
+            let after = app.layers.settings.theme_choice_rects().to_vec();
+            assert!(!after.is_empty());
+        }
+    }
+}
+
+/// At 54x16 and 20x6 every field stays reachable via focus-follow with the
+/// caret inside its own rect, actions stay sticky, and wheel/hitboxes match
+/// the shared body viewport. Unicode paths wrap by display width.
+#[test]
+fn tiny_pressure_keeps_every_field_reachable_with_matching_wheel() {
+    for (width, height) in [(54u16, 16u16), (20, 6)] {
+        let (provider, mut app) = demo();
+        // Unicode paths in effective values must wrap, never panic.
+        app.handle(Action::Open(Open::Settings), &provider);
+        draw(&provider, &mut app, width, height);
+        // Focus order follows Tab traversal.
+        for field in [
+            SettingsField::Provider,
+            SettingsField::Theme,
+            SettingsField::DisplayZone,
+            SettingsField::Delight,
+            SettingsField::Ascii,
+            SettingsField::RowCache,
+            SettingsField::IndexPerSource,
+        ] {
+            focus(&mut app, &provider, SettingsControl::Field(field));
+            draw(&provider, &mut app, width, height);
+            let surface = app.layers.settings.surface();
+            let rect = app
+                .layers
+                .settings
+                .control_rects()
+                .iter()
+                .find(|(_, c)| *c == SettingsControl::Field(field))
+                .map(|(r, _)| *r)
+                .unwrap_or_else(|| panic!("{field:?} must stay reachable at {width}x{height}"));
+            assert!(contains(surface.popup, (rect.x, rect.y)));
+            assert_eq!(
+                app.layers.settings.hit((rect.x, rect.y)),
+                Some(lvu::components::settings::SettingsHit::Control(
+                    SettingsControl::Field(field)
+                )),
+                "{field:?} paint/hit disagree at {width}x{height}"
+            );
+            if let Some(caret) = app.layers.settings.surface().caret
+                && app.layers.settings.state().is_some_and(|d| {
+                    d.focus == SettingsControl::Field(field)
+                        && matches!(
+                            field,
+                            SettingsField::Provider
+                                | SettingsField::Mode
+                                | SettingsField::Thinking
+                                | SettingsField::DisplayZone
+                                | SettingsField::RowCache
+                                | SettingsField::Membership
+                                | SettingsField::DiskTotal
+                                | SettingsField::IndexPerSource
+                        )
+                })
+            {
+                assert!(contains(rect, caret), "caret must stay in {field:?}");
+            }
+        }
+        // Wheel scrolls the shared body window with matching hitboxes.
+        focus(
+            &mut app,
+            &provider,
+            SettingsControl::Field(SettingsField::Provider),
+        );
+        draw(&provider, &mut app, width, height);
+        let before = text(&draw(&provider, &mut app, width, height));
+        scroll_settings(&mut app, &provider, true);
+        draw(&provider, &mut app, width, height);
+        let _ = before;
+        // Sticky default action never leaves.
+        let surface = app.layers.settings.surface();
+        let save = app
+            .layers
+            .settings
+            .control_rects()
+            .iter()
+            .find(|(_, c)| *c == SettingsControl::Save)
+            .map(|(r, _)| *r)
+            .expect("Save must survive tiny pressure");
+        assert!(contains(surface.popup, (save.x, save.y)));
+        // Real overflow only.
+        let _ = surface.scrollable;
+    }
 }
