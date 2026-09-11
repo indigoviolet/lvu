@@ -8,6 +8,7 @@ import pathlib
 import re
 import sys
 import tempfile
+import time
 
 from test_enrichment_chain_pty import stop, open_step_editor, paste, close_editor
 from test_lvu_pty import PtyApp
@@ -88,6 +89,7 @@ def run(binary: pathlib.Path) -> None:
             # Tab back into Details for the tree cursor below; the cursor
             # starts on the first row.
             app.send(b"\t")
+            time.sleep(0.1)
             app.send(b"\x1b[B\x1b[B")  # cursor to `http`
             app.send(b"\r")
             app.wait_for("status: 503")

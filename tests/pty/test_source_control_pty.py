@@ -38,7 +38,7 @@ def run(binary):
         app=PtyApp(binary,['--command',command,'--capture-dir',str(root/'capture-command')],width=135,height=28,environment=env)
         try:
             app.wait_for('command-ready')
-            app.send(b'/'); app.wait_for('Search'); app.send(b'command')
+            app.send(b'/'); app.wait_for('Search'); time.sleep(0.1); app.send(b'command')
             # A draft on All events applies only when it is submitted.
             app.send(b'\r'); app.wait_for('Applied   command')
             app.send(b'\x1b'); app.wait_until(lambda t:' Search ' not in t,'search closed')

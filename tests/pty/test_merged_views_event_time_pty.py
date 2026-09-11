@@ -12,6 +12,7 @@ dialog's order row says which of the two is in force.
 import pathlib
 import sys
 import tempfile
+import time
 from test_lvu_pty import PtyApp
 
 
@@ -59,6 +60,7 @@ def run(binary):
             # in; every record carries `ts`, so nothing is filtered away.
             app.send(b"/")
             app.wait_for("Search")
+            time.sleep(0.1)
             app.send(b"ts\r")
             app.wait_for("Applied   ts")
             app.send(b"\x1b")

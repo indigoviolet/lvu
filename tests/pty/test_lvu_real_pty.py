@@ -1204,7 +1204,20 @@ for line in sys.stdin:
             environment=environment,
         )
         try:
-            app.wait_for("ordinary", timeout=8.0)
+            app.wait_until(
+                lambda text: "ordinary" in text and "query pending" not in text,
+                "initial applied view before Ask",
+                timeout=15.0,
+            )
+            # Startup restore can enqueue its first native refresh immediately
+            # after the first quiet paint. Require a short stable quiet period
+            # before freezing the successful-proposal fixture.
+            time.sleep(0.5)
+            app.wait_until(
+                lambda text: "ordinary" in text and "query pending" not in text,
+                "stable applied view before Ask",
+                timeout=15.0,
+            )
             app.send(b"A")
             app.wait_for("Ask 🧠")
             app.send(b"keep errors")
@@ -1254,17 +1267,15 @@ for line in sys.stdin:
             )
             assert "session-ask-2" in history and "session-ask-3" in history, history
 
-            # Both entries remain reachable in the existing Proposal pane when
-            # narrow geometry makes them overflow; no transcript surface is
-            # introduced for this bounded two-answer history.
+            # Both bounded entries remain visible in the responsive Proposal
+            # pane at the supported narrow geometry; no transcript surface is
+            # introduced for this two-answer history. Scrolling farther down
+            # intentionally reveals Activity, so assert the answer history at
+            # its initial reveal position rather than scrolling past it.
             app.resize(70, 16)
-            narrow = app.wait_for("standard answer", timeout=5.0)
-            assert "session-ask-2" in narrow, narrow
-            app.send(b"\t\t")  # Apply -> Cancel -> scrollable Proposal pane.
-            app.send(b"\x1b[B" * 12)
-            app.wait_until(
-                lambda text: "wider answer" in text and "session-ask-3" in text,
-                "the wider answer after scrolling the narrow Proposal pane",
+            narrow = app.wait_until(
+                lambda text: "standard answer" in text and "wider answer" in text,
+                "both answers in the narrow Proposal pane",
                 timeout=5.0,
             )
             app.resize(160, 30)
@@ -1578,7 +1589,7 @@ for line in sys.stdin:
         )
         try:
             enter_source_dialog(app)
-            app.wait_for("No view selected", timeout=8.0)
+            app.wait_for("NO VIEW", timeout=8.0)
             activate_source_mode(app, "🧠")
             app.wait_for("Describe")
             app.send(b"follow the controlled backend file\r")
@@ -1871,7 +1882,7 @@ def run_event_time_story(binary: pathlib.Path) -> None:
         try:
             reopened.wait_for("event-time:absolute", timeout=10.0)
             reopened.send(b"t")
-            reopened.wait_for("Recognized event", timeout=5.0)
+            reopened.wait_for("order: recognized", timeout=5.0)
             click_time_action(reopened, "[ Clear ]")
             restored = reopened.wait_for("ambiguous visible raw", timeout=10.0)
             assert "missing event time visible raw" in restored

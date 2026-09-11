@@ -2018,31 +2018,32 @@ impl Composition {
                         });
                     }
                     AssistancePreparationState::Complete => {
-                        if app.view_definition_revision(&start.view_id)
-                            != Some(start.definition_revision)
+                        // The prepared sample remains bound to `start`. If the
+                        // view advances while sampling, let the request reach
+                        // a concrete bridge/provider failure; only a successful
+                        // proposal depends on the definition and is refused by
+                        // `finish_ask_ai` (and again by Apply). This keeps a
+                        // harmless diagnostic visible without weakening either
+                        // mutation fence.
+                        match status
+                            .result
+                            .ok_or_else(|| {
+                                "assistance preparation completed without context".to_owned()
+                            })
+                            .and_then(|result| prepared_sample_context(&start, result))
                         {
-                            finish_ai_error(app, &start, "view changed while preparing assistance; submit the current definition".into());
-                        } else {
-                            match status
-                                .result
-                                .ok_or_else(|| {
-                                    "assistance preparation completed without context".to_owned()
-                                })
-                                .and_then(|result| prepared_sample_context(&start, result))
-                            {
-                                Ok((output_dir, context)) => {
-                                    // What the bound actually admitted, told to
-                                    // the dialog before the prompt goes out.
-                                    if let Some(inline) = &context.inline_context {
-                                        app.record_ask_sample(
-                                            start.generation,
-                                            sample_from_coverage(inline, start.tier),
-                                        );
-                                    }
-                                    self.begin_agent_request(app, start, output_dir, context)
+                            Ok((output_dir, context)) => {
+                                // What the bound actually admitted, told to
+                                // the dialog before the prompt goes out.
+                                if let Some(inline) = &context.inline_context {
+                                    app.record_ask_sample(
+                                        start.generation,
+                                        sample_from_coverage(inline, start.tier),
+                                    );
                                 }
-                                Err(error) => finish_ai_error(app, &start, error),
+                                self.begin_agent_request(app, start, output_dir, context)
                             }
+                            Err(error) => finish_ai_error(app, &start, error),
                         }
                     }
                     AssistancePreparationState::Limited

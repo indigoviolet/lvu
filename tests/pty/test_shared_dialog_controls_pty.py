@@ -221,6 +221,7 @@ def exercise_theme(
                 search = open_surface(
                     app, evidence, theme, "search", b"/", FILTER_TITLE, ("Apply", "Clear")
                 )
+                time.sleep(0.1)
                 app.send("q界e\u0301".encode())
                 app.wait_for("q界é")
                 assert_input_focus(app, expected["input"])

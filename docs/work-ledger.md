@@ -3279,3 +3279,35 @@ mutate the view. The direct submit/recovery regression and all-target `lvu`
 Clippy pass; the actual bridge-diagnostics PTY passes all five failure modes
 against the rebuilt primary. Evidence:
 `primary-sol-scratch/v018-bridge-diagnostics-final2.log`.
+
+### Final combined-candidate stabilization — 2026-09-11
+
+Primary direct review resolved the last five reproducible PTY failures without
+launching more reviewer sessions. Search, merged event-time and shared-control
+stories now wait for the responsive text field before sending the first input;
+the Fields story waits for Details focus before driving its JSON cursor. Ask
+continues to reject a successful proposal if its definition changed, but lets a
+non-mutating bridge/provider failure reach the dialog after sampling so the
+actual remedy is not replaced by a generic fence message.
+
+The rebuilt primary passed all five formerly red suites: bridge diagnostics,
+Fields exploration, merged event-time, shared dialog controls and Source
+control. The isolated Ask story passed successful proposal/apply, wider sample,
+narrow two-answer history and failure handling. Source-assistance and restored
+event-time stories pass. `cargo test -p lvu-app` passed 207 unit tests plus its
+settings/shared-key/storage/union targets, and app all-target Clippy passed with
+warnings denied. Durable logs are
+`primary-sol-scratch/v018-failed4-rerun2.log`,
+`primary-sol-scratch/v018-failed5-rerun2.log`,
+`primary-sol-scratch/v018-ask-story-final2.log`,
+`primary-sol-scratch/v018-source-ai-story-final.log`,
+`primary-sol-scratch/v018-event-time-story-final.log`, and
+`primary-sol-scratch/v018-final-app-validation.log`.
+
+Two warm whole-story attempts were retained rather than retried until green:
+after passing earlier stories they found only stale responsive assertions—an
+empty workspace now says `NO VIEW`, and restored event-time acceptance is named
+by `order: recognized`. Their focused successor stories pass. Complete exact
+workspace, bridge, full PTY, two-window, sequential-reopen and remote-union
+verification remains the sole pre-tag acceptance step; no release is claimed
+by this preflight.
