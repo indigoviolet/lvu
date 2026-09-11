@@ -10,7 +10,7 @@ import pathlib
 import sys
 import tempfile
 import time
-from test_lvu_pty import PtyApp
+from test_lvu_pty import FILTER_TITLE, PtyApp
 
 with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
     root = pathlib.Path(directory)
@@ -32,6 +32,8 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
         # All events keeps its draft to itself; applying one creates the
         # editable view the rest of this suite races against.
         app.send(b"/")
+        app.wait_for(FILTER_TITLE)
+        time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
         app.wait_for("No filter every record is shown")
         app.send(b"gamma")
         time.sleep(0.5)
@@ -67,25 +69,34 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
                            and "every record is shown" in screen,
                            "empty draft restores all records", timeout=5)
         app.send(b"beta")
-        app.wait_until(lambda screen: "beta two" in screen and "alpha one" not in screen
+        # The open dialog covers the matching row at this size, so the
+        # settled filter is read from the accepted marker and the counts
+        # (the file's convention for occluded rows); the row text itself
+        # is asserted after dismissal sequences below.
+        app.wait_until(lambda screen: "Applied   beta" in screen and "alpha one" not in screen
                        and "1-1/1" in screen,
                        "settled search filters rows", timeout=5)
         app.send(b"\x7f" * 4 + b"\x1b")
         app.wait_until(lambda screen: "alpha one" in screen and "gamma three" in screen
                        and "search:on" not in screen, "clear survives immediate editor close", timeout=5)
         app.send(b"/")
+        app.wait_for(FILTER_TITLE)
+        time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
         app.wait_for("Search")
-        for query, visible, absent in [
-            ("level: error", "alpha one", "beta two"),
-            (r'"field name": \/var/log', "alpha one", "beta two"),
-            (r'"field name": /^ready$/', "beta two", "alpha one"),
-            (r'\/var/log', "alpha one", "beta two"),
-            ("/beta|gamma/", "beta two", "alpha one"),
-            ("message: /^gamma/", "gamma three", "alpha one"),
-            ("pl.col('status') == '503'", "alpha one", "beta two"),
+        for query, absent, matched in [
+            ("level: error", "beta two", "matched 1/3"),
+            (r'"field name": \/var/log', "beta two", "matched 1/3"),
+            (r'"field name": /^ready$/', "alpha one", "matched 1/3"),
+            (r'\/var/log', "beta two", "matched 1/3"),
+            ("/beta|gamma/", "alpha one", "matched 2/3"),
+            ("message: /^gamma/", "alpha one", "matched 1/3"),
+            ("pl.col('status') == '503'", "beta two", "matched 1/3"),
         ]:
             app.send(b"\x1b[200~" + query.encode() + b"\x1b[201~")
-            app.wait_until(lambda screen: visible in screen and absent not in screen,
+            # As above, the open dialog covers matching rows: read the
+            # accepted marker plus counts, never the occluded row text.
+            app.wait_until(lambda screen: f"Applied   {query}" in screen
+                           and matched in screen and absent not in screen,
                            "search form " + query, timeout=15)
             app.send(b"\x7f" * len(query))
             # As above: the top-biased prompt covers the record rows in this
@@ -94,10 +105,11 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
                            and "every record is shown" in screen,
                            "clear " + query, timeout=5)
         app.send(b"alpha")
-        # Wait for the message row to name the accepted filter: that is the
-        # unambiguous signal that there *is* a last-accepted value to preserve.
+        # Wait for the accepted marker to name the accepted filter: that is
+        # the unambiguous signal that there *is* a last-accepted value to
+        # preserve (the covered message row cannot name it at this size).
         app.wait_until(lambda screen: "Applied   alpha" in screen
-                       and "alpha one" in screen and "beta two" not in screen,
+                       and "matched 1/3" in screen and "beta two" not in screen,
                        "last good search", timeout=5)
         # Prepend the invalid fragment (Ctrl-A, then type) instead of clearing
         # first: clearing applies
@@ -106,7 +118,12 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
         # because the narrower pre-spec dialog left a sliver of log visible.
         app.send(b"\x01/[/")
         app.wait_until(lambda text: "Error" in text, "rejected draft", timeout=5)
-        assert "alpha one" in app.text() and "beta two" not in app.text()
+        # The open error dialog covers the viewport's single applied row,
+        # so the preserved filter is read from the dialog's own
+        # last-accepted line (proven visible at this size by the wide
+        # layout check below); the row text itself is asserted after
+        # dismissal sequences.
+        assert "last accepted alpha" in app.text() and "beta two" not in app.text()
         wide_cursor_row = app.screen.cursor.y
         app.resize(72, 16)
         app.wait_until(lambda text: app.screen.cursor.y != wide_cursor_row

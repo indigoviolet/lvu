@@ -29,7 +29,8 @@ def diagnostic_shown(text):
     # screen (not even after whitespace collapsing: border cells sit between
     # rows). Match token pieces instead, each contiguous within one row.
     return (
-        "available in this batch" in text
+        "available in this" in text
+        and "batch" in text
         and "never_produced_xyz" in text
         and "filter needs" in text
     )
@@ -62,20 +63,28 @@ def run(binary):
         try:
             app.wait_for("level=ERROR first", timeout=15.0)
 
-            # Valid advanced filter first: only the ERROR row remains.
+            # Valid advanced filter first: only the ERROR row remains. The
+            # open dialog covers the matching row, so accepted status is
+            # awaited first, the dialog is closed, and only then are rows
+            # asserted.
             open_advanced_filter(app)
             clear_field(app)
             paste(app, VALID)
             app.send(b"\r")
             app.wait_until(
-                lambda text: "level=INFO second" not in text
-                and "level=ERROR first" in text,
-                "valid filter applied",
+                lambda text: "Applied" in text and "matched 1/2" in text,
+                "valid filter accepted",
                 timeout=15,
             )
             app.send(b"\x1b")
             app.wait_until(
                 lambda text: FILTER_TITLE not in text, "filter closed", timeout=5
+            )
+            app.wait_until(
+                lambda text: "level=INFO second" not in text
+                and "level=ERROR first" in text,
+                "valid filter rows after close",
+                timeout=15,
             )
 
             # Candidate names a column absent from this batch. The applied rows
@@ -93,7 +102,11 @@ def run(binary):
             assert "never_produced_xyz" in failed, failed
             assert "lowered" not in failed, failed
             assert "unable to find" not in failed, failed
-            assert "level=ERROR first" in failed, (
+            # The open rejected dialog covers the viewport's single applied
+            # row, so survival is read from the dialog's own last-accepted
+            # line (stable regardless of footer chip pressure); the exact
+            # row text is asserted after dismissal below.
+            assert "last accepted pl.col('level') == 'ERROR'" in failed, (
                 "applied rows stay while the candidate fails",
                 failed,
             )

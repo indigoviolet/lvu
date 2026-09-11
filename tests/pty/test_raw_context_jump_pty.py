@@ -10,7 +10,7 @@ import tempfile
 import time
 
 from test_enrichment_chain_pty import stop
-from test_lvu_pty import PtyApp
+from test_lvu_pty import FILTER_TITLE, PtyApp
 
 
 def workspace(root: pathlib.Path) -> dict:
@@ -23,7 +23,10 @@ def workspace(root: pathlib.Path) -> dict:
 
 
 def filter_to_needle(app: PtyApp) -> None:
-    app.send(b"/"); app.wait_for("Search"); app.send(b"need")
+    app.send(b"/")
+    app.wait_for(FILTER_TITLE)
+    time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
+    app.send(b"need")
     app.send(b"\r"); app.wait_for("Applied   need", timeout=15)
     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
     # The filter forked All events into its own view; wait until that view
@@ -106,9 +109,18 @@ def readiness(binary: pathlib.Path, root: pathlib.Path) -> None:
                  width=80, height=24, environment=workspace(root))
     try:
         app.wait_for("big-", timeout=30)
-        app.send(b"/"); app.wait_for("Search"); app.send(b"needle")
-        app.send(b"\r"); app.wait_until(lambda t: "needle big-399990" in t, "the needle matched", timeout=90)
+        app.send(b"/")
+        app.wait_for(FILTER_TITLE)
+        time.sleep(0.3)  # fresh dialog takes focus a tick after its frame; first keystroke would be lost
+        app.send(b"needle")
+        app.send(b"\r")
+        # Accepted status first: the single matching row paints beneath
+        # the open dialog, so the row itself is only asserted after the
+        # dialog closes (it keeps arriving live while indexing finishes).
+        app.wait_until(lambda t: "Applied" in t and "› needle" in t,
+                       "needle applied and forked", timeout=15)
         app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
+        app.wait_until(lambda t: "needle big-399990" in t, "the needle matched", timeout=90)
         app.wait_until(lambda t: "› needle" in t, "the filtered view is active", timeout=30)
         app.send(b"o")
         seen = app.wait_until(lambda t: "locating…" in t or "o back" in t, "jump status", timeout=30)
