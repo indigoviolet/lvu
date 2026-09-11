@@ -20,25 +20,23 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use lvu_core::{ExactScalar, FieldCorrelation};
-use ratatui::{
-    Frame,
-    layout::{Margin, Rect},
-    style::{Modifier, Style},
-    widgets::{Block, Borders, Paragraph},
-};
+use ratatui::{Frame, layout::Rect, style::Modifier, widgets::Paragraph};
 
 use crate::app::Views;
 use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface,
 };
-use crate::dialog_controls::{ActionRow, DialogStyles};
-use crate::dialog_layout::{DialogClass, DialogContent, MIN_LIVE_ROWS, content_width, pane};
+use crate::dialog_controls::{ButtonRole, DialogStyles, stable_action_rows};
+use crate::dialog_layout::{
+    AnchoredSpec, ContextFootprint, DialogSpec, MIN_LIVE_ROWS, PresentationKind, anchored_geometry,
+    plan_list,
+};
 use crate::provider::RowId;
 use crate::theme::Theme;
 use crate::ui::{
-    MessageState, clear_themed, clipped_width, dialog_frame_regions, help_rows, message_rows,
-    packed_button_rows, render_actions, render_help_text, render_message, truncated,
+    MessageState, clear_themed, clipped_width, help_rows, message_rows, render_help_text,
+    render_message, render_scrollbar, truncated,
 };
 
 /// The legacy `MAX_CORRELATION_REQUESTS`: distinct generations that may be in
@@ -57,6 +55,48 @@ const HELP: &str =
 const BUTTONS: [&str; 2] = ["Co&rrelate", "&Cancel"];
 const BUTTON_CONTROLS: [CorrelationControl; 2] =
     [CorrelationControl::Correlate, CorrelationControl::Cancel];
+
+/// Stable Contextual Inspector budgets: outer size is policy-only, never async
+/// lookup counts. Header 1 (identity line), body minimum 3, message/help stable
+/// maxima from the longest sentences at the policy width, actions from the
+/// stable 2-verb row so pending/mapping/error share one frame and sticky tail.
+/// Hand-rolled list projection below is presentation-only folding, never query
+/// membership (AGENTS.md).
+fn correlation_spec_for(area: Rect, reserved_rows: usize) -> DialogSpec {
+    let (policy_w, _) = crate::dialog_layout::policy_size(
+        area,
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+    );
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let action_rows = stable_action_rows(estimate, &BUTTONS).clamp(1, 2);
+    // §5.2.1 again, for the message: the lookup's answer changes which
+    // sentence is shown, so the rows are reserved for the longest one the
+    // layer can say, and the frame is the same before and after.
+    let longest = [
+        "finding records that share this value",
+        "no source is mapped yet, so there is nothing to correlate",
+        &format!(
+            "{0} of {0} sources mapped · field names come from a bounded sample, \
+             so a rarely used field may be missing",
+            reserved_rows
+        ),
+    ]
+    .into_iter()
+    .map(|candidate| message_rows(candidate, estimate))
+    .max()
+    .unwrap_or(0)
+    .clamp(1, 2);
+    let message = if area.height <= 6 { 1 } else { longest };
+    let help = help_rows(HELP, estimate).min(2);
+    DialogSpec::new(
+        PresentationKind::Contextual(ContextFootprint::Inspector),
+        1,
+        3,
+        message,
+        help,
+        action_rows,
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CorrelationRequest {
@@ -732,24 +772,6 @@ impl CorrelationDialog {
         }
     }
 
-    /// Keep the selected source inside the reserved rows.
-    fn scroll_to_selection(&mut self, rows: usize) {
-        let Some(mapping) = self.mapping.as_ref() else {
-            self.top = 0;
-            return;
-        };
-        if rows == 0 {
-            self.top = 0;
-            return;
-        }
-        if mapping.selected < self.top {
-            self.top = mapping.selected;
-        } else if mapping.selected >= self.top + rows {
-            self.top = mapping.selected + 1 - rows;
-        }
-        self.top = self.top.min(mapping.sources.len().saturating_sub(rows));
-    }
-
     /// The §7.4 message for the state on screen.
     fn message(&self) -> (MessageState, String) {
         if let Some(error) = self.error.as_deref() {
@@ -967,7 +989,6 @@ impl Component for CorrelationDialog {
         let theme: Theme = ctx.theme;
         let styles = DialogStyles::new(theme);
         let ascii = ctx.ascii;
-        let width = content_width(area, DialogClass::M);
         let header = match self.mapping.as_ref() {
             Some(mapping) => format!(
                 "{} = {} · from the selected record",
@@ -977,91 +998,91 @@ impl Component for CorrelationDialog {
         };
         let (state, sentence) = self.message();
         let labels = BUTTONS;
-        // §5.2.1 again, for the message: the lookup's answer changes which
-        // sentence is shown, so the rows are reserved for the longest one the
-        // layer can say, and the frame is the same before and after.
-        let message = [
-            sentence.as_str(),
-            "finding records that share this value",
-            "no source is mapped yet, so there is nothing to correlate",
-            &format!(
-                "{0} of {0} sources mapped · field names come from a bounded sample, \
-                 so a rarely used field may be missing",
-                self.reserved_rows
-            ),
-        ]
-        .into_iter()
-        .map(|candidate| message_rows(candidate, width))
-        .max()
-        .unwrap_or(0);
-        let content = DialogContent {
-            header: 1,
-            // Pane heading plus the reserved rows (§5.2.1), whatever the
-            // lookup has answered so far.
-            body: u16::try_from(self.reserved_rows.saturating_add(1)).unwrap_or(u16::MAX),
-            message,
-            help: help_rows(HELP, width),
-            actions: packed_button_rows(width, &labels),
-        };
-        let regions = dialog_frame_regions(
-            frame,
+        // Responsive frame: Contextual Inspector policy plus stable budgets
+        // only. Body rows size only the scroll extent; the frame and sticky
+        // tail are identical before and after the lookup answers. The frozen
+        // RenderCtx anchor places the inspector; no layer computes its own row.
+        let spec = correlation_spec_for(area, self.reserved_rows);
+        let Ok(geometry) = crate::dialog_layout::resolve_dialog(
             area,
-            DialogClass::M,
+            &spec,
+            1,
+            &labels,
+            Some(0),
+            ctx.context_anchor,
+        ) else {
+            // Below the 20x6 floor the existing tiny fallback owns the frame;
+            // stay open with nothing drawn, as the palette does.
+            self.surface = Surface::default();
+            return self.surface;
+        };
+        // One geometry authority for paint/mouse: visible buttons come from the
+        // shared plan. Overflow (only the floor) stays keyboard-reachable via
+        // mnemonics; a More menu is follow-up work.
+        crate::ui::render_responsive_frame(
+            frame,
+            &geometry,
             "Correlate across sources",
-            &content,
+            ctx.active,
             theme,
         );
-        if regions.header.height > 0 {
+        if geometry.header.height > 0 {
             frame.render_widget(
-                Paragraph::new(truncated(&header, usize::from(regions.header.width)))
+                Paragraph::new(truncated(&header, usize::from(geometry.header.width)))
                     .style(styles.label.add_modifier(Modifier::BOLD)),
-                regions.header,
+                geometry.header,
             );
         }
-        if regions.body.height > 0 && regions.body.width > 0 {
-            self.geometry.body = Some(regions.body);
-            let rects = pane(regions.body, 0, self.reserved_rows);
+        if geometry.body.viewport.height > 0 && geometry.body.viewport.width > 0 {
+            self.geometry.body = Some(geometry.body.viewport);
             let source_count = self
                 .mapping
                 .as_ref()
                 .map_or(0, |mapping| mapping.sources.len());
-            if rects.heading.height > 0 {
+            let count_text = self
+                .mapping
+                .as_ref()
+                .map(|mapping| format!("{} of {}", mapping.mapped_sources(), source_count));
+            let count_w = count_text.as_ref().map_or(0, |text| {
+                u16::try_from(unicode_width::UnicodeWidthStr::width(text.as_str())).unwrap_or(0)
+            });
+            // One authoritative list plan: heading/count/viewport/scrollbar plus
+            // the selected window and painted row rects. The same rects drive
+            // paint, selection, scrollbar and mouse hit-testing.
+            let selected = self
+                .mapping
+                .as_ref()
+                .map(|mapping| mapping.selected.min(source_count.saturating_sub(1)));
+            let list = plan_list(
+                geometry.body.viewport,
+                if source_count > 0 { count_w } else { 0 },
+                source_count,
+                selected,
+                self.top,
+            );
+            self.top = list.first_row;
+            if list.heading.height > 0 {
                 frame.render_widget(
                     Paragraph::new("Source").style(styles.label.add_modifier(Modifier::BOLD)),
-                    rects.heading,
+                    list.heading,
                 );
-                if let Some(mapping) = self.mapping.as_ref() {
-                    let count = format!("{} of {}", mapping.mapped_sources(), source_count);
-                    let count_width = u16::try_from(count.chars().count()).unwrap_or(0);
-                    if rects.heading.width > count_width {
+                if let (Some(text), Some(mapping)) = (count_text, self.mapping.as_ref()) {
+                    let _ = mapping;
+                    if list.count.width > 0 {
                         frame.render_widget(
-                            Paragraph::new(count).style(styles.description),
-                            Rect::new(
-                                rects.heading.right().saturating_sub(count_width),
-                                rects.heading.y,
-                                count_width,
-                                1,
-                            ),
+                            Paragraph::new(text).style(styles.description),
+                            list.count,
                         );
                     }
                 }
             }
-            let visible = usize::from(rects.viewport.height);
-            self.scroll_to_selection(visible);
-            let name_width = usize::from(rects.viewport.width).saturating_sub(24).max(8);
+            let name_width = usize::from(list.viewport.width).saturating_sub(24).max(8);
             if let Some(mapping) = self.mapping.as_ref() {
-                for (offset, index) in (self.top..source_count).take(visible).enumerate() {
+                for (offset, row) in list.row_rects.iter().enumerate() {
+                    let index = list.first_row.saturating_add(offset);
                     let Some(source) = mapping.sources.get(index) else {
                         continue;
                     };
-                    let Some(y) = u16::try_from(offset)
-                        .ok()
-                        .map(|offset| rects.viewport.y.saturating_add(offset))
-                        .filter(|y| *y < rects.viewport.bottom())
-                    else {
-                        continue;
-                    };
-                    let row = Rect::new(rects.viewport.x, y, rects.viewport.width, 1);
                     let selected =
                         self.control == CorrelationControl::Sources && index == mapping.selected;
                     let gutter = if selected {
@@ -1088,24 +1109,34 @@ impl Component for CorrelationDialog {
                                 styles.description
                             },
                         ),
-                        row,
+                        *row,
                     );
-                    self.geometry.rows.push((row, index));
+                    self.geometry.rows.push((*row, index));
                     let field_x = row
                         .x
                         .saturating_add(u16::try_from(name_width.saturating_add(4)).unwrap_or(0))
                         .min(row.right().saturating_sub(1));
                     self.geometry.field_rects.push(Rect::new(
                         field_x,
-                        y,
+                        row.y,
                         row.right().saturating_sub(field_x),
                         1,
                     ));
                 }
             }
+            if let Some(bar) = list.scrollbar {
+                render_scrollbar(
+                    frame,
+                    bar,
+                    list.first_row,
+                    source_count.saturating_sub(list.row_rects.len()),
+                    theme,
+                    ascii,
+                );
+            }
         }
-        render_message(frame, regions.message, state, &sentence, theme, ascii);
-        render_help_text(frame, regions.help, HELP, theme);
+        render_message(frame, geometry.message, state, &sentence, theme, ascii);
+        render_help_text(frame, geometry.help, HELP, theme);
 
         let action_controls = BUTTON_CONTROLS;
         let default_action = action_controls
@@ -1114,79 +1145,102 @@ impl Component for CorrelationDialog {
         let focused = action_controls
             .iter()
             .position(|control| *control == self.control);
-        for (index, rect) in render_actions(
-            frame,
-            regions.actions,
-            ActionRow {
-                labels: &labels,
-                default: default_action,
-                destructive: &[],
-                focused,
-            },
-            theme,
-        ) {
-            self.geometry.controls.push((rect, action_controls[index]));
+        for (index, rect) in geometry.actions.buttons.iter() {
+            let control = action_controls[*index];
+            crate::dialog_controls::render_role_button(
+                frame,
+                *rect,
+                labels[*index],
+                if geometry.actions.default == Some(*index) {
+                    ButtonRole::Default
+                } else {
+                    ButtonRole::Normal
+                },
+                focused == Some(*index),
+                theme,
+            );
+            self.geometry.controls.push((*rect, control));
         }
+        let _ = default_action;
 
-        let mut popup = regions.popup;
+        let mut popup = geometry.frontmost;
         // §8.3: the field choice is a dropdown, so the options open as an
-        // anchored popup over the dialog rather than cycling invisibly.
+        // anchored popup over the dialog rather than cycling invisibly. One
+        // shared anchored_geometry call drives popup, viewport, scrollbar,
+        // selection window, paint and mouse, and the shared scrollbar alone
+        // communicates real overflow.
         if let Some(mapping) = self.mapping.as_ref()
             && let Some(highlighted) = mapping.popup
-            && let Some(anchor) = mapping
+        {
+            // The selected source's field rect drives the anchor; it is the
+            // same rect paint used, so the popup cannot drift from its field.
+            let anchor = mapping
                 .selected
                 .checked_sub(self.top)
                 .and_then(|offset| self.geometry.field_rects.get(offset))
                 .copied()
-        {
+                .unwrap_or(geometry.body.viewport);
             let options = mapping.options(mapping.selected);
-            let hint = options
+            let preferred = options
                 .iter()
-                .map(|option| u16::try_from(option.chars().count()).unwrap_or(0))
+                .map(|option| {
+                    u16::try_from(unicode_width::UnicodeWidthStr::width(option.as_str()))
+                        .unwrap_or(0)
+                })
                 .max()
                 .unwrap_or(12)
                 .saturating_add(4);
-            let rect =
-                crate::dialog_layout::anchored_rect(regions.interior, anchor, options.len(), hint);
-            clear_themed(frame, rect, theme);
-            frame.render_widget(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.active_border)),
-                rect,
-            );
-            let inner = rect.inner(Margin::new(1, 1));
-            let visible = usize::from(inner.height);
-            let top = highlighted.saturating_sub(visible.saturating_sub(1));
-            for (offset, index) in (top..options.len()).take(visible).enumerate() {
-                let Some(y) = u16::try_from(offset)
-                    .ok()
-                    .map(|offset| inner.y.saturating_add(offset))
-                    .filter(|y| *y < inner.bottom())
-                else {
-                    continue;
-                };
-                let choice = Rect::new(inner.x, y, inner.width, 1);
+            let anchored_spec = AnchoredSpec::new(options.len(), None, preferred, 0);
+            let pop = anchored_geometry(area, anchor, &anchored_spec, highlighted, 0);
+            let rect = pop.popup;
+            if rect.width >= 3 && rect.height >= 3 {
+                clear_themed(frame, rect, theme);
                 frame.render_widget(
-                    Paragraph::new(truncated(&options[index], usize::from(choice.width))).style(
-                        if index == highlighted {
-                            styles.selection
-                        } else if index == 0 {
-                            styles.unavailable
-                        } else {
-                            styles.description
-                        },
-                    ),
-                    choice,
+                    ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .border_style(ratatui::style::Style::default().fg(theme.active_border)),
+                    rect,
                 );
-                self.geometry.choices.push((choice, index));
+                let viewport = pop.viewport;
+                for (offset, index) in (pop.first_item..options.len())
+                    .take(usize::from(viewport.height))
+                    .enumerate()
+                {
+                    let y = viewport.y.saturating_add(offset as u16);
+                    if y >= viewport.bottom() {
+                        break;
+                    }
+                    let choice = Rect::new(viewport.x, y, viewport.width, 1);
+                    frame.render_widget(
+                        Paragraph::new(truncated(&options[index], usize::from(choice.width)))
+                            .style(if index == highlighted {
+                                styles.selection
+                            } else if index == 0 {
+                                styles.unavailable
+                            } else {
+                                styles.description
+                            }),
+                        choice,
+                    );
+                    self.geometry.choices.push((choice, index));
+                }
+                if let Some(bar) = pop.scrollbar {
+                    render_scrollbar(
+                        frame,
+                        bar,
+                        pop.first_item,
+                        options.len().saturating_sub(usize::from(viewport.height)),
+                        theme,
+                        ascii,
+                    );
+                }
+                popup = popup.union(rect);
             }
-            popup = popup.union(rect);
         }
 
         self.surface = Surface {
             popup,
-            interior: regions.interior,
+            interior: geometry.interior,
             caret: None,
             scrollable: false,
             text_focus: false,

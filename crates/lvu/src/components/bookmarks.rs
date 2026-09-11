@@ -9,10 +9,11 @@
 //! bookmark is selected, which control has focus, the note draft and its
 //! caret, and the geometry it draws.
 //!
-//! Note editing is still one layer, not the `OpenChild` §6.3 anticipates: the
-//! note form replaces the list today rather than stacking over it, so making
-//! it a child would draw the list under a scrim — a presentation change, which
-//! §7.13 keeps out of a conversion commit.
+//! Note editing is the shared child presentation (§10): noncompact draws the
+//! parent list behind the child with a second scrim pass, compact reuses the
+//! parent frame with a breadcrumb title. Escape returns child→Bookmarks→base;
+//! save semantics are unchanged. Hand-rolled layout below is presentation-only
+//! folding, never query membership (AGENTS.md).
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -25,13 +26,13 @@ use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface, is_typed_char,
 };
-use crate::dialog_controls::DialogStyles;
+use crate::dialog_controls::{ButtonRole, DialogStyles, stable_action_rows};
+use crate::dialog_layout::{ContextFootprint, DialogSpec, PresentationKind, plan_list};
 use crate::provider::RowId;
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit};
 use crate::ui::{
-    FIELD_GUTTER, MessageState, dialog_frame_regions, help_rows, message_rows, packed_button_rows,
-    render_action_row, render_form_field, render_help_text, render_message, render_scrollbar,
-    truncated,
+    FIELD_GUTTER, MessageState, help_rows, render_form_field, render_help_text, render_message,
+    render_responsive_frame, render_scrollbar, truncated,
 };
 
 #[doc(hidden)]
@@ -460,6 +461,180 @@ impl BookmarksDialog {
             _ => Outcome::Consumed,
         }
     }
+
+    /// Parent list behind the Note child (roomy viewports only): same rows as
+    /// the foreground list, painted inactive with no hitboxes recorded while
+    /// the child is modal. Hand-rolled painting here is presentation-only
+    /// folding, never query membership (AGENTS.md).
+    fn paint_parent_list(
+        frame: &mut ratatui::Frame<'_>,
+        parent: &crate::dialog_layout::DialogGeometry,
+        bookmarks: &[Bookmark],
+        dialog: &BookmarkState,
+        provider: &dyn crate::provider::RowProvider,
+        theme: crate::theme::Theme,
+        ascii: bool,
+    ) {
+        use crate::dialog_layout::plan_list;
+        let styles = DialogStyles::new(theme);
+        let inner = parent.body.viewport;
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        // Parent message/help/actions are still painted by the caller? No:
+        // the background shows the list only; the child's second scrim dims
+        // the whole parent frame including its sticky tail, so paint the list
+        // pane plus the parent message/help/actions bands as dimmed context?
+        // To keep the background legible but clearly inactive, paint only the
+        // list pane here; the frame title/border already marks the parent.
+        // Message/help/actions bands are left to the scrimmed parent frame
+        // background (blank dimmed rows), which is what a stacked child shows:
+        // the parent's chrome stays visible as a frame, not as live controls.
+        let count = format!("{} of {BOOKMARK_CAPACITY}", bookmarks.len());
+        let count_w = u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0);
+        let total_rows = bookmarks.len().saturating_mul(2);
+        let selected_logical = (!bookmarks.is_empty()).then(|| {
+            dialog
+                .selected
+                .min(bookmarks.len().saturating_sub(1))
+                .saturating_mul(2)
+        });
+        let list = plan_list(inner, count_w, total_rows, selected_logical, 0);
+        if list.heading.height > 0 {
+            frame.render_widget(
+                Paragraph::new("Bookmarks").style(styles.label.add_modifier(Modifier::BOLD)),
+                list.heading,
+            );
+            if list.count.width > 0 {
+                frame.render_widget(Paragraph::new(count).style(styles.description), list.count);
+            }
+        }
+        if bookmarks.is_empty() {
+            if list.viewport.height > 0 {
+                frame.render_widget(
+                    Paragraph::new(truncated(
+                        "No bookmarks in this view yet",
+                        usize::from(list.viewport.width),
+                    ))
+                    .style(styles.description),
+                    Rect::new(
+                        list.viewport.x,
+                        list.viewport.y,
+                        list.viewport.width,
+                        1.min(list.viewport.height),
+                    ),
+                );
+            }
+            return;
+        }
+        for (offset, row_rect) in list.row_rects.iter().enumerate() {
+            let logical = list.first_row.saturating_add(offset);
+            let index = logical / 2;
+            let is_first = logical % 2 == 0;
+            let Some(bookmark) = bookmarks.get(index) else {
+                continue;
+            };
+            let focused = index == dialog.selected;
+            if is_first {
+                let record = provider.row_by_id(&dialog.view_id, &bookmark.id);
+                let marker = if focused {
+                    if ascii { "> " } else { "› " }
+                } else {
+                    "  "
+                };
+                let id = format!("{marker}#{}", bookmark.id.sequence);
+                let id_width = (BOOKMARK_ID_WIDTH + 2).min(row_rect.width);
+                frame.render_widget(
+                    Paragraph::new(truncated(&id, usize::from(id_width))).style(if focused {
+                        styles.selection
+                    } else {
+                        styles.label
+                    }),
+                    Rect::new(row_rect.x, row_rect.y, id_width, 1),
+                );
+                let time_x = row_rect
+                    .x
+                    .saturating_add(id_width)
+                    .saturating_add(FIELD_GUTTER);
+                let time = record.as_ref().map_or_else(String::new, |row| {
+                    row.timestamp
+                        .split('.')
+                        .next()
+                        .unwrap_or(&row.timestamp)
+                        .rsplit('T')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned()
+                });
+                if time_x < row_rect.right() {
+                    let time_width =
+                        BOOKMARK_TIME_WIDTH.min(row_rect.right().saturating_sub(time_x));
+                    frame.render_widget(
+                        Paragraph::new(truncated(&time, usize::from(time_width)))
+                            .style(styles.description),
+                        Rect::new(time_x, row_rect.y, time_width, 1),
+                    );
+                    let text_x = time_x
+                        .saturating_add(time_width)
+                        .saturating_add(FIELD_GUTTER);
+                    if text_x < row_rect.right() {
+                        let text = record.as_ref().map_or_else(
+                            || "record is no longer loaded".to_owned(),
+                            |row| row.text.clone(),
+                        );
+                        frame.render_widget(
+                            Paragraph::new(truncated(
+                                &text,
+                                usize::from(row_rect.right().saturating_sub(text_x)),
+                            ))
+                            .style(styles.description),
+                            Rect::new(
+                                text_x,
+                                row_rect.y,
+                                row_rect.right().saturating_sub(text_x),
+                                1,
+                            ),
+                        );
+                    }
+                }
+            } else {
+                let note_x = row_rect
+                    .x
+                    .saturating_add(BOOKMARK_ID_WIDTH + 2)
+                    .saturating_add(FIELD_GUTTER);
+                let empty = bookmark.note.is_empty();
+                if note_x < row_rect.right() {
+                    frame.render_widget(
+                        Paragraph::new(truncated(
+                            if empty { "no note" } else { &bookmark.note },
+                            usize::from(row_rect.right().saturating_sub(note_x)),
+                        ))
+                        .style(if empty {
+                            styles.unavailable
+                        } else {
+                            styles.description
+                        }),
+                        Rect::new(
+                            note_x,
+                            row_rect.y,
+                            row_rect.right().saturating_sub(note_x),
+                            1,
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some(bar) = list.scrollbar {
+            render_scrollbar(
+                frame,
+                bar,
+                list.first_row,
+                total_rows.saturating_sub(list.row_rects.len()),
+                theme,
+                ascii,
+            );
+        }
+    }
 }
 
 /// §8.9/§8.10: the row of bookmark actions, in drawn order. `Edit note` and
@@ -473,6 +648,39 @@ fn bookmark_actions() -> [(&'static str, BookmarkDialogControl); 4] {
         ("Raw context", BookmarkDialogControl::Context),
         ("&Remove", BookmarkDialogControl::Delete),
     ]
+}
+
+/// Stable LongContent budgets: outer size is policy-only, never bookmark
+/// counts or note length. Header 0, body minimum 3, message 1 stable, help 2
+/// stable maxima, actions from the stable 4-verb row so empty/populated share
+/// one frame and sticky tail.
+fn bookmarks_spec_for(area: Rect) -> DialogSpec {
+    let labels = ["Go to", "&Edit note", "Raw context", "&Remove"];
+    let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let action_rows = stable_action_rows(estimate, &labels).clamp(1, 2);
+    DialogSpec::new(PresentationKind::LongContent, 0, 3, 1, 2, action_rows)
+}
+
+/// Stable child budgets for the Note editor (class S, one field): outer size
+/// is policy-only, never draft length. Header 0, body minimum 1, message 1,
+/// help from the stable note sentence, actions 1 (Save).
+fn note_spec_for(area: Rect) -> DialogSpec {
+    const NOTE_HELP: &str = "Notes are capped at 1024 bytes and saved with the view.";
+    let (policy_w, _) = crate::dialog_layout::policy_size(
+        area,
+        PresentationKind::Contextual(ContextFootprint::Prompt),
+    );
+    let estimate = policy_w.saturating_sub(4).max(1);
+    let help = help_rows(NOTE_HELP, estimate).clamp(1, 2);
+    DialogSpec::new(
+        PresentationKind::Contextual(ContextFootprint::Prompt),
+        0,
+        1,
+        1,
+        help,
+        1,
+    )
 }
 
 impl Component for BookmarksDialog {
@@ -587,7 +795,6 @@ impl Component for BookmarksDialog {
         use BookmarkDialogControl as C;
         let theme = ctx.theme;
         let provider = ctx.provider;
-        use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
         let styles = DialogStyles::new(theme);
         let ascii = ctx.ascii;
         let cursor = self.note_caret();
@@ -603,43 +810,110 @@ impl Component for BookmarksDialog {
             .iter()
             .find(|view| view.id == dialog.view_id)
             .map_or_else(|| "this view".to_owned(), |view| view.name.clone());
-        let width = content_width(area, DialogClass::M);
 
-        // §12.10: editing a note is its own small dialog, named for the record it
-        // belongs to, so the list behind it is not competing for attention.
+        // §12.10 child: the Note editor is a shared child presentation. In a
+        // roomy viewport the parent list stays visible behind the child with a
+        // second scrim pass; in compact the child reuses the parent frame with
+        // a breadcrumb title. Escape returns child→Bookmarks→base; save
+        // semantics are unchanged. Go to/Raw context behavior stays as-is.
         if let Some(editing) = dialog.editing.clone() {
-            // The child is class S, so it measures at the S content width; using
-            // the list's width would under-count the help and clip it.
-            let width = content_width(area, DialogClass::S);
+            let parent_spec = bookmarks_spec_for(area);
+            let parent_labels = ["Go to", "&Edit note", "Raw context", "&Remove"];
+            let Ok(parent_geometry) = crate::dialog_layout::resolve_dialog(
+                area,
+                &parent_spec,
+                1,
+                &parent_labels,
+                Some(0),
+                None,
+            ) else {
+                return self.record(
+                    rows_hit,
+                    controls_hit,
+                    Surface {
+                        popup: Rect::default(),
+                        interior: Rect::default(),
+                        caret: None,
+                        scrollable: false,
+                        text_focus: dialog.control == C::Input,
+                    },
+                );
+            };
+            let compact = crate::dialog_layout::is_compact(area);
+            // Parent background in roomy viewports only: the frame stays
+            // visible behind the child with an inactive border, exactly as a
+            // stacked child dims its parent once more than the base (§10).
+            if !compact {
+                let parent_title = format!("Bookmarks · {view_name}");
+                render_responsive_frame(frame, &parent_geometry, &parent_title, false, theme);
+                // Paint the parent list behind the child for context; no
+                // hitboxes are recorded for it while the child is modal.
+                Self::paint_parent_list(
+                    frame,
+                    &parent_geometry,
+                    &bookmarks,
+                    &dialog,
+                    provider,
+                    theme,
+                    ascii,
+                );
+                // Second scrim pass over the parent before the child, as §10.
+                crate::dialog_layout::scrim(frame.buffer_mut(), area, theme);
+            }
+            let child_spec = note_spec_for(area);
+            let child_labels = ["Save note"];
+            let Ok(mut child_geometry) = crate::dialog_layout::resolve_dialog(
+                area,
+                &child_spec,
+                1,
+                &child_labels,
+                Some(0),
+                None,
+            ) else {
+                return self.record(
+                    rows_hit,
+                    controls_hit,
+                    Surface {
+                        popup: Rect::default(),
+                        interior: Rect::default(),
+                        caret: None,
+                        scrollable: false,
+                        text_focus: dialog.control == C::Input,
+                    },
+                );
+            };
+            // Child has one verb; overflow cannot happen at covered sizes.
+            // Compact child uses the parent frame; the breadcrumb keeps context.
+            if compact {
+                child_geometry.frame = parent_geometry.frame;
+                child_geometry.interior = parent_geometry.interior;
+                child_geometry.content = parent_geometry.content;
+            }
+            let title = format!("Bookmarks › Note for #{}", editing.sequence);
+            // When compact reuses the parent frame, paint the child frame over
+            // it with the active border; otherwise paint the resolved child
+            // frame centred over the dimmed parent.
+            render_responsive_frame(frame, &child_geometry, &title, ctx.active, theme);
             let help = "Notes are capped at 1024 bytes and saved with the view.";
             let (state, sentence) = if dialog.status.is_empty() {
                 (MessageState::Ready, String::new())
             } else {
                 (MessageState::Applied, dialog.status.clone())
             };
-            let action_labels = ["Save note"];
-            let content = DialogContent {
-                header: 0,
-                body: 1,
-                message: message_rows(&sentence, width).max(1),
-                help: help_rows(help, width),
-                actions: packed_button_rows(width, &action_labels),
-            };
-            let title = format!("Bookmarks › Note for #{}", editing.sequence);
-            let regions =
-                dialog_frame_regions(frame, area, DialogClass::S, &title, &content, theme);
             let mut surface = Surface {
-                popup: regions.popup,
-                interior: regions.interior,
+                popup: child_geometry.frontmost,
+                interior: child_geometry.interior,
                 caret: None,
-                scrollable: true,
+                scrollable: false,
                 // The note form takes text; the list behind it does not (§1).
                 text_focus: dialog.control == C::Input,
             };
-            if regions.body.height > 0 {
+            // Child body is one reserved field row from the shared geometry.
+            let body = child_geometry.body.viewport;
+            if body.width > 0 && body.height > 0 {
                 let (input, caret) = render_form_field(
                     frame,
-                    Rect::new(regions.body.x, regions.body.y, regions.body.width, 1),
+                    Rect::new(body.x, body.y, body.width, 1.min(body.height)),
                     BOOKMARK_LABEL_WIDTH,
                     "Note",
                     &dialog.draft,
@@ -651,16 +925,38 @@ impl Component for BookmarksDialog {
                 surface.caret = caret;
                 controls_hit.push((input, C::Input));
             }
-            render_message(frame, regions.message, state, &sentence, theme, ascii);
-            render_help_text(frame, regions.help, help, theme);
-            let controls = [C::Save];
-            let focused = controls
-                .iter()
-                .position(|control| *control == dialog.control);
-            for (index, rect) in
-                render_action_row(frame, regions.actions, &action_labels, focused, &[], theme)
-            {
-                controls_hit.push((rect, controls[index]));
+            render_message(
+                frame,
+                child_geometry.message,
+                state,
+                &sentence,
+                theme,
+                ascii,
+            );
+            render_help_text(frame, child_geometry.help, help, theme);
+            for (index, rect) in child_geometry.actions.buttons.iter() {
+                let control = [C::Save][*index];
+                crate::dialog_controls::render_role_button(
+                    frame,
+                    *rect,
+                    child_labels[*index],
+                    if child_geometry.actions.default == Some(*index) {
+                        ButtonRole::Default
+                    } else {
+                        ButtonRole::Normal
+                    },
+                    dialog.control == control,
+                    theme,
+                );
+                controls_hit.push((*rect, control));
+            }
+            // Surface popup stays the child frontmost for modal containment.
+            surface.popup = child_geometry.frontmost;
+            if compact {
+                // Compact reuses the parent frame: keep the union for
+                // containment so the breadcrumb frame is the modal bound.
+                surface.popup = parent_geometry.frame.union(child_geometry.frontmost);
+                surface.interior = child_geometry.interior;
             }
             return self.record(rows_hit, controls_hit, surface);
         }
@@ -688,183 +984,231 @@ impl Component for BookmarksDialog {
         }
         let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
 
-        // Each bookmark is two rows: the record, then its note.
-        let row_pairs = bookmarks.len().clamp(1, 8);
-        let content = DialogContent {
-            header: 0,
-            body: u16::try_from(row_pairs * 2 + 1).unwrap_or(u16::MAX),
-            message: message_rows(&sentence, width).max(1),
-            help: help_rows(help, width),
-            actions: packed_button_rows(width, &action_labels),
+        // Responsive frame: LongContent policy plus stable budgets only. Each
+        // bookmark is two logical rows (record, note); the body owns surplus
+        // via the shared list pane. Short/long bookmark counts share one frame
+        // and sticky tail.
+        let spec = bookmarks_spec_for(area);
+        let Ok(geometry) =
+            crate::dialog_layout::resolve_dialog(area, &spec, 1, &action_labels, Some(0), None)
+        else {
+            // Below the 20x6 floor the existing tiny fallback owns the frame;
+            // stay open with nothing drawn, as the palette does.
+            return self.record(
+                rows_hit,
+                controls_hit,
+                Surface {
+                    popup: Rect::default(),
+                    interior: Rect::default(),
+                    caret: None,
+                    scrollable: false,
+                    text_focus: false,
+                },
+            );
         };
+        // One geometry authority for paint/mouse: visible buttons come from the
+        // shared plan. Overflow (only the floor) stays keyboard-reachable via
+        // mnemonics; a More menu is follow-up work.
         let title = format!("Bookmarks · {view_name}");
-        let regions = dialog_frame_regions(frame, area, DialogClass::M, &title, &content, theme);
+        render_responsive_frame(frame, &geometry, &title, ctx.active, theme);
         let surface = Surface {
-            popup: regions.popup,
-            interior: regions.interior,
+            popup: geometry.frontmost,
+            interior: geometry.interior,
             caret: None,
             scrollable: true,
             text_focus: false,
         };
-        let inner = regions.body;
+        let inner = geometry.body.viewport;
         if inner.width == 0 || inner.height == 0 {
             return self.record(rows_hit, controls_hit, surface);
         }
         let count = format!("{} of {BOOKMARK_CAPACITY}", bookmarks.len());
-        let rects = pane(
-            inner,
-            u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
-            bookmarks.len() * 2,
-        );
-        if rects.heading.height > 0 {
+        let count_w = u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0);
+        // One authoritative list plan over 2*len logical rows (record, note).
+        // The same rects drive paint, selection, scrollbar and mouse.
+        let total_rows = bookmarks.len().saturating_mul(2);
+        let selected_logical = (!bookmarks.is_empty()).then(|| {
+            dialog
+                .selected
+                .min(bookmarks.len().saturating_sub(1))
+                .saturating_mul(2)
+        });
+        let list = plan_list(inner, count_w, total_rows, selected_logical, 0);
+        if list.heading.height > 0 {
             frame.render_widget(
                 Paragraph::new("Bookmarks").style(styles.label.add_modifier(Modifier::BOLD)),
-                rects.heading,
+                list.heading,
             );
-            if rects.count.width > 0 {
-                frame.render_widget(Paragraph::new(count).style(styles.description), rects.count);
+            if list.count.width > 0 {
+                frame.render_widget(Paragraph::new(count).style(styles.description), list.count);
             }
         }
-        let visible_pairs = usize::from(rects.viewport.height / 2).max(1);
-        let first = dialog
-            .selected
-            .saturating_add(1)
-            .saturating_sub(visible_pairs);
         if bookmarks.is_empty() {
-            if rects.viewport.height > 0 {
+            if list.viewport.height > 0 {
                 frame.render_widget(
                     Paragraph::new(truncated(
                         "No bookmarks in this view yet",
-                        usize::from(rects.viewport.width),
+                        usize::from(list.viewport.width),
                     ))
                     .style(styles.description),
-                    Rect::new(rects.viewport.x, rects.viewport.y, rects.viewport.width, 1),
+                    Rect::new(
+                        list.viewport.x,
+                        list.viewport.y,
+                        list.viewport.width,
+                        1.min(list.viewport.height),
+                    ),
                 );
             }
         } else {
-            for (offset, (index, bookmark)) in bookmarks
-                .iter()
-                .enumerate()
-                .skip(first)
-                .take(visible_pairs)
-                .enumerate()
-            {
-                let y = rects.viewport.y.saturating_add((offset * 2) as u16);
-                if y >= rects.viewport.bottom() {
-                    break;
-                }
-                let focused = index == dialog.selected;
-                let row = Rect::new(rects.viewport.x, y, rects.viewport.width, 1);
-                let record = provider.row_by_id(&dialog.view_id, &bookmark.id);
-                let marker = if focused {
-                    if ascii { "> " } else { "› " }
-                } else {
-                    "  "
+            for (offset, row_rect) in list.row_rects.iter().enumerate() {
+                let logical = list.first_row.saturating_add(offset);
+                let index = logical / 2;
+                let is_first = logical % 2 == 0;
+                let Some(bookmark) = bookmarks.get(index) else {
+                    continue;
                 };
-                let id = format!("{marker}#{}", bookmark.id.sequence);
-                let id_width = (BOOKMARK_ID_WIDTH + 2).min(row.width);
-                frame.render_widget(
-                    Paragraph::new(truncated(&id, usize::from(id_width))).style(if focused {
-                        styles.selection
+                let focused = index == dialog.selected;
+                if is_first {
+                    let record = provider.row_by_id(&dialog.view_id, &bookmark.id);
+                    let marker = if focused {
+                        if ascii { "> " } else { "› " }
                     } else {
-                        styles.label
-                    }),
-                    Rect::new(row.x, y, id_width, 1),
-                );
-                let time_x = row.x.saturating_add(id_width).saturating_add(FIELD_GUTTER);
-                let time = record.as_ref().map_or_else(String::new, |row| {
-                    // The seconds-resolution clock is what the log column shows.
-                    row.timestamp
-                        .split('.')
-                        .next()
-                        .unwrap_or(&row.timestamp)
-                        .rsplit('T')
-                        .next()
-                        .unwrap_or_default()
-                        .to_owned()
-                });
-                if time_x < row.right() {
-                    let time_width = BOOKMARK_TIME_WIDTH.min(row.right().saturating_sub(time_x));
+                        "  "
+                    };
+                    let id = format!("{marker}#{}", bookmark.id.sequence);
+                    let id_width = (BOOKMARK_ID_WIDTH + 2).min(row_rect.width);
                     frame.render_widget(
-                        Paragraph::new(truncated(&time, usize::from(time_width)))
-                            .style(styles.description),
-                        Rect::new(time_x, y, time_width, 1),
+                        Paragraph::new(truncated(&id, usize::from(id_width))).style(if focused {
+                            styles.selection
+                        } else {
+                            styles.label
+                        }),
+                        Rect::new(row_rect.x, row_rect.y, id_width, 1),
                     );
-                    let text_x = time_x
-                        .saturating_add(time_width)
+                    let time_x = row_rect
+                        .x
+                        .saturating_add(id_width)
                         .saturating_add(FIELD_GUTTER);
-                    if text_x < row.right() {
-                        let text = record.as_ref().map_or_else(
-                            || "record is no longer loaded".to_owned(),
-                            |row| row.text.clone(),
+                    let time = record.as_ref().map_or_else(String::new, |row| {
+                        // The seconds-resolution clock is what the log column shows.
+                        row.timestamp
+                            .split('.')
+                            .next()
+                            .unwrap_or(&row.timestamp)
+                            .rsplit('T')
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned()
+                    });
+                    if time_x < row_rect.right() {
+                        let time_width =
+                            BOOKMARK_TIME_WIDTH.min(row_rect.right().saturating_sub(time_x));
+                        frame.render_widget(
+                            Paragraph::new(truncated(&time, usize::from(time_width)))
+                                .style(styles.description),
+                            Rect::new(time_x, row_rect.y, time_width, 1),
                         );
+                        let text_x = time_x
+                            .saturating_add(time_width)
+                            .saturating_add(FIELD_GUTTER);
+                        if text_x < row_rect.right() {
+                            let text = record.as_ref().map_or_else(
+                                || "record is no longer loaded".to_owned(),
+                                |row| row.text.clone(),
+                            );
+                            frame.render_widget(
+                                Paragraph::new(truncated(
+                                    &text,
+                                    usize::from(row_rect.right().saturating_sub(text_x)),
+                                ))
+                                .style(styles.description),
+                                Rect::new(
+                                    text_x,
+                                    row_rect.y,
+                                    row_rect.right().saturating_sub(text_x),
+                                    1,
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    // §12.10: the note is the second line, muted only when absent —
+                    // "no note" is not information, the note itself is.
+                    let note_x = row_rect
+                        .x
+                        .saturating_add(BOOKMARK_ID_WIDTH + 2)
+                        .saturating_add(FIELD_GUTTER);
+                    let empty = bookmark.note.is_empty();
+                    if note_x < row_rect.right() {
                         frame.render_widget(
                             Paragraph::new(truncated(
-                                &text,
-                                usize::from(row.right().saturating_sub(text_x)),
+                                if empty { "no note" } else { &bookmark.note },
+                                usize::from(row_rect.right().saturating_sub(note_x)),
                             ))
-                            .style(styles.description),
-                            Rect::new(text_x, y, row.right().saturating_sub(text_x), 1),
+                            .style(if empty {
+                                styles.unavailable
+                            } else {
+                                styles.description
+                            }),
+                            Rect::new(
+                                note_x,
+                                row_rect.y,
+                                row_rect.right().saturating_sub(note_x),
+                                1,
+                            ),
+                        );
+                    } else {
+                        frame.render_widget(
+                            Paragraph::new(truncated(
+                                if empty { "no note" } else { &bookmark.note },
+                                usize::from(row_rect.width),
+                            ))
+                            .style(if empty {
+                                styles.unavailable
+                            } else {
+                                styles.description
+                            }),
+                            *row_rect,
                         );
                     }
                 }
-                // §12.10: the note is the second line, muted only when absent —
-                // "no note" is not information, the note itself is.
-                let note_y = y.saturating_add(1);
-                if note_y < rects.viewport.bottom() {
-                    let note_x = row.x.saturating_add(id_width).saturating_add(FIELD_GUTTER);
-                    let empty = bookmark.note.is_empty();
-                    frame.render_widget(
-                        Paragraph::new(truncated(
-                            if empty { "no note" } else { &bookmark.note },
-                            usize::from(row.right().saturating_sub(note_x)),
-                        ))
-                        .style(if empty {
-                            styles.unavailable
-                        } else {
-                            styles.description
-                        }),
-                        Rect::new(note_x, note_y, row.right().saturating_sub(note_x), 1),
-                    );
-                }
-                // The whole two-line block is the row's hitbox, so clicking a note
-                // selects the bookmark it belongs to.
-                rows_hit.push((
-                    Rect::new(
-                        row.x,
-                        y,
-                        row.width,
-                        2.min(rects.viewport.bottom().saturating_sub(y)),
-                    ),
-                    index,
-                ));
+                // Each logical line selects the bookmark it belongs to, so
+                // clicking a note selects its record, as the 2-line block did.
+                rows_hit.push((*row_rect, index));
             }
         }
-        if let Some(bar) = rects.scrollbar {
+        if let Some(bar) = list.scrollbar {
             render_scrollbar(
                 frame,
                 bar,
-                first * 2,
-                (bookmarks.len() * 2).saturating_sub(usize::from(rects.viewport.height)),
+                list.first_row,
+                total_rows.saturating_sub(list.row_rects.len()),
                 theme,
                 ascii,
             );
         }
-        render_message(frame, regions.message, state, &sentence, theme, ascii);
-        render_help_text(frame, regions.help, help, theme);
+        render_message(frame, geometry.message, state, &sentence, theme, ascii);
+        render_help_text(frame, geometry.help, help, theme);
         let focused = actions
             .iter()
             .position(|(_, control)| *control == dialog.control);
-        for (index, rect) in render_action_row(
-            frame,
-            regions.actions,
-            &action_labels,
-            focused,
-            // Removing a bookmark is the destructive one.
-            &[3],
-            theme,
-        ) {
-            controls_hit.push((rect, actions[index].1));
+        for (index, rect) in geometry.actions.buttons.iter() {
+            let control = actions[*index].1;
+            crate::dialog_controls::render_role_button(
+                frame,
+                *rect,
+                actions[*index].0,
+                if geometry.actions.default == Some(*index) {
+                    ButtonRole::Default
+                } else if *index == 3 {
+                    ButtonRole::Destructive
+                } else {
+                    ButtonRole::Normal
+                },
+                focused == Some(*index),
+                theme,
+            );
+            controls_hit.push((*rect, control));
         }
         self.record(rows_hit, controls_hit, surface)
     }

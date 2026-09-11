@@ -297,7 +297,8 @@ fn correlate_replaces_fields_with_the_shared_key_union_carrying_the_frozen_recor
     key(&mut app, &provider, KeyCode::Down);
     key(&mut app, &provider, KeyCode::Char(' '));
     let ready = screen(&draw(&provider, &mut app, 100, 30));
-    assert!(ready.contains("filtered by the selected enriched key"));
+    assert!(ready.contains("2 of 2 views selected"), "{ready}");
+    assert!(ready.contains("filtered by the"), "{ready}");
     key(&mut app, &provider, KeyCode::Enter);
     let requests = app.layers.union.take_requests();
     let [lvu::UnionDialogRequest::Create { shared_key, .. }] = requests.as_slice() else {
@@ -330,4 +331,108 @@ fn the_list_scrolls_only_far_enough_to_keep_the_selection_visible() {
     draw(&provider, &mut app, 80, 12);
     assert_eq!(app.view_state().unwrap().field_picker_selected, 0);
     assert_eq!(app.layers.fields.top(), 0);
+}
+
+#[test]
+fn responsive_frame_is_policy_stable_for_inspector() {
+    use lvu::dialog_layout::{ContextFootprint, PresentationKind, policy_size};
+
+    // 80x24 and 54x16 share one Contextual Inspector frame per size; moving
+    // the selection (which changes the Value heading) never moves the frame.
+    // The Value pane stays beside/below with its sample note.
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        let (provider, mut app) = opened();
+        let buffer = draw(&provider, &mut app, width, height);
+        let rendered = screen(&buffer);
+        assert!(rendered.contains("Fields"), "{rendered}");
+        assert!(rendered.contains("Pin"), "{rendered}");
+        // Value pane heading and sample note from the shared geometry.
+        assert!(rendered.contains("Value"), "{rendered}");
+        assert!(
+            rendered.contains("first ") || rendered.contains("all "),
+            "{rendered}"
+        );
+        let surface = app.layers.fields.surface();
+        let (want_w, want_h) = policy_size(
+            ratatui::layout::Rect::new(0, 0, width, height),
+            PresentationKind::Contextual(ContextFootprint::Inspector),
+        );
+        assert_eq!(
+            (surface.popup.width, surface.popup.height),
+            (want_w, want_h),
+            "{width}x{height} frame must be policy"
+        );
+        let frame = surface.popup;
+        // Moving the selection changes the Value heading, not the frame.
+        key(&mut app, &provider, KeyCode::Down);
+        key(&mut app, &provider, KeyCode::Down);
+        let after = screen(&draw(&provider, &mut app, width, height));
+        assert!(after.contains("Fields"), "{after}");
+        assert_eq!(
+            app.layers.fields.surface().popup,
+            frame,
+            "{width}x{height} frame must not move with selection"
+        );
+    }
+
+    // Below the floor the tiny fallback owns the frame.
+    let (provider, mut app) = opened();
+    let tiny = screen(&draw(&provider, &mut app, 19, 5));
+    assert!(tiny.contains("terminal too small"), "{tiny}");
+}
+
+#[test]
+fn tree_scroll_reveals_with_matching_mouse_and_scrollbar() {
+    // At 80x24 the Inspector body shows one tree row; moving Down scrolls the
+    // shared viewport, the highlighted row stays visibly selected, and a click
+    // on the visible row selects it (same rects for paint and mouse).
+    let (provider, mut app) = opened();
+    let buffer = draw(&provider, &mut app, 80, 24);
+    let rendered = screen(&buffer);
+    assert!(rendered.contains("Fields"), "{rendered}");
+    // Two flat fields share one visible tree row at 80x24; moving Down
+    // scrolls the shared viewport (top follows the selection).
+    let count = lvu::components::fields::anchored_row(&app.views, &provider)
+        .unwrap()
+        .fields
+        .len();
+    assert!(count >= 2, "fixture needs two fields to scroll");
+    key(&mut app, &provider, KeyCode::Down);
+    let scrolled = draw(&provider, &mut app, 80, 24);
+    let scrolled_text = screen(&scrolled);
+    assert!(scrolled_text.contains("Fields"), "{scrolled_text}");
+    assert!(
+        app.layers.fields.top() > 0,
+        "shared viewport must have scrolled"
+    );
+    // Highlighted row is visibly selected.
+    let selected_bg = Theme::TERMINAL.selection_bg;
+    let selected = app.view_state().unwrap().field_picker_selected;
+    let rows = app.layers.fields.row_rects().to_vec();
+    assert!(!rows.is_empty());
+    assert!(rows.iter().any(|(_, index)| *index == selected));
+    assert!(
+        rows.iter().any(|(rect, index)| *index == selected
+            && (0..rect.height).any(|dy| {
+                let y = rect.y + dy;
+                (rect.x..rect.right()).any(|x| scrolled[(x, y)].bg == selected_bg)
+            })),
+        "highlighted row is not visibly selected"
+    );
+    // Clicking the visible row selects it (same rects for paint and mouse).
+    let (rect, index) = rows[0];
+    click(&mut app, &provider, (rect.x, rect.y));
+    assert_eq!(app.view_state().unwrap().field_picker_selected, index);
+    assert_eq!(
+        app.view_state().unwrap().field_picker_control,
+        FieldPickerControl::List
+    );
+
+    // Same at compact 54x16: frame is policy, list still scrolls.
+    let (provider, mut app) = opened();
+    let buffer = draw(&provider, &mut app, 54, 16);
+    assert!(screen(&buffer).contains("Fields"));
+    key(&mut app, &provider, KeyCode::Down);
+    draw(&provider, &mut app, 54, 16);
+    assert!(app.layers.fields.top() > 0);
 }
