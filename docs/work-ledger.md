@@ -3329,3 +3329,13 @@ editor and recipe export in `v018-exact-failed4-rerun.log`, palette in
 `v018-storage-story-final.log`. Storage's existing byte assertions—not a
 simultaneous visibility assertion—prove raw journal and investigation exports
 survive derived cleanup. A successor exact commit/run remains required.
+
+Exact successor `7841502`, tree `70e244a`, passed the same workspace, Clippy,
+bridge and binary-build phases; its PTY matrix improved to 81/82, including the
+complete end-to-end suite and all four prior failures. The sole new failure was
+Details colouring opening during the initial `pending` refresh, when no record
+was yet selected. The story now requires a stable settled view before selecting
+the comparison row; its focused rerun passes in
+`primary-sol-scratch/v018-details-colouring-final2.log`. Failed exact evidence
+is preserved under `lvu-v018-7841502-final-acceptance/`; no `accepted.json` was
+created, and a successor exact run remains required.

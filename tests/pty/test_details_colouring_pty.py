@@ -12,6 +12,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import time
 
 from test_lvu_pty import PtyApp
 from test_enrichment_chain_pty import close_details, stop
@@ -86,7 +87,17 @@ def run(binary):
         arguments = [str(source), "--capture-dir", str(root / "capture")]
         app = PtyApp(binary, arguments, width=80, height=24, environment=environment)
         try:
-            app.wait_for("r-43")
+            app.wait_until(
+                lambda text: "r-43" in text and "pending" not in text,
+                "settled rows before selecting Details",
+                timeout=10.0,
+            )
+            time.sleep(0.5)
+            app.wait_until(
+                lambda text: "r-43" in text and "pending" not in text,
+                "stable settled rows before selecting Details",
+                timeout=10.0,
+            )
             # The cursor sits on the first record, so the second one renders in
             # the log in its own colours rather than in the selection highlight.
             app.send(b"g")
