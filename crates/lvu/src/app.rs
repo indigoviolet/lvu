@@ -7013,20 +7013,21 @@ impl App {
             Outcome::Ignored | Outcome::Consumed => {}
             Outcome::Close => self.pop_layer(),
             Outcome::Replace(open) => {
-                // Phase B: `Replace` retains the held anchor across the
-                // pop/push pair. A plain pop would clear it when the stack
-                // empties and the push would recapture from hit regions that
-                // may have moved; save and restore instead so the original
-                // frozen row survives.
+                // Phase B: `Replace` preserves the held anchor exactly across
+                // the pop/push pair — including None. A plain pop would clear
+                // it when the stack empties and the push would recapture; a
+                // resize may have invalidated the anchor, and recapturing from
+                // stale pre-resize hit regions with no intervening redraw
+                // would silently serve old geometry once the next component
+                // wave consumes `RenderCtx::context_anchor`. Save and restore
+                // unconditionally instead.
                 let held = self.shell.context_anchor;
                 self.layers.stack.pop();
                 if self.layers.stack.is_empty() {
                     self.focus = self.layer_return_focus;
                 }
                 self.push_layer(open, provider);
-                if held.is_some() {
-                    self.shell.context_anchor = held;
-                }
+                self.shell.context_anchor = held;
             }
             Outcome::OpenChild(open) => self.push_layer(open, provider),
             Outcome::Legacy(action) => {
@@ -7367,10 +7368,19 @@ impl App {
     /// that are not on top. `pop_layer` is the top-of-stack case.
     fn close_layer(&mut self, id: LayerId) {
         self.layers.stack.retain(|open| *open != id);
-        if self.layers.stack.is_empty() && self.focus == Focus::Layer {
-            self.focus = self.layer_return_focus;
-            // Phase B: same clearing as `pop_layer` when the stack empties.
+        if self.layers.stack.is_empty() {
+            // Phase B: the stack returned to base, so the frozen opening-row
+            // anchor no longer names anything on screen. Clear regardless of
+            // focus: async completions (Source success, discovery, agent
+            // launch) select the new view — Focus::Logs — before closing the
+            // layer, and a focus-gated clear would leak the stale anchor into
+            // the next first-layer open, which retains a held anchor instead
+            // of capturing fresh. Base focus itself is still restored only
+            // when a layer held it.
             self.shell.context_anchor = None;
+            if self.focus == Focus::Layer {
+                self.focus = self.layer_return_focus;
+            }
         }
     }
 

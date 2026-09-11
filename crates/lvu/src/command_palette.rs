@@ -717,19 +717,21 @@ impl Palette {
             .unwrap_or(0)
             .min(14);
         let columns = palette_columns(list, name_width, shortcut_width);
-        // Row hitboxes and paint share the stored scroll viewport: project the
-        // logical display index (scroll + offset) through it, so an
-        // out-of-range row can never receive a hitbox.
-        let body_for_rows = self
-            .geometry
-            .as_ref()
-            .map(|geometry| geometry.body)
-            .unwrap_or_else(|| ScrollViewport::new(body_viewport, display_len, self.scroll));
+        // Single viewport authority: this render path stored the shared
+        // geometry above, so only that exact stored body issues row rects,
+        // for paint and hitboxes alike. No replacement ScrollViewport is
+        // synthesized here; an invalid projection paints nothing and creates
+        // no hitbox.
+        let Some(body_for_rows) = self.geometry.as_ref().map(|geometry| geometry.body) else {
+            // Unreachable: geometry was stored above before any list work.
+            // Paint nothing rather than invent rows from a second authority.
+            return;
+        };
         for (screen_row, entry) in visible_rows.iter().enumerate() {
             let display_index = self.scroll.saturating_add(screen_row);
-            let row = body_for_rows
-                .project_row(display_index)
-                .unwrap_or_else(|| Rect::new(list.x, list.y + screen_row as u16, list.width, 1));
+            let Some(row) = body_for_rows.project_row(display_index) else {
+                continue;
+            };
             let Some(result_index) = *entry else {
                 // The group heading: a §8.7 pane heading, not a row.
                 frame.render_widget(

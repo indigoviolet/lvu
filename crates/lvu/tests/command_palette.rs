@@ -1070,3 +1070,89 @@ fn palette_selection_cursor_and_hitboxes_share_the_returned_geometry() {
         "selection must consume the returned interior"
     );
 }
+
+#[test]
+fn out_of_window_rows_never_paint_or_hitbox() {
+    // Blank query: many matches and no unavailable heading, so display index
+    // == result index and every visible row is selectable. At 80x24 the list
+    // viewport holds far fewer rows than the catalog matches, giving real
+    // above/below boundary rows for this negative control.
+    let mut palette = open_logs();
+    assert!(
+        palette.unavailable_start().is_none(),
+        "blank query must list only what runs, or the heading math below is wrong"
+    );
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| palette.render(frame, frame.area()))
+        .unwrap();
+    let geometry = palette.geometry().expect("resolves").clone();
+    let total = geometry.body.content_rows;
+    let window = usize::from(geometry.body.viewport.height);
+    assert!(
+        total > window + 1,
+        "need overflow with rows on both boundaries: total {total}, window {window}"
+    );
+    // Every visible display row paints exactly one hitbox, and each hitbox is
+    // exactly its display index's projection from the stored body — the exact
+    // stored body this render used, not a re-derived viewport.
+    let visible = geometry.body.visible_range();
+    assert_eq!(
+        palette.hitboxes().len(),
+        visible.len(),
+        "visible rows without hitboxes, or hitboxes without rows"
+    );
+    for (rect, result) in palette.hitboxes() {
+        assert_eq!(
+            Some(*rect),
+            geometry.body.project_row(palette.display_index(*result)),
+            "hitbox for result {result} is not its stored-body projection"
+        );
+    }
+    // Boundary: past-the-end and extreme indices project to nothing...
+    assert_eq!(geometry.body.project_row(total), None);
+    assert_eq!(geometry.body.project_row(usize::MAX), None);
+    // ...and the tail has no hitbox while the head window is showing.
+    assert!(!visible.contains(&(total - 1)));
+    assert!(
+        !palette
+            .hitboxes()
+            .iter()
+            .any(|(_, result)| palette.display_index(*result) == total - 1),
+        "tail row hitboxed while scrolled out"
+    );
+    // Scroll to the bottom: the head leaves and the tail paints, all from the
+    // same stored body.
+    for _ in 0..total {
+        handle(&mut palette, press(KeyCode::Down));
+    }
+    terminal
+        .draw(|frame| palette.render(frame, frame.area()))
+        .unwrap();
+    let geometry = palette.geometry().expect("resolves").clone();
+    let visible = geometry.body.visible_range();
+    assert!(
+        visible.contains(&(total - 1)),
+        "tail not revealed: {visible:?}"
+    );
+    assert!(!visible.contains(&0), "head still visible: {visible:?}");
+    assert!(
+        !palette
+            .hitboxes()
+            .iter()
+            .any(|(_, result)| palette.display_index(*result) == 0),
+        "head row hitboxed while scrolled out"
+    );
+    assert_eq!(
+        palette.hitboxes().len(),
+        visible.len(),
+        "visible rows without hitboxes, or hitboxes without rows"
+    );
+    for (rect, result) in palette.hitboxes() {
+        assert_eq!(
+            Some(*rect),
+            geometry.body.project_row(palette.display_index(*result)),
+            "hitbox for result {result} is not its stored-body projection"
+        );
+    }
+}

@@ -3002,6 +3002,164 @@ fn anchor_does_not_chase_live_row_movement_and_survives_child_and_replace() {
 }
 
 #[test]
+fn async_source_success_clears_the_last_layer_anchor_despite_logs_focus() {
+    // Production HOLD path: an async Source success selects the new view
+    // (Focus::Logs) *before* closing the Source layer, so `close_layer`
+    // empties the stack while focus is Logs, not Layer. The anchor must still
+    // clear; otherwise the stale value leaks into the next first-layer open,
+    // which retains a held anchor instead of capturing fresh.
+    let (provider, mut app) = demo();
+    let theme = Theme::TERMINAL;
+    draw(&provider, &mut app, 100, 20, theme);
+    app.handle(Action::Top, &provider);
+    draw(&provider, &mut app, 100, 20, theme);
+    // Open Source as the first layer from the base screen: captures the
+    // painted Top row.
+    app.handle(Action::Open(Open::Source), &provider);
+    let stale = app
+        .shell
+        .context_anchor
+        .expect("anchor captured on Source open");
+    assert!(
+        !stale.row.is_empty(),
+        "Top row must be painted for a real held anchor: {stale:?}"
+    );
+    // Drive the real async-success path with a request matching the dialog's
+    // submitted draft, selecting the existing "all" view.
+    let request = {
+        let state = app.layers.source.state();
+        lvu::app::SourceLaunchRequest {
+            kind: state.kind,
+            text: state.draft.clone(),
+        }
+    };
+    app.source_request_succeeded(&request, "all");
+    assert!(app.layers.stack.is_empty(), "Source layer closed");
+    assert_eq!(
+        app.focus,
+        lvu::Focus::Logs,
+        "select_view moves focus before the close; the close must not touch it"
+    );
+    assert_eq!(
+        app.shell.context_anchor, None,
+        "last-layer close must clear even with Logs focus"
+    );
+    // No leak into the next session: move the selection, reopen from base,
+    // and capture fresh geometry rather than retaining the stale anchor.
+    draw(&provider, &mut app, 100, 20, theme);
+    app.handle(Action::End, &provider);
+    draw(&provider, &mut app, 100, 20, theme);
+    let (log_now, rows_now) = base_geometry(&app);
+    let log_now = log_now.expect("base log viewport");
+    let selected = selected_index(&provider, &app).expect("live End selection");
+    let row_now = rows_now
+        .iter()
+        .find(|(_, index)| *index == selected)
+        .map(|(rect, _)| *rect)
+        .expect("End row painted");
+    app.handle(Action::Open(Open::Search), &provider);
+    let fresh = app
+        .shell
+        .context_anchor
+        .expect("fresh capture on next first open");
+    assert_ne!(fresh, stale, "stale anchor leaked into the next session");
+    assert_eq!(
+        fresh.log, log_now,
+        "fresh anchor carries the current log viewport"
+    );
+    assert_eq!(
+        fresh.row, row_now,
+        "fresh anchor carries the painted End row"
+    );
+}
+
+#[test]
+fn replace_after_resize_preserves_invalidation_without_render() {
+    // Replace-after-resize hole: resize invalidates the anchor to None, but a
+    // Replace whose push runs before the next redraw would recapture from
+    // stale pre-resize hit regions. `apply_outcome` must preserve the held
+    // Option exactly — including None — because the next component wave
+    // consumes `RenderCtx::context_anchor`.
+    let (provider, mut app) = demo();
+    let theme = Theme::TERMINAL;
+    draw(&provider, &mut app, 100, 20, theme);
+    app.handle(Action::Top, &provider);
+    draw(&provider, &mut app, 100, 20, theme);
+    // ViewSummary as the single first layer: nonempty anchor from the base.
+    // (Single depth matters: Replace pops to empty, which is exactly when a
+    // push would recapture. From depth two the pop never empties, so that
+    // shape cannot exercise this hole.)
+    app.handle(Action::Open(Open::ViewSummary), &provider);
+    assert_eq!(app.layers.stack.len(), 1);
+    let first = app.shell.context_anchor.expect("anchor captured");
+    assert!(!first.row.is_empty(), "Top row painted: {first:?}");
+    let log_before = base_geometry(&app).0.expect("base log viewport");
+    // Resize with NO intervening render: shell size moves on, hit regions go
+    // stale by construction, and the anchor invalidates.
+    app.handle(Action::Resize(80, 24), &provider);
+    assert_eq!(app.shell.size, (80, 24));
+    assert_eq!(app.shell.context_anchor, None, "resize must invalidate");
+    assert_eq!(
+        base_geometry(&app).0,
+        Some(log_before),
+        "no redraw has run: hit regions are still pre-resize"
+    );
+    // Real Replace while stale: ViewSummary Enter replaces the single layer
+    // with its owner. The pop empties the stack, so the push would recapture
+    // from the stale pre-resize hit regions; preservation must keep None.
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))),
+        &provider,
+    );
+    assert_eq!(app.layers.stack.len(), 1, "Replace swaps the single layer");
+    assert_eq!(app.focus, lvu::Focus::Layer);
+    assert_eq!(
+        app.shell.context_anchor, None,
+        "Replace must preserve invalidated None, not recapture stale geometry"
+    );
+    // Stack returns to base; a fresh post-resize render plus first open
+    // captures new-size geometry.
+    for _ in 0..4 {
+        app.handle(
+            Action::Raw(RawEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))),
+            &provider,
+        );
+        if app.layers.stack.is_empty() {
+            break;
+        }
+    }
+    assert!(app.layers.stack.is_empty(), "stack returned to base");
+    draw(&provider, &mut app, 80, 24, theme);
+    app.handle(Action::Top, &provider);
+    draw(&provider, &mut app, 80, 24, theme);
+    let (log_now, rows_now) = base_geometry(&app);
+    let log_now = log_now.expect("post-resize log viewport");
+    assert_ne!(log_now, log_before, "post-resize geometry must differ");
+    app.handle(Action::Open(Open::Search), &provider);
+    let fresh = app.shell.context_anchor.expect("fresh post-resize capture");
+    assert_eq!(
+        fresh.log, log_now,
+        "fresh anchor carries the current log viewport"
+    );
+    assert!(!fresh.row.is_empty(), "Top row painted at the new size");
+    let selected = selected_index(&provider, &app).expect("selection");
+    assert_eq!(
+        rows_now
+            .iter()
+            .find(|(_, index)| *index == selected)
+            .map(|(rect, _)| *rect),
+        Some(fresh.row),
+        "fresh anchor carries the painted Top row"
+    );
+}
+
+#[test]
 fn anchor_invalidates_on_resize_and_captures_compact_logs() {
     let (provider, mut app) = demo();
     let theme = Theme::TERMINAL;
