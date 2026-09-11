@@ -1133,65 +1133,70 @@ async fn recover_union_commit(
             );
         }
         let remaining = deadline - now;
-        let attempt = remaining.min(UNION_COMMIT_ATTEMPT_TIMEOUT);
-        // Deadline discipline: the outer bound is the remaining absolute
-        // deadline (covering the client-mutex wait plus the RPC) while the
-        // inner attempt stays min(10s, remaining). On every nonfinal
-        // attempt the outer bound is strictly greater, so a timeout is
-        // always the inner recoverable one: it records the attempt stale
-        // and releases the exchange before reporting, which keeps late
-        // replies drainable and the connection reusable. An outer win
-        // would instead cancel the exchange mid-flight — no stale record,
-        // `in_flight` stuck — and the next exchange would retire on the
-        // shifted stream; that failure mode was measured as a full-deadline
-        // spin, so the bounds must never coincide before the deadline.
-        // Only the final attempt can meet the outer bound, and there
-        // cancellation is terminal: the deadline error returns at once
-        // with no recovery following it.
-        let commit = tokio::time::timeout(remaining, async {
-            let mut client = client.lock().await;
-            client
-                .request_union_commit(window_id, &request, attempt)
-                .await
-        })
-        .await;
-        match commit {
-            Ok(Ok(receipt)) => {
-                if receipt.worker_session != expected_session
-                    || receipt.union_view_id != request.union_view_id
-                    || receipt.candidate_generation != request.candidate_generation
-                    || receipt.nonce != request.nonce
-                    || receipt.digest != request.digest
-                {
-                    // A receipt that does not bind this attempt is worker
-                    // confusion, not a slow answer: no status poll from the
-                    // same peer could be trusted either, so this fails the
-                    // submission loudly rather than adopting or re-deriving.
-                    return Err(
-                        "union commit receipt does not bind this attempt; failing closed".into(),
-                    );
-                }
-                match receipt.outcome {
-                    lvu_shared::union_commit::CommitOutcome::Pending => {
-                        // Admitted and verifying: fall through to status
-                        // recovery, which observes settlement with the same
-                        // identity.
-                    }
-                    _ => return Ok(receipt),
-                }
-            }
-            // Inner ambiguity (transport fault or recoverable attempt
-            // timeout): delivery is ambiguous (the worker may still settle
-            // late), so recover by status instead of claiming anything.
-            Ok(Err(_)) => {}
-            // Outer elapsed: the absolute deadline passed mid-attempt, so
-            // this is terminal — no status poll follows a dead deadline.
+        // Deadline discipline: only the client-lock acquisition is
+        // bounded by the remaining absolute deadline. Cancelling there is
+        // harmless (nothing was sent, no exchange opened). Once the lock
+        // is held the remaining time is recomputed; zero returns the
+        // terminal deadline error BEFORE sending, so the exchange never
+        // opens past the deadline. The request then runs under its own
+        // inner attempt bound (min(10s, recomputed remaining)) with no
+        // outer timer around it: the recoverable exchange always performs
+        // its stale bookkeeping and releases `in_flight` before reporting,
+        // which keeps late replies drainable and the connection reusable.
+        // Cancelling an in-progress request instead would skip exactly
+        // that bookkeeping — the next exchange would retire on the
+        // shifted stream and recovery would spin to the deadline (the
+        // measured 40s failure) — so no request future is ever cancelled
+        // between setting and clearing it. After it returns, the loop
+        // re-checks the absolute deadline: one total deadline modulo
+        // scheduler completion.
+        let mut locked = match tokio::time::timeout(remaining, client.lock()).await {
+            Ok(client) => client,
             Err(_) => {
                 return Err(
                     "remote union commit exceeded its deadline without a terminal receipt".into(),
                 );
             }
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                "remote union commit exceeded its deadline without a terminal receipt".into(),
+            );
         }
+        let attempt = remaining.min(UNION_COMMIT_ATTEMPT_TIMEOUT);
+        let commit = locked
+            .request_union_commit(window_id, &request, attempt)
+            .await;
+        drop(locked);
+        if let Ok(receipt) = commit {
+            if receipt.worker_session != expected_session
+                || receipt.union_view_id != request.union_view_id
+                || receipt.candidate_generation != request.candidate_generation
+                || receipt.nonce != request.nonce
+                || receipt.digest != request.digest
+            {
+                // A receipt that does not bind this attempt is worker
+                // confusion, not a slow answer: no status poll from the
+                // same peer could be trusted either, so this fails the
+                // submission loudly rather than adopting or re-deriving.
+                return Err(
+                    "union commit receipt does not bind this attempt; failing closed".into(),
+                );
+            }
+            if !matches!(
+                receipt.outcome,
+                lvu_shared::union_commit::CommitOutcome::Pending
+            ) {
+                return Ok(receipt);
+            }
+            // Admitted and verifying: fall through to status recovery,
+            // which observes settlement with the same identity.
+        }
+        // Inner ambiguity (transport fault or recoverable attempt timeout)
+        // falls through here: delivery is ambiguous (the worker may still
+        // settle late), so recover by status instead of claiming anything.
+        // The exchange already cleaned up under its own bound above.
         // Ambiguous delivery (or an admitted-but-unsettled attempt):
         // recover by status instead of claiming anything.
         match recover_union_status(client, window_id, &request, deadline).await {
@@ -1237,33 +1242,40 @@ async fn recover_union_status(
             return UnionStatusOutcome::Deadline;
         }
         let remaining = deadline - now;
+        // Same discipline as the commit path: only the lock acquisition
+        // is bounded by the remaining deadline; after it the remaining
+        // time is recomputed, zero returns Deadline before sending, and
+        // the poll runs under its own inner bound with no outer timer
+        // around it, so its stale bookkeeping always completes.
+        let mut locked = match tokio::time::timeout(remaining, client.lock()).await {
+            Ok(client) => client,
+            Err(_) => return UnionStatusOutcome::Deadline,
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return UnionStatusOutcome::Deadline;
+        }
         let attempt = remaining.min(UNION_STATUS_ATTEMPT_TIMEOUT);
-        // Same deadline discipline as the commit path: the outer bound is
-        // the remaining absolute deadline while the inner poll stays
-        // min(10s, remaining), so a timeout is always the inner
-        // recoverable one — stale bookkeeping runs, late replies stay
-        // drainable — and only a dead deadline ends the wait.
-        let status = tokio::time::timeout(remaining, async {
-            let mut client = client.lock().await;
-            client
-                .request_union_status(
-                    window_id,
-                    &request.union_view_id,
-                    request.candidate_generation,
-                    &request.nonce,
-                    &request.digest,
-                    attempt,
-                )
-                .await
-        })
-        .await;
+        let status = locked
+            .request_union_status(
+                window_id,
+                &request.union_view_id,
+                request.candidate_generation,
+                &request.nonce,
+                &request.digest,
+                attempt,
+            )
+            .await;
+        drop(locked);
         match status {
-            Ok(Ok(UnionCommitStatus::Settled(outcome))) => {
+            Ok(UnionCommitStatus::Settled(outcome)) => {
                 return UnionStatusOutcome::Settled(outcome);
             }
-            Ok(Ok(UnionCommitStatus::Unknown)) => return UnionStatusOutcome::Unknown,
-            Ok(Ok(UnionCommitStatus::Pending)) => {}
-            Ok(Err(_)) | Err(_) => {}
+            Ok(UnionCommitStatus::Unknown) => return UnionStatusOutcome::Unknown,
+            Ok(UnionCommitStatus::Pending) => {}
+            // Inner ambiguity only: no outer timer exists here, so this
+            // is always a cleaned-up exchange, never a cancellation.
+            Err(_) => {}
         }
         let wait = UNION_STATUS_POLL_INTERVAL.min(deadline.saturating_duration_since(now));
         if !wait.is_zero() {
@@ -2830,16 +2842,16 @@ mod tests {
 
     /// Repeated timeouts keep the connection usable: against a peer that
     /// drops every frame, each attempt must time out through the INNER
-    /// recoverable bound — never through an outer cancellation racing it
-    /// at the same instant. An outer win would cancel the exchange
-    /// mid-flight (no stale record, `in_flight` stuck), retire the client
-    /// on its next use, and spin the recovery loop on instant failures
-    /// until the absolute deadline: the measured 40s full-deadline spin.
-    /// So after the deadline error the client must still serve: a direct
-    /// status poll reports a fresh ambiguity, never retirement or a stuck
-    /// exchange. Exactly one commit goes out (only `Unknown` replays, and
-    /// no reply ever arrives to say it); the status polls partition the
-    /// rest of the single absolute deadline.
+    /// recoverable bound — no outer timer may cancel an in-progress
+    /// exchange, or its bookkeeping is skipped (`in_flight` stuck, no
+    /// stale record) and the next exchange retires on the shifted stream,
+    /// spinning recovery to the deadline (the measured 40s failure).
+    /// After the deadline error the peer starts answering, and a full
+    /// status exchange on the SAME client must succeed: anything less —
+    /// retirement, a stuck exchange, a shifted reply — proves a
+    /// cancellation poisoned it. Exactly one commit goes out (only
+    /// `Unknown` replays, and no reply ever arrives to say it); the
+    /// status polls partition the single absolute deadline.
     #[tokio::test]
     async fn union_transport_repeated_timeouts_leave_client_usable() {
         let root = tempfile::tempdir().unwrap();
@@ -2849,6 +2861,15 @@ mod tests {
         let socket = root.path().join("control.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let (peer, seen) = ScriptedPeer::new();
+        // Time-gated peer: drops everything for the first 26s (past the
+        // 25s submission deadline below), then answers status. The
+        // submission therefore meets total silence; the post-deadline
+        // probe below meets a live peer. The 26s threshold sits strictly
+        // after every submission frame (all sent before its 25s deadline)
+        // and strictly before the probe (sent 2s after the submission
+        // ends, which is itself at or past 25s), so scheduling slop
+        // cannot move a frame across it.
+        let switched = std::time::Instant::now();
         tokio::spawn(peer.serve(listener, move |kind, id| match kind {
             "hello" => Some(lvu_shared::WorkerEvent::Welcome {
                 request_id: id.into(),
@@ -2857,7 +2878,14 @@ mod tests {
                 worker_session: "session-u".into(),
                 sources: Vec::new(),
             }),
-            // Every frame is dropped: commit and status alike.
+            "union_status" if switched.elapsed() >= Duration::from_secs(26) => Some(
+                lvu_shared::WorkerEvent::Store(lvu_shared::StoreEvent::UnionStatus {
+                    request_id: id.into(),
+                    status: lvu_shared::protocol::UnionCommitStatus::Settled(
+                        lvu_shared::union_commit::CommitOutcome::Committed { current: vec![] },
+                    ),
+                }),
+            ),
             _ => None,
         }));
         let (client, _) = WorkerClient::connect(root.path(), &socket, "window-u", 6216)
@@ -2891,11 +2919,16 @@ mod tests {
             elapsed < Duration::from_secs(35),
             "nothing may run past the deadline plus scheduling slack: {elapsed:?}"
         );
-        // The discriminator: every timeout above was inner, so the shared
-        // connection is still healthy. A direct poll reports a NEW
-        // ambiguity with stale bookkeeping — retirement or a stuck
-        // in-flight flag would prove an outer cancellation poisoned it.
-        let probe = {
+        // The discriminator, strengthened: after the deadline error, wait
+        // past the peer's answer threshold and run a FULL status exchange
+        // on the same client. Success proves every timed-out attempt
+        // cleaned up after itself; retirement, a stuck in-flight flag, or
+        // a shifted reply would prove an outer cancellation poisoned it.
+        // The 2s wait lands the probe strictly after the 26s threshold:
+        // the submission ends at or past its 25s deadline, so the probe
+        // goes out at 27s or later however the host scheduled the wait.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let status = {
             let mut client = store.client.lock().await;
             client
                 .request_union_status(
@@ -2904,18 +2937,19 @@ mod tests {
                     11,
                     "nonce-11",
                     &[0xB7; lvu_shared::union_commit::COMMIT_DIGEST_BYTES],
-                    Duration::from_secs(2),
+                    Duration::from_secs(10),
                 )
                 .await
         };
-        let error = probe.expect_err("dropped poll must stay ambiguous");
+        let status = status.expect("post-deadline exchange must fully succeed");
         assert!(
-            error.contains("status poll"),
-            "post-deadline poll must take the recoverable path: {error}"
-        );
-        assert!(
-            !error.contains("retired") && !error.contains("never completed"),
-            "no outer cancellation may have poisoned the connection: {error}"
+            matches!(
+                status,
+                lvu_shared::protocol::UnionCommitStatus::Settled(
+                    lvu_shared::union_commit::CommitOutcome::Committed { .. }
+                )
+            ),
+            "same-client exchange after deadline expiry must settle: {status:?}"
         );
         let seen = seen.lock().expect("seen poisoned");
         assert_eq!(
