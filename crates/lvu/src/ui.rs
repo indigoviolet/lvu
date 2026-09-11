@@ -2822,6 +2822,45 @@ pub(crate) fn dialog_frame_regions(
     crate::dialog_layout::regions(popup, content)
 }
 
+/// Phase A responsive frame renderer (foundation only, no component switched).
+///
+/// Draws `geometry.frame` with the shared padded [`Block`] so geometry and
+/// paint share one definition: bordered, titled, padded per viewport via
+/// `dialog_layout::frame_block`. Clearing uses the dialog surface so the
+/// scrimmed workspace never shows through.
+#[allow(dead_code)]
+pub(crate) fn render_responsive_frame(
+    frame: &mut Frame<'_>,
+    geometry: &crate::dialog_layout::DialogGeometry,
+    title: &str,
+    active: bool,
+    theme: Theme,
+) {
+    let colour = if active {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    clear_themed(frame, geometry.frame, theme);
+    let compact = crate::dialog_layout::is_compact(frame.area());
+    frame.render_widget(
+        crate::dialog_layout::frame_block(compact)
+            .title(Span::styled(
+                format!(" {title} "),
+                Style::default().fg(colour).add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(colour)),
+        geometry.frame,
+    );
+}
+
+/// Display-width truncation shared by responsive lists and anchored popups.
+/// Delegates to the layout core so paint and geometry clip identically.
+#[allow(dead_code)]
+pub(crate) fn responsive_truncate(text: &str, max_width: usize) -> String {
+    crate::dialog_layout::truncate_cell(text, max_width)
+}
+
 fn dialog_body(popup: Rect) -> Rect {
     dialog_body_with_footer(popup, 1)
 }
