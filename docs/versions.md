@@ -4,22 +4,21 @@ lvu has one publication scheme: annotated `vX.Y.Z` tags and matching GitHub
 releases. There is no separate preview channel or preview numbering. Every
 version must agree with `crates/lvu-app/Cargo.toml` and `Cargo.lock`.
 
-Current version: **[v0.1.6](https://github.com/indigoviolet/lvu/releases/tag/v0.1.6)**,
-published 2026-09-10 at 05:44:57 UTC from `697865e`. All four native archives
-passed release CI. The local installation is the official x86_64 Linux musl
-archive, SHA-256 `efc28fe5a2046d98997a9e9531761719dec0df579d7d78674422282f96baad59`.
-Its bundled resources and eleven actual terminal suites passed acceptance outside
-the checkout, including ordinary, shared-key and colour union coverage;
-`versions/latest` points to `v0.1.6`. What each version shipped is recorded in
-[CHANGELOG.md](../CHANGELOG.md).
+Current version: **[v0.1.8](https://github.com/indigoviolet/lvu/releases/tag/v0.1.8)**,
+published 2026-09-11 at 12:47:41 UTC from `bb114fa`. Release CI built and
+executed the three supported native archives. The local installation is the
+official x86_64 Linux musl archive, SHA-256
+`f3c0a20755adcce7751caf7a40dc15d4406a1fd1f0ff6a18d0982d01e9be58cd`;
+its installed binary is `777cb9b5960f5d3721db557af1e40f6103da27da0aa9ee7fd7b855c06cfdd284`.
+Bundled helper/bridge execution and sixteen actual terminal suites passed
+outside the checkout; `versions/latest` points to `v0.1.8`.
 
-Exact-source acceptance passed 1510 Rust tests (7 ignored), clippy, 105 bridge
-tests and all 80 PTY suites. Live unions, enrichment shared keys and exact-value
-colour classification are published, including creation-time key pinning and
-persistent manual pin changes. Shared background capture remains unreleased.
-The volume-backed full soak remains unaccepted: cold-query latency,
-autosave-flush shutdown and the broader 512 MB viewport investigation remain
-unresolved and long-running validation is paused.
+Exact-source acceptance passed the full Rust workspace, all-target Clippy, 105
+bridge tests, all 82 PTY suites and ten source-bound shared-capture/remote-union
+proofs. Human Apple-silicon macOS and arm64 Linux terminal acceptance remains
+unverified. The volume-backed full soak, cold-query latency and slow-storage
+autosave investigations remain paused and unaccepted. What each version shipped
+is recorded in [CHANGELOG.md](../CHANGELOG.md).
 
 See the [release runbook](release-runbook.md) for validation, archive publication,
 Homebrew updates and installation checks. Archives contain the application,

@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.6**. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.8**. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -19,27 +19,19 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 | **Paused** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. Existing fixes and evidence are preserved; long-running validation is paused. |
 | **Paused** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no causal explanation or full performance acceptance is claimed. |
 
-## Active parallel assignments
+## Active work
 
-Supervisor handover refreshed 2026-09-10. These are implementation assignments,
-not claims of integrated or published behavior. Completed cleanup reports 69.8 GiB free; bounded validation can resume under
-the shared lock after checking the 6 GiB free-space gate.
+Published v0.1.8 removed the shared-capture and responsive-dialog delivery rows
+from this list. Remaining entries are unresolved follow-up work, not release
+holds.
 
 | Status | Work |
 | --- | --- |
 | **Open** | Prevent build-output accumulation: implement explicit retirement for completed worktree/release targets while preserving named investigation binaries and proof. Cleanup is complete: lvu-build fell from 85.7 to 19.8 GiB, with 69.8 GiB volume free and a running 3 GiB compiler cache. Ordinary janitor omits release/integration names and retires existing worktrees only by `main` containment; current integration uses a separate branch. |
 | **Open** | Optionally retain and display a bookmark's originating view. Bookmarks are deliberately source-scoped today, so the durable record identity and note survive across views but no origin-view metadata is stored; adding it needs a separate compatible schema/product decision. |
-| **Working** | Automatic shared capture: final controller `60648d2` and restore fix `1e32fdb` are integrated through primary `5fddf2e`. Same-cache windows share one worker/journal, per-window derived indexes avoid writer-lock contention, session writes have one worker owner, and sequential reopen preserves exact records with no replay. Focused combined tests and app Clippy pass; only complete exact candidate verification remains before release. |
-| **Working** | Shared-worker admission and failure tracking are integrated in the final controller ancestry. Schema/path validation precedes deduplication; failed save/recipe outcomes remain authoritative through Flush. Their former standalone holds are resolved, but complete workspace/PTY acceptance still belongs to the final candidate. |
-| **Working** | Remote-union commit is integrated through `60648d2`: sorted progress guards pin attestation through settlement, actual framed worker commit/status/foreign paths pass, and the application preserves original identity across lost/delayed replies under one absolute deadline without cancelling a client exchange mid-cleanup. Final release proof must rerun every stage on the combined binary. |
-| **Working** | Two-window acceptance now includes checked-in draining sequential close/append/reopen coverage (`77018fc`) with settled exact bytes, journal-prefix extension, socket/worker cleanup and no replay. It is integrated and focused-green; complete exact candidate verification remains. |
-| **Working** | Responsive dialogs: the exhaustive audit, View segmented header, shared geometry/action core, shell/context anchors, palette and every planned component group are integrated. Self-contained workspaces use the viewport; contextual editors retain their frozen log anchor; rendering, scrolling, cursors, selection and mouse share geometry. The combined release test remains pending, so this is integrated rather than published behavior. |
-| **Open** | Apple-silicon macOS human terminal acceptance: run the v0.1.6 checklist in Terminal.app and iTerm2. Automated arm64 installed-resource, kernel-PTY and process-cleanup evidence exists; human acceptance remains outstanding. Linux arm64 also lacks human interactive acceptance. Intel Macs and Windows are unsupported and are not acceptance targets. |
+| **Open** | Apple-silicon macOS human terminal acceptance: run the v0.1.8 checklist in Terminal.app and iTerm2. The v0.1.8 archive built and executed on native CI; human acceptance remains outstanding. Linux arm64 also lacks human interactive acceptance. Intel Macs and Windows are unsupported and are not acceptance targets. |
 
 ## Ready for the next release
 
-| Status | Work |
-| --- | --- |
-| **Ready** | CLI help points to `/` → `Alt-A` for Advanced filtering (`4ccb1a9`). The v0.1.6 macOS checklist refresh is integrated (`b287894`); the checklist itself has not been executed. |
-| **Ready** | Release/validation workflows and default formula renderer target Linux x86_64/arm64 and Apple-silicon macOS only. Intel formula rendering is available solely through an explicit historical option. Six local fixture checks pass; no hosted run or new release is claimed. |
-| **Ready** | View operations New blank, Clone, Rename and Sources are modes in one segmented header; Apply / Apply membership is the sole action and filled default. Keyboard, mouse, narrow-layout and actual named-view PTY coverage are integrated. |
+None. The accepted shared-capture, responsive-dialog, View-mode and release
+workflow work shipped in v0.1.8.

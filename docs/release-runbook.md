@@ -12,12 +12,10 @@ Homebrew renderer require this three-target set. Historical four-archive
 releases remain immutable; `--with-intel-darwin` is available only when
 re-rendering a historical formula.
 
-**State: `v0.1.6` is the latest published release, with four historical
-archives. `v0.1.7` is an immutable draft with a known restore defect and must
-never be published, retagged or have its assets replaced.** The corrective next
-release is `v0.1.8` and uses three targets. Steps 1–4 retain `v0.1.0` command
-examples; substitute the new version when following
-[step 5](#5-cutting-the-next-version).
+**State: `v0.1.8` is the latest published release, with the supported
+three-archive target set. `v0.1.7` is an immutable draft with a known restore
+defect and must never be published, retagged or have its assets replaced.**
+Steps 1–4 retain `v0.1.0` command examples; substitute the version being cut.
 Do not recreate or move a published tag. Historical installation evidence is
 described in [distribution](distribution.md); local fixture checks of the
 three-target change are recorded in the [work ledger](work-ledger.md).
@@ -288,28 +286,28 @@ brew install uv node     # or: mise use -g uv node
 
 ## 5. Cutting the next version
 
-`v0.1.6` is published. `v0.1.7` remains an immutable unpublished draft because
-its restore defect was confirmed after archive creation. Use `0.1.8` for the
-next release only after its integrated features pass the checks above; never
-move or reuse the `v0.1.7` tag, and do not replace or publish its draft assets.
+`v0.1.8` is published. `v0.1.7` remains an immutable unpublished draft because
+its restore defect was confirmed after archive creation. The next release must
+use a new normal `vX.Y.Z` number; never move or reuse `v0.1.7` or `v0.1.8`, and
+do not replace or publish the v0.1.7 draft assets.
 
-The next release requires verified Linux x86_64, Linux arm64 and Apple-silicon
+Every next release requires verified Linux x86_64, Linux arm64 and Apple-silicon
 macOS archives and checksums. Intel Darwin is excluded. Run
 `mise exec -- bash packaging/homebrew/tests/test-render-formula.sh` when changing
 formula generation; local fixtures do not replace actual archive acceptance.
 
 ```sh
 git status --short --branch # use the reviewed integration/release checkout
-# bump `version` in crates/lvu-app/Cargo.toml to 0.1.8
+# bump `version` in crates/lvu-app/Cargo.toml to the next unused version
 mise exec -- cargo update -p lvu-app --offline    # refresh Cargo.lock
 # Any build or `cargo check` refreshes it just as well. The point is only that
 # Cargo.lock must record the new version before you commit, or the release
 # build fails on --locked.
-git commit -am "lvu 0.1.8"
+git commit -am "lvu X.Y.Z"
 git push
 ```
 
-Then repeat steps 1–4 with `0.1.8`. The tap formula is
+Then repeat steps 1–4 with that version. The tap formula is
 re-rendered from the new release's `SHA256SUMS` and overwrites the old one,
 because `render-formula.sh` writes the whole file.
 

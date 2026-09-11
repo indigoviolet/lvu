@@ -1,18 +1,22 @@
 # Installation and distribution
 
-Current release: **v0.1.6**, published from `697865e` with four historical
-native archives. Exact-source and installed Linux acceptance are recorded in
-the [work ledger](work-ledger.md). Supported platforms are Linux x86_64/arm64
-and Apple-silicon macOS; Intel Macs and Windows are unsupported. The working tree now uses a three-target release workflow and default
-formula renderer; this change awaits its first release. Existing
-release archives and their evidence remain immutable.
+Current release: **v0.1.8**, published from `bb114fa` with Linux x86_64/arm64
+and Apple-silicon macOS archives. Intel Macs and Windows are unsupported.
+Exact-source, CI archive, Homebrew, mise and installed Linux acceptance are
+recorded in the [work ledger](work-ledger.md). Existing release archives and
+their evidence remain immutable; v0.1.7 remains an unpublished immutable draft.
 
-The v0.1.1/v0.1.2 installation evidence below is historical; it is not a claim
-that those install routes were repeated for v0.1.6. See the
-[release runbook](release-runbook.md) for the publication procedure.
+The older installation evidence below is historical. See the
+[release runbook](release-runbook.md) for the current publication procedure.
 
 ## What is verified
 
+- **v0.1.8 source and installed runtime.** Exact acceptance passed the full Rust
+  workspace, Clippy, 105 bridge tests, 82 PTY suites and ten shared-capture and
+  remote-union proof stages. Release CI built and executed all three archives.
+  The official x86_64 archive passed checksum/resource/helper/bridge checks and
+  sixteen installed PTYs outside the checkout; pinned mise and Homebrew installs
+  both passed.
 - **v0.1.2 archives and installed runtime.** Release run `34303930416` built
   and executed all four archives. API digests, downloaded files and SHA256SUMS
   agree. The installed x86_64 Linux binary resolves both resources directly

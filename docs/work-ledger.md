@@ -3339,3 +3339,56 @@ the comparison row; its focused rerun passes in
 `primary-sol-scratch/v018-details-colouring-final2.log`. Failed exact evidence
 is preserved under `lvu-v018-7841502-final-acceptance/`; no `accepted.json` was
 created, and a successor exact run remains required.
+
+### v0.1.8 accepted, published and installed — 2026-09-11
+
+Exact source `bb114fa902d9e81040e60d5158e2a6242f0d3edb`, tree
+`90f30b1264ed398f7935f0d47fd7d352cc80f3e8`, passed the complete immutable
+candidate run: locked Rust workspace, all-target Clippy, 105 bridge tests,
+82/82 actual PTY suites, real two-window shared capture, both sequential
+exact-ID/byte restart-no-replay probes, and all seven remote-union proof
+families. The accepted app/TUI binary hashes are `97311ff4919b…` and
+`fa2c67e8332a…`; the commands-log SHA-256 is `c4a45875d4c2…`.
+The exclusive record is
+`lvu-v018-bb114fa-final-acceptance/release-gate-bb114fa902d9-5b5c8e653e6a413ca33efb9d589e4fcc/accepted.json`.
+
+Annotated tag object `d8b280d298acb6646089d64b50e72e3cd40124d4`
+peels locally and remotely to that exact source. Release workflow `34599128103`
+completed successfully: native Linux x86_64, Linux arm64 and Apple-silicon
+macOS jobs each built, executed and uploaded their archive, and the publish job
+created the draft with SHA256SUMS. Primary downloaded all four assets and
+verified every checksum. Archive SHA-256 values are:
+
+- Apple-silicon macOS: `4e181c5636b3907ce293d3141e22dde022f9c16236cdf87333f25d3fb016777e`.
+- arm64 Linux musl: `3eba810b1516a1285be9d3f7493e9033bd9bab28e683db311aef66eece60fab5`.
+- x86_64 Linux musl: `f3c0a20755adcce7751caf7a40dc15d4406a1fd1f0ff6a18d0982d01e9be58cd`.
+
+The formula was rendered only from SHA256SUMS, omitted Intel macOS, and passed
+`brew style` plus strict name-based audit. Tap commit
+`0f320cda1e934baa9ded4c23fbf0be7f8d68fa36` was pushed before the release
+was undrafted. v0.1.8 became public/latest at 12:47:41 UTC with exactly the
+three archives plus SHA256SUMS. v0.1.7's tag, draft and assets were untouched.
+
+Pinned mise installation selected the official x86_64 musl asset and verified
+its checksum, GitHub attestations and SLSA provenance; help and both installed
+resources passed from `/tmp`. Homebrew upgraded 0.1.1 to 0.1.8, `brew test`
+passed, and direct installed help/resources passed. The staged official archive
+then compiled a real Polars helper expression, answered bridge capabilities and
+passed sixteen installed-binary PTYs from disposable external working
+directories, including shared capture/sequential reopen, unions/colour,
+responsive dialogs, bookmarks/context, Source control, folding and FOLLOW.
+Logs are `primary-sol-scratch/v018-mise-install.log`,
+`v018-homebrew-install.log`, `v018-staged-resources.log`,
+`v018-installed-pty.log`, `v018-installed-shared-capture-short-root.log` and
+`v018-released-launcher.log`.
+
+`versions/latest` now points to `v0.1.8`. Installed binary SHA-256 is
+`777cb9b5960f5d3721db557af1e40f6103da27da0aa9ee7fd7b855c06cfdd284`;
+the 1,006-entry tree manifest digest is
+`94572c1c0dcdd56419230070c943efc2c1eafc4a81e079aa4c73f1a76e0d0442`.
+Immutable local records are under `versions/records/v0.1.8*.json`. A privileged
+scan of 374 processes found no v0.1.6 references and no denied paths, so only
+the superseded `versions/v0.1.6` install was moved to trash (recoverable); its
+records remain. Human Apple-silicon macOS and arm64 Linux terminal acceptance,
+plus the paused volume/cold-query/slow-storage investigations, remain explicitly
+unverified rather than fabricated green.
