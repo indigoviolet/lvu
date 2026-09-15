@@ -1,22 +1,23 @@
 # Installation and distribution
 
-Current release: **v0.1.8**, published from `bb114fa` with Linux x86_64/arm64
+Current release: **v0.1.10**, published from `f822b9b` with Linux x86_64/arm64
 and Apple-silicon macOS archives. Intel Macs and Windows are unsupported.
 Exact-source, CI archive, Homebrew, mise and installed Linux acceptance are
 recorded in the [work ledger](work-ledger.md). Existing release archives and
-their evidence remain immutable; v0.1.7 remains an unpublished immutable draft.
+their evidence remain immutable; v0.1.7 remains an unpublished immutable draft,
+and v0.1.9 remains an immutable failed tag with no release or assets.
 
 The older installation evidence below is historical. See the
 [release runbook](release-runbook.md) for the current publication procedure.
 
 ## What is verified
 
-- **v0.1.8 source and installed runtime.** Exact acceptance passed the full Rust
-  workspace, Clippy, 105 bridge tests, 82 PTY suites and ten shared-capture and
+- **v0.1.10 source and installed runtime.** Exact acceptance passed the full Rust
+  workspace, Clippy, 110 bridge tests, 83 PTY suites and ten shared-capture and
   remote-union proof stages. Release CI built and executed all three archives.
   The official x86_64 archive passed checksum/resource/helper/bridge checks and
-  sixteen installed PTYs outside the checkout; pinned mise and Homebrew installs
-  both passed.
+  six focused installed PTYs outside the checkout; pinned mise (including
+  attestations/provenance) and Homebrew installs both passed.
 - **v0.1.2 archives and installed runtime.** Release run `34303930416` built
   and executed all four archives. API digests, downloaded files and SHA256SUMS
   agree. The installed x86_64 Linux binary resolves both resources directly

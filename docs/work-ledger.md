@@ -3596,3 +3596,45 @@ correctly rendered `Updating` rather than the asserted settled empty summary.
 The tests now wait for the existing final-row marker plus `raw view` readiness,
 and for `raw view` readiness, respectively. No product path or timeout changed; a fresh exact run remains
 required.
+
+### v0.1.10 accepted, published and installed — 2026-09-15
+
+Exact source `f822b9b6f7b89c0117d04191349aa3dd8b5de839`, tree
+`d6da89c978bc60aedd0409282babe20be72d70f1`, passed the clean immutable
+candidate run: locked workspace tests, all-target Clippy, 110 bridge tests,
+83/83 actual PTY suites, three shared-capture/restart PTYs and all seven
+remote-union proof families. Accepted app/TUI hashes are `5da572885796…` and
+`83638627bd2b…`; accepted record SHA-256 is
+`c8778e8d6f544c5d3a6abe198166889f111be35c50503b49bd1fb1a3302b7d55` at
+`lvu-v010-f822b9b-final-acceptance/release-gate-f822b9b6f7b8-46e248b9b0534a2f997477b7aa42aa82/accepted.json`.
+
+Annotated tag object `19081ed077d6bb7a49f39f8f06bad9f2c83a4f19`
+peels locally and remotely to that source. Release run `34997304486` built,
+executed and uploaded exactly Linux x86_64, Linux arm64 and Apple-silicon
+macOS; the draft contained those three archives plus SHA256SUMS, and every
+downloaded checksum matched. Archive SHA-256 values are Apple-silicon macOS
+`4cd01495698b286d45d3cdb707f880abb7204f82b6d1255f47bfb8187d578ca6`,
+arm64 Linux `1f214460f94a8f83292c1fdc1e67dcf0f1a408e82847e6c9319a4855addcc7ce`,
+and x86_64 Linux `1dba091c09422f6b9af73e344d46914d3fbda58a9ae0b3797440798e90587252`.
+The formula was rendered only from those sums, passed style and strict audit,
+and tap commit `fa80b8decc046dc5700587365a97b257b7918efd` was pushed before
+undrafting. The release became public at 17:02:59 UTC with release ID
+`389324496`. v0.1.7 and v0.1.9 remained untouched.
+
+Pinned mise installation verified checksum, GitHub attestations and SLSA
+provenance; Homebrew upgraded 0.1.8 to 0.1.10 and its formula test passed.
+The official x86_64 archive resolved both bundled resources, compiled a real
+Polars expression and reached the Paseo capabilities exchange. Six
+installed-binary PTYs passed from disposable external working directories:
+source/view deletion plus discovery, bridge diagnostics, two-window exact
+restart/no-replay, merged views, Fields and View Summary. Logs are
+`primary-sol-scratch/v010-{mise-install,homebrew-install,installed-helper-bridge,installed-pty}.log`.
+`versions/latest` points to v0.1.10; installed binary SHA-256 is
+`fdc4e60d40ea20deb8b3767487d74a95fdaebab54123b38a2d46146abf352f34`.
+Its 944-file checksum manifest digest is
+`63515c30124ae1e9da5b012948f3161f697b40e36b0f0e86cb76e0060bf1b92b`.
+No process referenced the superseded repository-local v0.1.8 install, so it
+was moved to the desktop trash and remains recoverable; small release records
+were retained. Human Apple-silicon macOS and arm64 Linux terminal acceptance,
+plus the paused volume/cold-query/slow-storage investigations, remain
+explicitly unverified.

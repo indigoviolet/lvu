@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.8**. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.10**. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -21,7 +21,7 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 
 ## Active work
 
-Published v0.1.8 removed the shared-capture and responsive-dialog delivery rows
+Published v0.1.10 removed the deletion, discovery and bridge-diagnostic delivery rows
 from this list. Remaining entries are unresolved follow-up work, not release
 holds.
 
@@ -29,17 +29,9 @@ holds.
 | --- | --- |
 | **Open** | Prevent build-output accumulation: implement explicit retirement for completed worktree/release targets while preserving named investigation binaries and proof. Cleanup is complete: lvu-build fell from 85.7 to 19.8 GiB, with 69.8 GiB volume free and a running 3 GiB compiler cache. Ordinary janitor omits release/integration names and retires existing worktrees only by `main` containment; current integration uses a separate branch. |
 | **Open** | Optionally retain and display a bookmark's originating view. Bookmarks are deliberately source-scoped today, so the durable record identity and note survive across views but no origin-view metadata is stored; adding it needs a separate compatible schema/product decision. |
-| **Open** | Apple-silicon macOS human terminal acceptance: run the v0.1.8 checklist in Terminal.app and iTerm2. The v0.1.8 archive built and executed on native CI; human acceptance remains outstanding. Linux arm64 also lacks human interactive acceptance. Intel Macs and Windows are unsupported and are not acceptance targets. |
+| **Open** | Apple-silicon macOS human terminal acceptance: run the v0.1.10 checklist in Terminal.app and iTerm2. The v0.1.10 archive built and executed on native CI; human acceptance remains outstanding. Linux arm64 also lacks human interactive acceptance. Intel Macs and Windows are unsupported and are not acceptance targets. |
 
 ## Ready for the next release
 
-- **Ready** — Delete derived views and remove sources from the workspace with
-  durable acknowledgement, dependency refusal and capture preservation.
-- **Ready** — Report every discovery category and run Docker discovery without
-  starvation; preserve daemon/socket failures as actionable diagnostics.
-- **Ready** — Distinguish owned assistance-route contention from Paseo daemon
-  connectivity failures, including exact lock-path recovery guidance.
-
-These changes are integrated for v0.1.10. They are not published until the exact
-candidate gate, immutable tag, three native archives, tap update and installed
-archive checks complete.
+None. The acknowledged deletion, explicit discovery/Docker and assistance
+diagnostic changes shipped in v0.1.10.

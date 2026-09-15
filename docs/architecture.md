@@ -1,19 +1,14 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.8` (2026-09-11) is the current public release. In addition to the earlier
-live unions, shared keys and enrichment-backed colours, it includes automatic
-shared capture across application windows, explicit restore safety and the
-responsive dialog system.
+`v0.1.10` (2026-09-15) is the current public release. In addition to live
+unions, shared keys, enrichment-backed colours, automatic shared capture and
+the responsive dialog system, it includes acknowledged view deletion,
+capture-preserving source removal, explicit concurrent discovery outcomes and
+distinct assistance route/daemon diagnostics.
 Releases use only the vX.Y.Z scheme.
 Historical build numbers below date when behavior arrived; they are not a separate
 release channel.
-
-Post-v0.1.8 integration for the v0.1.10 candidate adds acknowledged derived-view
-deletion, source removal that preserves capture data, concurrent Docker/process/
-project discovery with explicit category outcomes, and distinct owned-route vs
-daemon-unreachable assistance diagnostics. These are integrated, not yet
-published behavior until the v0.1.9 release completes.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
 open work, [contracts](contracts.md) for invariants, and [version notes](versions.md)
@@ -39,7 +34,7 @@ time authority. Startup installs the validated effective zone into Appearance.
 
 ## Component map
 
-Published v0.1.8 includes enrichment-based colour classification for
+Published v0.1.10 includes enrichment-based colour classification for
 ordinary views. The dialog selects an accepted output and an exact value;
 native Polars evaluates matching, using the same scalar text representation
 as displayed derived cells. Accepted output authority excludes raw namesakes
@@ -49,8 +44,8 @@ classifier fields, so older readers retain legacy rules but omit classifiers
 when saving. Union colour rules use the dedup-winning input's accepted output
 authority; unauthorized raw namesakes are excluded before typed concatenation.
 Focused terminal coverage verifies rule order, row colours and restart.
-Combined v0.1.8 release acceptance passed: the complete workspace, Clippy,
-bridge, 82 PTY suites, real two-window and sequential-reopen capture, and remote
+Combined v0.1.10 release acceptance passed: the complete workspace, Clippy,
+110 bridge tests, 83 PTY suites, real two-window and sequential-reopen capture, and remote
 union identity/deadline/atomic-settlement proofs are green. The three native
 archives were built and executed in release CI; human arm64 Linux and
 Apple-silicon terminal acceptance remains unverified.
