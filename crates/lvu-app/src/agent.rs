@@ -1554,18 +1554,19 @@ fn not_running_reason(status: &HostStatus) -> String {
 }
 
 /// Stable owned-route signal. `OWNED_ROOT_BUSY` is the structured marker new
-/// bridges emit; `bridge.lock` and `owned assistance` cover legacy bridges
-/// whose EEXIST message has neither the marker nor the word lease. Checked
-/// before any daemon test so a combined stderr containing both the generic
-/// `bridge connection failed` wrapper and an owned busy line is never
-/// reported as daemon unreachable.
+/// bridges emit; `bridge.lock`, `owned assistance root/route` and
+/// `assistance lease` cover legacy bridges whose EEXIST message has neither
+/// the marker nor the word lease. Checked before any daemon test so a combined
+/// stderr containing both the generic `bridge connection failed` wrapper and
+/// an owned busy line is never reported as daemon unreachable. The bare
+/// substring `lease` is deliberately absent: it matches unrelated words such
+/// as `please` and `released`.
 fn looks_like_owned_root_busy(text: &str) -> bool {
     text.contains("OWNED_ROOT_BUSY")
         || text.contains("bridge.lock")
         || text.contains("owned assistance root")
         || text.contains("owned assistance route")
         || text.contains("assistance lease")
-        || text.contains("lease")
 }
 
 /// Bounded extraction of the exact reported `bridge.lock` path for safe
@@ -1575,42 +1576,105 @@ fn looks_like_owned_root_busy(text: &str) -> bool {
 // presentation-only folding of an already-reported path (raw-bytes/stable
 // identity invariant): Polars cannot express it.
 fn owned_lock_path(text: &str) -> Option<String> {
-    // Prefer the last mention: the prose names `bridge.lock` first and the
-    // exact path (`.../bridge.lock`) last.
-    let end = text.rfind("bridge.lock")? + "bridge.lock".len();
-    // Prefer a quoted exact path so directories containing spaces survive.
-    for quote in ['"', '\'', '`'] {
-        if let Some(close) = text[end..].find(quote)
-            && let Some(open) = text[..end].rfind(quote)
-        {
-            let after = &text[end..end + close];
-            // Only treat as quoted when the quote closes the token promptly
-            // (trailing punctuation, not prose).
-            if after.len() <= 2
-                && after
-                    .chars()
-                    .all(|c| matches!(c, ';' | ',' | '.' | ':' | ' ' | '\n' | '\t'))
-            {
-                let quoted = text[open + 1..end].to_owned();
-                if quoted.ends_with("bridge.lock") && quoted.len() <= 1024 && quoted.contains('/') {
-                    return Some(quoted);
+    // The bridge emits one JSON-quoted exact path (`at "/tmp/My
+    // Logs/.../bridge.lock";`) amid bare prose mentions (`stale bridge.lock`,
+    // `that exact bridge.lock`). The exact path is the only quoted one, so
+    // find it by its closing quote rather than by position: prose mentions
+    // never end in `bridge.lock"`.
+    let mut offset = 0;
+    while let Some(rel) = text[offset..].find("bridge.lock\"") {
+        let end = offset + rel + "bridge.lock".len();
+        if let Some(open) = text[..end].rfind('"') {
+            let after = &text[end..end + 1];
+            if after == "\"" {
+                let token = &text[open..=end];
+                if let Ok(decoded) = serde_json::from_str::<String>(token)
+                    && decoded.ends_with("bridge.lock")
+                    && decoded.len() <= 1024
+                    && decoded.contains('/')
+                {
+                    return Some(decoded);
+                }
+                let raw = text[open + 1..end].to_owned();
+                if raw.ends_with("bridge.lock") && raw.len() <= 1024 && raw.contains('/') {
+                    return Some(raw);
                 }
             }
         }
+        offset = end + 1;
+        if offset >= text.len() {
+            break;
+        }
     }
-    // Walk back over path characters to the start of the token.
+    // Legacy quoting and unquoted paths: try every mention from last to first
+    // and keep the first token containing a separator, so a trailing bare
+    // prose mention never shadows an earlier exact path.
+    let mut mentions: Vec<usize> = Vec::new();
+    let mut off = 0;
+    while let Some(rel) = text[off..].find("bridge.lock") {
+        mentions.push(off + rel);
+        off += rel + "bridge.lock".len();
+        if off >= text.len() {
+            break;
+        }
+    }
+    if mentions.is_empty() {
+        return None;
+    }
+    for &mention in mentions.iter().rev() {
+        let end = mention + "bridge.lock".len();
+        // Legacy single-quote/backtick quoting (hand-written, never JSON).
+        for quote in ['\'', '`'] {
+            if let Some(close) = text[end..].find(quote)
+                && let Some(open) = text[..end].rfind(quote)
+            {
+                let after = &text[end..end + close];
+                if after.len() <= 2
+                    && after
+                        .chars()
+                        .all(|c| matches!(c, ';' | ',' | '.' | ':' | ' ' | '\n' | '\t'))
+                {
+                    let quoted = text[open + 1..end].to_owned();
+                    if quoted.ends_with("bridge.lock")
+                        && quoted.len() <= 1024
+                        && quoted.contains('/')
+                    {
+                        return Some(quoted);
+                    }
+                }
+            }
+        }
+        if let Some(path) = unquoted_token_path(text, end)
+            && path.contains('/')
+        {
+            return Some(path);
+        }
+    }
+    // No exact path anywhere: name the file so recovery still points at it.
+    if text.contains("bridge.lock") {
+        return Some("bridge.lock".to_owned());
+    }
+    None
+}
+
+/// Walk back over unquoted path bytes to the start of the token. Spaces end
+/// the token (quoted paths are handled above); non-ASCII bytes are kept so
+/// Unicode roots survive.
+fn unquoted_token_path(text: &str, end: usize) -> Option<String> {
     let bytes = text.as_bytes();
+    if end > text.len() || !text[..end].ends_with("bridge.lock") {
+        return None;
+    }
     let mut start = end - "bridge.lock".len();
     while start > 0 {
         let byte = bytes[start - 1];
-        let is_path =
-            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~' | b'+');
+        let is_path = byte.is_ascii_alphanumeric()
+            || byte >= 128
+            || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~' | b'+');
         if !is_path {
             break;
         }
         start -= 1;
-        // Bound the scan: a lock path longer than this is not a usable exact
-        // path to quote back.
         if end - start > 1024 {
             break;
         }
@@ -1619,14 +1683,10 @@ fn owned_lock_path(text: &str) -> Option<String> {
     path = path
         .trim_matches(|character: char| character == '"' || character == '\'' || character == '`')
         .to_owned();
-    if path.len() > 1024 {
-        return None;
-    }
-    if !path.ends_with("bridge.lock") {
+    if path.len() > 1024 || !path.ends_with("bridge.lock") {
         return None;
     }
     if path.contains('/') {
-        // Trim any leading prose still attached before the first slash.
         if let Some(slash) = path.find('/') {
             path = path[slash..].to_owned();
         }
@@ -1830,10 +1890,11 @@ done
     #[test]
     fn owned_route_busy_is_never_reported_as_daemon_unreachable() {
         let lock = "/tmp/lvu-muse-bridge-route-combined/capture/assistance/bridge.lock";
-        // New bridge: stable marker plus the exact lock path.
+        let lock_json = serde_json::to_string(lock).expect("lock path quotes");
+        // New bridge: stable marker plus the JSON-quoted exact lock path.
         let combined_new = format!(
             "bridge disconnected: bridge stdout reached EOF; bridge connection failed [OWNED_ROOT_BUSY]: \
-             Error: OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at {lock}; \
+             Error: OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at {lock_json}; \
              automatic stale-lock removal is intentionally refused"
         );
         // Legacy bridge: no marker, no lease word — only the busy/stale prose.
@@ -1934,6 +1995,117 @@ done
         assert!(
             generic.contains("not available"),
             "generic startup failure needs a neutral message: {generic}"
+        );
+    }
+
+    /// Negative control: unrelated words containing the `lease` substring
+    /// (`please`, `released`) must not classify as owned-route busy.
+    #[test]
+    fn generic_please_is_not_owned_busy() {
+        let text = "bridge disconnected: please try again; bridge connection failed: Error: released probe boom";
+        assert!(
+            !looks_like_owned_root_busy(text),
+            "generic 'please/released' misclassified as owned busy"
+        );
+        assert!(!looks_like_daemon_failure(text));
+        let message = not_running_message(text);
+        assert!(
+            message.starts_with("the agent bridge is not available"),
+            "generic failure needs a neutral message: {message}"
+        );
+        assert!(!message.contains("assistance lease"), "{message}");
+        assert!(!message.contains("bridge.lock"), "{message}");
+    }
+
+    /// End to end: the actual `OwnedSessionLedger` error for a root containing
+    /// spaces, run through the stderr classifier. Guards the real quoting
+    /// contract, not just a hand-authored string.
+    #[test]
+    fn spaced_root_ledger_error_classifies_with_exact_path() {
+        let dist =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bridge/dist/owned_sessions.js");
+        if !dist.exists() {
+            eprintln!("SKIPPED spaced-root ledger probe: bridge/dist is not built");
+            return;
+        }
+        let temp = TempDir::new().expect("temp root");
+        let root = temp
+            .path()
+            .join("My Logs")
+            .join("capture")
+            .join("assistance");
+        std::fs::create_dir_all(&root).expect("spaced root");
+        let lock_path = root.join("bridge.lock");
+        // Force EEXIST with a stale well-formed lock the probe must not remove.
+        std::fs::write(&lock_path, "{\"pid\":1,\"nonce\":\"stale-probe\"}\n").expect("stale lock");
+        let probe = temp.path().join("spaced-lease-probe.mjs");
+        let spec = format!("file://{}", dist.display());
+        std::fs::write(
+            &probe,
+            format!(
+                "import {{ OwnedSessionLedger }} from {spec:?};\n\
+                 const root = process.argv[2];\n\
+                 const ledger = new OwnedSessionLedger(root);\n\
+                 await ledger.initialize();\n\
+                 try {{ await ledger.acquireLease(); console.log(\"UNEXPECTED_SUCCESS\"); process.exit(2); }}\n\
+                 catch (e) {{ console.log(`CODE:${{e?.code ?? \"\"}}`); console.log(`MESSAGE:${{e?.message ?? String(e)}}`); }}\n"
+            ),
+        )
+        .expect("probe script");
+        let output = std::process::Command::new("node")
+            .arg(&probe)
+            .arg(&root)
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("SKIPPED spaced-root ledger probe: node unavailable ({error})");
+                return;
+            }
+        };
+        assert!(
+            output.status.success(),
+            "ledger probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let code = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("CODE:"))
+            .unwrap_or("");
+        let error_message = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("MESSAGE:"))
+            .unwrap_or("");
+        assert_eq!(code, "OWNED_ROOT_BUSY", "probe stdout:\n{stdout}");
+        // The exact lock path is JSON-quoted in the real error.
+        let expected_json =
+            serde_json::to_string(&lock_path.to_string_lossy()).expect("quote lock");
+        assert!(
+            error_message.contains(&expected_json),
+            "real ledger error lost the quoted path:\n{error_message}"
+        );
+        // Through the CLI wrapper and the Rust classifier.
+        let stderr = format!(
+            "bridge disconnected: bridge stdout reached EOF; bridge connection failed [{code}]: Error: {error_message}"
+        );
+        assert!(looks_like_owned_root_busy(&stderr));
+        assert!(!looks_like_daemon_failure(&stderr));
+        let expected = lock_path.to_string_lossy().into_owned();
+        assert_eq!(owned_lock_path(&stderr).as_deref(), Some(expected.as_str()));
+        let message = not_running_message(&stderr);
+        assert!(
+            message.starts_with("the owned assistance route is busy"),
+            "spaced-root error misclassified: {message}"
+        );
+        assert!(
+            message.contains(expected.as_str()),
+            "exact spaced path lost: {message}"
+        );
+        // The stale probe lock was refused, never silently removed.
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).expect("lock survives"),
+            "{\"pid\":1,\"nonce\":\"stale-probe\"}\n"
         );
     }
 

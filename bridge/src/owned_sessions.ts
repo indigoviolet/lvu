@@ -162,8 +162,10 @@ export class OwnedSessionLedger {
         // across races or PID reuse, so automatic stale-lock removal is
         // intentionally refused. The stable OWNED_ROOT_BUSY marker lets the
         // host classify without parsing wrapper prose, and the exact lock path
-        // lets it give safe recovery guidance.
-        throw coded("OWNED_ROOT_BUSY", `OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at ${path}; close competing lvu windows for this capture root, or remove only that exact bridge.lock after verifying no lvu/bridge process owns it; automatic stale-lock removal is intentionally refused`);
+        // lets it give safe recovery guidance. The path is JSON-quoted so
+        // roots containing spaces (or quotes) survive intact; the host
+        // JSON-decodes it back to the exact bytes.
+        throw coded("OWNED_ROOT_BUSY", `OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at ${JSON.stringify(path)}; close competing lvu windows for this capture root, or remove only that exact bridge.lock after verifying no lvu/bridge process owns it; automatic stale-lock removal is intentionally refused`);
       }
       throw error;
     }

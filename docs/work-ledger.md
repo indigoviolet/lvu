@@ -3439,3 +3439,21 @@ Real-ledger exclusivity/reacquisition/no-silent-removal are unit-proven; no
 real `bridge.lock`, assistance root, capture, session, proof or user data was
 removed. No `TODO.md` row added: no new open work beyond the intentional
 no-auto-removal limitation.
+
+### Follow-up — quoted spaced paths and precise lease matching
+
+Primary review of `6dea0b4` found two blockers, fixed here with no scope
+expansion. `acquireLease()` now emits the exact path JSON-quoted
+(`at ${JSON.stringify(path)}`); `owned_lock_path()` finds the quoted
+`bridge.lock"` token and `serde_json`-decodes it, so `/tmp/My
+Logs/capture/assistance/bridge.lock` survives intact, with legacy
+single-quote/backtick and unquoted fallbacks tried last-to-first so trailing
+bare prose never shadows the exact path. `looks_like_owned_root_busy()` drops
+the bare `lease` substring (which matched `please`/`released`) and keeps only
+`OWNED_ROOT_BUSY`, `bridge.lock`, `owned assistance root/route` and
+`assistance lease`. New coverage: a bridge spaced-root test asserting the
+quoted exact bytes round-trip; Rust `generic_please_is_not_owned_busy`
+negative control; and `spaced_root_ledger_error_classifies_with_exact_path`,
+which runs the actual built `OwnedSessionLedger` against a real `My Logs`
+root through the CLI wrapper and the Rust classifier and proves the stale lock
+survives. Revalidation below names the successor commit.

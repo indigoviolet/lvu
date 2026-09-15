@@ -74,10 +74,27 @@ describe("owned session ledger", () => {
       const failure = await second.acquireLease().catch((error: unknown) => error);
       expect(String(failure)).toContain("OWNED_ROOT_BUSY");
       expect(String(failure)).toContain("busy or contains a stale bridge.lock");
-      expect(String(failure)).toContain(join(root, "bridge.lock"));
+      expect(String(failure)).toContain(JSON.stringify(join(root, "bridge.lock")));
       expect((failure as { code?: unknown }).code).toBe("OWNED_ROOT_BUSY");
       await first.releaseLease(); await expect(second.acquireLease()).resolves.toBeUndefined(); await second.releaseLease();
     } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("quotes a spaced root exactly so the host recovers the full path", async () => {
+    const base = await mkdtemp(join(tmpdir(), "lvu-ledger-"));
+    const root = join(base, "My Logs", "capture", "assistance");
+    try {
+      const ledger = new OwnedSessionLedger(root); await ledger.initialize();
+      const { writeFile } = await import("node:fs/promises");
+      const lock = join(root, "bridge.lock");
+      await writeFile(lock, `${JSON.stringify({ pid: 1, nonce: "spaced-stale" })}\n`, { flag: "wx" });
+      const failure = await ledger.acquireLease().catch((error: unknown) => error);
+      expect((failure as { code?: unknown }).code).toBe("OWNED_ROOT_BUSY");
+      // JSON-quoted exact bytes: a space-splitting walk must not truncate this.
+      expect(String(failure)).toContain(JSON.stringify(lock));
+      expect(JSON.parse(String(failure).slice(String(failure).indexOf("at ") + 3).split(";")[0]!)).toBe(lock);
+      expect(await readFile(lock, "utf8")).toContain("spaced-stale");
+    } finally { await rm(base, { recursive: true, force: true }); }
   });
 
   it("refuses a possibly stale lock without removing it", async () => {

@@ -219,7 +219,7 @@ STUB_OWNED_BUSY_BRIDGE = """
 const ownedRoot = process.env.LVU_PASEO_OWNED_ROOT ?? "<unknown owned root>";
 const lock = ownedRoot + "/bridge.lock";
 process.stderr.write(
-  `bridge connection failed [OWNED_ROOT_BUSY]: Error: OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at ${lock}; automatic stale-lock removal is intentionally refused\\n`
+  `bridge connection failed [OWNED_ROOT_BUSY]: Error: OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at ${JSON.stringify(lock)}; automatic stale-lock removal is intentionally refused\\n`
 );
 process.exit(1);
 """

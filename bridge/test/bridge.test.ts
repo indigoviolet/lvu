@@ -113,7 +113,7 @@ describe("Bridge lifecycle", () => {
       const failure = await bridge.start().catch((error: unknown) => error);
       expect((failure as { code?: unknown }).code).toBe("OWNED_ROOT_BUSY");
       expect(String(failure)).toContain("OWNED_ROOT_BUSY");
-      expect(String(failure)).toContain(join(root, "bridge.lock"));
+      expect(String(failure)).toContain(JSON.stringify(join(root, "bridge.lock")));
       await firstLedger.releaseLease();
       await bridge.close().catch(() => {});
     } finally { await rm(root, { recursive: true, force: true }); }
