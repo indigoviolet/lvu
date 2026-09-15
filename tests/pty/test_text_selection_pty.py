@@ -68,6 +68,12 @@ with tempfile.TemporaryDirectory(prefix="lvu-copy-pty-") as directory:
         app.wait_for("COPY_BACKGROUND_MARKER")
         app.send(b"e")
         app.wait_for("┌ Enrichment ")
+        # Opening can briefly show the view's asynchronous refresh as
+        # Updating. Selection compares two opposite-direction copies of one
+        # stable surface, so wait for that refresh to settle before snapshotting
+        # the dialog text; otherwise the state row can legitimately change
+        # between the two drags.
+        app.wait_for("Ready     no steps yet")
         # The enrichment rework dropped the trailing period and only renders the
         # output pane once a step exists; the step list's empty row is what is
         # reliably on screen to select here.

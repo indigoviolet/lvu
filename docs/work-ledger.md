@@ -3531,3 +3531,26 @@ whose stop succeeds but durable delete then fails stays visible stopped (loud,
 retryable); the Delete-key escape sequence can split under pty load (palette
 path covers it; keymap pinned in Rust); protocol bumped 1→2 so old peers
 refuse loudly rather than misreading new methods.
+
+## 2026-09-15 — v0.1.9 candidate synchronization correction
+
+Primary integrated the deletion/discovery commit as `08c9da2`, then prepared
+version `0.1.9` as candidate `b480b27` (tree `a5e72b8`). Targeted integration
+checks passed discovery 18/18, memory 69/69, shared-worker library 148/148 plus
+its integration targets, deletion UI 14/14 and bridge-host diagnostics 28/28.
+The first clean exact run preserved under
+`lvu-v019-b480b27-final-acceptance/release-gate-b480b277383e-37ff8d0d1a9b4968beb9fce1119e31a1/`
+passed the full Rust workspace, all-target Clippy, 110 bridge tests and both
+binary builds, then stopped at PTY 81/83; it created no `accepted.json`.
+
+The two failures were test synchronization, not waived results. Merged-view
+typing waited only for a broad `Search` label; its failure screen showed the
+first byte absent (`eep`), while the same binary passed the whole scenario
+alone. It now waits through the bounded multi-source startup restore phase
+before opening the editor, so synthetic keystrokes cannot race those initial
+view replies. Text selection deterministically snapshotted the
+dialog during an asynchronous `Updating` row, then compared its second drag
+after that row legitimately became `Ready`; it now waits for the settled empty
+step-list state before either copy. No product path or timeout changed. Focused
+diagnosis is `primary-sol-scratch/v019-matrix-focused-diagnosis.log`; a fresh
+exact candidate run remains required.

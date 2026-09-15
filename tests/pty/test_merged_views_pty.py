@@ -20,6 +20,10 @@ def run(binary):
         app = PtyApp(binary, args, width=140, height=28, cwd=root, environment=env)
         try:
             app.wait_for("keep alpha")
+            # The rows can paint before all three startup restore replies have
+            # settled. This suite tests merged views, so let that bounded
+            # startup phase finish before editing the selected canonical view.
+            app.assert_remains("keep alpha", "impossible startup sentinel", .25)
             app.send(b"/"); app.wait_for("Search"); app.send(b"keep")
             # A draft on All events applies only when it is submitted.
             app.send(b"\r"); app.wait_for("Applied   keep")
