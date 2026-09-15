@@ -33,5 +33,13 @@ holds.
 
 ## Ready for the next release
 
-None. The accepted shared-capture, responsive-dialog, View-mode and release
-workflow work shipped in v0.1.8.
+- **Ready** — Delete derived views and remove sources from the workspace with
+  durable acknowledgement, dependency refusal and capture preservation.
+- **Ready** — Report every discovery category and run Docker discovery without
+  starvation; preserve daemon/socket failures as actionable diagnostics.
+- **Ready** — Distinguish owned assistance-route contention from Paseo daemon
+  connectivity failures, including exact lock-path recovery guidance.
+
+These changes are integrated for v0.1.9. They are not published until the exact
+candidate gate, immutable tag, three native archives, tap update and installed
+archive checks complete.

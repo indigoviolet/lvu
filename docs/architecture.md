@@ -9,6 +9,12 @@ Releases use only the vX.Y.Z scheme.
 Historical build numbers below date when behavior arrived; they are not a separate
 release channel.
 
+Post-v0.1.8 integration for the v0.1.9 candidate adds acknowledged derived-view
+deletion, source removal that preserves capture data, concurrent Docker/process/
+project discovery with explicit category outcomes, and distinct owned-route vs
+daemon-unreachable assistance diagnostics. These are integrated, not yet
+published behavior until the v0.1.9 release completes.
+
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
 open work, [contracts](contracts.md) for invariants, and [version notes](versions.md)
 for binary-specific acceptance. The [implementation plan](implementation-plan.md)

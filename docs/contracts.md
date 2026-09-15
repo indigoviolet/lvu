@@ -46,6 +46,21 @@ time window, presentation (pins/color rules), navigation settings. Applied
 revision and editor draft are distinct. A new query generation cancels or fences
 older results. Matching results retain stable RecordIds/logical EventIds.
 
+Deleting a derived view removes only its durable working-view row after an
+explicit acknowledgement. The canonical All events view cannot be deleted by
+itself, and any surviving union or cross-source view that depends on the target
+must block deletion with an actionable reason. Saves accepted before or racing
+with deletion may complete first or conflict, but must never recreate a deleted
+row. Removing a source from the workspace stops acquisition first, atomically
+deletes all of that source's working views, then drops session/sidebar membership
+only after acknowledgement. It does not delete source metadata, journal bytes,
+capture directories, bookmarks, recipes or proof data; reconnecting the same
+source may therefore reuse its durable capture and identity.
+
+Shared-capture control protocol version 2 adds acknowledged `DeleteView` and
+`RemoveSource` methods. A version mismatch is an explicit refusal; peers never
+infer compatibility or silently omit a destructive request.
+
 ## Expression helper: JSON Lines request/response
 
 Request: {schema_version:1, request_id, operation:"compile", kind:"filter"|

@@ -4,6 +4,38 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## v0.1.9 — 2026-09-15
+
+### Features
+
+- Delete user-created views from the View dialog after explicit confirmation.
+  All events remains protected, and a view still used by a union is refused
+  with the dependent view named.
+- Remove a source and its owned views from the workspace after stopping its
+  capture and confirming twice. Captured bytes, journals, bookmarks, recipes
+  and proof data remain on disk so the source can be reconnected later.
+- Show every source-discovery category with its result count and outcome,
+  including processes/open files, project files, Docker containers and
+  remembered sources.
+
+### Fixes
+
+- Run Docker, project and process discovery concurrently under the shared
+  deadline, so a slow earlier provider cannot prevent Docker from being tried.
+  Docker daemon and socket-permission failures now remain visible and
+  actionable.
+- Distinguish an assistance route already owned by another lvu window from an
+  unreachable Paseo daemon. Diagnostics preserve the exact quoted lock path,
+  give topology-specific daemon guidance and never remove a lock automatically.
+- Prevent queued saves and late restore completions from resurrecting a deleted
+  view; the UI changes only after durable acknowledgement.
+
+### Breaking changes
+
+- The internal shared-capture protocol is version 2. Mixed-version windows
+  refuse the connection explicitly instead of guessing how to interpret view
+  and source deletion requests.
+
 ## v0.1.8 — 2026-09-11
 
 ### Features
