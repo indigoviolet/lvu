@@ -19,7 +19,10 @@ except that works offline.
   from a durable cursor, so a restart repeats nothing.
 - **Many sources, many views.** Open several sources at once; each keeps a
   permanent unfiltered All events view, and views can be cloned or merged
-  over open sources.
+  over open sources. Derived views delete permanently after confirmation
+  (All events only with its source); sources remove from the workspace after
+  confirmation while their captured bytes, journals and bookmarks stay on
+  disk for reconnect.
 - **Live unions with shared keys.** Combine existing views into one live
   union, matching inputs on an accepted enrichment column pinned at creation.
 - **Filtering that meets you halfway.** Literal words, `field: value`,
@@ -92,8 +95,9 @@ this behavior explicitly. `--fresh` starts with nothing acquired; it deletes
 nothing, and every capture and saved view stays in the workspace.
 
 With no source and nothing to resume, lvu opens the Add source dialog: Tab
-completes paths, Ctrl-D discovers Docker containers, processes and project
-files. Nothing starts capturing until you choose it.
+completes paths, Ctrl-D discovers processes/open files, project files,
+Docker containers and remembered sources, naming every category checked and
+which produced no results. Nothing starts capturing until you choose it.
 
 In the viewer:
 
@@ -105,7 +109,8 @@ In the viewer:
 | `i` | Fields: the record's structure with types and sample values; one key pins, filters, colours, folds or correlates a field |
 | `d` | Details: the selected record as a tree beside the log |
 | `b` / `B` | Bookmark the selected record / open bookmarks and notes; `Open in All events` stays there, while `Inspect context` returns with `o` |
-| `v` | Views: new, cloned and merged views over open sources |
+| `v` | Views: new, cloned, merged and deleted views over open sources (Alt-E selects Delete; Enter arms, Enter confirms) |
+| `Delete` | Remove the selected source from the workspace after confirmation; captured data stays on disk |
 | `r` | Recipes: save, apply, export and review a view's setup |
 | `z` / `m` | Grouping: Run, Filter or Off using enrichment columns |
 | `f` | Follow the tail; `g` and `G` jump to the ends; `[` and `]` switch views |
@@ -121,7 +126,16 @@ Escape closes a dialog. `q` quits from the base screen.
   in Details, and a record keeps its identity across everything you do.
 - **All events is the source, unfiltered.** Every source has a permanent All
   events view that cannot be filtered in place. Editing it forks a new view,
-  so there is always a way back to everything that was captured.
+  so there is always a way back to everything that was captured. It cannot
+  be deleted on its own; removing its source deletes it with everything else
+  the source owns, and only after confirmation.
+- **Deletion removes membership, never captures.** Deleting a view removes
+  its workspace row only after the store acknowledges it; queued saves can
+  never resurrect it. Removing a source stops its capture, drops it from
+  session restore and deletes its owned views only after acknowledgement,
+  refusing actionably while surviving views or unions still depend on it.
+  Journals, capture directories, source bookmarks, recipes and proof data
+  stay byte-identical.
 - **A view you break stays usable.** An invalid search, filter or step
   leaves the last accepted view on screen and tells you what was wrong.
 - **Folding and grouping are presentation.** Collapsing repeated lines or

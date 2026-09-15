@@ -392,7 +392,7 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ("c", "Colour rules that classify enrichment columns".into()),
                 ("o", "Raw context around the selected record".into()),
                 ("B", "Bookmarks and notes".into()),
-                ("v", "Views".into()),
+                ("v", "Views: blank, clone, rename, sources, delete".into()),
                 ("V", "View summary: everything applied to this view".into()),
                 ("r", "Recipes".into()),
                 ("n", "Add source".into()),
@@ -408,6 +408,11 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 (
                     "R",
                     "Restart the selected source · resumes where it stopped, repeating no records"
+                        .into(),
+                ),
+                (
+                    "Delete",
+                    "Remove the selected source from the workspace after confirmation · captured data stays on disk"
                         .into(),
                 ),
             ],

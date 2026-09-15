@@ -267,11 +267,13 @@ fn discovery_arrows_preserve_separate_diagnostics_scroll_focus() {
         other => panic!("unexpected request: {other:?}"),
     };
     // A report long enough to overflow the pane is what gives it a scroll
-    // limit; the renderer records both the limit and the pane's rect.
+    // limit; the renderer records both the limit and the pane's rect. An
+    // empty completed scan expands the report into the unused candidate
+    // space first, so the report must overflow even that combined area.
     assert!(app.apply_discovery_result(
         generation,
         Vec::new(),
-        "a bounded scan report long enough to overflow the diagnostics pane ".repeat(6),
+        "a bounded scan report long enough to overflow the diagnostics pane ".repeat(30),
     ));
     let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
     terminal
@@ -283,6 +285,10 @@ fn discovery_arrows_preserve_separate_diagnostics_scroll_focus() {
         .source
         .scroll_rect()
         .expect("diagnostics surface");
+    assert!(
+        pane.height > 3,
+        "empty scan must expand the report into the list space: {pane:?}"
+    );
     click(&mut app, pane.x, pane.y);
     press(&mut app, KeyCode::Down);
     assert_eq!(app.layers.source.state().discovery.status_scroll, 1);

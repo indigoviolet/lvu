@@ -1278,6 +1278,10 @@ fn store_event_request_id(event: &StoreEvent) -> Option<&str> {
         | StoreEvent::Saved { request_id, .. }
         | StoreEvent::SaveFailed { request_id, .. }
         | StoreEvent::DerivedViewCreated { request_id, .. }
+        | StoreEvent::ViewDeleted { request_id, .. }
+        | StoreEvent::ViewDeleteFailed { request_id, .. }
+        | StoreEvent::SourceRemoved { request_id, .. }
+        | StoreEvent::SourceRemoveFailed { request_id, .. }
         | StoreEvent::Recent { request_id, .. }
         | StoreEvent::RecentFailed { request_id, .. }
         | StoreEvent::Recipes { request_id, .. }
@@ -1385,6 +1389,12 @@ fn set_store_window(method: &mut StoreMethod, window_id: &str) {
             window_id: slot, ..
         }
         | StoreMethod::CreateDerivedView {
+            window_id: slot, ..
+        }
+        | StoreMethod::DeleteView {
+            window_id: slot, ..
+        }
+        | StoreMethod::RemoveSource {
             window_id: slot, ..
         }
         | StoreMethod::Recent {

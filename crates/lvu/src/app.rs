@@ -550,9 +550,16 @@ pub enum ViewDialogMode {
     Blank,
     Clone,
     Rename,
+    Delete,
 }
 impl ViewDialogMode {
-    pub const ALL: [Self; 4] = [Self::Blank, Self::Clone, Self::Rename, Self::Sources];
+    pub const ALL: [Self; 5] = [
+        Self::Blank,
+        Self::Clone,
+        Self::Rename,
+        Self::Sources,
+        Self::Delete,
+    ];
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2086,6 +2093,12 @@ pub enum Action {
     ToggleFollow,
     StopCapture,
     RestartCapture,
+    /// Arm (first press) and confirm (second press) workspace removal of the
+    /// selected source. Captured bytes, journals, bookmarks, recipes and
+    /// proof data stay on disk; only the sidebar/workspace membership and
+    /// the source's owned views are removed, and only after durable
+    /// acknowledgement.
+    RemoveSource,
     /// Jump to the next or previous quiet period longer than the view's gap
     /// threshold. Presentation-only navigation: it moves the selection and
     /// says what it found, and changes no constraint.
@@ -3684,6 +3697,14 @@ pub struct App {
     /// Candidate views the runtime must unregister.
     pending_jump: Option<PendingJump>,
     source_controls: VecDeque<SourceControlRequest>,
+    /// Workspace removal of one source, armed by the first Delete press (or
+    /// palette invocation) and confirmed by the second for the same source.
+    /// Cleared on confirm, refusal, selection change to another source, and
+    /// successful removal. Captured data is never part of this state.
+    pending_source_remove: Option<String>,
+    /// Confirmed source removals awaiting the controller sequence.
+    /// Drained in order; each is re-validated before any mutation.
+    source_removals: VecDeque<String>,
     field_stats_requests: VecDeque<FieldStatsRequest>,
     /// The live whole-view answer, and the question it answers. Held on the app
     /// rather than in the dialog so a dialog that closes and reopens over the
@@ -3754,6 +3775,8 @@ impl App {
             restored_selections: HashSet::new(),
             pending_jump: None,
             source_controls: VecDeque::new(),
+            pending_source_remove: None,
+            source_removals: VecDeque::new(),
             field_stats_requests: VecDeque::new(),
             whole_view_stats: None,
             field_stats_pending: None,
@@ -5357,6 +5380,162 @@ impl App {
         self.views.items.push(view);
     }
 
+    /// Views that would lose an input if `view_id` were deleted: surviving
+    /// union views naming it. Sorted names for actionable refusal messages.
+    /// The view itself is never a blocker of its own deletion.
+    pub fn view_deletion_blockers(&self, view_id: &str) -> Vec<String> {
+        let mut blockers: Vec<String> = self
+            .views
+            .items
+            .iter()
+            .filter(|view| view.id != view_id)
+            .filter(|view| {
+                self.views
+                    .states
+                    .get(&view.id)
+                    .and_then(|state| state.union_inputs.as_ref())
+                    .is_some_and(|inputs| inputs.iter().any(|input| input.view_id == view_id))
+            })
+            .map(|view| view.name.clone())
+            .collect();
+        blockers.sort();
+        blockers.dedup();
+        blockers
+    }
+
+    /// Human descriptions of surviving views/unions that depend on
+    /// `source_id`, blocking its workspace removal. Owned views (primary
+    /// source == `source_id`) are removed with the source and never block.
+    /// Merged membership, union inputs through owned views, and exact-field
+    /// correlations naming the source all block with actionable text.
+    pub fn source_removal_blockers(&self, source_id: &str) -> Vec<String> {
+        let owned: std::collections::HashSet<&str> = self
+            .views
+            .items
+            .iter()
+            .filter(|view| view.source_id == source_id)
+            .map(|view| view.id.as_str())
+            .collect();
+        let mut blockers = Vec::new();
+        for view in &self.views.items {
+            if view.source_id == source_id {
+                continue;
+            }
+            let Some(state) = self.views.states.get(&view.id) else {
+                continue;
+            };
+            if state.source_ids.iter().any(|id| id == source_id) {
+                blockers.push(format!("view \"{}\" includes this source", view.name));
+                continue;
+            }
+            if state.union_inputs.as_ref().is_some_and(|inputs| {
+                inputs
+                    .iter()
+                    .any(|input| owned.contains(input.view_id.as_str()))
+            }) {
+                blockers.push(format!("union \"{}\" uses this source", view.name));
+                continue;
+            }
+            if state
+                .exact_field
+                .as_ref()
+                .is_some_and(|correlation| correlation.source_ids().any(|id| id == source_id))
+            {
+                blockers.push(format!("view \"{}\" correlates on this source", view.name));
+            }
+        }
+        blockers.sort();
+        blockers.dedup();
+        blockers
+    }
+
+    /// Removes one view from the UI after durable acknowledgement: cancels
+    /// its correlation request, drops items/states/roles/cursors, and
+    /// selects a deterministic survivor (same index, clamped). Returns false
+    /// when the view is unknown. Query/union worker unregistration is the
+    /// controller's (it owns the adapter); assistance proposals for the view
+    /// go stale through their revision fences.
+    pub fn remove_view(&mut self, view_id: &str) -> bool {
+        if !self.views.items.iter().any(|view| view.id == view_id) {
+            return false;
+        }
+        self.cancel_correlation_for_view(view_id);
+        if self.pending_source_remove.is_some() {
+            // A removal armed for another source stays armed only while the
+            // selection still names it; selecting the survivor below clears
+            // a stale arm through select_view.
+        }
+        self.views.items.retain(|view| view.id != view_id);
+        self.views.states.remove(view_id);
+        self.views.roles.remove(view_id);
+        self.shell.cursors.prune_identity(view_id);
+        self.shell
+            .cursors
+            .prune_identity(&format!("time:{view_id}"));
+        self.shell
+            .cursors
+            .prune_where_identity_contains(&format!(":{view_id}:"));
+        if self.views.items.is_empty() {
+            self.views.selected = 0;
+        } else {
+            self.views.selected = self
+                .views
+                .selected
+                .min(self.views.items.len().saturating_sub(1));
+        }
+        self.broadcast_view_event(ViewEvent::ViewDeleted {
+            view_id: view_id.to_owned(),
+        });
+        true
+    }
+
+    /// Removes every UI view owned by `source_id` after durable
+    /// acknowledgement, returning the removed view ids in sidebar order.
+    /// Selection is deterministic (clamped index). Sources, bookmarks,
+    /// journals and recipes are untouched here as everywhere.
+    pub fn remove_source_views(&mut self, source_id: &str) -> Vec<String> {
+        let removed: Vec<String> = self
+            .views
+            .items
+            .iter()
+            .filter(|view| view.source_id == source_id)
+            .map(|view| view.id.clone())
+            .collect();
+        for view_id in &removed {
+            self.cancel_correlation_for_view(view_id);
+            self.views.states.remove(view_id);
+            self.views.roles.remove(view_id);
+            self.shell.cursors.prune_identity(view_id);
+            self.shell
+                .cursors
+                .prune_identity(&format!("time:{view_id}"));
+            self.shell
+                .cursors
+                .prune_where_identity_contains(&format!(":{view_id}:"));
+        }
+        self.views.items.retain(|view| view.source_id != source_id);
+        if self.views.items.is_empty() {
+            self.views.selected = 0;
+        } else {
+            self.views.selected = self
+                .views
+                .selected
+                .min(self.views.items.len().saturating_sub(1));
+        }
+        self.broadcast_view_event(ViewEvent::SourceRemoved {
+            source_id: source_id.to_owned(),
+        });
+        removed
+    }
+
+    pub fn take_source_removals(&mut self) -> Vec<String> {
+        self.source_removals.drain(..).collect()
+    }
+
+    pub fn pending_source_remove(&self) -> Option<&str> {
+        self.pending_source_remove.as_deref()
+    }
+
     pub fn rename_view(&mut self, view_id: &str, name: String) -> bool {
         let Some(source_id) = self
             .views
@@ -5665,6 +5844,14 @@ impl App {
         if let Some(index) = self.views.items.iter().position(|view| view.id == view_id) {
             if self.active_view_id() != Some(view_id) {
                 self.cancel_active_correlation();
+            }
+            // A source-removal arm names one source; moving the selection to
+            // another source's view disarms it rather than confirming a
+            // removal the user is no longer looking at.
+            if let Some(armed) = self.pending_source_remove.clone()
+                && self.views.items[index].source_id != armed
+            {
+                self.pending_source_remove = None;
             }
             self.views.selected = index;
             // Source/query completions can select a view while a dialog is
@@ -6953,6 +7140,7 @@ impl App {
             Open::FieldColumn { column } => layers.fields.open(Some(column), &mut ctx),
             Open::View => layers.view.open(ViewDialogMode::Clone, &mut ctx),
             Open::ViewMembership => layers.view.open(ViewDialogMode::Sources, &mut ctx),
+            Open::ViewDelete => layers.view.open(ViewDialogMode::Delete, &mut ctx),
             Open::Source => layers.source.open((), &mut ctx),
             Open::Folding => layers.folding.open((), &mut ctx),
             Open::ViewSummary => layers.view_summary.open((), &mut ctx),
@@ -7965,6 +8153,59 @@ impl App {
                         );
                     }
                 }
+            }
+            Action::RemoveSource => {
+                // Workspace removal, never capture erasure: two presses for
+                // the same source (arm + confirm). The first press only
+                // arms and names what survives; the second re-validates
+                // dependents and queues the controller sequence. Moving the
+                // selection elsewhere disarms (see select_view).
+                if !matches!(self.focus, Focus::Logs | Focus::Selector) {
+                    return;
+                }
+                let Some(view) = self.views.items.get(self.views.selected).cloned() else {
+                    return;
+                };
+                let source_id = view.source_id.clone();
+                let source_name = self
+                    .sources
+                    .iter()
+                    .find(|source| source.id == source_id)
+                    .map(|source| source.name.clone())
+                    .unwrap_or_else(|| source_id.clone());
+                if self.pending_source_remove.as_deref() != Some(source_id.as_str()) {
+                    self.pending_source_remove = Some(source_id);
+                    self.action_notice = Some(format!(
+                        "Remove source \"{source_name}\" from the workspace? Captured data stays on disk. Press Delete again to confirm."
+                    ));
+                    return;
+                }
+                self.pending_source_remove = None;
+                let blockers = self.source_removal_blockers(&source_id);
+                if !blockers.is_empty() {
+                    self.action_notice = Some(format!(
+                        "cannot remove \"{source_name}\": {}; change or delete those views first",
+                        blockers.join("; ")
+                    ));
+                    return;
+                }
+                if self.source_removals.len() >= 8 {
+                    self.action_notice =
+                        Some("source removal queue full; retry after pending work settles".into());
+                    return;
+                }
+                if self
+                    .source_removals
+                    .iter()
+                    .any(|queued| queued == &source_id)
+                {
+                    self.action_notice = Some("source removal already pending".into());
+                    return;
+                }
+                self.source_removals.push_back(source_id);
+                self.action_notice = Some(format!(
+                    "removing source \"{source_name}\"… captured data stays on disk"
+                ));
             }
             Action::CancelEditor => {
                 // Dismissing an editor does *not* abandon a candidate: on the
@@ -9278,6 +9519,11 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Char('R') => return Action::RestartCapture,
             KeyCode::Char('s') if alt => return Action::StopCapture,
             KeyCode::Char('r') if alt => return Action::RestartCapture,
+            // Workspace removal of the selected source: two presses (arm +
+            // confirm) with captured data staying on disk. The palette row
+            // shows this chord; Alt has no alias (Delete arrives as one
+            // key, not a letter).
+            KeyCode::Delete => return Action::RemoveSource,
             _ => {}
         }
     }

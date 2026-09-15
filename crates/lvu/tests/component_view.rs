@@ -314,14 +314,24 @@ fn modes_render_as_a_segmented_header_with_apply_as_the_only_button() {
         let (provider, mut app) = demo();
         app.handle(Action::Open(Open::View), &provider);
         let rendered = screen(&draw(&provider, &mut app, width, height));
-        // The four modes are segments, never action buttons.
-        for bracketed in ["[ New blank ]", "[ Clone ]", "[ Rename ]", "[ Sources ]"] {
+        // The five modes are segments, never action buttons.
+        for bracketed in [
+            "[ New blank ]",
+            "[ Clone ]",
+            "[ Rename ]",
+            "[ Sources ]",
+            "[ Delete ]",
+            "[ Del ]",
+        ] {
             assert!(
                 !rendered.contains(bracketed),
                 "{width}x{height}: {bracketed} must not render as a button:\n{rendered}"
             );
         }
-        for segment in ["New blank", "Clone", "Rename", "Sources"] {
+        // Full labels at these widths; the compact set only renders at
+        // the 20x6 floor (covered below).
+        let segments: &[&str] = &["New blank", "Clone", "Rename", "Sources", "Delete"];
+        for segment in segments {
             assert!(
                 rendered.contains(segment),
                 "{width}x{height}: missing header segment {segment}:\n{rendered}"
@@ -336,8 +346,8 @@ fn modes_render_as_a_segmented_header_with_apply_as_the_only_button() {
             !rendered.contains("[ Apply membership ]"),
             "Clone mode applies a name, not membership:\n{rendered}"
         );
-        // Geometry agrees: four header rects plus one action rect.
-        assert_eq!(app.layers.view.tab_rects().len(), 4, "{width}x{height}");
+        // Geometry agrees: five header rects plus one action rect.
+        assert_eq!(app.layers.view.tab_rects().len(), 5, "{width}x{height}");
         let controls = app.layers.view.control_rects();
         assert_eq!(controls.len(), 1, "{width}x{height}: {controls:?}");
         assert_eq!(controls[0].1, ViewDialogControl::Apply);
@@ -364,13 +374,20 @@ fn modes_render_as_a_segmented_header_with_apply_as_the_only_button() {
     alt(&mut app, &provider, KeyCode::Char('m'));
     let rendered = screen(&draw(&provider, &mut app, 90, 24));
     assert!(rendered.contains("[ Apply membership ]"), "{rendered}");
-    for bracketed in ["[ New blank ]", "[ Clone ]", "[ Rename ]", "[ Sources ]"] {
+    for bracketed in [
+        "[ New blank ]",
+        "[ Clone ]",
+        "[ Rename ]",
+        "[ Sources ]",
+        "[ Delete ]",
+        "[ Del ]",
+    ] {
         assert!(
             !rendered.contains(bracketed),
             "{bracketed} leaked:\n{rendered}"
         );
     }
-    assert_eq!(app.layers.view.tab_rects().len(), 4);
+    assert_eq!(app.layers.view.tab_rects().len(), 5);
     assert_eq!(app.layers.view.control_rects().len(), 1);
 }
 
@@ -499,28 +516,39 @@ fn responsive_frame_is_policy_stable_across_modes_lists_and_sizes() {
                     "{width}x{height} became full frame"
                 );
             }
-            // Segmented header is the only mode control; sole Apply default.
+            // Segmented header is the only mode control; sole Apply default
+            // (Delete is destructive and never the default: it arms first).
             // At the 20x6 floor the header is 16 cells, so the explicit
-            // compact set (Bl/Clone/Ren/Src) renders instead of the full one —
-            // same four modes, same mnemonics, still one segment per mode.
-            assert_eq!(app.layers.view.tab_rects().len(), 4, "{width}x{height}");
+            // compact set (Bl/Cl/Rn/Sr/De) renders instead of the full one —
+            // same five modes, same mnemonics, still one segment per mode.
+            assert_eq!(app.layers.view.tab_rects().len(), 5, "{width}x{height}");
             assert_eq!(app.layers.view.control_rects().len(), 1, "{width}x{height}");
             if (width, height) == (20, 6) {
-                for compact in ["Bl", "Clone", "Ren", "Src"] {
+                for compact in ["Bl", "Cl", "Rn", "Sr", "De"] {
                     assert!(
                         rendered.contains(compact),
                         "{width}x{height} missing compact segment {compact}:\n{rendered}"
                     );
                 }
             } else {
-                for segment in ["New blank", "Clone", "Rename", "Sources"] {
+                for segment in ["New blank", "Clone", "Rename", "Sources", "Delete"] {
                     assert!(
                         rendered.contains(segment),
                         "{width}x{height} missing header segment {segment}:\n{rendered}"
                     );
                 }
             }
-            if mode == ViewDialogMode::Sources {
+            if mode == ViewDialogMode::Delete {
+                // Delete names the view, warns that captured data stays, and
+                // draws its destructive verb unfilled: Enter arms, Enter
+                // confirms, and the first press mutates nothing.
+                assert!(rendered.contains("Delete view"), "{rendered}");
+                assert!(rendered.contains("stays on disk"), "{rendered}");
+                assert!(
+                    !surface.scrollable,
+                    "{width}x{height} Delete confirmation must not want the wheel"
+                );
+            } else if mode == ViewDialogMode::Sources {
                 // At the 20x6 floor the 20-cell "Apply membership" button clips
                 // to its 16-cell band; the default still survives as "Apply".
                 if (width, height) == (20, 6) {
@@ -565,7 +593,7 @@ fn responsive_frame_is_policy_stable_across_modes_lists_and_sizes() {
             // set tiles the 16-cell header exactly).
             {
                 let tabs = app.layers.view.tab_rects().to_vec();
-                assert_eq!(tabs.len(), 4, "{width}x{height}");
+                assert_eq!(tabs.len(), 5, "{width}x{height}");
                 for (rect, m) in &tabs {
                     assert_eq!(rect.height, 1, "{width}x{height} {m:?}");
                     assert!(rect.width > 0, "{width}x{height} {m:?} segment is empty");
@@ -702,7 +730,7 @@ fn responsive_frame_is_policy_stable_across_modes_lists_and_sizes() {
     app.handle(Action::Open(Open::View), &provider);
     let floor = screen(&draw(&provider, &mut app, 20, 6));
     assert!(floor.contains("Apply"), "{floor}");
-    assert_eq!(app.layers.view.tab_rects().len(), 4);
+    assert_eq!(app.layers.view.tab_rects().len(), 5);
 }
 
 #[test]

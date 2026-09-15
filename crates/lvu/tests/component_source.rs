@@ -291,7 +291,7 @@ fn the_scroll_pane_takes_focus_from_the_field() {
     assert!(app.apply_discovery_result(
         generation,
         Vec::new(),
-        "a bounded scan report long enough to overflow the diagnostics pane ".repeat(6),
+        "a bounded scan report long enough to overflow the diagnostics pane ".repeat(30),
     ));
     draw(&mut app, 100, 28);
     assert!(app.layers.source.surface().text_focus);
@@ -301,6 +301,13 @@ fn the_scroll_pane_takes_focus_from_the_field() {
         .source
         .scroll_rect()
         .expect("diagnostics surface");
+    // An empty completed scan gives the category report the unused
+    // candidate-list space, so the report pane is taller than the old
+    // three-row details viewport.
+    assert!(
+        pane.height > 3,
+        "empty scan must expand the report into the list space: {pane:?}"
+    );
     click(&mut app, (pane.x, pane.y));
     draw(&mut app, 100, 28);
     assert!(!app.layers.source.surface().text_focus);

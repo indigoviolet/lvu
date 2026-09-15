@@ -96,6 +96,8 @@ pub enum CommandId {
     ViewClone,
     ViewRename,
     ViewSources,
+    ViewDelete,
+    RemoveSource,
     UnionViews,
     Recipes,
     RecipeBrowse,
@@ -192,6 +194,8 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::ViewClone,
     CommandId::ViewRename,
     CommandId::ViewSources,
+    CommandId::ViewDelete,
+    CommandId::RemoveSource,
     CommandId::UnionViews,
     CommandId::Recipes,
     CommandId::RecipeBrowse,
@@ -1413,11 +1417,32 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
         command(
             CommandId::ViewDialog,
             "Manage views",
-            "Open blank, clone, and rename choices",
+            "Open blank, clone, rename, sources and delete choices",
             "Views",
             &["new view", "copy view"],
             Action::Open(crate::component::Open::View),
             view_reason,
+        ),
+        command(
+            CommandId::ViewDelete,
+            "Delete view",
+            "Delete this view permanently after confirmation; captured data stays on disk",
+            "Views",
+            &["remove view", "delete view"],
+            Action::Open(crate::component::Open::ViewDelete),
+            view_reason,
+        ),
+        command(
+            CommandId::RemoveSource,
+            "Remove source from workspace",
+            "Remove the selected source and its views after confirmation; captured data stays on disk",
+            "Sources",
+            &["delete source", "remove source", "sidebar"],
+            Action::RemoveSource,
+            (!context.has_view)
+                .then_some("select a source view first")
+                .or((!matches!(context.focus, Focus::Logs | Focus::Selector))
+                    .then_some("close the current dialog first")),
         ),
         command(
             CommandId::ViewSummary,
@@ -1855,6 +1880,7 @@ const SHORTCUT_CANDIDATES: &[(KeyCode, KeyModifiers, &str)] = &[
     // every terminal delivers rather than the Alt alias behind it.
     (KeyCode::Char('X'), KeyModifiers::SHIFT, "X"),
     (KeyCode::Char('R'), KeyModifiers::SHIFT, "R"),
+    (KeyCode::Delete, KeyModifiers::NONE, "Delete"),
     (KeyCode::Char('r'), KeyModifiers::ALT, "Alt-R"),
     (KeyCode::Char('s'), KeyModifiers::ALT, "Alt-S"),
     (KeyCode::Char('i'), KeyModifiers::ALT, "Alt-I"),

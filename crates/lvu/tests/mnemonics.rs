@@ -178,10 +178,12 @@ fn every_action_row_mnemonic_in_the_product_is_accounted_for() {
         // Settings opens with its theme dropdown owning the surface, so it
         // publishes no text focus; it has no mnemonic either way.
         ("Settings", vec![], false),
-        // View opens with the caret in its Name field, so its four letters
+        // View opens with the caret in its Name field, so its five letters
         // are text until Tab moves focus off it — which is the rule working,
-        // and why its palette rows print the Alt chord.
-        ("View", vec!['b', 'c', 'r', 's'], true),
+        // and why its palette rows print the Alt chord. Delete's `e` arms
+        // (never deletes) and is not a letter of its destructive button, so
+        // no bare key can delete.
+        ("View", vec!['b', 'c', 'r', 's', 'e'], true),
         ("Source", vec![], true),
         ("Folding", vec![], false),
         // The Filter dialog opens with the caret in the active tab's field;
@@ -398,6 +400,7 @@ fn alt_selects_a_view_mode_from_inside_the_name_field() {
         ('r', lvu::ViewDialogMode::Rename),
         ('s', lvu::ViewDialogMode::Sources),
         ('c', lvu::ViewDialogMode::Clone),
+        ('e', lvu::ViewDialogMode::Delete),
     ] {
         press(
             &mut app,

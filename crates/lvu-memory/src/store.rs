@@ -2191,6 +2191,48 @@ impl WorkspaceStore {
             .collect()
     }
 
+    /// Durably deletes one derived view. Refuses the canonical All events
+    /// view (deleted only with its entire source) and reports an unknown id
+    /// as not-found rather than inventing a deletion. Source rows,
+    /// source_bookmarks, journals, recipes and proof data are untouched, so
+    /// captured bytes and source-scoped notes survive byte-identical.
+    pub fn delete_view(&self, id: ViewId) -> Result<bool, MemoryError> {
+        let role: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT role FROM working_views WHERE view_id=?1",
+                [id.0.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(role) = role else {
+            return Ok(false);
+        };
+        if ViewRole::parse_token(&role) == ViewRole::Canonical {
+            return Err(MemoryError::InvalidData(
+                "All events is deleted only with its entire source".into(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "DELETE FROM working_views WHERE view_id=?1",
+            [id.0.to_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Durably deletes every working view owned by one source, including its
+    /// canonical All events view. One statement, therefore atomic: no partial
+    /// mutate. Sources, source_bookmarks, journals, recipes and proof data
+    /// are untouched, so capture bytes and notes survive byte-identical and
+    /// re-adding the same source may reconnect to its old capture.
+    pub fn delete_views_for_source(&self, source_id: SourceId) -> Result<usize, MemoryError> {
+        let changed = self.conn.execute(
+            "DELETE FROM working_views WHERE source_id=?1",
+            [source_id.0.to_string()],
+        )?;
+        Ok(changed)
+    }
+
     /// Returns the source's canonical view, creating it when the source has
     /// none.
     ///

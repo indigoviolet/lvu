@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 /// Wire protocol version. A window refuses a worker on mismatch with an
 /// explicit error rather than guessing field meanings.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Lifecycle and acquisition traffic: window to worker.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -235,6 +235,22 @@ pub enum StoreMethod {
         view_id: lvu_core::ViewId,
         state: lvu_memory::WorkingView,
     },
+    /// Durably delete one derived view (canonical refused). Only success
+    /// removes the view from any window; queued saves for it conflict
+    /// instead of resurrecting it.
+    DeleteView {
+        request_id: String,
+        window_id: String,
+        view_id: lvu_core::ViewId,
+    },
+    /// Durably delete every working view owned by one source (canonical
+    /// included). Sources, bookmarks, journals and recipes are untouched.
+    /// Only success removes the source and its views from any window.
+    RemoveSource {
+        request_id: String,
+        window_id: String,
+        source_id: lvu_core::SourceId,
+    },
     Recent {
         request_id: String,
         window_id: String,
@@ -340,6 +356,8 @@ impl StoreMethod {
             StoreMethod::Load { window_id, .. }
             | StoreMethod::Save { window_id, .. }
             | StoreMethod::CreateDerivedView { window_id, .. }
+            | StoreMethod::DeleteView { window_id, .. }
+            | StoreMethod::RemoveSource { window_id, .. }
             | StoreMethod::Recent { window_id, .. }
             | StoreMethod::ListRecipes { window_id, .. }
             | StoreMethod::RecipeHistory { window_id, .. }
@@ -362,6 +380,8 @@ impl StoreMethod {
             StoreMethod::Load { request_id, .. }
             | StoreMethod::Save { request_id, .. }
             | StoreMethod::CreateDerivedView { request_id, .. }
+            | StoreMethod::DeleteView { request_id, .. }
+            | StoreMethod::RemoveSource { request_id, .. }
             | StoreMethod::Recent { request_id, .. }
             | StoreMethod::ListRecipes { request_id, .. }
             | StoreMethod::RecipeHistory { request_id, .. }
@@ -422,6 +442,25 @@ pub enum StoreEvent {
         request_id: String,
         view_id: lvu_core::ViewId,
         error: Option<String>,
+    },
+    ViewDeleted {
+        request_id: String,
+        view_id: lvu_core::ViewId,
+    },
+    ViewDeleteFailed {
+        request_id: String,
+        view_id: lvu_core::ViewId,
+        reason: String,
+    },
+    SourceRemoved {
+        request_id: String,
+        source_id: lvu_core::SourceId,
+        removed_views: usize,
+    },
+    SourceRemoveFailed {
+        request_id: String,
+        source_id: lvu_core::SourceId,
+        reason: String,
     },
     Recent {
         request_id: String,

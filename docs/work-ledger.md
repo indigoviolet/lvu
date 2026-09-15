@@ -3392,7 +3392,6 @@ the superseded `versions/v0.1.6` install was moved to trash (recoverable); its
 records remain. Human Apple-silicon macOS and arm64 Linux terminal acceptance,
 plus the paused volume/cold-query/slow-storage investigations, remain explicitly
 unverified rather than fabricated green.
-
 ## 2026-09-15 — owned-route busy no longer misreported as daemon unreachable
 
 Branch `fix/bridge-route-diagnostics`, base `f92474f`. Field report: startup
@@ -3457,3 +3456,78 @@ negative control; and `spaced_root_ledger_error_classifies_with_exact_path`,
 which runs the actual built `OwnedSessionLedger` against a real `My Logs`
 root through the CLI wrapper and the Rust classifier and proves the stale lock
 survives. Revalidation below names the successor commit.
+## 2026-09-15 — safe view deletion, source removal, explicit discovery report
+
+Single-owner sequential handoff on `feature/delete-sources-views-discovery-status`
+(post-v0.1.8 integration work; no tag or release). Users can now durably delete
+user-created views, remove sources from the workspace/sidebar, and read exactly
+which discovery categories were checked.
+
+View deletion is a fifth Delete mode in the View dialog (`Del_e_te`, Alt-E,
+compact `D_e_` inside the 20x6 floor budget) with `[Delete view]` as its sole
+contextual action. The button is destructive and never filled; Delete opens on
+the header so Enter cannot reach it before an explicit focus move, the first
+press arms reversibly and only the second submits through the view-mutation
+outbox. All events refuses with its source named; views still used by a
+surviving union refuse naming the union. The UI removes the view only on the
+durable ack; queue saturation, worker loss and version conflicts stay loud with
+UI/durable coherent. Queued saves for deleted ids UPDATE zero rows and conflict
+instead of INSERT-resurrecting (worker keeps the version base; the controller
+tombstones autosaves/restores permanently for the session, and a second
+window's later save conflicts on the missing row). Unregister covers query,
+union, correlation, union-inflight and memory bookkeeping with a deterministic
+clamped survivor; assistance proposals go stale through revision fences.
+
+Source removal arms twice on the base screen (Delete key from Logs/Selector,
+or the `Remove source from workspace` palette row showing the Delete chord)
+and queues only after re-validating merged-membership, union-input and
+exact-field dependents actionably. The controller stops the capture first (a
+stop failure aborts with views intact), then durably deletes every owned view
+in one atomic statement, then removes sidebar/session membership from the UI.
+Journals, capture directories, source rows, source bookmarks, recipes and proof
+data stay byte-identical, so re-adding reconnects. A retained stopped shared
+handle reads Stopped, not running: liveness is the progress snapshot's
+terminal state, which fixed a removal hang found only by running the app
+(the stop had completed while ownership still read live).
+
+Discovery runs Procfs, Project and Docker concurrently against the one global
+deadline with deterministic provider-order merge, so a slow scan can no longer
+starve Docker (previously last, reported only `shared deadline reached`). The
+report uses product labels with per-category matches and
+checked/partial/unavailable/unsupported/cancelled/time-limit outcomes plus
+bounded detail: Processes/open files, Project files, Docker containers,
+Remembered sources. Docker permission failures keep the actual `docker ps`
+reason with a daemon/socket-access suggestion that never claims lvu fixes OS
+permissions. An empty completed scan gives the report the unused candidate
+space; candidate-present geometry is unchanged and scrollable.
+
+Validation on this worktree with
+`CARGO_TARGET_DIR=/mnt/HC_Volume_106796581/lvu-build/lvu-delete-sources-views-target`,
+`CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, debug info off, under
+`flock --close sol-validation.lock`, fixtures under marker-backed
+`/tmp/lvu-muse-delete-*`, durable logs on the large volume: `cargo fmt
+--all --check` clean; `cargo test --workspace --locked` green; `cargo clippy
+-p lvu -p lvu-app -p lvu-memory -p lvu-shared -p lvu-discovery --all-targets
+-D warnings` clean; bridge built; PTY matrix **83/83** in 212s at 4 workers
+(includes the new `test_delete_sources_views_pty`: derived-view
+delete/restart-persistence, source remove/restart-persistence with retained
+journal bytes and source rows, explicit discovery categories). New Rust
+coverage: 13 TestBackend tests (`component_delete`: arm/confirm, refusal
+disarm, mode-switch disarm, mouse path, Alt-E, 140x40/80x24/54x16/20x6
+geometry with Unicode names and hitbox containment, union/merged blockers,
+double-arm source queueing with selection-change disarm, canonical role
+fixed by metadata, deterministic survivor, empty-report expansion, palette
+rows, Delete keymap); 4 store tests (derived delete + canonical refusal +
+unknown idempotent, bookmark/source-row preservation, atomic
+remove-source with byte-identical preservation, save-after-delete
+conflicts); shared mediated delete/remove test (cross-ack idempotence,
+canonical refusal, no-resurrect conflict, source-row survival); local + shared
+memory roundtrips; 4 Docker discovery tests (permission-denied, context
+failure, running-container keys, slow-project starvation regression).
+
+Residual risks: two-window delete-vs-save races resolve by version conflict
+(the loser retries after explicit rebase) rather than by locking; a source
+whose stop succeeds but durable delete then fails stays visible stopped (loud,
+retryable); the Delete-key escape sequence can split under pty load (palette
+path covers it; keymap pinned in Rust); protocol bumped 1→2 so old peers
+refuse loudly rather than misreading new methods.

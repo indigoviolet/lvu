@@ -65,6 +65,18 @@ enum Command {
     Load(Box<SourceDefinition>, ViewId),
     Save(Box<SaveRequest>),
     CreateDerivedView(Box<SaveRequest>),
+    /// Durably delete one derived view. Only the success event may remove
+    /// the view from the UI; queued/in-flight saves for it must not
+    /// resurrect it.
+    DeleteView {
+        view_id: ViewId,
+    },
+    /// Durably delete every working view owned by one source (including its
+    /// canonical view). Sources, bookmarks, journals and recipes are
+    /// untouched. Only the success event may remove the source/views.
+    RemoveSource {
+        source_id: SourceId,
+    },
     Recent,
     ListRecipes(RecipeRequestMeta, Option<SuggestionContext>),
     RecipeHistory(RecipeRequestMeta, lvu_core::RecipeId),
@@ -93,6 +105,15 @@ pub enum Event {
     /// A derived view was persisted, or could not be. Only the success case
     /// may make the view visible.
     DerivedViewCreated(ViewId, Result<(), String>),
+    /// A view was durably deleted, or could not be. Only the success case
+    /// may remove the view from the UI.
+    ViewDeleted(ViewId),
+    ViewDeleteFailed(ViewId, String),
+    /// Every working view owned by a source was durably deleted, or the
+    /// removal failed with nothing partially mutated. Only success may
+    /// remove the source and its views from the UI.
+    SourceRemoved(SourceId, usize),
+    SourceRemoveFailed(SourceId, String),
     Recent(Vec<SourceMetadata>),
     RecentFailed(String),
     Recipes(
@@ -160,6 +181,19 @@ impl MemoryWorker {
     pub fn create_derived_view(&self, request: Box<SaveRequest>) -> Result<(), String> {
         self.tx
             .try_send(Command::CreateDerivedView(request))
+            .map_err(queue_error)
+    }
+    /// Durably deletes one view. The reply decides whether the UI removes it.
+    pub fn delete_view(&self, view_id: ViewId) -> Result<(), String> {
+        self.tx
+            .try_send(Command::DeleteView { view_id })
+            .map_err(queue_error)
+    }
+    /// Durably deletes every working view owned by one source. The reply
+    /// decides whether the UI removes the source and its views.
+    pub fn remove_source(&self, source_id: SourceId) -> Result<(), String> {
+        self.tx
+            .try_send(Command::RemoveSource { source_id })
             .map_err(queue_error)
     }
 
@@ -414,6 +448,18 @@ impl Memory {
             Memory::Shared(shared) => shared.create_derived_view(request),
         }
     }
+    pub fn delete_view(&self, view_id: ViewId) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.delete_view(view_id),
+            Memory::Shared(shared) => shared.delete_view(view_id),
+        }
+    }
+    pub fn remove_source(&self, source_id: SourceId) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.remove_source(source_id),
+            Memory::Shared(shared) => shared.remove_source(source_id),
+        }
+    }
     pub fn recent(&self) -> Result<(), String> {
         match self {
             Memory::Local(worker) => worker.recent(),
@@ -565,6 +611,22 @@ impl SharedMemory {
         }
         self.tx
             .try_send(Command::CreateDerivedView(request))
+            .map_err(queue_error)
+    }
+    fn delete_view(&self, view_id: ViewId) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::DeleteView { view_id })
+            .map_err(queue_error)
+    }
+    fn remove_source(&self, source_id: SourceId) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::RemoveSource { source_id })
             .map_err(queue_error)
     }
     fn recent(&self) -> Result<(), String> {
@@ -810,6 +872,24 @@ fn shared_worker(
                     let event = match store.create_derived_view(&request).await {
                         Ok(event) => event,
                         Err(error) => Event::DerivedViewCreated(request.view_id, Err(error)),
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::DeleteView { view_id } => {
+                    let event = match store.delete_view(view_id).await {
+                        Ok(event) => event,
+                        Err(error) => Event::ViewDeleteFailed(view_id, error),
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::RemoveSource { source_id } => {
+                    let event = match store.remove_source(source_id).await {
+                        Ok(event) => event,
+                        Err(error) => Event::SourceRemoveFailed(source_id, error),
                     };
                     if events.send(event).is_err() {
                         break;
@@ -1084,6 +1164,46 @@ fn worker(
                     .send(Event::DerivedViewCreated(request.view_id, result))
                     .is_err()
                 {
+                    break;
+                }
+            }
+            Command::DeleteView { view_id } => {
+                let event = match store.delete_view(view_id) {
+                    Ok(_) => {
+                        // Keep `versions` so a queued/in-flight save that
+                        // arrives after the delete UPDATEs zero rows and
+                        // conflicts instead of INSERT-resurrecting the view.
+                        // Drop `newest` so it can never ack such a save
+                        // Saved without a write; drop `failed` (moot).
+                        newest.remove(&view_id);
+                        failed.remove(&view_id);
+                        Event::ViewDeleted(view_id)
+                    }
+                    Err(error) => Event::ViewDeleteFailed(view_id, error.to_string()),
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
+            Command::RemoveSource { source_id } => {
+                // Collect owned view ids first (bounded: admission caps
+                // views per source far below the page limit) so save
+                // bookkeeping can be fenced without resurrecting rows.
+                let owned: Vec<ViewId> = store
+                    .working_views_for_source(source_id, 100)
+                    .map(|views| views.into_iter().map(|view| view.id).collect())
+                    .unwrap_or_default();
+                let event = match store.delete_views_for_source(source_id) {
+                    Ok(removed) => {
+                        for id in owned {
+                            newest.remove(&id);
+                            failed.remove(&id);
+                        }
+                        Event::SourceRemoved(source_id, removed)
+                    }
+                    Err(error) => Event::SourceRemoveFailed(source_id, error.to_string()),
+                };
+                if events.send(event).is_err() {
                     break;
                 }
             }
@@ -2373,6 +2493,100 @@ mod tests {
         }
     }
 
+    fn poll_worker_until(worker: &MemoryWorker, mut wanted: impl FnMut(&Event) -> bool) -> Event {
+        let start = Instant::now();
+        loop {
+            while let Some(event) = worker.poll() {
+                if wanted(&event) {
+                    return event;
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "timed out waiting for memory event"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Local durable deletion roundtrip: derived views delete and stay
+    /// deleted across reopen, canonical deletion is refused, a save after
+    /// delete conflicts instead of resurrecting, and source removal deletes
+    /// every owned view atomically while the source row survives.
+    #[test]
+    fn delete_view_and_remove_source_roundtrip_through_local_worker() {
+        let root = TempDir::new().unwrap();
+        let worker = MemoryWorker::start(root.path().to_path_buf());
+        let definition = definition();
+        let source_id = definition.id;
+        let canonical_hint = ViewId::new();
+        worker.load(definition.clone(), canonical_hint).unwrap();
+        let loaded = poll_worker_until(&worker, |event| {
+            matches!(event, Event::Loaded(..) | Event::LoadFailed(..))
+        });
+        let views = match loaded {
+            Event::Loaded(_, _, views) => views,
+            Event::LoadFailed(_, _, error) => panic!("load failed: {error}"),
+            _ => unreachable!(),
+        };
+        assert!(!views.is_empty(), "load ensures the canonical view");
+        let canonical = views
+            .iter()
+            .find(|view| view.role == lvu_memory::ViewRole::Canonical)
+            .map(|view| view.id)
+            .expect("canonical view");
+        let derived = ViewId::new();
+        worker
+            .create_derived_view(Box::new(request(1, definition.clone(), derived, "derived")))
+            .unwrap();
+        match poll_worker_until(
+            &worker,
+            |event| matches!(event, Event::DerivedViewCreated(id, _) if *id == derived),
+        ) {
+            Event::DerivedViewCreated(_, Ok(())) => {}
+            Event::DerivedViewCreated(_, Err(error)) => panic!("create failed: {error}"),
+            _ => unreachable!(),
+        }
+        worker.delete_view(derived).unwrap();
+        match poll_worker_until(
+            &worker,
+            |event| matches!(event, Event::ViewDeleted(id) | Event::ViewDeleteFailed(id, _) if *id == derived),
+        ) {
+            Event::ViewDeleted(_) => {}
+            Event::ViewDeleteFailed(_, error) => panic!("delete failed: {error}"),
+            _ => unreachable!(),
+        }
+        // Canonical deletion is refused, not silently applied.
+        worker.delete_view(canonical).unwrap();
+        match poll_worker_until(
+            &worker,
+            |event| matches!(event, Event::ViewDeleted(id) | Event::ViewDeleteFailed(id, _) if *id == canonical),
+        ) {
+            Event::ViewDeleteFailed(_, error) => assert!(error.contains("All events"), "{error}"),
+            Event::ViewDeleted(_) => panic!("canonical delete must fail"),
+            _ => unreachable!(),
+        }
+        worker.remove_source(source_id).unwrap();
+        match poll_worker_until(
+            &worker,
+            |event| matches!(event, Event::SourceRemoved(id, _) | Event::SourceRemoveFailed(id, _) if *id == source_id),
+        ) {
+            Event::SourceRemoved(_, removed) => assert!(removed >= 1, "owned views deleted"),
+            Event::SourceRemoveFailed(_, error) => panic!("remove failed: {error}"),
+            _ => unreachable!(),
+        }
+        drop(worker);
+        let store = WorkspaceStore::open(root.path()).unwrap();
+        assert!(store.get_view(derived).unwrap().is_none());
+        assert!(
+            store
+                .working_views_for_source(source_id, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.recent_sources(None, 100).unwrap().len(), 1);
+    }
+
     #[test]
     fn full_slow_worker_queue_never_blocks_the_caller() {
         let (tx, commands) = mpsc::sync_channel(QUEUE_CAPACITY);
@@ -3241,6 +3455,48 @@ mod tests {
         {
             Event::Loaded(..) => {}
             other => panic!("expected loaded, got {other:?}"),
+        }
+        memory.stop().expect("clean stop joins");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_delete_and_remove_roundtrip() {
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6211).await;
+        let mut memory = SharedMemory::wrap(store);
+        let definition = definition();
+        let source_id = definition.id;
+        let view = ViewId::new();
+        memory
+            .save(Box::new(request(1, definition.clone(), view, "seek")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match poll_until(&memory, deadline, |event| matches!(event, Event::Saved(..))).await {
+            Event::Saved(..) => {}
+            other => panic!("expected saved, got {other:?}"),
+        }
+        memory.delete_view(view).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match poll_until(&memory, deadline, |event| {
+            matches!(event, Event::ViewDeleted(..) | Event::ViewDeleteFailed(..))
+        })
+        .await
+        {
+            Event::ViewDeleted(_) => {}
+            other => panic!("expected view deleted, got {other:?}"),
+        }
+        memory.remove_source(source_id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match poll_until(&memory, deadline, |event| {
+            matches!(
+                event,
+                Event::SourceRemoved(..) | Event::SourceRemoveFailed(..)
+            )
+        })
+        .await
+        {
+            Event::SourceRemoved(_, _) => {}
+            other => panic!("expected source removed, got {other:?}"),
         }
         memory.stop().expect("clean stop joins");
     }

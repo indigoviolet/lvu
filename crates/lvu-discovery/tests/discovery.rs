@@ -773,6 +773,169 @@ async fn persisted_source_wins_merge_and_full_evidence_keys_are_retained() {
     );
 }
 
+/// Reproduces the real host failure: `docker context show` succeeds but
+/// `docker ps` exits 1 with a permission-denied socket error and zero rows.
+/// The Docker category must report Unavailable with the actionable reason,
+/// never an empty success or an untried/starved status.
+#[tokio::test]
+async fn docker_permission_denied_reports_unavailable_with_actionable_reason() {
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
+    let tmp = TempDir::new().unwrap();
+    let body = "if [ \"$1\" = \"context\" ]; then echo default; exit 0; fi\nprintf 'permission denied while trying to connect to the docker API at unix:///var/run/docker.sock\n' >&2; exit 1";
+    let result = discover(docker_request(docker_script(&tmp, body))).await;
+    assert!(result.candidates.is_empty(), "{:?}", result.candidates);
+    assert_eq!(result.statuses.len(), 1);
+    let status = &result.statuses[0];
+    assert_eq!(status.provider, Provider::Docker);
+    assert_eq!(status.state, ProviderState::Unavailable);
+    assert!(
+        status.message.contains("docker ps"),
+        "must name the failed operation: {}",
+        status.message
+    );
+    assert!(
+        status.message.contains("permission denied"),
+        "must preserve the actionable OS reason: {}",
+        status.message
+    );
+}
+
+/// A failing `docker context show` surfaces explicitly with its own operation
+/// name rather than a generic Docker error.
+#[tokio::test]
+async fn docker_context_failure_names_context_show() {
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
+    let tmp = TempDir::new().unwrap();
+    let body = "printf 'permission denied while trying to connect to the docker API at unix:///var/run/docker.sock\n' >&2; exit 1";
+    let mut req = request();
+    req.docker = Some(DockerConfig {
+        runner: DockerRunner {
+            executable: docker_script(&tmp, body),
+        },
+        context: None,
+        history_lines: 77,
+    });
+    let result = discover(req).await;
+    assert!(result.candidates.is_empty());
+    let status = &result.statuses[0];
+    assert_eq!(status.state, ProviderState::Unavailable);
+    assert!(
+        status.message.contains("docker context show"),
+        "must name the failed operation: {}",
+        status.message
+    );
+    assert!(
+        status.message.contains("permission denied"),
+        "{}",
+        status.message
+    );
+}
+
+/// Current `docker ps --format '{{json .}}'` keys for a running container
+/// produce a usable candidate with the expected evidence.
+#[tokio::test]
+async fn docker_running_container_keys_produce_candidate() {
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
+    let tmp = TempDir::new().unwrap();
+    let body = "printf '%s\\n' '{\"ID\":\"abc123\",\"Names\":\"web\",\"Image\":\"nginx:latest\",\"State\":\"running\",\"Status\":\"Up 5 minutes\",\"Labels\":\"\"}'";
+    let result = discover(docker_request(docker_script(&tmp, body))).await;
+    assert_eq!(result.candidates.len(), 1, "{:?}", result.statuses);
+    let candidate = &result.candidates[0];
+    assert_eq!(candidate.provider, Provider::Docker);
+    assert!(candidate.display_label.contains("web"));
+    assert!(candidate.display_label.contains("(Docker)"));
+    assert_eq!(candidate.availability, crate::Availability::Available);
+    let evidence = &candidate.evidence[0];
+    assert_eq!(
+        evidence.attributes.get("container_id").map(String::as_str),
+        Some("abc123")
+    );
+    assert_eq!(
+        evidence.attributes.get("image").map(String::as_str),
+        Some("nginx:latest")
+    );
+    assert_eq!(
+        evidence.attributes.get("state").map(String::as_str),
+        Some("running")
+    );
+    assert_eq!(
+        evidence.attributes.get("status").map(String::as_str),
+        Some("Up 5 minutes")
+    );
+    assert_eq!(result.statuses[0].state, ProviderState::Complete);
+}
+
+/// Regression for sequential shared-deadline starvation: Project is slow
+/// enough to consume the old leftover budget while a fake Docker runner
+/// returns a running container immediately. Docker runs concurrently against
+/// the same global deadline, so its candidate must appear even though
+/// Project hits the time limit.
+#[tokio::test]
+async fn slow_project_does_not_starve_docker() {
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
+    let tmp = TempDir::new().unwrap();
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    // Enough log files that Project cannot finish inside the deadline even on
+    // a fast disk; each needs stat + canonicalize + candidate insert work.
+    // The scan aborts via its own deadline checks (bounded), it never hangs.
+    for index in 0..30_000 {
+        fs::write(work.join(format!("service-{index:05}.log")), b"line\n").unwrap();
+    }
+    let docker_body = "printf '%s\\n' '{\"ID\":\"web-id\",\"Names\":\"web\",\"Image\":\"nginx\",\"State\":\"running\",\"Status\":\"Up\",\"Labels\":\"\"}'";
+    let docker_path = tmp.path().join("docker-fixture");
+    fs::write(&docker_path, format!("#!/bin/sh\n{docker_body}\n")).unwrap();
+    let mut permissions = fs::metadata(&docker_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&docker_path, permissions).unwrap();
+    let mut req = request();
+    req.limits.maximum_duration = Duration::from_millis(40);
+    req.limits.maximum_files = 200_000;
+    req.limits.maximum_candidates = 50_000;
+    req.project = Some(ProjectConfig {
+        roots: vec![work],
+        ..Default::default()
+    });
+    req.docker = Some(DockerConfig {
+        runner: DockerRunner {
+            executable: docker_path,
+        },
+        context: Some("ctx".into()),
+        history_lines: 77,
+    });
+    let result = discover(req).await;
+    let docker_status = result
+        .statuses
+        .iter()
+        .find(|status| status.provider == Provider::Docker)
+        .expect("docker provider status");
+    assert_eq!(
+        docker_status.state,
+        ProviderState::Complete,
+        "docker must get a real attempt, not starvation: {:?}",
+        result.statuses
+    );
+    assert!(
+        result.candidates.iter().any(|candidate| {
+            candidate.provider == Provider::Docker
+                && candidate
+                    .evidence
+                    .iter()
+                    .flat_map(|evidence| evidence.attributes.get("container_id"))
+                    .any(|id| id == "web-id")
+        }),
+        "docker candidate missing; statuses: {:?}",
+        result.statuses
+    );
+    // Statuses stay in established provider order regardless of finish order.
+    let order: Vec<Provider> = result
+        .statuses
+        .iter()
+        .map(|status| status.provider.clone())
+        .collect();
+    assert_eq!(order, vec![Provider::Project, Provider::Docker]);
+}
+
 #[tokio::test]
 async fn cancellation_and_zero_budget_do_not_start_providers() {
     let tmp = TempDir::new().unwrap();

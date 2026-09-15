@@ -1848,7 +1848,63 @@ fn render_source(
                     .saturating_sub(gap)
                     .saturating_sub(details_rows),
             );
-            if list_area.height > 0 {
+            // A completed scan with no candidates gives the category report
+            // the unused list space: the report is the content, not a
+            // two-line viewport. Filtered-empty (items exist, query hides
+            // them) keeps stable list geometry; only truly empty expands.
+            // Hand-rolled here is presentation-only folding (AGENTS.md).
+            let empty_report = !dialog.discovery.scanning && dialog.discovery.items.is_empty();
+            if empty_report {
+                let report_area = Rect::new(
+                    body.x,
+                    list_y,
+                    body.width,
+                    body.bottom().saturating_sub(list_y),
+                );
+                if report_area.height > 0 {
+                    let wrapped = wrap_pane_lines(
+                        report_area,
+                        &format!("No candidate selected\n{}", dialog.discovery.status)
+                            .lines()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>(),
+                    );
+                    let total = wrapped.len().max(1);
+                    let rects =
+                        plan_list(report_area, 0, total, None, dialog.discovery.status_scroll);
+                    frame.render_widget(
+                        Paragraph::new("Details").style(if this.scroll_focused {
+                            styles.shortcut.add_modifier(Modifier::BOLD)
+                        } else {
+                            styles.label.add_modifier(Modifier::BOLD)
+                        }),
+                        rects.heading,
+                    );
+                    let scroll_limit = total.saturating_sub(rects.row_rects.len());
+                    let scroll = rects.first_row.min(scroll_limit);
+                    for (offset, row) in rects.row_rects.iter().copied().enumerate() {
+                        let Some(line) = wrapped.get(scroll.saturating_add(offset)) else {
+                            continue;
+                        };
+                        frame.render_widget(
+                            Paragraph::new(truncated(line, usize::from(row.width)))
+                                .style(styles.description),
+                            row,
+                        );
+                    }
+                    if let Some(bar) = rects.scrollbar {
+                        render_scrollbar(frame, bar, scroll, scroll_limit, theme, ascii);
+                        surface.scrollable = true;
+                    }
+                    geometry.scroll = Some(report_area);
+                    {
+                        let state = &mut this.state;
+                        state.discovery.status_scroll_limit = scroll_limit;
+                        state.discovery.status_scroll = scroll;
+                    }
+                }
+            }
+            if !empty_report && list_area.height > 0 {
                 let total = discovery_indices.len();
                 let selected = dialog
                     .discovery
@@ -1942,7 +1998,7 @@ fn render_source(
                 body.width,
                 body.bottom().saturating_sub(list_area.bottom()),
             );
-            if details_area.height > 0 {
+            if !empty_report && details_area.height > 0 {
                 let detail = discovery_indices
                     .get(
                         dialog

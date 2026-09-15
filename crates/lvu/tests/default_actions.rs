@@ -824,17 +824,24 @@ fn view_fills_apply_rather_than_the_first_mode_button() {
         let buffer = draw(&provider, &mut app, width, height, theme);
         let rendered = screen(&buffer);
         // The modes are header segments, never action buttons.
-        for bracketed in ["[ New blank ]", "[ Clone ]", "[ Rename ]", "[ Sources ]"] {
+        for bracketed in [
+            "[ New blank ]",
+            "[ Clone ]",
+            "[ Rename ]",
+            "[ Sources ]",
+            "[ Delete ]",
+            "[ Del ]",
+        ] {
             assert!(
                 !rendered.contains(bracketed),
                 "{width}x{height}: {bracketed} must not render:\n{rendered}"
             );
         }
         // The header still names every mode and the action row holds Apply.
-        for segment in ["New blank", "Clone", "Rename", "Sources"] {
+        for segment in ["New blank", "Clone", "Rename", "Sources", "Delete"] {
             assert!(rendered.contains(segment), "{width}x{height}:\n{rendered}");
         }
-        assert_eq!(app.layers.view.tab_rects().len(), 4, "{width}x{height}");
+        assert_eq!(app.layers.view.tab_rects().len(), 5, "{width}x{height}");
         let rects: Vec<(Rect, String)> = app
             .layers
             .view

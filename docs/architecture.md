@@ -96,6 +96,25 @@ enriching or cloning must not launch another capture. Explicit source admission
 and restart belong to the application/ingest lifecycle. Stdin gets a fresh source
 identity per attachment and cannot be restarted without a new reader.
 
+Deletion removes membership, never captures. A derived view deletes
+durably through a fifth Delete mode with two-press confirmation; All events
+is refused (deleted only with its source) as are views still used by a
+surviving union, with the union named. A source removes from the
+sidebar/workspace via Delete or the palette after the same two-press
+confirmation: capture stops, session restore drops it, and its owned views
+delete only after durable acknowledgement. The UI removes either only on
+that acknowledgement; queue saturation, worker loss and optimistic conflicts
+stay loud. Journals, capture directories, source bookmarks, recipes and proof
+data stay byte-identical, and a re-added source may reconnect to its old
+capture. Queued saves for deleted ids conflict instead of resurrecting them.
+
+Discovery checks every enabled category concurrently against the one global
+deadline (processes/open files, project files, Docker containers), so a slow
+scan cannot starve Docker, and reports each with product labels, match counts
+and checked/partial/unavailable/unsupported/cancelled/time-limit outcomes
+plus bounded detail; remembered sources report alongside. An empty completed
+scan gives the report the unused candidate space.
+
 The journal owns exact bytes, delimiters, invalid UTF-8, capture timestamps and
 physical identities. Display strings and parsed/derived fields are projections.
 A record is addressed by source ID and sequence, not viewport position or time.

@@ -36,7 +36,7 @@ use lvu_core::{
 };
 use lvu_discovery::{
     CancellationToken, DiscoveryCandidate, DiscoveryLimits, DiscoveryRequest, DiscoveryResult,
-    DockerConfig, ProcConfig, ProjectConfig, ProviderStatus,
+    DockerConfig, ProcConfig, ProjectConfig, Provider, ProviderState,
 };
 use lvu_ingest::{RuntimeConfig, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
@@ -467,6 +467,25 @@ struct PendingMemorySave {
     dirty_since: std::time::Instant,
 }
 
+/// Workspace removal of one source in flight: stop the capture first (so a
+/// failure aborts with views intact), then durably delete its owned views,
+/// then remove them from the UI. Views stay visible until the durable ack.
+struct PendingSourceRemove {
+    /// Owned view ids (UI strings) for UI removal after the durable ack.
+    views: Vec<String>,
+    /// Owned view ids (durable ids) for tombstoning at durable submit.
+    view_ids: Vec<lvu_core::ViewId>,
+    /// Whether the capture stop phase settled (true immediately when no
+    /// stop is needed).
+    stop_settled: bool,
+    /// Whether the durable view deletion was submitted.
+    durable_submitted: bool,
+    /// Whether the durable view deletion was acked.
+    durable_acked: bool,
+    /// Owned views removed by the durable ack.
+    removed_views: usize,
+}
+
 type StartResult = Result<StartedSource, StartFailure>;
 
 struct ScanResult {
@@ -798,6 +817,19 @@ struct Composition {
     memory_failed: HashMap<lvu_core::ViewId, lvu::PersistentViewState>,
     memory_ack_sequence: HashMap<lvu_core::ViewId, u64>,
     memory_sequence: u64,
+    /// Views with a durable delete in flight. The UI still shows them; only
+    /// the ack removes them.
+    pending_view_deletes: HashSet<lvu_core::ViewId>,
+    /// Views this session deleted (pending or acked). Autosaves and restore
+    /// completions skip them permanently so nothing resurrects them; another
+    /// window's later save conflicts on the missing row.
+    deleted_views: HashSet<lvu_core::ViewId>,
+    /// Sources with a workspace removal in flight: stop, then durable view
+    /// deletion, then UI removal. Views stay visible until the durable ack.
+    pending_source_removes: HashMap<SourceId, PendingSourceRemove>,
+    /// Sources this session removed (pending or done). Autosaves and
+    /// restores skip their views permanently.
+    deleted_sources: HashSet<SourceId>,
     completions_tx: mpsc::Sender<PathCompletionResult>,
     completions_rx: mpsc::Receiver<PathCompletionResult>,
     active_completion: Option<(u64, Arc<AtomicBool>)>,
@@ -938,7 +970,7 @@ impl Composition {
                 if app.apply_discovery_result(
                     scan.generation,
                     items,
-                    discovery_status(&scan.result),
+                    discovery_status(&scan.result, self.recent_sources.len()),
                 ) {
                     self.discovery_candidates = scan
                         .result
@@ -1038,6 +1070,8 @@ impl Composition {
         }
         changed |= self.handle_view_forks(app, adapter);
         changed |= self.handle_view_requests(app, adapter);
+        changed |= self.drain_source_removals(app);
+        changed |= self.progress_source_removes(app, adapter);
         changed |= self.handle_correlation(app, adapter);
         changed |= self.handle_union(app, adapter);
         changed |= self.handle_field_stats(app, adapter);
@@ -4322,6 +4356,65 @@ impl Composition {
                 }
                 continue;
             }
+            if request.mode == lvu::ViewDialogMode::Delete {
+                // Durable deletion, never hiding: canonical All events is
+                // refused (deleted only with its entire source), union
+                // dependents refuse actionably, and the UI removes the view
+                // only on the durable ack. Persistence refusal, queue
+                // saturation and worker loss stay loud with UI/durable
+                // coherent.
+                let Some(view) = app
+                    .views()
+                    .iter()
+                    .find(|view| view.id == request.view_id)
+                    .cloned()
+                else {
+                    app.view_request_failed("selected view no longer exists".into());
+                    continue;
+                };
+                if app.view_role(&view.id) == lvu::ViewRole::Canonical {
+                    app.view_request_failed(
+                        "All events cannot be deleted; remove its source to delete it with everything".into(),
+                    );
+                    continue;
+                }
+                let blockers = app.view_deletion_blockers(&view.id);
+                if !blockers.is_empty() {
+                    app.view_request_failed(format!(
+                        "cannot delete \"{}\": still used by {}; delete or change those unions first",
+                        view.name,
+                        blockers
+                            .iter()
+                            .map(|name| format!("\"{name}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    continue;
+                }
+                let Ok(view_uuid) = Uuid::parse_str(&view.id) else {
+                    app.view_request_failed("selected view identity is invalid".into());
+                    continue;
+                };
+                let view_id = lvu_core::ViewId(view_uuid);
+                // Block autosaves/restores for this view from now: drop
+                // queued state and remember the deletion so a late save or
+                // restore completion cannot resurrect it. Another window's
+                // later save conflicts on the missing row instead.
+                self.deleted_views.insert(view_id);
+                self.drop_memory_bookkeeping(view_id);
+                self.pending_view_deletes.insert(view_id);
+                match self.memory.delete_view(view_id) {
+                    Ok(()) => {
+                        app.source_notice = Some(format!("deleting view \"{}\"…", view.name));
+                    }
+                    Err(error) => {
+                        self.pending_view_deletes.remove(&view_id);
+                        self.deleted_views.remove(&view_id);
+                        app.view_request_failed(error);
+                    }
+                }
+                continue;
+            }
             if request.mode == lvu::ViewDialogMode::Rename {
                 if app.views().iter().any(|view| {
                     view.id != request.view_id
@@ -4524,116 +4617,136 @@ impl Composition {
         self.handle_command_memory_event(app, &event);
         match event {
             MemoryEvent::Loaded(source_id, _requested, stored) => {
-                for value in stored {
-                    let id = value.id;
-                    let ui_id = id.0.to_string();
-                    let sources = if value.presentation.source_ids.is_empty() {
-                        vec![source_id]
-                    } else {
-                        value.presentation.source_ids.clone()
-                    };
-                    let fence = self
-                        .memory_load_fences
-                        .get(&id)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            app.view_interaction_revision(&ui_id).unwrap_or_default()
-                        });
-                    if app
-                        .view_interaction_revision(&ui_id)
-                        .is_some_and(|current| current != fence)
-                    {
-                        continue;
-                    }
-                    if sources
-                        .iter()
-                        .any(|source| !self.sources.contains_key(source))
-                    {
-                        if self.memory_deferred.len() < 128
-                            || self.memory_deferred.contains_key(&id)
-                        {
-                            app.defer_view_restore(&ui_id);
-                            app.action_notice = Some(format!(
-                                "Waiting for sources: view {:?}. Press n to open its other sources; remembered commands never start automatically.",
-                                value.name
-                            ));
-                            self.memory_load_fences.insert(id, fence);
-                            self.memory_deferred.insert(id, value);
-                        } else {
-                            memory_notice(app, "deferred view restoration limit reached".into());
-                        }
-                        continue;
-                    }
-                    if app.views().iter().all(|view| view.id != ui_id) {
-                        if let Some(error) = view_admission_error(app, &source_id.0.to_string()) {
-                            memory_notice(app, format!("restore view {:?}: {error}", value.name));
+                // A deleted source never restores: its session entry is gone
+                // and its views must not come back through a late load.
+                if self.deleted_sources.contains(&source_id) {
+                    self.memory_ready.insert(source_id);
+                } else {
+                    for value in stored {
+                        let id = value.id;
+                        // A deleted view never restores through a late load,
+                        // however its save was queued.
+                        if self.deleted_views.contains(&id) {
                             continue;
                         }
-                        if value.presentation.union.is_some() {
-                            // Union views register their merged membership,
-                            // never an ordinary source scan.
-                            let mut uuids = Vec::with_capacity(sources.len());
-                            let mut bad = None;
-                            for id in &sources {
-                                if self.sources.contains_key(id) {
-                                    uuids.push(*id);
-                                } else {
-                                    bad = Some(*id);
-                                    break;
-                                }
-                            }
-                            if let Some(id) = bad {
+                        let ui_id = id.0.to_string();
+                        let sources = if value.presentation.source_ids.is_empty() {
+                            vec![source_id]
+                        } else {
+                            value.presentation.source_ids.clone()
+                        };
+                        let fence =
+                            self.memory_load_fences
+                                .get(&id)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    app.view_interaction_revision(&ui_id).unwrap_or_default()
+                                });
+                        if app
+                            .view_interaction_revision(&ui_id)
+                            .is_some_and(|current| current != fence)
+                        {
+                            continue;
+                        }
+                        if sources
+                            .iter()
+                            .any(|source| !self.sources.contains_key(source))
+                        {
+                            if self.memory_deferred.len() < 128
+                                || self.memory_deferred.contains_key(&id)
+                            {
+                                app.defer_view_restore(&ui_id);
+                                app.action_notice = Some(format!(
+                                    "Waiting for sources: view {:?}. Press n to open its other sources; remembered commands never start automatically.",
+                                    value.name
+                                ));
+                                self.memory_load_fences.insert(id, fence);
+                                self.memory_deferred.insert(id, value);
+                            } else {
                                 memory_notice(
                                     app,
-                                    format!(
-                                        "restore union {:?}: source {id:?} unavailable",
-                                        value.name
-                                    ),
+                                    "deferred view restoration limit reached".into(),
+                                );
+                            }
+                            continue;
+                        }
+                        if app.views().iter().all(|view| view.id != ui_id) {
+                            if let Some(error) = view_admission_error(app, &source_id.0.to_string())
+                            {
+                                memory_notice(
+                                    app,
+                                    format!("restore view {:?}: {error}", value.name),
                                 );
                                 continue;
                             }
-                            if let Err(error) = adapter.register_union_view(&ui_id, uuids) {
-                                memory_notice(app, format!("restore union: {error}"));
+                            if value.presentation.union.is_some() {
+                                // Union views register their merged membership,
+                                // never an ordinary source scan.
+                                let mut uuids = Vec::with_capacity(sources.len());
+                                let mut bad = None;
+                                for id in &sources {
+                                    if self.sources.contains_key(id) {
+                                        uuids.push(*id);
+                                    } else {
+                                        bad = Some(*id);
+                                        break;
+                                    }
+                                }
+                                if let Some(id) = bad {
+                                    memory_notice(
+                                        app,
+                                        format!(
+                                            "restore union {:?}: source {id:?} unavailable",
+                                            value.name
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                if let Err(error) = adapter.register_union_view(&ui_id, uuids) {
+                                    memory_notice(app, format!("restore union: {error}"));
+                                    continue;
+                                }
+                            } else if let Err(error) =
+                                adapter.register_view(&ui_id, sources.clone())
+                            {
+                                memory_notice(app, format!("restore view: {error}"));
                                 continue;
                             }
-                        } else if let Err(error) = adapter.register_view(&ui_id, sources.clone()) {
-                            memory_notice(app, format!("restore view: {error}"));
+                            app.add_view(ViewItem {
+                                id: ui_id.clone(),
+                                source_id: source_id.0.to_string(),
+                                name: value.name.clone(),
+                            });
+                        }
+                        // The role always comes from persisted metadata, including
+                        // for a view this session created before the load finished.
+                        app.set_view_role(&ui_id, view_role(value.role));
+                        if value.presentation.union.is_none()
+                            && adapter.view_sources(&ui_id).as_ref() != Some(&sources)
+                            && let Err(error) = adapter.register_view(&ui_id, sources)
+                        {
+                            memory_notice(app, format!("restore source membership: {error}"));
                             continue;
                         }
-                        app.add_view(ViewItem {
-                            id: ui_id.clone(),
-                            source_id: source_id.0.to_string(),
-                            name: value.name.clone(),
-                        });
+                        let fence =
+                            self.memory_load_fences
+                                .get(&id)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    app.view_interaction_revision(&ui_id).unwrap_or_default()
+                                });
+                        self.memory_load_fences.insert(id, fence);
+                        let restored = memory::restored(value);
+                        if app.restore_persistent_view_if_unmodified(&ui_id, fence, restored) {
+                            self.memory_restoring.insert(id);
+                        }
                     }
-                    // The role always comes from persisted metadata, including
-                    // for a view this session created before the load finished.
-                    app.set_view_role(&ui_id, view_role(value.role));
-                    if value.presentation.union.is_none()
-                        && adapter.view_sources(&ui_id).as_ref() != Some(&sources)
-                        && let Err(error) = adapter.register_view(&ui_id, sources)
-                    {
-                        memory_notice(app, format!("restore source membership: {error}"));
-                        continue;
-                    }
-                    let fence = self
-                        .memory_load_fences
-                        .get(&id)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            app.view_interaction_revision(&ui_id).unwrap_or_default()
-                        });
-                    self.memory_load_fences.insert(id, fence);
-                    let restored = memory::restored(value);
-                    if app.restore_persistent_view_if_unmodified(&ui_id, fence, restored) {
-                        self.memory_restoring.insert(id);
-                    }
+                    // Every view of this source has its remembered position now, so
+                    // reopen the one that was last in use rather than leaving the
+                    // user on All events.
+                    app.restore_source_selection(&source_id.0.to_string());
+                    self.memory_ready.insert(source_id);
                 }
-                // Every view of this source has its remembered position now, so
-                // reopen the one that was last in use rather than leaving the
-                // user on All events.
-                app.restore_source_selection(&source_id.0.to_string());
-                self.memory_ready.insert(source_id);
             }
             MemoryEvent::DerivedViewCreated(view_id, result) => {
                 let candidate = view_id.0.to_string();
@@ -4657,7 +4770,12 @@ impl Composition {
                 memory_notice(app, error);
             }
             MemoryEvent::Saved(_source_id, view_id, sequence) => {
-                if let Some((_, state)) = self.memory_inflight.remove(&sequence)
+                // A late save for a deleted view is dropped, never recorded:
+                // recording it would advance the durable baseline past the
+                // deletion and resurrect the view on the next restart.
+                if self.deleted_views.contains(&view_id) {
+                    self.memory_inflight.remove(&sequence);
+                } else if let Some((_, state)) = self.memory_inflight.remove(&sequence)
                     && self
                         .memory_ack_sequence
                         .get(&view_id)
@@ -4669,10 +4787,30 @@ impl Composition {
                 }
             }
             MemoryEvent::SaveFailed(_source_id, view_id, sequence, error) => {
-                if let Some((_, state)) = self.memory_inflight.remove(&sequence) {
-                    self.memory_failed.insert(view_id, state);
+                if self.deleted_views.contains(&view_id) {
+                    self.memory_inflight.remove(&sequence);
+                } else {
+                    if let Some((_, state)) = self.memory_inflight.remove(&sequence) {
+                        self.memory_failed.insert(view_id, state);
+                    }
+                    memory_notice(app, error);
                 }
-                memory_notice(app, error);
+            }
+            MemoryEvent::ViewDeleted(view_id) => {
+                self.finish_view_delete(app, adapter, view_id);
+            }
+            MemoryEvent::ViewDeleteFailed(view_id, error) => {
+                self.pending_view_deletes.remove(&view_id);
+                self.deleted_views.remove(&view_id);
+                let message = format!("view deletion failed: {error}");
+                app.view_request_failed(message.clone());
+                memory_notice(app, message);
+            }
+            MemoryEvent::SourceRemoved(source_id, removed) => {
+                self.finish_source_remove(app, adapter, source_id, removed);
+            }
+            MemoryEvent::SourceRemoveFailed(source_id, error) => {
+                self.abort_source_remove(app, source_id, error);
             }
             MemoryEvent::Recent(values) => self.recent_sources = values,
             MemoryEvent::Recipes(meta, values, candidates) => {
@@ -4753,6 +4891,347 @@ impl Composition {
         }
     }
 
+    /// Drops every queued/in-flight save baseline for one view so a delete
+    /// cannot be resurrected by an autosave that was already admitted.
+    fn drop_memory_bookkeeping(&mut self, view_id: lvu_core::ViewId) {
+        self.memory_pending.remove(&view_id);
+        self.memory_inflight.retain(|_, (id, _)| *id != view_id);
+        self.memory_failed.remove(&view_id);
+        self.memory_last.remove(&view_id);
+        self.memory_ack_sequence.remove(&view_id);
+        self.memory_load_fences.remove(&view_id);
+        self.memory_restoring.remove(&view_id);
+        self.memory_deferred.remove(&view_id);
+    }
+
+    /// The durable delete ack for one view: unregister query/union work,
+    /// cancel dependent controller state, and remove the view from the UI
+    /// with a deterministic survivor. Durable refusal is handled by the
+    /// ViewDeleteFailed arm (view stays visible).
+    fn finish_view_delete(
+        &mut self,
+        app: &mut App,
+        adapter: &NativeViewAdapter,
+        view_id: lvu_core::ViewId,
+    ) {
+        self.pending_view_deletes.remove(&view_id);
+        let ui_id = view_id.0.to_string();
+        let name = app
+            .views()
+            .iter()
+            .find(|view| view.id == ui_id)
+            .map(|view| view.name.clone())
+            .unwrap_or_else(|| ui_id.clone());
+        adapter.unregister_view(&ui_id);
+        adapter.unregister_union_view(&ui_id);
+        self.union_inflight.remove(&ui_id);
+        self.drop_memory_bookkeeping(view_id);
+        if app.remove_view(&ui_id) {
+            app.action_notice = Some(format!("deleted view \"{name}\""));
+        }
+    }
+
+    /// Whether one source still has a live capture in this window. Shared
+    /// handles are retained after stop so health keeps reading Stopped, so
+    /// ownership alone is not liveness: the retained progress snapshot's
+    /// terminal state decides, exactly like the local manager handle.
+    fn source_capture_running(&self, source_id: SourceId) -> bool {
+        if let Some(shared) = self.shared.as_ref()
+            && let Some(progress) = shared.source_progress(source_id)
+        {
+            return !progress.state.is_terminal();
+        }
+        self.manager
+            .source(source_id)
+            .is_some_and(|handle| !handle.progress().state.is_terminal())
+    }
+
+    /// Drains confirmed source removals from the shell: re-validates
+    /// dependents (refusing without mutation), snapshots owned views, and
+    /// starts the stop phase. The durable view deletion follows only after
+    /// the stop settles, so a stop failure aborts with views intact.
+    fn drain_source_removals(&mut self, app: &mut App) -> bool {
+        let mut changed = false;
+        for source_id_text in app.take_source_removals() {
+            changed = true;
+            let Ok(source_uuid) = Uuid::parse_str(&source_id_text) else {
+                app.action_notice = Some("source removal unavailable for this view".into());
+                continue;
+            };
+            let source_id = SourceId(source_uuid);
+            if self.pending_source_removes.contains_key(&source_id)
+                || self.deleted_sources.contains(&source_id)
+            {
+                app.action_notice = Some("source removal already pending".into());
+                continue;
+            }
+            let blockers = app.source_removal_blockers(&source_id_text);
+            if !blockers.is_empty() {
+                let name = self
+                    .definitions
+                    .get(&source_id)
+                    .map(|definition| definition.name.clone())
+                    .unwrap_or_else(|| source_id_text.clone());
+                app.action_notice = Some(format!(
+                    "cannot remove \"{name}\": {}; change or delete those views first",
+                    blockers.join("; ")
+                ));
+                continue;
+            }
+            let views: Vec<String> = app
+                .views()
+                .iter()
+                .filter(|view| view.source_id == source_id_text)
+                .map(|view| view.id.clone())
+                .collect();
+            let view_ids: Vec<lvu_core::ViewId> = views
+                .iter()
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .map(lvu_core::ViewId)
+                .collect();
+            let stop_needed = self.source_capture_running(source_id);
+            if stop_needed {
+                if self.source_controls.len() + self.shared_controls.len() >= 8 {
+                    app.action_notice =
+                        Some("source control limit reached; retry after pending operations".into());
+                    continue;
+                }
+                let Some(definition) = self.definitions.get(&source_id).cloned() else {
+                    app.action_notice = Some("source definition is unavailable".into());
+                    continue;
+                };
+                // Route exactly like an explicit stop: worker-owned captures
+                // go shared, everything else goes local. Settlement is
+                // observed through the control maps (see
+                // progress_source_removes); the stop notice it writes is
+                // replaced by the removal notice below.
+                if let Some(shared) = self
+                    .shared
+                    .clone()
+                    .filter(|shared| shared.owns_source(source_id))
+                {
+                    let (sender, result) = tokio::sync::oneshot::channel();
+                    let worker = self.runtime.spawn(async move {
+                        let outcome = match shared.stop_source(source_id).await {
+                            Ok(()) => Ok(SharedControlOutcome::Stopped),
+                            Err(error) => Err(format!("stop capture: {error}")),
+                        };
+                        let _ = sender.send(outcome);
+                    });
+                    self.shared_controls.insert(
+                        source_id,
+                        SharedControlJob {
+                            restart: false,
+                            result,
+                            worker,
+                        },
+                    );
+                } else if !self.source_controls.contains_key(&source_id)
+                    && !self.shared_controls.contains_key(&source_id)
+                    && !self.pending_starts.contains(&source_id)
+                {
+                    let manager = self.manager.clone();
+                    let (sender, result) = tokio::sync::oneshot::channel();
+                    let worker = self.runtime.spawn(async move {
+                        let result = control_source(manager, definition, false).await;
+                        let _ = sender.send(result);
+                    });
+                    self.source_controls.insert(
+                        source_id,
+                        SourceControlJob {
+                            restart: false,
+                            result,
+                            worker,
+                        },
+                    );
+                }
+            }
+            self.pending_source_removes.insert(
+                source_id,
+                PendingSourceRemove {
+                    views,
+                    view_ids,
+                    stop_settled: !stop_needed,
+                    durable_submitted: false,
+                    durable_acked: false,
+                    removed_views: 0,
+                },
+            );
+            let name = self
+                .definitions
+                .get(&source_id)
+                .map(|definition| definition.name.clone())
+                .unwrap_or_else(|| source_id_text.clone());
+            app.action_notice = Some(format!(
+                "removing source \"{name}\"… captured data stays on disk"
+            ));
+        }
+        changed
+    }
+
+    /// Advances every pending source removal: when the stop phase settles
+    /// (control jobs gone and capture no longer running) submits the durable
+    /// view deletion once. A stop failure aborts with views intact and loud.
+    fn progress_source_removes(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
+        let mut changed = false;
+        let ids: Vec<SourceId> = self.pending_source_removes.keys().copied().collect();
+        for source_id in ids {
+            let stop_busy = self.source_controls.contains_key(&source_id)
+                || self.shared_controls.contains_key(&source_id)
+                || self.pending_starts.contains(&source_id);
+            let running = self.source_capture_running(source_id);
+            let stop_settled = self
+                .pending_source_removes
+                .get(&source_id)
+                .is_some_and(|pending| pending.stop_settled);
+            if !stop_settled {
+                if stop_busy {
+                    continue;
+                }
+                // Control jobs settled but the capture is still running: the
+                // stop failed. Abort before any durable mutation; views are
+                // intact and the stop notice already says why.
+                if running {
+                    self.pending_source_removes.remove(&source_id);
+                    app.action_notice = Some(
+                        "source removal aborted: capture is still running; retry removal".into(),
+                    );
+                    changed = true;
+                    continue;
+                }
+                if let Some(pending) = self.pending_source_removes.get_mut(&source_id) {
+                    pending.stop_settled = true;
+                }
+                changed = true;
+            }
+            // The durable ack may already have arrived while the stop was
+            // settling (see finish_source_remove): with both done, the UI
+            // removal is due right here rather than in the event arm.
+            let (durable_acked, stop_settled) = match self.pending_source_removes.get(&source_id) {
+                Some(pending) => (pending.durable_acked, pending.stop_settled),
+                None => continue,
+            };
+            if durable_acked && stop_settled {
+                self.complete_source_remove_ui(app, adapter, source_id);
+                changed = true;
+                continue;
+            }
+            let (durable_submitted, view_ids) = match self.pending_source_removes.get(&source_id) {
+                Some(pending) => (pending.durable_submitted, pending.view_ids.clone()),
+                None => continue,
+            };
+            if !durable_submitted {
+                if let Some(pending) = self.pending_source_removes.get_mut(&source_id) {
+                    pending.durable_submitted = true;
+                }
+                for view_id in &view_ids {
+                    self.deleted_views.insert(*view_id);
+                    self.drop_memory_bookkeeping(*view_id);
+                }
+                self.deleted_sources.insert(source_id);
+                if let Err(error) = self.memory.remove_source(source_id) {
+                    for view_id in &view_ids {
+                        self.deleted_views.remove(view_id);
+                    }
+                    self.deleted_sources.remove(&source_id);
+                    self.pending_source_removes.remove(&source_id);
+                    app.action_notice = Some(format!("source removal failed: {error}"));
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The durable ack for one source removal: records it, then removes
+    /// owned views and sidebar membership from the UI once the stop phase
+    /// has also settled (either order). Journals, bookmarks, recipes and
+    /// proof data stay byte-identical.
+    fn finish_source_remove(
+        &mut self,
+        app: &mut App,
+        adapter: &NativeViewAdapter,
+        source_id: SourceId,
+        removed: usize,
+    ) {
+        let Some(mut pending) = self.pending_source_removes.remove(&source_id) else {
+            return;
+        };
+        pending.durable_acked = true;
+        pending.removed_views = removed;
+        // The durable ack may win the race with the stop settlement; the
+        // capture must be stopped before the UI lets go of the source, so a
+        // pending stop parks here until progress_source_removes settles it.
+        if !pending.stop_settled
+            && (self.source_controls.contains_key(&source_id)
+                || self.shared_controls.contains_key(&source_id)
+                || self.source_capture_running(source_id))
+        {
+            self.pending_source_removes.insert(source_id, pending);
+            app.action_notice = Some("source removal finishing capture stop…".into());
+            return;
+        }
+        pending.stop_settled = true;
+        self.pending_source_removes.insert(source_id, pending);
+        self.complete_source_remove_ui(app, adapter, source_id);
+    }
+
+    /// Removes owned views and sidebar membership from the UI for a removal
+    /// whose stop phase settled and whose durable ack arrived (either
+    /// order), then reports the preservation wording.
+    fn complete_source_remove_ui(
+        &mut self,
+        app: &mut App,
+        adapter: &NativeViewAdapter,
+        source_id: SourceId,
+    ) {
+        let Some(pending) = self.pending_source_removes.remove(&source_id) else {
+            return;
+        };
+        let name = self
+            .definitions
+            .get(&source_id)
+            .map(|definition| definition.name.clone())
+            .unwrap_or_else(|| source_id.0.to_string());
+        for ui_id in &pending.views {
+            adapter.unregister_view(ui_id);
+            adapter.unregister_union_view(ui_id);
+            self.union_inflight.remove(ui_id);
+            if let Ok(uuid) = Uuid::parse_str(ui_id) {
+                self.drop_memory_bookkeeping(lvu_core::ViewId(uuid));
+            }
+        }
+        let removed_ids = app.remove_source_views(&source_id.0.to_string());
+        debug_assert_eq!(removed_ids.len(), pending.views.len());
+        self.sources.remove(&source_id);
+        self.definitions.remove(&source_id);
+        self.session_sources.retain(|value| value.id != source_id);
+        self.record_session(app);
+        self.recent_sources
+            .retain(|source| source.definition.id != source_id);
+        self.discovery_candidates
+            .retain(|_, selection| match selection {
+                CandidateSelection::Live(candidate) => candidate.source.id != source_id,
+                CandidateSelection::Recent(definition) => definition.id != source_id,
+            });
+        app.action_notice = Some(format!(
+            "removed source \"{name}\" from the workspace; captured data stays on disk"
+        ));
+    }
+
+    /// A refused durable source removal: nothing was partially mutated, so
+    /// the source and its views stay visible and autosaves resume.
+    fn abort_source_remove(&mut self, app: &mut App, source_id: SourceId, error: String) {
+        let Some(pending) = self.pending_source_removes.remove(&source_id) else {
+            return;
+        };
+        for view_id in pending.view_ids {
+            self.deleted_views.remove(&view_id);
+        }
+        self.deleted_sources.remove(&source_id);
+        app.action_notice = Some(format!("source removal failed: {error}"));
+    }
+
     fn queue_memory_saves(&mut self, app: &App, force: bool) -> bool {
         const AUTOSAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
         let mut changed = false;
@@ -4761,6 +5240,11 @@ impl Composition {
                 continue;
             };
             let memory_view_id = lvu_core::ViewId(view_uuid);
+            // Deleted views and removed sources never autosave: a queued
+            // save must not resurrect durable state after its deletion.
+            if self.deleted_views.contains(&memory_view_id) {
+                continue;
+            }
             if self.command_controller.suppresses_autosave(memory_view_id) {
                 continue;
             }
@@ -4768,6 +5252,9 @@ impl Composition {
                 continue;
             };
             let source_id = SourceId(source_uuid);
+            if self.deleted_sources.contains(&source_id) {
+                continue;
+            }
             if self.memory_deferred.contains_key(&memory_view_id) {
                 continue;
             }
@@ -6903,7 +7390,7 @@ fn write_source_ai_manifest(
         cwd: cwd.display().to_string(),
         candidate_count: candidates.len(),
         candidates,
-        discovery_status: discovery_status(discovered),
+        discovery_status: discovery_status(discovered, 0),
         note: "Read-only bounded discovery evidence; do not execute a proposed source during review.",
     };
     let mut writer = CappedWriter {
@@ -7513,33 +8000,115 @@ fn recent_discovery_item(source: &lvu_memory::SourceMetadata) -> DiscoveryItem {
     }
 }
 
-fn discovery_status(result: &DiscoveryResult) -> String {
-    let providers = result
-        .statuses
-        .iter()
-        .map(provider_status)
-        .collect::<Vec<_>>()
-        .join("; ");
+/// Explicit per-category discovery report with product labels, never Debug
+/// jargon. Every category names its match count and its outcome (checked /
+/// partial / unavailable / unsupported / cancelled / time limit reached) plus
+/// bounded provider detail, so an empty or failed provider reads as checked
+/// with no results rather than untried. Docker permission failures keep the
+/// actual command reason; the UI may suggest checking daemon/socket access
+/// but never claims lvu fixes OS permissions.
+fn discovery_status(result: &DiscoveryResult, remembered: usize) -> String {
+    fn state_word(state: &ProviderState) -> &'static str {
+        match state {
+            ProviderState::Complete => "checked",
+            ProviderState::Limited => "partial",
+            ProviderState::Unavailable => "unavailable",
+            ProviderState::Unsupported => "unsupported",
+            ProviderState::Cancelled => "cancelled",
+            ProviderState::TimedOut => "time limit reached",
+        }
+    }
+    fn matches_word(count: usize) -> String {
+        match count {
+            0 => "no matches".to_owned(),
+            1 => "1 match".to_owned(),
+            _ => format!("{count} matches"),
+        }
+    }
+    /// One logical line of bounded detail; newlines become separators and
+    /// overlong provider messages are truncated (chars, not bytes).
+    fn bounded_detail(message: &str) -> String {
+        const LIMIT: usize = 240;
+        let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.chars().count() <= LIMIT {
+            flat
+        } else {
+            let kept: String = flat.chars().take(LIMIT).collect();
+            format!("{kept}…")
+        }
+    }
+    let live = |provider: &Provider| {
+        result
+            .candidates
+            .iter()
+            .filter(|candidate| &candidate.provider == provider)
+            .count()
+    };
+    let status_for = |provider: &Provider| {
+        result
+            .statuses
+            .iter()
+            .find(|status| &status.provider == provider)
+    };
+    let category = |label: &str, provider: Provider| -> String {
+        let matches = live(&provider);
+        match status_for(&provider) {
+            Some(status) => {
+                let mut detail = bounded_detail(&status.message);
+                if provider == Provider::Docker
+                    && status.state == ProviderState::Unavailable
+                    && (detail.contains("permission denied")
+                        || detail.contains("docker API")
+                        || detail.contains("socket"))
+                {
+                    detail.push_str(
+                        "; check Docker daemon/socket access for this user (OS permission; lvu cannot change it)",
+                    );
+                }
+                if detail.is_empty() {
+                    format!(
+                        "{label}: {} · {}",
+                        matches_word(matches),
+                        state_word(&status.state)
+                    )
+                } else {
+                    format!(
+                        "{label}: {} · {} — {detail}",
+                        matches_word(matches),
+                        state_word(&status.state)
+                    )
+                }
+            }
+            None => format!("{label}: {} · not checked", matches_word(matches)),
+        }
+    };
+    let recent_live = live(&Provider::Recent);
+    let remembered_matches = remembered.saturating_add(recent_live);
+    let total = remembered.saturating_add(result.candidates.len());
     let ending = if result.cancelled {
         "cancelled"
     } else if result.timed_out {
         "time limit reached"
-    } else if result.candidates.is_empty() {
+    } else if total == 0 {
         "no candidates"
     } else {
         "complete"
     };
-    format!(
-        "{} candidates, {ending}; {providers}",
-        result.candidates.len()
-    )
-}
-
-fn provider_status(status: &ProviderStatus) -> String {
-    format!(
-        "{:?} {:?}: {}",
-        status.provider, status.state, status.message
-    )
+    let candidate_word = match total {
+        1 => "1 candidate",
+        _ => &format!("{total} candidates"),
+    };
+    [
+        format!("{candidate_word}, {ending}"),
+        category("Processes / open files", Provider::Procfs),
+        category("Project files", Provider::Project),
+        category("Docker containers", Provider::Docker),
+        format!(
+            "Remembered sources: {} · checked",
+            matches_word(remembered_matches)
+        ),
+    ]
+    .join("\n")
 }
 
 fn suggestion_context(
@@ -8156,6 +8725,10 @@ async fn run() -> Result<(), String> {
         memory_failed: HashMap::new(),
         memory_ack_sequence: HashMap::new(),
         memory_sequence: 0,
+        pending_view_deletes: HashSet::new(),
+        deleted_views: HashSet::new(),
+        pending_source_removes: HashMap::new(),
+        deleted_sources: HashSet::new(),
         completions_tx,
         completions_rx,
         active_completion: None,
@@ -10288,6 +10861,10 @@ mod tests {
             memory_failed: HashMap::new(),
             memory_ack_sequence: HashMap::new(),
             memory_sequence: 0,
+            pending_view_deletes: HashSet::new(),
+            deleted_views: HashSet::new(),
+            pending_source_removes: HashMap::new(),
+            deleted_sources: HashSet::new(),
             completions_tx,
             completions_rx,
             active_completion: None,
@@ -11974,6 +12551,10 @@ for line in sys.stdin:
             memory_failed: HashMap::new(),
             memory_ack_sequence: HashMap::new(),
             memory_sequence: 0,
+            pending_view_deletes: HashSet::new(),
+            deleted_views: HashSet::new(),
+            pending_source_removes: HashMap::new(),
+            deleted_sources: HashSet::new(),
             completions_tx,
             completions_rx,
             active_completion: None,
@@ -12106,6 +12687,10 @@ for line in sys.stdin:
             memory_failed: HashMap::new(),
             memory_ack_sequence: HashMap::new(),
             memory_sequence: 0,
+            pending_view_deletes: HashSet::new(),
+            deleted_views: HashSet::new(),
+            pending_source_removes: HashMap::new(),
+            deleted_sources: HashSet::new(),
             completions_tx,
             completions_rx,
             active_completion: None,
@@ -12688,6 +13273,48 @@ root = \"/tmp/elsewhere\"\n",
         assert_ne!(left_definition.id, right_definition.id);
     }
 
+    #[test]
+    fn discovery_report_names_every_category_with_product_labels() {
+        use lvu_discovery::{DiscoveryResult, Provider, ProviderState, ProviderStatus};
+        let result = DiscoveryResult {
+            candidates: Vec::new(),
+            statuses: vec![
+                ProviderStatus {
+                    provider: Provider::Procfs,
+                    state: ProviderState::Complete,
+                    message: "examined 12 entries".into(),
+                },
+                ProviderStatus {
+                    provider: Provider::Project,
+                    state: ProviderState::Complete,
+                    message: "examined 4 entries".into(),
+                },
+                ProviderStatus {
+                    provider: Provider::Docker,
+                    state: ProviderState::Unavailable,
+                    message: "docker ps failed: exit status: 1: permission denied while trying to connect to the docker API at unix:///var/run/docker.sock".into(),
+                },
+            ],
+            cancelled: false,
+            timed_out: false,
+        };
+        let report = discovery_status(&result, 0);
+        assert!(report.contains("no candidates"), "{report}");
+        assert!(report.contains("Processes / open files"), "{report}");
+        assert!(report.contains("Project files"), "{report}");
+        assert!(report.contains("Docker containers"), "{report}");
+        assert!(report.contains("Remembered sources"), "{report}");
+        assert!(!report.contains("Procfs"), "{report}");
+        assert!(report.contains("no matches · checked"), "{report}");
+        assert!(report.contains("unavailable"), "{report}");
+        assert!(report.contains("permission denied"), "{report}");
+        assert!(
+            report.contains("check Docker daemon/socket access"),
+            "{report}"
+        );
+        assert!(!report.contains("fix"), "{report}");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn recorded_docker_result_exposes_service_evidence_and_authoritative_definition() {
@@ -12733,7 +13360,12 @@ root = \"/tmp/elsewhere\"\n",
         assert!(item.detail.contains("Docker container"));
         assert!(item.status.contains("Docker"));
         assert_eq!(candidate.source.id, authoritative_id);
-        assert!(discovery_status(&result).contains("1 candidates"));
+        let report = discovery_status(&result, 0);
+        assert!(report.contains("1 candidate"), "{report}");
+        assert!(report.contains("Docker containers"), "{report}");
+        assert!(report.contains("1 match"), "{report}");
+        assert!(report.contains("checked"), "{report}");
+        assert!(report.contains("Remembered sources"), "{report}");
     }
 
     /// `record_session` refuses loudly when the existing manifest is

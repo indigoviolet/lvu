@@ -3316,3 +3316,154 @@ fn unrecognized_canonical_row_is_preserved_not_folded() {
     assert_eq!(canonical.id, foreign, "unclassified row preserved");
     assert!(store.get_view(preferred).unwrap().is_none());
 }
+
+/// Durable view deletion: a derived row disappears and stays gone across
+/// reopen, the canonical All events view is refused (deleted only with its
+/// entire source), and unknown ids report not-found without error.
+#[test]
+fn delete_view_removes_derived_and_refuses_canonical() {
+    let temp = TempDir::new().unwrap();
+    let store = WorkspaceStore::open(temp.path()).unwrap();
+    let source_id = SourceId::new();
+    store
+        .upsert_source(&metadata(source_id, "p", "c", 1, &[]))
+        .unwrap();
+    let canonical = store
+        .ensure_canonical_view(source_id, ViewId::new(), None, "All events")
+        .unwrap();
+    let derived_id = ViewId::new();
+    store
+        .create_view(&private_view(derived_id, source_id, "errors", 0))
+        .unwrap();
+    assert!(store.delete_view(derived_id).unwrap());
+    assert!(store.get_view(derived_id).unwrap().is_none());
+    // Durable across reopen: no resurrection through a fresh handle.
+    let reopened = WorkspaceStore::open(temp.path()).unwrap();
+    assert!(reopened.get_view(derived_id).unwrap().is_none());
+    assert!(reopened.get_view(canonical.id).unwrap().is_some());
+    let error = reopened.delete_view(canonical.id).unwrap_err().to_string();
+    assert!(
+        error.contains("All events"),
+        "canonical refusal must say why: {error}"
+    );
+    assert!(!reopened.delete_view(ViewId::new()).unwrap());
+}
+
+/// Deleting a view never touches source-scoped bookmarks: the surviving
+/// view of the same source still reads the identical note, and the sources
+/// row survives for reconnect.
+#[test]
+fn delete_view_preserves_source_bookmarks_and_source_row() {
+    let temp = TempDir::new().unwrap();
+    let store = WorkspaceStore::open(temp.path()).unwrap();
+    let source_id = SourceId::new();
+    store
+        .upsert_source(&metadata(source_id, "p", "c", 1, &[]))
+        .unwrap();
+    let mut first = private_view(ViewId::new(), source_id, "first", 7);
+    first.presentation.bookmarks = vec![StoredBookmark {
+        record: RecordId {
+            source_id,
+            sequence: 7,
+        },
+        note: "keep me".into(),
+    }];
+    store.create_view(&first).unwrap();
+    // Each create rewrites its sources' bookmark sets (last writer wins),
+    // so the second view carries the same note rather than wiping it.
+    let mut second = private_view(ViewId::new(), source_id, "second", 7);
+    second.presentation.bookmarks = first.presentation.bookmarks.clone();
+    store.create_view(&second).unwrap();
+    assert!(store.delete_view(first.id).unwrap());
+    let survivor = store.get_view(second.id).unwrap().expect("survivor");
+    assert_eq!(
+        survivor.presentation.bookmarks,
+        vec![StoredBookmark {
+            record: RecordId {
+                source_id,
+                sequence: 7,
+            },
+            note: "keep me".into(),
+        }]
+    );
+    assert_eq!(store.recent_sources(None, 100).unwrap().len(), 1);
+}
+
+/// Source removal deletes every owned view (canonical included) in one
+/// atomic step while the source row and its bookmarks survive byte-identical
+/// for reconnect; journals live outside SQLite and are untouched here.
+#[test]
+fn delete_views_for_source_is_atomic_and_preserves_bytes() {
+    let temp = TempDir::new().unwrap();
+    let store = WorkspaceStore::open(temp.path()).unwrap();
+    let source_id = SourceId::new();
+    store
+        .upsert_source(&metadata(source_id, "p", "c", 1, &[]))
+        .unwrap();
+    let canonical = store
+        .ensure_canonical_view(source_id, ViewId::new(), None, "All events")
+        .unwrap();
+    let mut derived = private_view(ViewId::new(), source_id, "errors", 3);
+    derived.presentation.bookmarks = vec![StoredBookmark {
+        record: RecordId {
+            source_id,
+            sequence: 3,
+        },
+        note: "retained".into(),
+    }];
+    store.create_view(&derived).unwrap();
+    let removed = store.delete_views_for_source(source_id).unwrap();
+    assert_eq!(removed, 2, "canonical + derived");
+    assert!(store.get_view(canonical.id).unwrap().is_none());
+    assert!(store.get_view(derived.id).unwrap().is_none());
+    assert!(
+        store
+            .working_views_for_source(source_id, 100)
+            .unwrap()
+            .is_empty()
+    );
+    // Byte-identical preservation, read below the view layer so no view
+    // write can mask a deletion.
+    let db = rusqlite::Connection::open(temp.path().join("workspace.sqlite3")).unwrap();
+    let sources: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sources WHERE source_id=?1",
+            [source_id.0.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sources, 1, "source row survives for reconnect");
+    let bookmarks: Vec<(i64, String)> = db
+        .prepare("SELECT sequence,note FROM source_bookmarks WHERE source_id=?1")
+        .unwrap()
+        .query_map([source_id.0.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(bookmarks, vec![(3, "retained".to_owned())]);
+}
+
+/// A save for a deleted view conflicts instead of INSERT-resurrecting it.
+#[test]
+fn save_after_delete_conflicts_instead_of_resurrecting() {
+    let temp = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(temp.path()).unwrap();
+    let source_id = SourceId::new();
+    let view_id = ViewId::new();
+    let view = private_view(view_id, source_id, "errors", 0);
+    store
+        .save_source_and_view(&metadata(source_id, "p", "c", 1, &[]), &view, None)
+        .unwrap();
+    assert!(store.delete_view(view_id).unwrap());
+    let error = store
+        .save_source_and_view(&metadata(source_id, "p", "c", 2, &[]), &view, Some(0))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("conflict") || error.contains("Conflict"),
+        "deleted-row save must conflict, got: {error}"
+    );
+    assert!(store.get_view(view_id).unwrap().is_none());
+}

@@ -250,6 +250,7 @@ const BASE_OPERATIONS: &[(KeyCode, KeyModifiers, &str)] = &[
     // they are the reason the rule now covers the base screen.
     (KeyCode::Char('X'), KeyModifiers::SHIFT, "X"),
     (KeyCode::Char('R'), KeyModifiers::SHIFT, "R"),
+    (KeyCode::Delete, KeyModifiers::NONE, "Delete"),
 ];
 
 /// §8.10: the base screen takes no text, so every letter there is a key and no

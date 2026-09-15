@@ -94,6 +94,10 @@ pub struct ViewDialog {
     /// Dialog-owned caret for the dialog-owned name draft (§2.5).
     cursor: TextCursor,
     error: Option<String>,
+    /// Delete-mode confirmation arm: the first Delete-view press arms, the
+    /// second submits. Reset on every mode switch, open and refusal, so a
+    /// destructive action is never accidental or default before confirmation.
+    confirm_delete: bool,
     geometry: ViewGeometry,
     surface: Surface,
     pub outbox: Outbox<ViewMutationRequest>,
@@ -110,6 +114,7 @@ impl Default for ViewDialog {
             draft: String::new(),
             cursor: TextCursor::default(),
             error: None,
+            confirm_delete: false,
             geometry: ViewGeometry::default(),
             surface: Surface::default(),
             outbox: Outbox::new(VIEW_OUTBOX_CAP),
@@ -136,6 +141,10 @@ impl ViewDialog {
 
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    pub fn delete_armed(&self) -> bool {
+        self.confirm_delete
     }
 
     pub fn selected_source(&self) -> usize {
@@ -167,16 +176,23 @@ impl ViewDialog {
     pub fn fail(&mut self, message: String) {
         if self.open {
             self.error = Some(message);
+            self.confirm_delete = false;
         }
     }
 
     fn text_editing(&self) -> bool {
-        self.mode != ViewDialogMode::Sources && self.control == ViewDialogControl::Input
+        !matches!(self.mode, ViewDialogMode::Sources | ViewDialogMode::Delete)
+            && self.control == ViewDialogControl::Input
     }
 
     /// Tab order (§8.8): the one header stop, then the mode-specific body
-    /// (the name field or the membership list), then Apply.
+    /// (the name field, the membership list, or nothing for Delete), then
+    /// the contextual action.
     fn controls(&self) -> Vec<ViewDialogControl> {
+        if self.mode == ViewDialogMode::Delete {
+            // Delete has no text body; Tab moves header → action.
+            return vec![ViewDialogControl::Tabs, ViewDialogControl::Apply];
+        }
         vec![
             ViewDialogControl::Tabs,
             if self.mode == ViewDialogMode::Sources {
@@ -193,16 +209,23 @@ impl ViewDialog {
             return;
         };
         self.mode = mode;
+        // Delete opens on the header, never on its destructive action, so
+        // Enter cannot delete before an explicit focus move + arm + confirm.
         self.control = if mode == ViewDialogMode::Sources {
             ViewDialogControl::Sources
+        } else if mode == ViewDialogMode::Delete {
+            ViewDialogControl::Tabs
         } else {
             ViewDialogControl::Input
         };
         self.error = None;
+        self.confirm_delete = false;
         self.draft = match mode {
             ViewDialogMode::Blank => "New view".into(),
             ViewDialogMode::Clone => format!("Copy of {}", view.name),
-            ViewDialogMode::Rename | ViewDialogMode::Sources => view.name.clone(),
+            ViewDialogMode::Rename | ViewDialogMode::Sources | ViewDialogMode::Delete => {
+                view.name.clone()
+            }
         };
         reset_cursor_to_end(&self.draft, &mut self.cursor);
     }
@@ -268,11 +291,32 @@ impl ViewDialog {
 
     /// The one place a view mutation leaves this component. The draft survives
     /// a refusal, so an invalid name never destroys what the user typed.
+    /// Delete arms first and submits only on the second press; the arm
+    /// resets on every mode switch, open and refusal.
     fn submit(&mut self, ctx: &Ctx<'_>) {
-        let name = self.draft.trim();
         let Some(view) = ctx.views.active_item() else {
             return;
         };
+        if self.mode == ViewDialogMode::Delete {
+            if !self.confirm_delete {
+                self.confirm_delete = true;
+                self.error = None;
+                return;
+            }
+            self.confirm_delete = false;
+            let request = ViewMutationRequest {
+                source_ids: Vec::new(),
+                mode: ViewDialogMode::Delete,
+                source_id: view.source_id.clone(),
+                view_id: view.id.clone(),
+                name: view.name.clone(),
+            };
+            if self.outbox.push(request).is_err() {
+                self.error = Some("view request queue is full".into());
+            }
+            return;
+        }
+        let name = self.draft.trim();
         if name.is_empty() {
             self.error = Some("view name cannot be empty".into());
             return;
@@ -293,10 +337,14 @@ impl ViewDialog {
         match self.control {
             // §8.9: a segmented control consumes Enter to select the focused
             // segment, which Left/Right already made the active one.
-            ViewDialogControl::Tabs => {}
-            ViewDialogControl::Apply | ViewDialogControl::Sources | ViewDialogControl::Input => {
-                self.submit(ctx)
-            }
+            // Delete is the exception: Enter on the header arms the
+            // confirmation (never deletes), so Enter, Enter is the obvious
+            // keyboard path and the first press is always reversible.
+            ViewDialogControl::Tabs if self.mode != ViewDialogMode::Delete => {}
+            ViewDialogControl::Tabs
+            | ViewDialogControl::Apply
+            | ViewDialogControl::Sources
+            | ViewDialogControl::Input => self.submit(ctx),
         }
     }
 
@@ -395,8 +443,14 @@ impl ViewDialog {
                 Outcome::Consumed
             }
             // §8.9: Enter and Space on the header select the focused segment,
-            // which Left/Right already made the active one.
-            KeyCode::Enter if self.control == ViewDialogControl::Tabs => Outcome::Consumed,
+            // which Left/Right already made the active one. Delete is the
+            // exception: Enter there arms the confirmation (see activate).
+            KeyCode::Enter
+                if self.control == ViewDialogControl::Tabs
+                    && self.mode != ViewDialogMode::Delete =>
+            {
+                Outcome::Consumed
+            }
             KeyCode::Char(' ') if self.control == ViewDialogControl::Tabs => Outcome::Consumed,
             KeyCode::Enter => {
                 self.activate(ctx);
@@ -460,30 +514,35 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
 }
 
-/// The four header segments in `ViewDialogMode::ALL` order (§8.6). They render
+/// The five header segments in `ViewDialogMode::ALL` order (§8.6). They render
 /// through `render_segmented_control` and never in the action row (§2.5).
-/// §8.10 mnemonics: `b`, `c`, `r`, `s`. Alt-D (clone) and Alt-M (membership)
-/// predate the rule that the letter is one of the label's; they keep working
-/// unlisted, and Alt-only, because a bare `d` or `m` is not a letter the
-/// header underlines.
-const VIEW_TAB_LABELS: [&str; 4] = ["New &blank", "&Clone", "&Rename", "&Sources"];
+/// §8.10 mnemonics: `b`, `c`, `r`, `s`, `e`. Alt-D (clone) and Alt-M
+/// (membership) predate the rule that the letter is one of the label's; they
+/// keep working unlisted, and Alt-only, because a bare `d` or `m` is not a
+/// letter the header underlines.
+const VIEW_TAB_LABELS: [&str; 5] = ["New &blank", "&Clone", "&Rename", "&Sources", "Del&ete"];
 
 /// Compact header segments for narrow headers (the 20x6 floor): the full set
-/// needs 30 cells with separators, so below that the same four modes render
-/// abbreviated. Same order, same underlined mnemonics (`b`/`c`/`r`/`s`), same
-/// `ViewDialogMode::ALL` mapping — only the drawn text is shorter. Exact-fit
-/// budget: 2 + 5 + 3 + 3 label cells plus 3 one-cell separators = 16, the
-/// narrowest content width an ordinary dialog resolves at.
-const VIEW_TAB_LABELS_COMPACT: [&str; 4] = ["&Bl", "&Clone", "&Ren", "&Src"];
+/// needs 37 cells with separators, so below that the same five modes render
+/// abbreviated. Same order, same underlined mnemonics (`b`/`c`/`r`/`s`/`e`),
+/// same `ViewDialogMode::ALL` mapping — only the drawn text is shorter.
+/// Exact-fit budget: 2 + 2 + 2 + 2 + 2 label cells plus 4 one-cell separators
+/// = 14, inside the narrowest content width an ordinary dialog resolves at.
+const VIEW_TAB_LABELS_COMPACT: [&str; 5] = ["&Bl", "&Cl", "&Rn", "&Sr", "D&e"];
 
 /// Content width below which the full segment set cannot fit and the compact
-/// set takes over: full labels plus separators measure 9 + 5 + 6 + 7 + 3.
-const VIEW_TABS_FULL_WIDTH: u16 = 30;
+/// set takes over: full labels plus separators measure 9 + 5 + 6 + 7 + 6 + 4.
+const VIEW_TABS_FULL_WIDTH: u16 = 37;
 
 /// The one action-row verb (§8.9). It is the only button the dialog draws.
+/// Delete is destructive and never the default: it arms first and submits
+/// only on the second press, opening on the header so Enter cannot reach it
+/// before an explicit focus move.
 fn view_apply_label(mode: ViewDialogMode) -> &'static str {
     if mode == ViewDialogMode::Sources {
         "Apply membership"
+    } else if mode == ViewDialogMode::Delete {
+        "Delete view"
     } else {
         "Apply"
     }
@@ -559,6 +618,17 @@ const VIEW_COMMANDS: &[(CommandId, CommandSpec)] = &[
             shortcut: None,
         },
     ),
+    (
+        CommandId::ViewDelete,
+        CommandSpec {
+            id: CommandId::ViewDelete,
+            name: "Delete view",
+            description: "Delete this view permanently; captured data stays on disk",
+            category: "Views",
+            aliases: &["remove view", "delete"],
+            shortcut: None,
+        },
+    ),
 ];
 
 fn view_command_mode(id: CommandId) -> Option<ViewDialogMode> {
@@ -567,6 +637,7 @@ fn view_command_mode(id: CommandId) -> Option<ViewDialogMode> {
         CommandId::ViewClone => Some(ViewDialogMode::Clone),
         CommandId::ViewRename => Some(ViewDialogMode::Rename),
         CommandId::ViewSources => Some(ViewDialogMode::Sources),
+        CommandId::ViewDelete => Some(ViewDialogMode::Delete),
         _ => None,
     }
 }
@@ -581,6 +652,7 @@ fn view_command_shortcut(id: CommandId) -> Option<&'static str> {
         CommandId::ViewClone => Some("Alt-C"),
         CommandId::ViewRename => Some("Alt-R"),
         CommandId::ViewSources => Some("Alt-S"),
+        CommandId::ViewDelete => Some("Alt-E"),
         _ => None,
     }
 }
@@ -614,9 +686,13 @@ impl Component for ViewDialog {
             }
             // §4.2: the shell says what happened to the view, not what this
             // dialog should do about it. A view whose membership the store has
-            // accepted is a view this dialog has nothing left to edit.
-            Event::View(ViewEvent::SourcesChanged { .. }) => {
+            // accepted is a view this dialog has nothing left to edit; a
+            // deleted view or a removed source closes it the same way.
+            Event::View(ViewEvent::SourcesChanged { .. })
+            | Event::View(ViewEvent::ViewDeleted { .. })
+            | Event::View(ViewEvent::SourceRemoved { .. }) => {
                 self.open = false;
+                self.confirm_delete = false;
                 Outcome::Close
             }
             Event::Command(id) => match view_command_mode(id) {
@@ -698,11 +774,20 @@ impl Component for ViewDialog {
         let mut caret: Option<(u16, u16)> = None;
 
         let sources_mode = self.mode == ViewDialogMode::Sources;
+        let delete_mode = self.mode == ViewDialogMode::Delete;
         let apply_label = view_apply_label(self.mode);
         let apply_labels = [apply_label];
 
         let (state, sentence) = match self.error.as_deref() {
             Some(error) => (MessageState::Error, error.to_owned()),
+            None if delete_mode && self.confirm_delete => (
+                MessageState::Updating,
+                "press Delete view again to confirm deletion".to_owned(),
+            ),
+            None if delete_mode => (
+                MessageState::Ready,
+                "deleting removes this view; captured data stays on disk".to_owned(),
+            ),
             None if sources_mode => (
                 MessageState::Ready,
                 "changing membership keeps every capture".to_owned(),
@@ -712,7 +797,9 @@ impl Component for ViewDialog {
                 "creating, cloning and renaming keep the capture".to_owned(),
             ),
         };
-        let help = if sources_mode && ctx.sources.len() > 1 {
+        let help = if delete_mode {
+            "All events cannot be deleted. Deleting a view cannot be undone."
+        } else if sources_mode && ctx.sources.len() > 1 {
             "Sources are ordered by position, then by record sequence, not by clock time."
         } else {
             ""
@@ -723,11 +810,13 @@ impl Component for ViewDialog {
             None => "View".to_owned(),
         };
         // Responsive frame: outer size is SelfContainedForm policy plus stable
-        // budgets only, never mode/source/pending counts, so all four modes
+        // budgets only, never mode/source/pending counts, so all five modes
         // share one frame and sticky tail origins. Body content rows size only
         // the scroll extent (1: the list scrolls inside via plan_list).
+        // Delete is destructive and never the default: no fill marks it.
         let spec = view_spec();
-        let Ok(geometry) = resolve_dialog(area, &spec, 1, &apply_labels, Some(0), None) else {
+        let default = (!delete_mode).then_some(0);
+        let Ok(geometry) = resolve_dialog(area, &spec, 1, &apply_labels, default, None) else {
             self.geometry = ViewGeometry::default();
             self.surface = Surface::default();
             return self.surface;
@@ -853,6 +942,31 @@ impl Component for ViewDialog {
             // The wheel is wanted exactly when the membership list overflows
             // its shared viewport.
             surface.scrollable = list.scrollbar.is_some();
+        } else if delete_mode {
+            // Delete has no editable body: two wrapped confirmation lines
+            // naming the view. Presentation-only text (AGENTS.md).
+            let name = ctx
+                .views
+                .active_item()
+                .map(|view| view.name.as_str())
+                .unwrap_or("");
+            let lines = [
+                format!("Delete view \"{name}\" permanently?"),
+                "Captured data stays on disk.".to_owned(),
+            ];
+            let mut y = geometry.body.viewport.y;
+            for line in &lines {
+                if y >= geometry.body.viewport.bottom() {
+                    break;
+                }
+                let row = Rect::new(geometry.content.x, y, geometry.content.width, 1);
+                frame.render_widget(
+                    Paragraph::new(clipped_width(line, usize::from(row.width)))
+                        .style(styles.description),
+                    row,
+                );
+                y = y.saturating_add(1);
+            }
         } else {
             // §4.2: one labelled row. The field rect is exactly what gets painted,
             // and the caret is placed inside it.
@@ -899,20 +1013,25 @@ impl Component for ViewDialog {
         // §3: the action row holds exactly one verb (§8.9). It is the default
         // the name field and the membership list submit; the modes live in the
         // header above and never here. One shared plan drives paint and mouse.
+        // Delete is destructive and never the default: the fill never marks
+        // it, and it submits only from an explicit focus + arm + confirm.
         let focused = (self.control == ViewDialogControl::Apply).then_some(0);
-        // The shared geometry already planned the single default button; render
-        // it from those rects so paint and hitboxes share one authority.
+        // The shared geometry already planned the single button; render it
+        // from those rects so paint and hitboxes share one authority.
         for (index, rect) in geometry.actions.buttons.iter() {
             debug_assert_eq!(*index, 0);
+            let role = if delete_mode {
+                crate::dialog_controls::ButtonRole::Destructive
+            } else if geometry.actions.default == Some(*index) {
+                crate::dialog_controls::ButtonRole::Default
+            } else {
+                crate::dialog_controls::ButtonRole::Normal
+            };
             crate::dialog_controls::render_role_button(
                 frame,
                 *rect,
                 apply_label,
-                if geometry.actions.default == Some(*index) {
-                    crate::dialog_controls::ButtonRole::Default
-                } else {
-                    crate::dialog_controls::ButtonRole::Normal
-                },
+                role,
                 focused == Some(*index),
                 theme,
             );

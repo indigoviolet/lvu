@@ -118,6 +118,9 @@ pub enum Open {
     /// the name field. Same layer and slot as `View`; the mode travels as
     /// `Open` data the way Recipes' does.
     ViewMembership,
+    /// The View dialog in its Delete mode: explicit two-press confirmation
+    /// for durable view deletion. Same layer and slot as `View`.
+    ViewDelete,
     Source,
     Folding,
     ViewSummary,
@@ -209,7 +212,7 @@ impl Open {
             Open::Settings => LayerId::Settings,
             Open::Fields | Open::FieldColumn { .. } => LayerId::Fields,
             Open::Bookmarks => LayerId::Bookmarks,
-            Open::View | Open::ViewMembership => LayerId::View,
+            Open::View | Open::ViewMembership | Open::ViewDelete => LayerId::View,
             Open::ViewSummary => LayerId::ViewSummary,
             Open::Source => LayerId::Source,
             Open::Folding => LayerId::Folding,
@@ -241,6 +244,7 @@ impl Open {
             Open::Bookmarks
             | Open::View
             | Open::ViewMembership
+            | Open::ViewDelete
             | Open::ViewSummary
             | Open::Folding
             | Open::Search
@@ -332,6 +336,12 @@ pub enum ViewEvent {
     },
     SourcesChanged {
         view_id: String,
+    },
+    ViewDeleted {
+        view_id: String,
+    },
+    SourceRemoved {
+        source_id: String,
     },
     SelectionChanged {
         view_id: String,

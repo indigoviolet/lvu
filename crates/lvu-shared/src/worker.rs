@@ -1693,6 +1693,68 @@ impl WorkerService {
         }
     }
 
+    /// Mediated view deletion: the store's row delete is the exactly-once
+    /// authority. Canonical views are refused; unknown ids report success
+    /// (already gone) so a retried delete after a lost ack still settles.
+    /// Later saves for the id UPDATE zero rows and conflict instead of
+    /// INSERT-resurrecting it. Bookmarks, sources, journals and recipes are
+    /// untouched.
+    pub async fn mediated_delete_view(
+        &self,
+        request_id: String,
+        view_id: lvu_core::ViewId,
+    ) -> StoreEvent {
+        let outcome = self
+            .with_store(move |store| {
+                store
+                    .delete_view(view_id)
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+        match outcome {
+            Ok(_) => StoreEvent::ViewDeleted {
+                request_id,
+                view_id,
+            },
+            Err(error) => StoreEvent::ViewDeleteFailed {
+                request_id,
+                view_id,
+                reason: error,
+            },
+        }
+    }
+
+    /// Mediated source removal: one atomic `DELETE FROM working_views WHERE
+    /// source_id` (canonical included). Sources, bookmarks, journals and
+    /// recipes are untouched, so capture bytes survive and re-adding the
+    /// same source may reconnect. Later saves for removed ids conflict
+    /// instead of resurrecting rows.
+    pub async fn mediated_remove_source(
+        &self,
+        request_id: String,
+        source_id: SourceId,
+    ) -> StoreEvent {
+        let outcome = self
+            .with_store(move |store| {
+                store
+                    .delete_views_for_source(source_id)
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+        match outcome {
+            Ok(removed) => StoreEvent::SourceRemoved {
+                request_id,
+                source_id,
+                removed_views: removed,
+            },
+            Err(error) => StoreEvent::SourceRemoveFailed {
+                request_id,
+                source_id,
+                reason: error,
+            },
+        }
+    }
+
     /// Mediated recipe save: `expected_revision` hesitation preserved
     /// verbatim from `Command::SaveRecipe` (`memory.rs`): a revisioned save
     /// updates exactly that revision, an unrevisioned save with suggestion
@@ -2120,6 +2182,16 @@ impl WorkerService {
                 self.mediated_create_derived_view(request_id, sequence, definition, view_id, state)
                     .await
             }
+            StoreMethod::DeleteView {
+                request_id,
+                window_id: _,
+                view_id,
+            } => self.mediated_delete_view(request_id, view_id).await,
+            StoreMethod::RemoveSource {
+                request_id,
+                window_id: _,
+                source_id,
+            } => self.mediated_remove_source(request_id, source_id).await,
             StoreMethod::Recent {
                 request_id,
                 window_id: _,
@@ -2248,6 +2320,24 @@ fn store_failure(method: StoreMethod, reason: String, worker_session: &str) -> S
             reason,
             current_version: None,
         },
+        StoreMethod::DeleteView {
+            request_id,
+            view_id,
+            ..
+        } => StoreEvent::ViewDeleteFailed {
+            request_id,
+            view_id,
+            reason,
+        },
+        StoreMethod::RemoveSource {
+            request_id,
+            source_id,
+            ..
+        } => StoreEvent::SourceRemoveFailed {
+            request_id,
+            source_id,
+            reason,
+        },
         StoreMethod::Recent { request_id, .. } => StoreEvent::RecentFailed { request_id, reason },
         StoreMethod::ListRecipes {
             request_id, meta, ..
@@ -2338,6 +2428,24 @@ fn store_timeout(method: &StoreMethod, timeout: std::time::Duration) -> StoreEve
             sequence: *sequence,
             reason,
             current_version: None,
+        },
+        StoreMethod::DeleteView {
+            request_id,
+            view_id,
+            ..
+        } => StoreEvent::ViewDeleteFailed {
+            request_id: request_id.clone(),
+            view_id: *view_id,
+            reason,
+        },
+        StoreMethod::RemoveSource {
+            request_id,
+            source_id,
+            ..
+        } => StoreEvent::SourceRemoveFailed {
+            request_id: request_id.clone(),
+            source_id: *source_id,
+            reason,
         },
         StoreMethod::Recent { request_id, .. } => StoreEvent::RecentFailed {
             request_id: request_id.clone(),
@@ -3666,6 +3774,8 @@ mod tests {
                 StoreMethod::Save { request_id, .. }
                 | StoreMethod::Load { request_id, .. }
                 | StoreMethod::CreateDerivedView { request_id, .. }
+                | StoreMethod::DeleteView { request_id, .. }
+                | StoreMethod::RemoveSource { request_id, .. }
                 | StoreMethod::Recent { request_id, .. }
                 | StoreMethod::ListRecipes { request_id, .. }
                 | StoreMethod::RecipeHistory { request_id, .. }
@@ -3760,6 +3870,128 @@ mod tests {
             ),
             other => panic!("expected versioned conflict, got {other:?}"),
         }
+        service.request_shutdown();
+        service.shutdown().await;
+    }
+
+    /// Durable deletion over the wire: one window's delete is acked, the
+    /// other window's later save conflicts instead of resurrecting the row,
+    /// canonical views are refused, and source removal deletes every owned
+    /// view atomically while sources, bookmarks and journals survive.
+    #[tokio::test]
+    async fn mediated_delete_and_remove_are_durable_and_never_resurrect() {
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        let (service, _) = WorkerService::open(config, Arc::new(AdmitAll)).unwrap();
+        let source = SourceId(uuid::Uuid::from_u128(71));
+        let derived = lvu_core::ViewId(uuid::Uuid::from_u128(72));
+        let definition = file_definition(71, &root.path().join("v.log"));
+        let state = test_view(source, 72, 0);
+        // Window A creates the derived view.
+        let created = service
+            .mediated_save(
+                "create".into(),
+                1,
+                definition.clone(),
+                derived,
+                state.clone(),
+                None,
+            )
+            .await;
+        assert!(matches!(created, StoreEvent::Saved { .. }), "{created:?}");
+        // Window B deletes it: acked deletion.
+        let deleted = service.mediated_delete_view("delete".into(), derived).await;
+        assert!(
+            matches!(deleted, StoreEvent::ViewDeleted { .. }),
+            "{deleted:?}"
+        );
+        // A retry after a lost ack still settles successfully (idempotent).
+        let retried = service
+            .mediated_delete_view("delete-retry".into(), derived)
+            .await;
+        assert!(
+            matches!(retried, StoreEvent::ViewDeleted { .. }),
+            "{retried:?}"
+        );
+        // Window A's in-flight save for the deleted id conflicts instead of
+        // INSERT-resurrecting the row.
+        let resurrected = service
+            .mediated_save(
+                "late-save".into(),
+                2,
+                definition.clone(),
+                derived,
+                state,
+                Some(0),
+            )
+            .await;
+        assert!(
+            matches!(resurrected, StoreEvent::SaveFailed { .. }),
+            "a save after delete must conflict, got {resurrected:?}"
+        );
+        // Canonical views are refused: they die only with their source.
+        let canonical = service
+            .with_store(move |store| {
+                store
+                    .ensure_canonical_view(
+                        source,
+                        canonical_view_id(source),
+                        Some(legacy_canonical_view_id(source)),
+                        "All events",
+                    )
+                    .map(|view| view.id)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("canonical ensured");
+        let refused = service
+            .mediated_delete_view("delete-canonical".into(), canonical)
+            .await;
+        match refused {
+            StoreEvent::ViewDeleteFailed { reason, .. } => assert!(
+                reason.contains("All events"),
+                "canonical refusal must say why: {reason}"
+            ),
+            other => panic!("canonical delete must fail, got {other:?}"),
+        }
+        // Source removal deletes every owned view (canonical included) in
+        // one atomic step while the source row survives for reconnect.
+        let removed = service
+            .mediated_remove_source("remove".into(), source)
+            .await;
+        match removed {
+            StoreEvent::SourceRemoved { removed_views, .. } => {
+                assert!(removed_views >= 1, "must delete owned views")
+            }
+            other => panic!("expected SourceRemoved, got {other:?}"),
+        }
+        let remaining = service
+            .with_store(move |store| {
+                store
+                    .working_views_for_source(source, 100)
+                    .map(|views| views.len())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("views listed");
+        assert_eq!(remaining, 0, "no owned view may survive removal");
+        let remembered = service
+            .with_store(move |store| {
+                store
+                    .recent_sources(None, 100)
+                    .map(|sources| {
+                        sources
+                            .iter()
+                            .filter(|source| {
+                                source.definition.id == SourceId(uuid::Uuid::from_u128(71))
+                            })
+                            .count()
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("sources listed");
+        assert_eq!(remembered, 1, "the source row survives for reconnect");
         service.request_shutdown();
         service.shutdown().await;
     }

@@ -824,6 +824,58 @@ impl SharedStore {
         }
     }
 
+    /// Durably delete one view through the worker. Only the success event
+    /// may remove the view from any window. Bases are kept so a later save
+    /// for the id conflicts instead of INSERT-resurrecting it.
+    pub async fn delete_view(&self, view_id: ViewId) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
+        let event = self
+            .client
+            .lock()
+            .await
+            .store(StoreMethod::DeleteView {
+                request_id,
+                window_id: String::new(),
+                view_id,
+            })
+            .await?;
+        match event {
+            StoreEvent::ViewDeleted { view_id, .. } => Ok(MemoryEvent::ViewDeleted(view_id)),
+            StoreEvent::ViewDeleteFailed {
+                view_id, reason, ..
+            } => Ok(MemoryEvent::ViewDeleteFailed(view_id, reason)),
+            unexpected => Err(unexpected_reply("delete-view", &unexpected)),
+        }
+    }
+
+    /// Durably delete every working view owned by one source through the
+    /// worker. Sources, bookmarks, journals and recipes are untouched.
+    /// Only the success event may remove the source and its views.
+    pub async fn remove_source(&self, source_id: SourceId) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
+        let event = self
+            .client
+            .lock()
+            .await
+            .store(StoreMethod::RemoveSource {
+                request_id,
+                window_id: String::new(),
+                source_id,
+            })
+            .await?;
+        match event {
+            StoreEvent::SourceRemoved {
+                source_id,
+                removed_views,
+                ..
+            } => Ok(MemoryEvent::SourceRemoved(source_id, removed_views)),
+            StoreEvent::SourceRemoveFailed {
+                source_id, reason, ..
+            } => Ok(MemoryEvent::SourceRemoveFailed(source_id, reason)),
+            unexpected => Err(unexpected_reply("remove-source", &unexpected)),
+        }
+    }
+
     /// List recent sources through the worker.
     pub async fn recent_sources(&self) -> Result<MemoryEvent, String> {
         let request_id = self.take_request_id();
