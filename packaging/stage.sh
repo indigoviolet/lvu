@@ -246,7 +246,8 @@ if [ "$skip_bridge" -eq 0 ] && command -v node >/dev/null 2>&1; then
             # The bridge constructed itself and got as far as the transport, so
             # the payload is complete and only the provider is absent. Anything
             # else -- a missing module, a syntax error -- is a broken archive.
-            if grep -q '^bridge connection failed:' "$probe_root/bridge.err"; then
+            if grep -Eq '^bridge connection failed \[(DAEMON_UNREACHABLE|DAEMON_TIMEOUT)\]:' \
+                "$probe_root/bridge.err"; then
                 echo "no agent provider is reachable here, so the capabilities exchange was skipped; the staged bridge started and failed only at the transport:" >&2
                 sed 's/^/    /' "$probe_root/bridge.err" >&2
             else

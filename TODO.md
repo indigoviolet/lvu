@@ -40,6 +40,6 @@ holds.
 - **Ready** — Distinguish owned assistance-route contention from Paseo daemon
   connectivity failures, including exact lock-path recovery guidance.
 
-These changes are integrated for v0.1.9. They are not published until the exact
+These changes are integrated for v0.1.10. They are not published until the exact
 candidate gate, immutable tag, three native archives, tap update and installed
 archive checks complete.

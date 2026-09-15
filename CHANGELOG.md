@@ -4,7 +4,7 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
-## v0.1.9 — 2026-09-15
+## v0.1.10 — 2026-09-15
 
 ### Features
 
@@ -29,12 +29,22 @@ validation evidence lives in the [work ledger](docs/work-ledger.md).
   give topology-specific daemon guidance and never remove a lock automatically.
 - Prevent queued saves and late restore completions from resurrecting a deleted
   view; the UI changes only after durable acknowledgement.
+- Accept the bridge's stable daemon-unreachable/timeout codes when verifying a
+  release archive on a runner without a Paseo daemon. Missing dependencies,
+  syntax errors and every other bridge failure still reject the archive.
 
 ### Breaking changes
 
 - The internal shared-capture protocol is version 2. Mixed-version windows
   refuse the connection explicitly instead of guessing how to interpret view
   and source deletion requests.
+
+## v0.1.9 — 2026-09-15 (not published)
+
+The immutable tag passed exact source acceptance, but native release staging
+rejected the bridge's new coded daemon-unreachable diagnostic as unknown. No
+release was published and no tap or installation was updated. v0.1.10 contains
+the same product changes plus the packaging correction.
 
 ## v0.1.8 — 2026-09-11
 

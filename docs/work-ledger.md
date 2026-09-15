@@ -3554,3 +3554,32 @@ after that row legitimately became `Ready`; it now waits for the settled empty
 step-list state before either copy. No product path or timeout changed. Focused
 diagnosis is `primary-sol-scratch/v019-matrix-focused-diagnosis.log`; a fresh
 exact candidate run remains required.
+
+## 2026-09-15 — v0.1.9 immutable publication failure; v0.1.10 packaging fix
+
+Candidate `68748ab` / tree `47fb349` passed the clean exact acceptance run:
+locked workspace tests, all-target Clippy, 110 bridge tests, stable app/TUI
+binaries, PTY **83/83**, three shared-capture/restart PTYs and all seven
+remote-union proof families. Accepted record:
+`lvu-v019-68748ab-final-acceptance/release-gate-68748abc8524-88b85c7aafb74247ba5331d5bd27d7d2/accepted.json`
+(SHA-256 `5758601e8996cc6e8e9517e8823f23b3646e5b07346fc4e484b07234a87460eb`).
+Annotated tag object `0c188adb01a75f77817a8d486c2552e3d07f4ae6`
+peels locally and remotely to exact source `68748abc8524e0826bcf94e8b852635f5ff7fbb0`.
+
+Release run `34991242088` then rejected all three native archives at the same
+staging check and produced no assets or GitHub release. The bridge correctly
+reported `bridge connection failed [DAEMON_UNREACHABLE]: …`, but `stage.sh`
+still required the superseded uncoded `bridge connection failed:` prefix and
+misclassified the known absent-daemon environment as an unknown bridge fault.
+Runner logs are `primary-sol-scratch/v019-{x86-104456141925,arm64-job-104456142138,mac-104456142421}.log`.
+The immutable v0.1.9 tag was not moved or reused; the successor is v0.1.10.
+
+The packaging-only successor accepts exactly the stable
+`DAEMON_UNREACHABLE`/`DAEMON_TIMEOUT` codes as the environmental no-provider
+skip; dependency, syntax, owned-route and unknown failures remain fatal. Shell
+syntax and the stage-profile argument test passed. A complete local dev-profile
+stage with `LVU_PASEO_URL=ws://127.0.0.1:1/ws` built 0.1.10, compiled a real
+helper expression, loaded bundled bridge dependencies and then accepted the
+exact coded daemon failure. Evidence:
+`primary-sol-scratch/v010-stage-coded-daemon-probe.log`. A fresh exact v0.1.10
+candidate run and native archive workflow remain required.

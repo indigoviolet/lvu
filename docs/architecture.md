@@ -9,7 +9,7 @@ Releases use only the vX.Y.Z scheme.
 Historical build numbers below date when behavior arrived; they are not a separate
 release channel.
 
-Post-v0.1.8 integration for the v0.1.9 candidate adds acknowledged derived-view
+Post-v0.1.8 integration for the v0.1.10 candidate adds acknowledged derived-view
 deletion, source removal that preserves capture data, concurrent Docker/process/
 project discovery with explicit category outcomes, and distinct owned-route vs
 daemon-unreachable assistance diagnostics. These are integrated, not yet

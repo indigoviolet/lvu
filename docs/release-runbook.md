@@ -15,7 +15,9 @@ re-rendering a historical formula.
 **State: `v0.1.8` is the latest published release, with the supported
 three-archive target set. `v0.1.7` is an immutable draft with a known restore
 defect and must never be published, retagged or have its assets replaced.
-`v0.1.9` is the next integrated candidate; it is not a release until the exact
+`v0.1.9` is an immutable failed publication tag: its archive verifier did not
+recognize the bridge's new coded daemon-unreachable diagnostic, and it was not
+published. `v0.1.10` is the next integrated candidate; it is not a release until the exact
 source gate and steps below complete.**
 Steps 1–4 retain `v0.1.0` command examples; substitute the version being cut.
 Do not recreate or move a published tag. Historical installation evidence is
@@ -289,8 +291,9 @@ brew install uv node     # or: mise use -g uv node
 ## 5. Cutting the next version
 
 `v0.1.8` is published. `v0.1.7` remains an immutable unpublished draft because
-its restore defect was confirmed after archive creation. The current next
-candidate is `v0.1.9`; never move or reuse `v0.1.7` or `v0.1.8`, and do not
+its restore defect was confirmed after archive creation. `v0.1.9` is an
+immutable failed publication tag and remains unpublished. The current next
+candidate is `v0.1.10`; never move or reuse `v0.1.7`, `v0.1.8` or `v0.1.9`, and do not
 replace or publish the v0.1.7 draft assets.
 
 Every next release requires verified Linux x86_64, Linux arm64 and Apple-silicon

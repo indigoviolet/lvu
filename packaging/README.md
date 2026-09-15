@@ -66,8 +66,10 @@ to both the checkout and the staging root:
 5. the staged bridge resolves `@getpaseo/client` and `zod` from its own
    bundled `node_modules`, then answers `capabilities`. `node dist/cli.js`
    connects to a Paseo provider before serving anything, so a machine without
-   one reports a skip naming the transport error rather than failing; a missing
-   module or a syntax error still fails.
+one reports a skip naming the transport error rather than failing; a missing
+module or a syntax error still fails. Only the bridge's stable
+`DAEMON_UNREACHABLE` and `DAEMON_TIMEOUT` codes count as that environmental
+skip; an owned-route conflict and every unknown startup error still fail.
 
 Steps 4 and 5 are skipped, with a message, when `uv` or `node` is absent.
 
