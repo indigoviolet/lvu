@@ -82,6 +82,9 @@ def run(binary):
         try:
             # The JSON lines run past 80 columns; the module key is on screen.
             app.wait_for('"module": "net"')
+            # Rows can paint while the initial raw-view work is still pending;
+            # the empty-summary assertion describes the settled view.
+            app.wait_for("raw view")
 
             # A canonical view with nothing applied: every operation row is a
             # dash and the view row says the definition is fixed.

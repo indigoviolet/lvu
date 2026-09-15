@@ -60,6 +60,11 @@ def run(binary: pathlib.Path) -> None:
         )
         try:
             app.wait_for("request 39 done")
+            # The invalid-byte record is the 41st and final fixture row. Wait
+            # for it before leaving FOLLOW so a late tail update cannot move
+            # Details from the selected 503 record while the tree is opening.
+            app.wait_for("bad � byte")
+            app.wait_for("raw view")
 
             # Details: the JSON record is a tree; `http` is collapsed to its
             # summary until Enter opens it, and Left climbs back out.

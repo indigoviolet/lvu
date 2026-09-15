@@ -3583,3 +3583,16 @@ helper expression, loaded bundled bridge dependencies and then accepted the
 exact coded daemon failure. Evidence:
 `primary-sol-scratch/v010-stage-coded-daemon-probe.log`. A fresh exact v0.1.10
 candidate run and native archive workflow remain required.
+
+The first exact v0.1.10 attempt at `e1b1d32` preserved under
+`lvu-v010-e1b1d32-final-acceptance/release-gate-e1b1d3258795-64038808fafd46a9b37443609e4a124e/`
+passed workspace tests, Clippy, bridge and binary builds, then stopped at PTY
+81/83 with no `accepted.json`. Both screens showed a fixture-state race:
+Field exploration navigated before its 41st/final invalid-byte record and the
+initial raw-view query had both settled, so FOLLOW legitimately re-tailed
+Details from sequence 0 to 40;
+View Summary opened while the status line still said `pending` and therefore
+correctly rendered `Updating` rather than the asserted settled empty summary.
+The tests now wait for the existing final-row marker plus `raw view` readiness,
+and for `raw view` readiness, respectively. No product path or timeout changed; a fresh exact run remains
+required.
