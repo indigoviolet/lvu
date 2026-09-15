@@ -3392,3 +3392,50 @@ the superseded `versions/v0.1.6` install was moved to trash (recoverable); its
 records remain. Human Apple-silicon macOS and arm64 Linux terminal acceptance,
 plus the paused volume/cold-query/slow-storage investigations, remain explicitly
 unverified rather than fabricated green.
+
+## 2026-09-15 — owned-route busy no longer misreported as daemon unreachable
+
+Branch `fix/bridge-route-diagnostics`, base `f92474f`. Field report: startup
+stderr carried both the generic `bridge connection failed` wrapper (plus
+disconnect/EOF lifecycle) and an owned busy line, and lvu reported daemon
+unreachable. Root cause: `acquireLease()` had neither `OWNED_ROOT_BUSY` nor
+`lease`, while `looks_like_daemon_failure()` matched the wrapper prose
+(`connection failed`/`connect `) that prefixes every startup failure.
+
+Fix, bridge lifecycle/diagnostic paths only (no `main.rs`, source/view/
+discovery edits): `owned_sessions.ts` throws coded `OWNED_ROOT_BUSY` with the
+exact `<owned-root>/bridge.lock` path and refuses automatic stale removal
+(`EEXIST` cannot prove stale; PID checks cannot prove ownership across races
+or reuse); `bridge.ts` wraps connect failures as `DAEMON_UNREACHABLE`/
+`DAEMON_TIMEOUT` with the transport message preserved; `cli.ts` reports
+`bridge connection failed [CODE]: …` so the host classifies by code.
+`agent.rs` checks owned first (`OWNED_ROOT_BUSY`, `bridge.lock`, owned
+assistance phrasing) and narrows daemon to stable/transport markers only —
+the wrapper alone is never daemon evidence. Owned guidance says close all lvu
+windows for the capture root, then remove only the exact reported lock after
+verifying no lvu/bridge owner (never the assistance root or data). Daemon
+guidance says localhost is the lvu machine/container, names `LVU_PASEO_URL`,
+topology (Desktop-managed/standalone/Docker), `paseo daemon status --json`
+and both Paseo docs links. Bounded stderr and lease exclusivity retained.
+
+Validation on this worktree with
+`CARGO_TARGET_DIR=/mnt/HC_Volume_106796581/lvu-build/lvu-bridge-route-diagnostics-target`,
+`TMPDIR=/tmp/lvu-muse-bridge-route-tmp`, under
+`flock --close /mnt/HC_Volume_106796581/lvu-build/sol-validation.lock`:
+`npm --prefix bridge run typecheck` clean; `npm --prefix bridge test` 109/109
+(105 prior + 2 lease-safety + 2 startup-code tests); `cargo test -p lvu-app
+--bin lvu-app agent::` 26/26 including new combined-string owned test (new
+marker, legacy prose, user paraphrase) and daemon topology test
+(`ECONNREFUSED`/timeout/EOF) plus unchanged `every_bridge_failure_mode`;
+`cargo clippy -p lvu-app --all-targets --locked -- -D warnings` clean;
+`cargo fmt --all -- --check` clean; `test_bridge_diagnostics_pty.py` against
+the fresh `lvu-app` binary passed all six modes (unbuilt, missing, unusable
+provider, new owned-root busy stub mimicking the real `OWNED_ROOT_BUSY` line
+with `LVU_PASEO_OWNED_ROOT`-derived path, launcher absent, daemon
+unreachable) with capture/search usable throughout — one earlier full run
+flaked in `missing-bridge` on `wait for the current view definition`
+under load, then passed clean on rerun; the owned case also passed alone.
+Real-ledger exclusivity/reacquisition/no-silent-removal are unit-proven; no
+real `bridge.lock`, assistance root, capture, session, proof or user data was
+removed. No `TODO.md` row added: no new open work beyond the intentional
+no-auto-removal limitation.

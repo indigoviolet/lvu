@@ -90,6 +90,35 @@ describe("Bridge lifecycle", () => {
     expect(response(h.output, "cap")).toMatchObject({ result: { providers: { code: "DAEMON_UNREACHABLE" } } });
   });
 
+  it("marks startup connect failures with a stable daemon code", async () => {
+    const refused = harness();
+    refused.backend.connectResult = deferred<void>();
+    const starting = refused.bridge.start();
+    refused.backend.connectResult.reject(new Error("connect ECONNREFUSED 127.0.0.1:6767"));
+    await expect(starting).rejects.toMatchObject({ code: "DAEMON_UNREACHABLE" });
+    await expect(starting.catch((error: unknown) => error)).resolves.toMatchObject({ message: expect.stringContaining("DAEMON_UNREACHABLE") });
+
+    const timeout = harness({ ...limits, defaultTimeoutMs: 5 });
+    timeout.backend.connectResult = deferred<void>();
+    await expect(timeout.bridge.start()).rejects.toMatchObject({ code: "DAEMON_TIMEOUT" });
+  });
+
+  it("propagates an owned-root busy lease with its exact path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-start-"));
+    try {
+      const firstLedger = new OwnedSessionLedger(root); await firstLedger.initialize(); await firstLedger.acquireLease();
+      const backend = new FakeBackend();
+      const output: Array<Record<string, unknown>> = [];
+      const bridge = new Bridge(backend, (message) => output.push(message), limits, new OwnedSessionLedger(root));
+      const failure = await bridge.start().catch((error: unknown) => error);
+      expect((failure as { code?: unknown }).code).toBe("OWNED_ROOT_BUSY");
+      expect(String(failure)).toContain("OWNED_ROOT_BUSY");
+      expect(String(failure)).toContain(join(root, "bridge.lock"));
+      await firstLedger.releaseLease();
+      await bridge.close().catch(() => {});
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("reserves capacity across concurrent resumes", async () => {
     const h = harness({ ...limits, maxSessions: 1 }); await h.bridge.start();
     h.backend.refAgent("resume-a"); h.backend.refAgent("resume-b"); const a = h.backend.agents.get("resume-a")!; const b = h.backend.agents.get("resume-b")!;

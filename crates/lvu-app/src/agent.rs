@@ -1478,6 +1478,11 @@ fn launch_message(message: &str) -> String {
 /// `reason` already carries the bridge's own last words: `terminate_generation`
 /// and `submit` fold `stderr` into it, because the lifecycle message alone
 /// ("stdout reached EOF") is the symptom and never the cause.
+///
+/// Classification is by stable marker, not wrapper prose. The CLI prefixes
+/// every startup failure with `bridge connection failed`, so that wrapper
+/// alone never implies a daemon failure. Owned-root busy is checked first so
+/// it is never reported as daemon unreachable when both appear together.
 fn not_running_message(reason: &str) -> String {
     let detail = reason;
     let text = reason;
@@ -1491,17 +1496,29 @@ fn not_running_message(reason: &str) -> String {
             tail(detail, 400)
         );
     }
-    if text.contains("OWNED_ROOT_BUSY") || text.contains("lease") {
+    if looks_like_owned_root_busy(text) {
+        // EEXIST alone cannot prove the lock is stale versus a live competing
+        // bridge, and PID existence cannot prove ownership across races or PID
+        // reuse, so never unlink automatically. Instruct safe exact-path
+        // recovery instead, and never recommend deleting the assistance root
+        // or capture data.
+        let lock = owned_lock_path(text).unwrap_or_else(|| "the reported bridge.lock".into());
         return format!(
-            "another lvu window already holds the 🧠 assistance lease ({}); \
-             close that window, or wait for its agent request to finish",
-            tail(detail, 400)
+            "the owned assistance route is busy — another lvu window already holds the 🧠 assistance lease ({}); \
+             close all lvu windows using this capture root and wait for any agent request to finish. \
+             If no lvu window remains, verify no lvu or bridge process still owns it, then remove only the exact lock file at {} — never delete the assistance root or capture data. \
+             EEXIST alone cannot prove the lock is stale. Capture, search and native filtering stay usable",
+            tail(detail, 400),
+            lock,
         );
     }
     if looks_like_daemon_failure(text) {
         return format!(
             "the agent bridge started but could not reach the Paseo daemon ({}); \
-             start Paseo (or point LVU_PASEO_URL at it) and reopen 🧠",
+             start Paseo (or point LVU_PASEO_URL at it) and reopen 🧠. \
+             Localhost here is the machine/container running lvu, not a remote client: establish topology (Desktop-managed, standalone, or Docker), \
+             check Settings → host → Overview → Full status and `paseo daemon status --json`; a remotely connected client does not imply localhost has a daemon. \
+             See https://paseo.sh/docs/troubleshooting and https://paseo.sh/docs/connectivity. Capture, search and native filtering stay usable",
             tail(detail, 400)
         );
     }
@@ -1536,16 +1553,109 @@ fn not_running_reason(status: &HostStatus) -> String {
     }
 }
 
+/// Stable owned-route signal. `OWNED_ROOT_BUSY` is the structured marker new
+/// bridges emit; `bridge.lock` and `owned assistance` cover legacy bridges
+/// whose EEXIST message has neither the marker nor the word lease. Checked
+/// before any daemon test so a combined stderr containing both the generic
+/// `bridge connection failed` wrapper and an owned busy line is never
+/// reported as daemon unreachable.
+fn looks_like_owned_root_busy(text: &str) -> bool {
+    text.contains("OWNED_ROOT_BUSY")
+        || text.contains("bridge.lock")
+        || text.contains("owned assistance root")
+        || text.contains("owned assistance route")
+        || text.contains("assistance lease")
+        || text.contains("lease")
+}
+
+/// Bounded extraction of the exact reported `bridge.lock` path for safe
+/// recovery guidance. Returns the path characters only, without surrounding
+/// quotes or trailing punctuation, capped so the diagnostic stays bounded.
+// The engine computes; the app names and presents. This hand-rolled scan is
+// presentation-only folding of an already-reported path (raw-bytes/stable
+// identity invariant): Polars cannot express it.
+fn owned_lock_path(text: &str) -> Option<String> {
+    // Prefer the last mention: the prose names `bridge.lock` first and the
+    // exact path (`.../bridge.lock`) last.
+    let end = text.rfind("bridge.lock")? + "bridge.lock".len();
+    // Prefer a quoted exact path so directories containing spaces survive.
+    for quote in ['"', '\'', '`'] {
+        if let Some(close) = text[end..].find(quote)
+            && let Some(open) = text[..end].rfind(quote)
+        {
+            let after = &text[end..end + close];
+            // Only treat as quoted when the quote closes the token promptly
+            // (trailing punctuation, not prose).
+            if after.len() <= 2
+                && after
+                    .chars()
+                    .all(|c| matches!(c, ';' | ',' | '.' | ':' | ' ' | '\n' | '\t'))
+            {
+                let quoted = text[open + 1..end].to_owned();
+                if quoted.ends_with("bridge.lock") && quoted.len() <= 1024 && quoted.contains('/') {
+                    return Some(quoted);
+                }
+            }
+        }
+    }
+    // Walk back over path characters to the start of the token.
+    let bytes = text.as_bytes();
+    let mut start = end - "bridge.lock".len();
+    while start > 0 {
+        let byte = bytes[start - 1];
+        let is_path =
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~' | b'+');
+        if !is_path {
+            break;
+        }
+        start -= 1;
+        // Bound the scan: a lock path longer than this is not a usable exact
+        // path to quote back.
+        if end - start > 1024 {
+            break;
+        }
+    }
+    let mut path = text[start..end].to_owned();
+    path = path
+        .trim_matches(|character: char| character == '"' || character == '\'' || character == '`')
+        .to_owned();
+    if path.len() > 1024 {
+        return None;
+    }
+    if !path.ends_with("bridge.lock") {
+        return None;
+    }
+    if path.contains('/') {
+        // Trim any leading prose still attached before the first slash.
+        if let Some(slash) = path.find('/') {
+            path = path[slash..].to_owned();
+        }
+        Some(path)
+    } else if path == "bridge.lock" {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 fn looks_like_daemon_failure(text: &str) -> bool {
-    const MARKERS: [&str; 8] = [
+    // Stable daemon markers and transport errors only. The generic CLI wrapper
+    // `bridge connection failed` and bare `connect ` are deliberately absent:
+    // they prefix every startup failure, including owned-root busy, and must
+    // never alone imply the daemon is unreachable.
+    const MARKERS: [&str; 12] = [
+        "DAEMON_UNREACHABLE",
+        "DAEMON_TIMEOUT",
+        "ECONNREFUSED",
+        "ECONNRESET",
+        "EHOSTUNREACH",
+        "ENETUNREACH",
+        "ETIMEDOUT",
+        "CONNECT_TIMEOUT",
         "Daemon",
         "daemon",
-        "ECONNREFUSED",
-        "CONNECT_TIMEOUT",
         "WebSocket",
         "websocket",
-        "connection failed",
-        "connect ",
     ];
     MARKERS.iter().any(|marker| text.contains(marker))
 }
@@ -1553,7 +1663,9 @@ fn looks_like_daemon_failure(text: &str) -> bool {
 fn bridge_failure_message(failure: &BridgeFailure) -> String {
     match failure.code.as_str() {
         "DAEMON_UNREACHABLE" | "DAEMON_TIMEOUT" => format!(
-            "{}; start Paseo (or point LVU_PASEO_URL at it) and reopen 🧠",
+            "{}; start Paseo (or point LVU_PASEO_URL at it) and reopen 🧠. \
+             Localhost is the machine/container running lvu; a remotely connected client does not imply it has a daemon. \
+             See https://paseo.sh/docs/troubleshooting and https://paseo.sh/docs/connectivity",
             failure.message
         ),
         "PROVIDER_UNKNOWN" | "PROVIDER_UNAVAILABLE" | "PROVIDERS_UNAVAILABLE" => format!(
@@ -1561,7 +1673,8 @@ fn bridge_failure_message(failure: &BridgeFailure) -> String {
             failure.message
         ),
         "OWNED_ROOT_UNAVAILABLE" | "OWNED_ROOT_BUSY" => format!(
-            "{}; another lvu window may already hold the 🧠 assistance lease",
+            "{}; another lvu window may already hold the 🧠 assistance lease — close all lvu windows for this capture root; \
+             if none remain, remove only the exact reported bridge.lock after verifying no lvu/bridge process owns it, never the assistance root",
             failure.message
         ),
         "LIMIT_EXCEEDED" => format!(
@@ -1708,6 +1821,120 @@ done
                 "{code}: {message}"
             );
         }
+    }
+
+    /// The reported field failure: startup stderr carries both the generic
+    /// `bridge connection failed` wrapper (plus EOF/disconnect lifecycle) and
+    /// an owned-route busy line. It must never be reported as daemon
+    /// unreachable, with or without the stable marker.
+    #[test]
+    fn owned_route_busy_is_never_reported_as_daemon_unreachable() {
+        let lock = "/tmp/lvu-muse-bridge-route-combined/capture/assistance/bridge.lock";
+        // New bridge: stable marker plus the exact lock path.
+        let combined_new = format!(
+            "bridge disconnected: bridge stdout reached EOF; bridge connection failed [OWNED_ROOT_BUSY]: \
+             Error: OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at {lock}; \
+             automatic stale-lock removal is intentionally refused"
+        );
+        // Legacy bridge: no marker, no lease word — only the busy/stale prose.
+        let combined_legacy =
+            "bridge disconnected: bridge stdout reached EOF; bridge connection failed: \
+             Error: owned assistance root is busy or contains a stale bridge.lock; \
+             automatic stale-lock removal is intentionally refused"
+                .to_owned();
+        // User paraphrase from the field report, concatenating every observed line.
+        let combined_user =
+            "Agent bridge started but could not reach the Paseo daemon; bridge disconnected; \
+             bridge stdout reached EOF; bridge connection failed; \
+             owned assistance route is busy or contains a stale bridge.lock"
+                .to_owned();
+        for combined in [&combined_new, &combined_legacy, &combined_user] {
+            let message = not_running_message(combined);
+            assert!(
+                message.starts_with("the owned assistance route is busy"),
+                "owned cause lost (wrong classifier) in: {message}"
+            );
+            assert!(
+                message.contains("assistance lease"),
+                "owned cause lost in: {message}"
+            );
+            assert!(
+                message.contains("close all lvu windows"),
+                "missing competing-window guidance in: {message}"
+            );
+            assert!(
+                message.contains("remove only")
+                    && (message.contains("bridge.lock") || message.contains("exact lock")),
+                "missing safe exact-path recovery in: {message}"
+            );
+            // The daemon classifier must not win: its distinctive topology
+            // guidance belongs only to daemon failures, even when the input
+            // echoes an older daemon line alongside the owned busy line.
+            assert!(
+                !message.contains("machine/container running lvu")
+                    && !message.contains("paseo daemon status --json"),
+                "owned busy misreported as daemon in: {message}"
+            );
+            assert!(!message.contains("bridge is not running"), "{message}");
+        }
+        // The exact bounded lock path is preserved in the diagnostic.
+        let message = not_running_message(&combined_new);
+        assert!(message.contains(lock), "exact lock path lost in: {message}");
+        assert_eq!(owned_lock_path(&combined_new).as_deref(), Some(lock));
+        assert_eq!(
+            owned_lock_path("noise \"/tmp/a b/assistance/bridge.lock\"; more").as_deref(),
+            Some("/tmp/a b/assistance/bridge.lock"),
+            "quoted paths with spaces must survive intact"
+        );
+        assert_eq!(
+            owned_lock_path("stale bridge.lock with no directory"),
+            Some("bridge.lock".to_owned())
+        );
+    }
+
+    /// Daemon failures stay separate and explain topology: localhost is the
+    /// lvu machine/container and LVU_PASEO_URL selects the endpoint.
+    #[test]
+    fn daemon_failures_name_topology_not_a_competing_window() {
+        for stderr in [
+            "bridge connection failed [DAEMON_UNREACHABLE]: Error: DAEMON_UNREACHABLE: could not reach the Paseo daemon (Error: connect ECONNREFUSED 127.0.0.1:6767)".to_owned(),
+            "bridge connection failed: Error: connect ECONNREFUSED 127.0.0.1:6767".to_owned(),
+            "bridge connection failed [DAEMON_TIMEOUT]: Error: DAEMON_TIMEOUT: could not reach the Paseo daemon (Error: operation exceeded 10000ms)".to_owned(),
+            "bridge disconnected: bridge stdout reached EOF; bridge connection failed [DAEMON_UNREACHABLE]: Error: Daemon client closed".to_owned(),
+            "bridge disconnected: bridge stdout reached EOF; WebSocket connection to ws://127.0.0.1:6767/ws failed".to_owned(),
+        ] {
+            let message = not_running_message(&stderr);
+            assert!(
+                message.contains("could not reach the Paseo daemon"),
+                "daemon cause lost in: {message}"
+            );
+            assert!(message.contains("LVU_PASEO_URL"), "{message}");
+            assert!(message.contains("machine/container running lvu"), "{message}");
+            assert!(
+                message.contains("paseo daemon status --json"),
+                "missing authoritative status guidance in: {message}"
+            );
+            assert!(
+                message.contains("https://paseo.sh/docs/troubleshooting"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("assistance lease"),
+                "daemon misreported as owned busy in: {message}"
+            );
+        }
+        // The generic wrapper alone is not daemon evidence.
+        let generic = not_running_message(
+            "bridge disconnected: bridge stdout reached EOF; bridge connection failed: Error: boom",
+        );
+        assert!(
+            !generic.contains("could not reach the Paseo daemon"),
+            "generic wrapper misreported as daemon: {generic}"
+        );
+        assert!(
+            generic.contains("not available"),
+            "generic startup failure needs a neutral message: {generic}"
+        );
     }
 
     /// Submit until the host has observed the child's exit, then return the

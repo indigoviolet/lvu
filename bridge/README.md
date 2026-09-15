@@ -40,5 +40,15 @@ Session creation accepts provider-neutral `mode_id` and `thinking_option_id`; fo
 the configured implementation profile these are `codex/gpt-5.6-sol`,
 `full-access`, and `medium` respectively.
 
+Startup owns one exclusive lease per `LVU_PASEO_OWNED_ROOT`: `Bridge.start`
+connects to the daemon first, then creates `<owned-root>/bridge.lock` with
+`O_EXCL`. A second live bridge fails with stable code `OWNED_ROOT_BUSY` and the
+exact lock path; `EEXIST` alone cannot prove the lock is stale and PID checks
+cannot prove ownership across races or reuse, so automatic removal is refused.
+Daemon connect failures fail with `DAEMON_UNREACHABLE` (or `DAEMON_TIMEOUT` on
+deadline), preserving the transport message. The CLI reports startup as
+`bridge connection failed [CODE]: …` on stderr so the host classifies by code,
+never by the generic wrapper alone.
+
 Suggested root mise tasks call `npm --prefix bridge ci`, `npm --prefix bridge run
 typecheck`, `npm --prefix bridge test`, and `npm --prefix bridge run build`.

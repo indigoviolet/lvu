@@ -70,8 +70,42 @@ describe("owned session ledger", () => {
     const root = await mkdtemp(join(tmpdir(), "lvu-ledger-"));
     try {
       const first = new OwnedSessionLedger(root); const second = new OwnedSessionLedger(root); await first.initialize(); await second.initialize();
-      await first.acquireLease(); await expect(second.acquireLease()).rejects.toThrow("busy or contains a stale bridge.lock");
+      await first.acquireLease();
+      const failure = await second.acquireLease().catch((error: unknown) => error);
+      expect(String(failure)).toContain("OWNED_ROOT_BUSY");
+      expect(String(failure)).toContain("busy or contains a stale bridge.lock");
+      expect(String(failure)).toContain(join(root, "bridge.lock"));
+      expect((failure as { code?: unknown }).code).toBe("OWNED_ROOT_BUSY");
       await first.releaseLease(); await expect(second.acquireLease()).resolves.toBeUndefined(); await second.releaseLease();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("refuses a possibly stale lock without removing it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-ledger-"));
+    try {
+      const ledger = new OwnedSessionLedger(root); await ledger.initialize();
+      // A stale but well-formed lock from a dead bridge: EEXIST alone cannot
+      // prove it is stale, so acquisition refuses and leaves the file intact.
+      const { writeFile } = await import("node:fs/promises");
+      await writeFile(join(root, "bridge.lock"), `${JSON.stringify({ pid: 1, nonce: "stale-nonce-that-never-matches" })}\n`, { flag: "wx" });
+      await expect(ledger.acquireLease()).rejects.toMatchObject({ code: "OWNED_ROOT_BUSY" });
+      expect(await readFile(join(root, "bridge.lock"), "utf8")).toContain("stale-nonce-that-never-matches");
+      // A non-owner release must not unlink a lock it does not own.
+      await ledger.releaseLease();
+      expect(await readFile(join(root, "bridge.lock"), "utf8")).toContain("stale-nonce-that-never-matches");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("never silently removes a malformed lock file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-ledger-"));
+    try {
+      const ledger = new OwnedSessionLedger(root); await ledger.initialize();
+      const { writeFile } = await import("node:fs/promises");
+      await writeFile(join(root, "bridge.lock"), "not-json\n", { flag: "wx" });
+      await expect(ledger.acquireLease()).rejects.toThrow("OWNED_ROOT_BUSY");
+      expect(await readFile(join(root, "bridge.lock"), "utf8")).toBe("not-json\n");
+      await ledger.releaseLease();
+      expect(await readFile(join(root, "bridge.lock"), "utf8")).toBe("not-json\n");
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

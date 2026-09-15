@@ -151,6 +151,16 @@ Suggestions are proposals: you review and validate them before they touch a
 view. Capture and query execution stay local; text a hosted model reads is
 subject to that provider's terms.
 
+Two assistance failures look similar but have different remedies. An owned-route
+busy report names the exact `bridge.lock` under the capture's `assistance`
+directory: close all lvu windows using that capture root first; only when none
+remain, verify no lvu or bridge process still owns it, then remove only that
+exact lock file — never the assistance root or capture data. A daemon-unreachable
+report means the machine/container running lvu has no Paseo daemon at
+`LVU_PASEO_URL` (default `ws://127.0.0.1:6767/ws`): establish topology
+(Desktop-managed, standalone, or Docker) and check `paseo daemon status --json`.
+A remotely connected client does not imply localhost has a daemon.
+
 Without assistance, everything else works. Polars expressions need `uv` on
 `PATH`, which provisions the pinned interpreter and Polars the first time
 they are used. Literal and `/regex/` search, regex enrichment, views,

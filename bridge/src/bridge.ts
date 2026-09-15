@@ -49,7 +49,18 @@ export class Bridge {
     if (this.#state !== "new") throw coded("INVALID_STATE", "bridge can only be started once");
     this.#state = "starting";
     try {
-      await deadline(this.backend.connect(), this.limits.defaultTimeoutMs, "CONNECT_TIMEOUT");
+      // The daemon lives beside lvu (same machine/container selected by
+      // LVU_PASEO_URL, default ws://127.0.0.1:6767/ws). A connect failure is
+      // therefore a daemon-reachability failure, not a bridge bug. Give it a
+      // stable DAEMON_* marker so the host classifies by code, not by the
+      // generic "bridge connection failed" wrapper the CLI adds later.
+      try {
+        await deadline(this.backend.connect(), this.limits.defaultTimeoutMs, "CONNECT_TIMEOUT");
+      } catch (error) {
+        if (errorCode(error) === "CONNECT_TIMEOUT") throw coded("DAEMON_TIMEOUT", `DAEMON_TIMEOUT: could not reach the Paseo daemon (${errorMessage(error)})`);
+        if (errorCode(error) === "DAEMON_UNREACHABLE" || errorCode(error) === "DAEMON_TIMEOUT") throw error;
+        throw coded("DAEMON_UNREACHABLE", `DAEMON_UNREACHABLE: could not reach the Paseo daemon (${errorMessage(error)})`);
+      }
       if (this.ledger !== null) {
         await deadline(this.ledger.initialize(), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
         await deadline(this.ledger.acquireLease(), this.limits.defaultTimeoutMs, "OWNED_ROOT_BUSY");

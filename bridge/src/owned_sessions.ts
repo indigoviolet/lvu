@@ -156,7 +156,15 @@ export class OwnedSessionLedger {
     let handle: Awaited<ReturnType<typeof open>>;
     try { handle = await open(path, "wx", 0o600); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("owned assistance root is busy or contains a stale bridge.lock; automatic stale-lock removal is intentionally refused");
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        // EEXIST alone cannot distinguish a live competing bridge from a
+        // possibly stale lock, and pathname/PID checks cannot prove ownership
+        // across races or PID reuse, so automatic stale-lock removal is
+        // intentionally refused. The stable OWNED_ROOT_BUSY marker lets the
+        // host classify without parsing wrapper prose, and the exact lock path
+        // lets it give safe recovery guidance.
+        throw coded("OWNED_ROOT_BUSY", `OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at ${path}; close competing lvu windows for this capture root, or remove only that exact bridge.lock after verifying no lvu/bridge process owns it; automatic stale-lock removal is intentionally refused`);
+      }
       throw error;
     }
     try { await handle.writeFile(`${JSON.stringify({ pid: process.pid, nonce })}\n`); await handle.sync(); await syncDirectory(this.root); }
@@ -209,3 +217,4 @@ export class OwnedSessionLedger {
 
 async function syncDirectory(path: string): Promise<void> { const handle = await open(path, "r"); try { await handle.sync(); } finally { await handle.close(); } }
 function safeId(value: string): string { return id.parse(value); }
+function coded(code: string, message: string): Error { return Object.assign(new Error(message), { code }); }

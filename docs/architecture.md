@@ -540,4 +540,12 @@ resumable. Ownership and bounded activity are durable before confirmed archive.
 Archive acknowledgements have a separate bounded host queue; saturation faults
 explicitly and retains ownership for recovery. Normal EOF shutdown releases the
 nonce-owned bridge lease and reaps its process group. Existing stale leases are
-conservatively refused, not automatically removed.
+conservatively refused, not automatically removed: startup connects to the
+daemon first (`LVU_PASEO_URL`, default `ws://127.0.0.1:6767/ws`), then acquires
+`<owned-root>/bridge.lock` exclusively. Contention fails with stable
+`OWNED_ROOT_BUSY` and the exact lock path (`EEXIST` alone cannot prove stale;
+PID checks cannot prove ownership); daemon failures fail with
+`DAEMON_UNREACHABLE`/`DAEMON_TIMEOUT`. The host classifies by those markers —
+the generic `bridge connection failed` wrapper never implies a daemon — and
+reports owned busy with close-all-windows plus exact-lock-only recovery, and
+daemon failures with localhost-is-the-lvu-machine topology guidance.

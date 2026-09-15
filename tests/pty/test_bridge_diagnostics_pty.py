@@ -98,7 +98,7 @@ def quit_cleanly(app: PtyApp) -> None:
 
 
 def case(binary: pathlib.Path, root: pathlib.Path, source: pathlib.Path,
-         overrides: dict[str, str], needles: list[str], label: str) -> None:
+         overrides: dict[str, str], needles: list[str], label: str) -> str:
     # Each case gets its own workspace: a restored search from the previous one
     # would hide the rows this one asserts on.
     workspace = root / f"workspace-{label.replace(' ', '-')}"
@@ -122,10 +122,12 @@ def case(binary: pathlib.Path, root: pathlib.Path, source: pathlib.Path,
         assert "bridge is not running" not in message, message
         assert_workspace_still_works(app)
         quit_cleanly(app)
+        return message
     finally:
         if app.process.poll() is None:
             app.process.kill()
         app.close()
+    return ""
 
 
 def unbuilt_bridge_is_reported_at_startup(binary: pathlib.Path, root: pathlib.Path,
@@ -193,7 +195,7 @@ process.stdin.on("data", (chunk) => {
 
 
 def unusable_provider_is_reported(binary: pathlib.Path, root: pathlib.Path,
-                                  source: pathlib.Path) -> None:
+                                   source: pathlib.Path) -> None:
     stub = root / "stub-bridge"
     (stub / "dist").mkdir(parents=True, exist_ok=True)
     message = ("agent provider codex is not configured; "
@@ -206,6 +208,36 @@ def unusable_provider_is_reported(binary: pathlib.Path, root: pathlib.Path,
          "unusable provider")
 
 
+# A bridge that fails at startup holding the owned assistance lease. The real
+# ledger path needs a reachable daemon before it is attempted (Bridge.start
+# connects first), so the daemon's absence would mask it here; the startup
+# stderr below is byte-for-byte the new bridge's OWNED_ROOT_BUSY line, with
+# the exact lock path taken from LVU_PASEO_OWNED_ROOT like the real ledger.
+# The whole Rust path — EOF, stderr capture, classifier, wording — still runs
+# for real, and must never report this as daemon unreachable.
+STUB_OWNED_BUSY_BRIDGE = """
+const ownedRoot = process.env.LVU_PASEO_OWNED_ROOT ?? "<unknown owned root>";
+const lock = ownedRoot + "/bridge.lock";
+process.stderr.write(
+  `bridge connection failed [OWNED_ROOT_BUSY]: Error: OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at ${lock}; automatic stale-lock removal is intentionally refused\\n`
+);
+process.exit(1);
+"""
+
+
+def owned_root_busy_is_reported(binary: pathlib.Path, root: pathlib.Path,
+                                 source: pathlib.Path) -> None:
+    """Owned-route busy/stale is never reported as daemon unreachable."""
+    stub = root / "stub-owned-bridge"
+    (stub / "dist").mkdir(parents=True, exist_ok=True)
+    (stub / "dist" / "cli.js").write_text(STUB_OWNED_BUSY_BRIDGE)
+    message = case(binary, root, source, {"LVU_BRIDGE_DIR": str(stub)},
+         ["owned assistance", "bridge.lock", "close all", "remove only"],
+         "owned root busy")
+    assert "could not reach the Paseo daemon" not in message, message
+    assert "machine/container running lvu" not in message, message
+
+
 def run(binary: pathlib.Path) -> None:
     repository = pathlib.Path(__file__).resolve().parents[2]
     bridge = repository / "bridge"
@@ -216,6 +248,7 @@ def run(binary: pathlib.Path) -> None:
         unbuilt_bridge_is_reported_at_startup(binary, root, source)
         missing_bridge_is_reported_at_startup(binary, root, source)
         unusable_provider_is_reported(binary, root, source)
+        owned_root_busy_is_reported(binary, root, source)
         if (bridge / "dist" / "cli.js").exists():
             missing_node_is_reported(binary, root, source, bridge)
             unreachable_daemon_is_reported(binary, root, source, bridge)
@@ -226,4 +259,4 @@ def run(binary: pathlib.Path) -> None:
 if __name__ == "__main__":
     run(pathlib.Path(sys.argv[1]).resolve())
     print("Bridge diagnostics PTY passed: unbuilt, missing, unusable provider, "
-          "launcher absent, daemon unreachable; workspace stays usable throughout")
+          "owned root busy, launcher absent, daemon unreachable; workspace stays usable throughout")

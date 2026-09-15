@@ -56,7 +56,13 @@ try {
   server = await lifecycle.start();
   if (server !== null) await lifecycle.settleInput();
 } catch (error) {
-  process.stderr.write(`bridge connection failed: ${String(error)}\n`);
+  // Preserve the stable marker (OWNED_ROOT_BUSY, DAEMON_UNREACHABLE,
+  // DAEMON_TIMEOUT, CONNECT_TIMEOUT, ...) in stderr so the host classifies by
+  // code, not by this generic wrapper. The wrapper alone must never imply a
+  // daemon failure: it prefixes every startup failure including owned-root busy.
+  const code = (error as { code?: unknown }).code;
+  const marker = typeof code === "string" && code.length > 0 && code.length <= 64 ? ` [${code}]` : "";
+  process.stderr.write(`bridge connection failed${marker}: ${String(error)}\n`);
   process.exitCode = 1;
   await bridge.close().catch(() => {});
 }
