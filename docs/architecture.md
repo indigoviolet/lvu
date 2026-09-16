@@ -1,11 +1,13 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.10` (2026-09-15) is the current public release. In addition to live
+`v0.1.11` (2026-09-16) is the current public release. In addition to live
 unions, shared keys, enrichment-backed colours, automatic shared capture and
 the responsive dialog system, it includes acknowledged view deletion,
 capture-preserving source removal, explicit concurrent discovery outcomes and
-distinct assistance route/daemon diagnostics.
+distinct assistance route/daemon diagnostics. The unified Sources dialog keeps
+stopped/error sources selectable, shows full health, and restarts or durably
+removes them by stable identity.
 Releases use only the vX.Y.Z scheme.
 Historical build numbers below date when behavior arrived; they are not a separate
 release channel.

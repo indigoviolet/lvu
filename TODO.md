@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.10**. A **v0.1.11 candidate** is under validation. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.11**. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -21,7 +21,7 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 
 ## Active work
 
-Published v0.1.10 removed the deletion, discovery and bridge-diagnostic delivery rows
+Published v0.1.11 removed the unified Sources/stopped-source lifecycle row
 from this list. Remaining entries are unresolved follow-up work, not release
 holds.
 
@@ -29,10 +29,9 @@ holds.
 | --- | --- |
 | **Open** | Prevent build-output accumulation: implement explicit retirement for completed worktree/release targets while preserving named investigation binaries and proof. Cleanup is complete: lvu-build fell from 85.7 to 19.8 GiB, with 69.8 GiB volume free and a running 3 GiB compiler cache. Ordinary janitor omits release/integration names and retires existing worktrees only by `main` containment; current integration uses a separate branch. |
 | **Open** | Optionally retain and display a bookmark's originating view. Bookmarks are deliberately source-scoped today, so the durable record identity and note survive across views but no origin-view metadata is stored; adding it needs a separate compatible schema/product decision. |
-| **Open** | Apple-silicon macOS human terminal acceptance: run the v0.1.10 checklist in Terminal.app and iTerm2. The v0.1.10 archive built and executed on native CI; human acceptance remains outstanding. Linux arm64 also lacks human interactive acceptance. Intel Macs and Windows are unsupported and are not acceptance targets. |
+| **Open** | Apple-silicon macOS human terminal acceptance: run the v0.1.11 checklist in Terminal.app and iTerm2. The v0.1.11 archive built and executed on native CI; human acceptance remains outstanding. Linux arm64 also lacks human interactive acceptance. Intel Macs and Windows are unsupported and are not acceptance targets. |
 
 ## Ready for the next release
 
-| Status | Work |
-| --- | --- |
-| **Working** | v0.1.11 unified Sources dialog and stopped-source lifecycle: selectable remembered sources, complete diagnostics, explicit restart, immediate acknowledged removal and durable non-resurrection. Focused Rust and real PTY restart/remove/reopen coverage is green; full release acceptance remains. |
+None. The unified Sources dialog and stopped-source lifecycle shipped in
+v0.1.11.

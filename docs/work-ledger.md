@@ -3681,3 +3681,44 @@ verifies two complete clean diagnostic lifetimes, while the same suite's
 ordinary sequential reopen still proves byte-prefix extension, exact stable
 IDs and no replay. A fresh full matrix after those corrections passed 84/84.
 The immutable exact-source release proof remains pending.
+
+### v0.1.11 accepted, published and installed — 2026-09-16
+
+Exact source `63f6ac0ae26193ed0776c46857bab115063c2367`, tree
+`5bf63f7a84966642e93eddfcdb8a4c38f0235f49`, passed the clean immutable
+candidate run: locked workspace tests, all-target Clippy, 110 bridge tests,
+84/84 actual PTY suites, two-window shared capture, sequential exact
+restart/no-replay, and all seven remote-union proof families. Accepted app/TUI
+hashes are `cbcac9f04cc4…` and `c7cf8b4efcc8…`; accepted record SHA-256 is
+`0e9d1f4917fc9b37cd94575fbd15635c3f043bb2bd19eb2ece51e1387e8c4b1c` at
+`lvu-v011-63f6ac0-final-acceptance/release-gate-63f6ac0ae261-7c85dff835ab45ce9615b19730faa2aa/accepted.json`.
+
+Annotated tag object `37164b28f66aca4ed5b4f335ff17a14fa7cc675b`
+peels locally and remotely to that source. Release run `35051009545` built,
+executed and uploaded exactly Linux x86_64, Linux arm64 and Apple-silicon
+macOS; the draft contained those three archives plus SHA256SUMS, and every
+downloaded checksum matched. Archive SHA-256 values are Apple-silicon macOS
+`f6cdb35d0544a19f52c5fb3151e30ed4b57fd94e86013d965c31ebdcaa323f7a`,
+arm64 Linux `031987a60264cbcdbd7062a5be96b33fdb616f7a2d97ff4e004a4182a918d4d6`,
+and x86_64 Linux `bb2175141d081031b4578857c52e0d1d29f833ca744798fa267180aacf82d9d3`.
+The formula was rendered only from those sums, passed style and strict audit,
+and tap commit `a3888b858f0550ae690518fe538bc957ac5814c9` was pushed before
+undrafting. The release became public at 03:27:31 UTC with release ID
+`389617406`.
+
+Pinned mise installation verified checksum, GitHub artifact attestations and
+SLSA provenance; Homebrew upgraded to 0.1.11 and its formula test passed. The
+official x86_64 archive resolved both bundled resources, compiled a real Polars
+expression without writing into its install tree and completed a live Paseo
+capabilities exchange. Four installed-binary PTYs passed from `/tmp`: unified
+Sources restart/removal/reopen, source/view deletion, exact shared-capture
+sequential reopen and bridge diagnostics. `versions/latest` points to v0.1.11;
+installed binary SHA-256 is
+`d377f9a78dbc60f87832e9e9779e38c382e259689bbd22f03e72e42ca1ac2971`.
+Its 944-file checksum manifest digest is
+`4271421f0736ba83b2103a5bbd8499ecaeaf7b2463ab453bc0b07d9e32bbe2ac`.
+No process used superseded installs: the repository-local v0.1.10 copy was
+moved to trash, and mise/Homebrew retained only v0.1.11. Tags, release records,
+captures and proof archives were preserved. Human Apple-silicon macOS and arm64
+Linux terminal acceptance, plus the paused volume/cold-query/slow-storage
+investigations, remain explicitly unverified.
