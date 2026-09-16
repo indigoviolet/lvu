@@ -121,11 +121,18 @@ data stay byte-identical, and a re-added source may reconnect to its old
 capture. Queued saves for deleted ids conflict instead of resurrecting them.
 
 Discovery checks every enabled category concurrently against the one global
-deadline (processes/open files, project files, Docker containers), so a slow
-scan cannot starve Docker, and reports each with product labels, match counts
-and checked/partial/unavailable/unsupported/cancelled/time-limit outcomes
-plus bounded detail; remembered sources report alongside. An empty completed
-scan gives the report the unused candidate space.
+deadline (processes/open files, project files, Docker services/containers), so
+a slow scan cannot starve Docker, and reports each with product labels, match
+counts and checked/partial/unavailable/unsupported/cancelled/time-limit outcomes
+plus bounded detail; remembered sources report alongside. Docker keeps each
+container candidate and adds one Compose project/service aggregate when the
+recorded configuration is locally addressable. Its commands are exact argv:
+implicit routing preserves `DOCKER_HOST`/`DOCKER_CONTEXT`, while only an
+explicitly selected context emits `--context`. Compose config paths are read
+from independently JSON-escaped label fields because Docker's flattened Labels
+text cannot preserve a comma-separated config-file list. Aggregates with stale
+remote-host paths are omitted while their container candidates remain. An empty
+completed scan gives the report the unused candidate space.
 
 The journal owns exact bytes, delimiters, invalid UTF-8, capture timestamps and
 physical identities. Display strings and parsed/derived fields are projections.

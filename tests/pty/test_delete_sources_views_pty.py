@@ -4,7 +4,7 @@ Covers: obvious keyboard paths with explicit confirmation (View dialog
 Delete mode Enter/Enter; sidebar Delete/Delete), canonical/dependency
 safety is unit-tested in Rust, durable deletion across restart, retained
 journal bytes and source bookmarks, and explicit discovery categories
-(Processes/open files, Project files, Docker containers, Remembered
+(Processes/open files, Project files, Docker services / containers, Remembered
 sources) including zero-match outcomes.
 """
 import os
@@ -203,7 +203,7 @@ def run(binary):
             categories = (
                 "Processes / open files",
                 "Project files",
-                "Docker containers",
+                "Docker services / containers",
                 "Remembered sources",
             )
             while _time.monotonic() < deadline:
@@ -232,7 +232,7 @@ def run(binary):
                 )
             joined = "\n".join(seen)
             for category in ("Processes / open files", "Project files",
-                             "Docker containers", "Remembered sources"):
+                             "Docker services / containers", "Remembered sources"):
                 assert category in joined, f"discovery names {category}:\n{joined}"
             assert "Procfs" not in joined, "product labels, not Debug names"
             app.send(b"\x1b")

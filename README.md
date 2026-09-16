@@ -99,10 +99,14 @@ for an explicit launch; select one to read its complete status, restart it or
 remove it from the workspace. Its Add source action opens the separate creation
 dialog. `n` goes straight to that Add source dialog, whose Manual tab opens
 files or commands, while Discover checks processes/open files, project files,
-Docker containers and remembered sources, naming every category checked and
-which produced no results; Agent proposes reviewed sources. With no source and
-nothing to resume, Add source opens automatically. Nothing starts capturing
-until you choose it.
+Docker services/containers and remembered sources, naming every category
+checked and which produced no results. Docker discovery keeps every individual
+container source and also offers one Compose-service source that follows all
+replicas when its Compose configuration is available locally; it uses the same
+implicit Docker environment routing as the CLI unless a context was explicitly
+configured. Agent proposes reviewed sources. With no source and nothing to
+resume, Add source opens automatically. Nothing starts capturing until you
+choose it.
 
 In the viewer:
 

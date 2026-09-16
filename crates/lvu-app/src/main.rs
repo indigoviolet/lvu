@@ -8015,11 +8015,34 @@ fn source_ai_generation(work: &SourceAiWork) -> u64 {
 fn discovery_item(candidate: &DiscoveryCandidate) -> DiscoveryItem {
     let acquisition = match &candidate.source.acquisition {
         Acquisition::File { path, .. } => path.display().to_string(),
-        Acquisition::Command { .. } => candidate
+        Acquisition::Command { .. } => match candidate
             .identity_hints
-            .get("compose_service")
-            .or_else(|| candidate.identity_hints.get("container_name"))
-            .map_or_else(|| "managed command source".into(), |value| value.clone()),
+            .get("docker_log_scope")
+            .map(String::as_str)
+        {
+            Some("compose_service") => format!(
+                "Compose service {}/{}",
+                candidate
+                    .identity_hints
+                    .get("compose_project")
+                    .map(String::as_str)
+                    .unwrap_or("?"),
+                candidate
+                    .identity_hints
+                    .get("compose_service")
+                    .map(String::as_str)
+                    .unwrap_or("?")
+            ),
+            Some("container") => format!(
+                "Docker container {}",
+                candidate
+                    .identity_hints
+                    .get("docker_container_name")
+                    .map(String::as_str)
+                    .unwrap_or("?")
+            ),
+            _ => "managed command source".into(),
+        },
         Acquisition::Http { url, .. } => url.clone(),
         Acquisition::Stdin => "one-shot standard input".into(),
     };
@@ -8054,10 +8077,24 @@ fn discovery_item(candidate: &DiscoveryCandidate) -> DiscoveryItem {
         } else {
             format!("{acquisition} — {evidence}")
         },
-        status: format!(
-            "{:?} {:?} {:?}",
-            candidate.provider, candidate.confidence, candidate.availability
-        ),
+        status: match candidate
+            .identity_hints
+            .get("docker_log_scope")
+            .map(String::as_str)
+        {
+            Some("compose_service") => format!(
+                "Docker service {:?} {:?}",
+                candidate.confidence, candidate.availability
+            ),
+            Some("container") => format!(
+                "Docker container {:?} {:?}",
+                candidate.confidence, candidate.availability
+            ),
+            _ => format!(
+                "{:?} {:?} {:?}",
+                candidate.provider, candidate.confidence, candidate.availability
+            ),
+        },
     }
 }
 
@@ -8186,7 +8223,7 @@ fn discovery_status(result: &DiscoveryResult, remembered: usize) -> String {
         format!("{candidate_word}, {ending}"),
         category("Processes / open files", Provider::Procfs),
         category("Project files", Provider::Project),
-        category("Docker containers", Provider::Docker),
+        category("Docker services / containers", Provider::Docker),
         format!(
             "Remembered sources: {} · checked",
             matches_word(remembered_matches)
@@ -13446,7 +13483,7 @@ root = \"/tmp/elsewhere\"\n",
         assert!(report.contains("no candidates"), "{report}");
         assert!(report.contains("Processes / open files"), "{report}");
         assert!(report.contains("Project files"), "{report}");
-        assert!(report.contains("Docker containers"), "{report}");
+        assert!(report.contains("Docker services / containers"), "{report}");
         assert!(report.contains("Remembered sources"), "{report}");
         assert!(!report.contains("Procfs"), "{report}");
         assert!(report.contains("no matches · checked"), "{report}");
@@ -13468,10 +13505,16 @@ root = \"/tmp/elsewhere\"\n",
         use std::{os::unix::fs::PermissionsExt, time::Duration};
 
         let directory = tempfile::tempdir().expect("tempdir");
+        let compose = directory.path().join("compose.yaml");
+        std::fs::write(&compose, "services: {api: {image: example}}\n").expect("compose fixture");
         let script = directory.path().join("docker-fixture");
         std::fs::write(
             &script,
-            "#!/bin/sh\nprintf '%s\\n' '{\"ID\":\"recorded-id\",\"Names\":\"shop-api-1\",\"State\":\"running\",\"Status\":\"Up\",\"Labels\":\"com.docker.compose.project=shop,com.docker.compose.service=api,com.docker.compose.container-number=1\"}'\n",
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"ID\":\"recorded-id\",\"Names\":\"shop-api-1\",\"State\":\"running\",\"Status\":\"Up\",\"ComposeProject\":\"shop\",\"ComposeService\":\"api\",\"ComposeReplica\":\"1\",\"ComposeWorkingDir\":\"{}\",\"ComposeConfigFiles\":\"{}\"}}'\n",
+                directory.path().display(),
+                compose.display()
+            ),
         )
         .expect("fixture");
         let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
@@ -13496,18 +13539,28 @@ root = \"/tmp/elsewhere\"\n",
             project: None,
         })
         .await;
-        assert_eq!(result.candidates.len(), 1, "{:?}", result.statuses);
-        let candidate = &result.candidates[0];
+        assert_eq!(result.candidates.len(), 2, "{:?}", result.statuses);
+        let candidate = result
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .identity_hints
+                    .get("docker_log_scope")
+                    .is_some_and(|scope| scope == "compose_service")
+            })
+            .expect("service candidate");
         let authoritative_id = candidate.source.id;
         let item = discovery_item(candidate);
-        assert!(item.label.contains("shop/api #1"));
-        assert!(item.detail.contains("Docker container"));
-        assert!(item.status.contains("Docker"));
+        assert!(item.label.contains("shop/api (Docker service)"));
+        assert!(item.detail.contains("Compose service shop/api"));
+        assert!(item.detail.contains("Docker Compose service"));
+        assert!(item.status.contains("Docker service"));
         assert_eq!(candidate.source.id, authoritative_id);
         let report = discovery_status(&result, 0);
-        assert!(report.contains("1 candidate"), "{report}");
-        assert!(report.contains("Docker containers"), "{report}");
-        assert!(report.contains("1 match"), "{report}");
+        assert!(report.contains("2 candidates"), "{report}");
+        assert!(report.contains("Docker services / containers"), "{report}");
+        assert!(report.contains("2 matches"), "{report}");
         assert!(report.contains("checked"), "{report}");
         assert!(report.contains("Remembered sources"), "{report}");
     }

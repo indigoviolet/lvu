@@ -65,6 +65,16 @@ the source header and durably drop worker session membership. It never deletes
 the retained journal. Source creation is a separate dialog and creates no
 ambiguity about which existing source Restart or Remove targets.
 
+Docker discovery is read-only and retains one candidate for every listed
+container, including stopped and Compose-managed containers. A Compose service
+candidate may additionally aggregate replicas only when an exact local
+`docker compose logs` argv can be constructed from usable recorded project
+configuration. Missing or remote-only config paths suppress the aggregate, not
+its containers. Implicit Docker routing must preserve the CLI environment;
+`--context` is added only for an explicit application configuration. Stable
+daemon identity may hash an environment endpoint but must not persist or display
+its credentials or path. Discovery selection alone never starts capture.
+
 Shared-capture control protocol version 2 adds acknowledged `DeleteView` and
 `RemoveSource` methods. A version mismatch is an explicit refusal; peers never
 infer compatibility or silently omit a destructive request.

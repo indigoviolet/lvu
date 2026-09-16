@@ -395,6 +395,48 @@ fn with_discovery_complete() -> App {
     app
 }
 
+#[test]
+fn docker_service_and_container_candidates_remain_distinct_and_selectable() {
+    let mut app = empty();
+    key_with(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    let generation = match app.take_discovery_requests().pop().unwrap() {
+        lvu::DiscoveryUiRequest::Scan { generation } => generation,
+        other => panic!("unexpected request: {other:?}"),
+    };
+    assert!(app.apply_discovery_result(
+        generation,
+        vec![
+            DiscoveryItem {
+                key: "container-key".into(),
+                label: "shop/api #1 (Docker)".into(),
+                detail: "Docker container shop-api-1 — Docker container log source".into(),
+                status: "Docker container · High · Available".into(),
+            },
+            DiscoveryItem {
+                key: "service-key".into(),
+                label: "shop/api (Docker service)".into(),
+                detail: "Compose service shop/api — Docker Compose service log source".into(),
+                status: "Docker service · High · Available".into(),
+            },
+        ],
+        "Docker services / containers: 2 matches · checked".into(),
+    ));
+    let rendered = screen(&draw(&mut app, 80, 24));
+    assert!(rendered.contains("shop/api #1 (Docker)"), "{rendered}");
+    assert!(rendered.contains("shop/api (Docker service)"), "{rendered}");
+
+    paste(&mut app, "Docker service");
+    draw(&mut app, 80, 24);
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.take_discovery_requests(),
+        vec![lvu::DiscoveryUiRequest::Select {
+            generation,
+            key: "service-key".into(),
+        }]
+    );
+}
+
 fn reviewed_proposal() -> App {
     let mut app = empty();
     app.handle(

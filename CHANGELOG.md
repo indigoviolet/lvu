@@ -4,6 +4,22 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## Unreleased
+
+### Features
+
+- Discover one Docker Compose service source that follows all replicas when its
+  recorded Compose configuration is locally usable, while retaining every
+  individual container source, including stopped and one-off containers.
+
+### Fixes
+
+- Preserve Docker CLI environment routing during discovery. lvu no longer
+  forces the currently named context over `DOCKER_HOST`; it emits `--context`
+  only when a context was explicitly configured.
+- Distinguish Docker services from containers in candidate details and the
+  per-category discovery report, without exposing daemon endpoint credentials.
+
 ## v0.1.12 — 2026-09-16
 
 ### Fixes

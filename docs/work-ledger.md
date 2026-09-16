@@ -3781,3 +3781,62 @@ capabilities exchange, and passed the installed split-dialog PTY from `/tmp`.
 `versions/latest` points to v0.1.12; only v0.1.12 binaries remain locally.
 Human macOS/arm64 Linux interactive acceptance and the paused long-running
 investigations remain explicitly unverified.
+
+## 2026-09-16 — v0.1.13 Docker Compose service discovery candidate
+
+Primary continued the existing uncommitted Docker draft rather than replacing
+it. Discover now retains every individual container candidate and adds one
+stable `project/service (Docker service)` candidate per reliably addressable
+Compose service. The aggregate uses an exact `CommandProgram::Exec` argv for
+`docker compose --project-name ... [--project-directory ...] [--file ...]
+logs --follow --timestamps --tail ... SERVICE`; replicas merge their evidence
+and availability, while one-off containers remain container-only. Candidate
+pressure evicts an optional service aggregate before hiding a later container.
+
+Implicit discovery still runs `docker context show` for descriptive identity,
+but no longer feeds that value back through `--context`: `DOCKER_HOST` and
+`DOCKER_CONTEXT` retain ordinary Docker CLI routing. Only an explicitly
+configured context emits `--context`. Environment daemon endpoints contribute
+only a stable hash to identity and are absent from hints/argv. The Docker ps
+template requests Compose labels as independently JSON-escaped fields because
+the documented flattened Labels field cannot preserve the label's own
+comma-separated config-file list. Every recorded config file must resolve to a
+local file (or Compose's documented default file must exist in the recorded
+working directory) before an aggregate is offered; stale remote-host paths omit
+the aggregate while preserving every container source.
+
+Targeted validation used the primary target on the large volume, jobs 2,
+incremental/debug info disabled, the canonical `flock --close` validation lock
+and marker-backed `/tmp/lvu-primary-docker-ctHdYR`. The first compile was
+preserved as a real draft failure: moved `id`/state/status values and one unused
+import stopped compilation before tests. A second compile exposed only a test
+comparison type mismatch. After those direct fixes, discovery integration passed
+**22/22**; focused app discovery/report tests and the Docker result integration
+passed; focused lvu/lvu-app/lvu-discovery all-target Clippy passed with warnings
+denied; the new Ratatui TestBackend selection test passed; and the new actual PTY
+started both the Compose aggregate and its retained individual container through
+Add source Discover using an environment-routed controlled Docker executable.
+The host's real Docker socket remains permission-denied, so no real Docker
+happy-path is claimed. Full workspace, bridge, 85-suite PTY matrix, immutable
+exact acceptance and release publication remain pending.
+
+Unversioned primary preflight is now green. Locked `cargo test --workspace`
+passed, workspace all-target Clippy passed with warnings denied, and a fresh
+complete PTY matrix passed **85/85** in 218 seconds, including the new Docker
+service/container selection and start story. Bridge typecheck passed; its first
+full test run passed 109/110 but missed the ephemeral cleanup assertion at
+105 ms after already recording `run_settled` and `cleanup_requested`. This is
+the runbook-documented tight timing family on a loaded shared runner; the log is
+preserved as `v013-preflight-clippy-bridge.log`. A second complete unchanged
+run passed 110/110 and built the bridge (`v013-preflight-bridge-r2.log`).
+
+The first PTY matrix is likewise preserved at 84/85. Its sole screen contained
+the correct controlled tee candidate, but primary had unnecessarily renamed
+non-Docker status text from `Procfs High Available` to `Process / open file ·
+High · Available`, violating an existing observable contract. The fix narrows
+new service/container wording to Docker candidates only. The complete focused
+real-source story then passed, and the fresh 85/85 matrix passed without timeout
+changes. Evidence: `v013-preflight-workspace.log`,
+`v013-preflight-pty-matrix.log`, `v013-real-pty-status-fix.log`, and
+`v013-preflight-pty-matrix-r2.log` under `primary-astra-scratch`. The immutable
+versioned exact-source release gate remains pending.

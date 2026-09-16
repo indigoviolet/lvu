@@ -357,6 +357,265 @@ fn docker_request(executable: PathBuf) -> DiscoveryRequest {
     req
 }
 
+struct EnvironmentGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+impl EnvironmentGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        // SAFETY: every Docker fixture that spawns a process holds
+        // EXECUTABLE_FIXTURE_LIFECYCLE, so no sibling Docker child can inherit
+        // this test-only routing value.
+        unsafe { std::env::set_var(name, value) };
+        Self { name, previous }
+    }
+
+    fn unset(name: &'static str) -> Self {
+        let previous = std::env::var_os(name);
+        // SAFETY: see `set`; the shared fixture lock covers this mutation.
+        unsafe { std::env::remove_var(name) };
+        Self { name, previous }
+    }
+}
+impl Drop for EnvironmentGuard {
+    fn drop(&mut self) {
+        // SAFETY: the fixture lock remains held until guards declared after it
+        // have restored their variables.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn docker_implicit_routing_preserves_environment_and_omits_context_argument() {
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
+    let _docker_context = EnvironmentGuard::unset("DOCKER_CONTEXT");
+    let secret_host = "tcp://user:secret@docker.example:2376";
+    let _docker_host = EnvironmentGuard::set("DOCKER_HOST", secret_host);
+    let tmp = TempDir::new().unwrap();
+    let body = r#"
+if [ "$1" = context ] && [ "$2" = show ]; then printf 'default\n'; exit 0; fi
+if [ "$1" = --context ]; then exit 41; fi
+if [ "$1" = ps ] && [ "$DOCKER_HOST" = 'tcp://user:secret@docker.example:2376' ]; then
+  printf '%s\n' '{"ID":"routed-id","Names":"routed","State":"running","Status":"Up"}'
+  exit 0
+fi
+exit 42
+"#;
+    let mut req = request();
+    req.docker = Some(DockerConfig {
+        runner: DockerRunner {
+            executable: docker_script(&tmp, body),
+        },
+        context: None,
+        history_lines: 77,
+    });
+    let result = discover(req).await;
+    assert_eq!(result.candidates.len(), 1, "{:?}", result.statuses);
+    let candidate = &result.candidates[0];
+    let Acquisition::Command { command } = &candidate.source.acquisition else {
+        panic!()
+    };
+    let lvu_core::CommandProgram::Exec { args, .. } = &command.program else {
+        panic!()
+    };
+    assert_eq!(args.first().map(String::as_str), Some("logs"));
+    assert!(!args.iter().any(|arg| arg == "--context"));
+    assert!(!candidate.dedup_key.contains(secret_host));
+    assert!(!candidate.fingerprint.contains(secret_host));
+}
+
+#[tokio::test]
+async fn compose_service_merges_replicas_and_executes_exact_multi_file_command() {
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("shop");
+    fs::create_dir(&project).unwrap();
+    let base = project.join("compose.yaml");
+    let override_file = project.join("compose.override.yaml");
+    fs::write(&base, "services: {api: {image: example}}\n").unwrap();
+    fs::write(&override_file, "services: {api: {}}\n").unwrap();
+    let config_files = format!("{},{}", base.display(), override_file.display());
+    let row = |id: &str, name: &str, replica: &str, state: &str, oneoff: &str| {
+        serde_json::json!({
+            "ID": id,
+            "Names": name,
+            "Image": "example",
+            "State": state,
+            "Status": if state == "running" { "Up" } else { "Exited" },
+            "ComposeProject": "shop",
+            "ComposeService": "api",
+            "ComposeReplica": replica,
+            "ComposeOneoff": oneoff,
+            "ComposeWorkingDir": project.to_string_lossy(),
+            "ComposeConfigFiles": config_files,
+        })
+        .to_string()
+    };
+    let standalone = serde_json::json!({
+        "ID": "standalone-id",
+        "Names": "standalone",
+        "State": "exited",
+        "Status": "Exited (0)",
+    })
+    .to_string();
+    let invocation = tmp.path().join("compose-argv");
+    let body = format!(
+        "if [ \"$3\" = ps ]; then printf '%s\\n' '{}' '{}' '{}' '{}'; elif [ \"$3\" = compose ]; then printf '%s\\n' \"$@\" > '{}'; printf 'service-follow-ok\\n'; else exit 23; fi",
+        row("old-id", "shop-api-1", "1", "exited", "False"),
+        row("new-id", "shop-api-2", "2", "running", "False"),
+        row("run-id", "shop-api-run", "9", "exited", "True"),
+        standalone,
+        invocation.display(),
+    );
+    let result = discover(docker_request(docker_script(&tmp, &body))).await;
+    assert_eq!(result.candidates.len(), 5, "{:?}", result.statuses);
+    let service = result
+        .candidates
+        .iter()
+        .find(|candidate| candidate.display_label == "shop/api (Docker service)")
+        .expect("Compose service aggregate");
+    assert_eq!(service.evidence.len(), 2);
+    assert_eq!(service.availability, crate::Availability::Available);
+    assert!(
+        result.statuses[0]
+            .message
+            .contains("1 Compose service log sources and 4 container log sources")
+    );
+    assert_eq!(
+        result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.display_label.contains("Docker service"))
+            .count(),
+        1,
+        "one-off containers must not create another service aggregate"
+    );
+    let stopped = result
+        .candidates
+        .iter()
+        .find(|candidate| candidate.display_label == "standalone (Docker)")
+        .unwrap();
+    assert_eq!(stopped.availability, crate::Availability::Unavailable);
+
+    let Acquisition::Command { command } = &service.source.acquisition else {
+        panic!()
+    };
+    let lvu_core::CommandProgram::Exec { args, .. } = &command.program else {
+        panic!()
+    };
+    assert_eq!(
+        args,
+        &[
+            "--context",
+            "ctx",
+            "compose",
+            "--project-name",
+            "shop",
+            "--project-directory",
+            project.to_str().unwrap(),
+            "--file",
+            base.to_str().unwrap(),
+            "--file",
+            override_file.to_str().unwrap(),
+            "logs",
+            "--follow",
+            "--timestamps",
+            "--tail",
+            "77",
+            "api",
+        ]
+    );
+    assert_eq!(command.cwd.as_deref(), Some(project.as_path()));
+    let (handle, mut events) = capture_command(command.clone(), CaptureLimits::default()).unwrap();
+    let mut observed = false;
+    while let Some(event) = events.recv().await {
+        observed |= event
+            .records()
+            .iter()
+            .any(|record| record.bytes == b"service-follow-ok");
+    }
+    handle.wait().await.unwrap();
+    assert!(observed, "service command did not execute fixture");
+    let invoked = fs::read_to_string(invocation)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(invoked.as_slice(), args.as_slice());
+}
+
+#[tokio::test]
+async fn compose_service_requires_locally_addressable_configuration() {
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
+    let tmp = TempDir::new().unwrap();
+    let row = serde_json::json!({
+        "ID": "remote-id",
+        "Names": "remote-api-1",
+        "State": "running",
+        "Status": "Up",
+        "ComposeProject": "remote",
+        "ComposeService": "api",
+        "ComposeReplica": "1",
+        "ComposeWorkingDir": "/remote/host/project",
+        "ComposeConfigFiles": "/remote/host/project/compose.yaml",
+    });
+    let body = format!("printf '%s\\n' '{}'", row);
+    let result = discover(docker_request(docker_script(&tmp, &body))).await;
+    assert_eq!(result.candidates.len(), 1, "{:?}", result.statuses);
+    assert_eq!(
+        result.candidates[0]
+            .identity_hints
+            .get("docker_log_scope")
+            .map(String::as_str),
+        Some("container")
+    );
+}
+
+#[tokio::test]
+async fn docker_candidate_limit_prioritizes_each_container_over_aggregates() {
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let compose = project.join("compose.yaml");
+    fs::write(&compose, "services: {}\n").unwrap();
+    let row = |id: &str, service: &str| {
+        serde_json::json!({
+            "ID": id,
+            "Names": id,
+            "State": "running",
+            "ComposeProject": "bounded",
+            "ComposeService": service,
+            "ComposeReplica": "1",
+            "ComposeWorkingDir": project.to_string_lossy(),
+            "ComposeConfigFiles": compose.to_string_lossy(),
+        })
+        .to_string()
+    };
+    let body = format!(
+        "printf '%s\\n' '{}' '{}'",
+        row("one", "api"),
+        row("two", "worker")
+    );
+    let mut req = docker_request(docker_script(&tmp, &body));
+    req.limits.maximum_candidates = 2;
+    let result = discover(req).await;
+    assert_eq!(result.statuses[0].state, ProviderState::Limited);
+    assert_eq!(result.candidates.len(), 2);
+    assert!(result.candidates.iter().all(|candidate| {
+        candidate
+            .identity_hints
+            .get("docker_log_scope")
+            .is_some_and(|scope| scope == "container")
+    }));
+}
+
 #[tokio::test]
 async fn docker_fixture_keeps_compose_replicas_and_uses_working_container_args() {
     let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;

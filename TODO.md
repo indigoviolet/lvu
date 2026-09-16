@@ -33,5 +33,6 @@ holds.
 
 ## Ready for the next release
 
-None. Separate Sources management (`N`) and Add source (`n`) shipped in
-v0.1.12.
+| Status | Work |
+| --- | --- |
+| **Ready** | v0.1.13 Docker discovery retains every individual container source and adds reliable Compose-service aggregates with implicit CLI routing and exact argv. Full unversioned preflight is green; immutable versioned acceptance remains. |
