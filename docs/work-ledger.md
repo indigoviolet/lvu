@@ -3840,3 +3840,15 @@ changes. Evidence: `v013-preflight-workspace.log`,
 `v013-preflight-pty-matrix.log`, `v013-real-pty-status-fix.log`, and
 `v013-preflight-pty-matrix-r2.log` under `primary-astra-scratch`. The immutable
 versioned exact-source release gate remains pending.
+
+Two clean exact-candidate attempts at `46222c0` passed locked workspace tests,
+all-target Clippy, 110/110 bridge checks and reproducible pinned binary builds,
+then both stopped at the same PTY **84/85** result. The preserved failure was
+not a product regression: `test_color_depth_pty.py` described and asserted an
+`xterm-256color` session but inherited the gate runner's `TERM`; `xterm` in the
+first invocation and `dumb` in the second correctly selected lvu's separate
+16-colour behavior. The unchanged pinned TUI binary passed the focused suite
+when the stated `TERM=xterm-256color` precondition was supplied. The suite now
+sets that precondition itself instead of depending on its caller. Failed gate
+evidence remains under `lvu-v013-46222c0-final-acceptance/`; a new commit-bound
+exact run is required.

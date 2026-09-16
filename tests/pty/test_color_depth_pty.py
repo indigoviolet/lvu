@@ -34,7 +34,10 @@ def cube_hex(index: int) -> str:
 
 
 def start(binary: pathlib.Path, colorterm: str | None) -> PtyApp:
-    environment = {"NO_COLOR": "", "LVU_NO_DELIGHT": "1"}
+    # The assertions below exercise the xterm-256color contract specifically.
+    # Do not inherit an agent or CI runner's TERM: xterm and dumb correctly make
+    # lvu choose its 16-colour path, which is a different product contract.
+    environment = {"NO_COLOR": "", "LVU_NO_DELIGHT": "1", "TERM": "xterm-256color"}
     # Unset rather than empty: an absent COLORTERM is what a plain
     # `xterm-256color` session actually looks like.
     environment["COLORTERM"] = colorterm if colorterm is not None else ""
