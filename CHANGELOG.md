@@ -4,6 +4,16 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## v0.1.12 — 2026-09-16
+
+### Fixes
+
+- Separate source management from source creation. `n` now always opens Add
+  source with Manual, Discover and Agent methods; `N` opens the Sources list.
+- Keep the Sources dialog list-focused: the highlighted existing source owns
+  full status, Restart and confirmed Remove. Add source transitions to the
+  separate creation dialog, whose Escape returns to Sources.
+
 ## v0.1.11 — 2026-09-16
 
 ### Features

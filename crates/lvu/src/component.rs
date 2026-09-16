@@ -121,7 +121,10 @@ pub enum Open {
     /// The View dialog in its Delete mode: explicit two-press confirmation
     /// for durable view deletion. Same layer and slot as `View`.
     ViewDelete,
+    /// Add a new source through Manual, Discover or Agent.
     Source,
+    /// Manage the existing source list. Same layer and slot as `Source`.
+    Sources,
     Folding,
     ViewSummary,
     /// The Recipes layer in one of its editable or browsing modes. Reaching a
@@ -214,7 +217,7 @@ impl Open {
             Open::Bookmarks => LayerId::Bookmarks,
             Open::View | Open::ViewMembership | Open::ViewDelete => LayerId::View,
             Open::ViewSummary => LayerId::ViewSummary,
-            Open::Source => LayerId::Source,
+            Open::Source | Open::Sources => LayerId::Source,
             Open::Folding => LayerId::Folding,
             Open::Recipes { .. } => LayerId::Recipes,
             Open::RecipeHistory { .. } => LayerId::RecipeHistory,
@@ -270,6 +273,7 @@ impl Open {
             | Open::Fields
             | Open::FieldColumn { .. }
             | Open::Source
+            | Open::Sources
             | Open::Recipes { .. }
             | Open::RecipeHistory { .. } => false,
             // Ask freezes the active view's id and definition revision at open

@@ -184,9 +184,10 @@ fn every_action_row_mnemonic_in_the_product_is_accounted_for() {
         // (never deletes) and is not a letter of its destructive button, so
         // no bare key can delete.
         ("View", vec!['b', 'c', 'r', 's', 'e'], true),
-        // Sources opens on the Existing list when the workspace has sources;
-        // Restart/Remove are actions but deliberately claim no bare mnemonic.
-        ("Source", vec![], false),
+        // `n` opens Add source on its editable Manual field. The separate
+        // Sources list is reached with `N`; neither action row claims a bare
+        // mnemonic.
+        ("Source", vec![], true),
         ("Folding", vec![], false),
         // The Filter dialog opens with the caret in the active tab's field;
         // `Clear` and the two tab segments carry the letters (§12.1).

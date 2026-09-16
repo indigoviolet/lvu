@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.11**. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.11**. A **v0.1.12 candidate** is under validation. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -33,5 +33,6 @@ holds.
 
 ## Ready for the next release
 
-None. The unified Sources dialog and stopped-source lifecycle shipped in
-v0.1.11.
+| Status | Work |
+| --- | --- |
+| **Working** | v0.1.12 separates Sources management (`N`) from Add source (`n`), while preserving full status, restart, confirmed removal and Manual/Discover/Agent creation. Focused Rust and PTY coverage is green; full release acceptance remains. |

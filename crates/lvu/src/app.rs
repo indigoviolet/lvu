@@ -7183,7 +7183,12 @@ impl App {
             Open::View => layers.view.open(ViewDialogMode::Clone, &mut ctx),
             Open::ViewMembership => layers.view.open(ViewDialogMode::Sources, &mut ctx),
             Open::ViewDelete => layers.view.open(ViewDialogMode::Delete, &mut ctx),
-            Open::Source => layers.source.open((), &mut ctx),
+            Open::Source => layers
+                .source
+                .open(crate::components::source::SourceOpen::Add, &mut ctx),
+            Open::Sources => layers
+                .source
+                .open(crate::components::source::SourceOpen::Existing, &mut ctx),
             Open::Folding => layers.folding.open((), &mut ctx),
             Open::ViewSummary => layers.view_summary.open((), &mut ctx),
             Open::Recipes { mode } => layers.recipes.open(
@@ -9622,6 +9627,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('A') => Action::Open(Open::Ask(crate::components::ask::AskOpen::Generic)),
         KeyCode::Char('I') => Action::Open(crate::component::Open::Investigation),
         KeyCode::Char('n') => Action::Open(crate::component::Open::Source),
+        KeyCode::Char('N') => Action::Open(crate::component::Open::Sources),
         KeyCode::Char('r') => Action::Open(crate::component::Open::Recipes {
             mode: RecipeDialogMode::Browse,
         }),

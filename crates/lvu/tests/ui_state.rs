@@ -851,10 +851,20 @@ fn sources_dialog_exposes_full_failure_and_manages_source_by_stable_id() {
         }],
         false,
     );
-    app.handle(Action::Open(Open::Source), &provider);
+    assert_eq!(
+        app.key_to_action(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+        Action::Open(Open::Source)
+    );
+    assert_eq!(
+        app.key_to_action(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+        Action::Open(Open::Sources)
+    );
+    app.handle(Action::Open(Open::Sources), &provider);
     assert_eq!(app.layers.source.state().mode, SourceDialogMode::Existing);
     let output = render(&provider, &mut app, 90, 24);
     assert!(output.contains("Sources"), "{output}");
+    assert!(output.contains("[ Add source ]"), "{output}");
+    assert!(!output.contains(" Discover "), "{output}");
     assert!(
         output.contains("remembered commands never start automatically"),
         "full status must wrap instead of being lost in the sidebar: {output}"
@@ -863,6 +873,15 @@ fn sources_dialog_exposes_full_failure_and_manages_source_by_stable_id() {
         output.contains("Restart for an explicit launch"),
         "{output}"
     );
+
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert_eq!(app.layers.source.state().mode, SourceDialogMode::Manual);
+    let add = render(&provider, &mut app, 90, 24);
+    assert!(add.contains("Add source"), "{add}");
+    assert!(add.contains("Manual") && add.contains("Discover"), "{add}");
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert_eq!(app.layers.source.state().mode, SourceDialogMode::Existing);
 
     app.handle(raw_key(KeyCode::Char('R')), &provider);
     assert_eq!(
@@ -1088,8 +1107,12 @@ fn source_activate<P: RowProvider>(app: &mut App, provider: &P, control: SourceC
 }
 
 fn source_mode<P: RowProvider>(app: &mut App, provider: &P, mode: SourceDialogMode) {
+    if mode == SourceDialogMode::Existing {
+        assert_eq!(app.layers.source.state().mode, mode);
+        return;
+    }
     let control = match mode {
-        SourceDialogMode::Existing => SourceControl::Existing,
+        SourceDialogMode::Existing => unreachable!(),
         SourceDialogMode::Manual => SourceControl::Manual,
         SourceDialogMode::Discovery => SourceControl::Discovery,
         SourceDialogMode::Ai => SourceControl::Agent,

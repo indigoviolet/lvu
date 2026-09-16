@@ -62,7 +62,8 @@ source ID and canonical All events view in the UI. Management actions address
 that source ID directly: Restart may attach the missing handle without creating
 a second identity, and acknowledged Remove must delete both view membership and
 the source header and durably drop worker session membership. It never deletes
-the retained journal.
+the retained journal. Source creation is a separate dialog and creates no
+ambiguity about which existing source Restart or Remove targets.
 
 Shared-capture control protocol version 2 adds acknowledged `DeleteView` and
 `RemoveSource` methods. A version mismatch is an explicit refusal; peers never

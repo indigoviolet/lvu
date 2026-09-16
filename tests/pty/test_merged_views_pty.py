@@ -52,7 +52,6 @@ def run(binary):
             app.wait_for("Waiting for sources")
             assert marker.read_text().splitlines() == ["started"], "restoration launched a remembered command"
             app.send(b"n"); app.wait_for("Add source")
-            app.send(b"\t\t\r"); app.wait_for("Path")
             app.send(str(second).encode() + b"\r")
             app.wait_until(lambda text: "Add source" not in text and "keep beta" in text, "explicit second source opened")
             # The newly opened source has its own view; select the restored merge.

@@ -865,7 +865,7 @@ does not need it.
 | 8 | View (`v`) — done | `ViewMutationRequest` outbox; `ViewEvent::SourcesChanged`. Both arrived as specified; the three deviations it forced are recorded in §6.5. |
 | 9 | Recipes (`r`) + History — done | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. History is reached and left by `Replace`, not `OpenChild`: this row said "History child" and was wrong (§6.5). |
 | 10 | Settings (`,`) — done | The `ctx.appearance` exception; `SettingsRequest` outbox. |
-| 11 | Source (`n`, four modes) — done | Five request kinds (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`, `SourceManagementRequest`) share one `SourceRequest` enum and typed drains (§8). `ctx.sources` stays read-only; Existing emits stable-ID Restart/Remove requests rather than mutating it during event dispatch. |
+| 11 | Add source (`n`) / Sources (`N`) — done | One layer has two explicit opens: a Sources list and a separate Manual/Discover/Agent creation dialog. Five request kinds (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`, `SourceManagementRequest`) share one `SourceRequest` enum and typed drains (§8). `ctx.sources` stays read-only; the list emits stable-ID Restart/Remove requests rather than mutating it during dispatch. |
 | 12 | Ask 🧠, Investigation 🧠 — done | Agent outboxes; multi-line `TextField`; long-running stages. Two commits: Ask lands first because it establishes the outbox-plus-fence shape for a remote turn and the derived `text_focus`, and Investigation reuses both. Investigation adds the second fence (session id) and the first layer-owned collection that outlives its layer. |
 | 13 | Enrichment + Step child + External command — done | Last, and only after the in-flight two-layer work lands: it is the deepest stack and has the most `ViewEvent` handling. Its `Focus::EnrichmentEditor`/`EnrichmentStep`/`CommandEnrichment` trio maps to `LayerId::Enrichment`, `EnrichmentStep`, `ExternalCommand`. The step editor is the model's one real `OpenChild`; External command is a `Replace`, because it is not a child today (§6.5). |
 | 14 | Correlation (Alt-R in Fields) — done | Last of all: it was the shell's until Fields could hand it over. `CorrelationRequest` outbox with the completion fence extended by the origin view; a lookup that is opened by `Replace` from Fields and shows its own pending state, which retired `Ctx::correlating` (the §7.2 exception W15 recorded for exactly this long); the first live region (§5.2.1) whose rows arrive from a completion rather than a keystroke. |
@@ -1109,8 +1109,8 @@ rule already forbids.
 `admit`/`stop`/`restart` on a `Sources` struct reached through `ctx.sources`.
 `admit` is the
 component's own `SourceRequest::Launch`, which goes through its outbox like
-every other request a component makes. The later Existing mode reads the
-source slice and emits `SourceManagementRequest::{Restart, Remove}` by stable
+every other request a component makes. The Sources open reads the source slice
+and emits `SourceManagementRequest::{Restart, Remove}` by stable
 ID; the controller applies those after dispatch through the same bounded
 control/removal queues as the base sidebar. This keeps rendering/event handling
 free of in-place collection mutation while allowing stopped sources with no

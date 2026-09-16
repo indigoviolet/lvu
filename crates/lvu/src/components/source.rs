@@ -80,6 +80,12 @@ pub enum SourceManagementRequest {
     Remove { source_id: String },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceOpen {
+    Add,
+    Existing,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SourceDialogMode {
     Existing,
@@ -93,7 +99,7 @@ pub enum SourceDialogMode {
 pub enum SourceControl {
     #[default]
     Input,
-    Existing,
+    Add,
     Manual,
     Discovery,
     Agent,
@@ -107,15 +113,7 @@ pub enum SourceControl {
 impl SourceControl {
     pub(crate) fn visible(mode: SourceDialogMode, kind: SourceKind) -> &'static [Self] {
         match mode {
-            SourceDialogMode::Existing => &[
-                Self::Input,
-                Self::Existing,
-                Self::Manual,
-                Self::Discovery,
-                Self::Agent,
-                Self::Restart,
-                Self::Remove,
-            ],
+            SourceDialogMode::Existing => &[Self::Input, Self::Add, Self::Restart, Self::Remove],
             SourceDialogMode::Manual if kind == SourceKind::File => &[
                 Self::Input,
                 Self::Manual,
@@ -207,6 +205,8 @@ pub struct SourceDialogState {
     pub existing_scroll: usize,
     pub existing_scroll_limit: usize,
     pub confirm_remove: bool,
+    /// Add source was opened from the Sources list, so Escape returns there.
+    pub return_to_existing: bool,
 }
 
 impl Default for SourceDialogState {
@@ -225,6 +225,7 @@ impl Default for SourceDialogState {
             existing_scroll: 0,
             existing_scroll_limit: 0,
             confirm_remove: false,
+            return_to_existing: false,
         }
     }
 }
@@ -1065,6 +1066,9 @@ impl SourceDialog {
         self.state.control = SourceControl::Input;
         self.state.controls_focused = false;
         self.state.confirm_remove = false;
+        if mode == SourceDialogMode::Existing {
+            self.state.return_to_existing = false;
+        }
         clear_path_completion(&mut self.state);
         self.drop_path_completions();
         if mode == SourceDialogMode::Discovery && self.state.discovery.generation == 0 {
@@ -1075,14 +1079,19 @@ impl SourceDialog {
     fn toggle_discovery(&mut self) {
         let mode = match self.state.mode {
             SourceDialogMode::Discovery => SourceDialogMode::Manual,
-            SourceDialogMode::Existing | SourceDialogMode::Manual | SourceDialogMode::Ai => {
+            SourceDialogMode::Existing => {
+                self.state.return_to_existing = true;
                 SourceDialogMode::Discovery
             }
+            SourceDialogMode::Manual | SourceDialogMode::Ai => SourceDialogMode::Discovery,
         };
         self.set_mode(mode);
     }
 
     fn toggle_ai(&mut self) {
+        if self.state.mode == SourceDialogMode::Existing {
+            self.state.return_to_existing = true;
+        }
         let mode = if self.state.mode == SourceDialogMode::Ai {
             SourceDialogMode::Manual
         } else {
@@ -1102,13 +1111,12 @@ impl SourceDialog {
     }
 
     fn move_source_mode(&mut self, delta: i32) {
-        const MODES: [SourceDialogMode; 4] = [
-            SourceDialogMode::Existing,
+        const MODES: [SourceDialogMode; 3] = [
             SourceDialogMode::Manual,
             SourceDialogMode::Discovery,
             SourceDialogMode::Ai,
         ];
-        if !self.state.controls_focused {
+        if !self.state.controls_focused || self.state.mode == SourceDialogMode::Existing {
             return;
         }
         let index = MODES
@@ -1117,7 +1125,7 @@ impl SourceDialog {
             .unwrap_or(0);
         self.state.mode = MODES[(index as i32 + delta).rem_euclid(MODES.len() as i32) as usize];
         self.state.control = match self.state.mode {
-            SourceDialogMode::Existing => SourceControl::Existing,
+            SourceDialogMode::Existing => SourceControl::Input,
             SourceDialogMode::Manual => SourceControl::Manual,
             SourceDialogMode::Discovery => SourceControl::Discovery,
             SourceDialogMode::Ai => SourceControl::Agent,
@@ -1146,7 +1154,10 @@ impl SourceDialog {
     fn activate(&mut self, ctx: &mut Ctx<'_>) {
         match self.state.control {
             SourceControl::Input => self.submit(ctx),
-            SourceControl::Existing => self.set_mode(SourceDialogMode::Existing),
+            SourceControl::Add => {
+                self.state.return_to_existing = !ctx.sources.is_empty();
+                self.set_mode(SourceDialogMode::Manual);
+            }
             SourceControl::Manual => self.set_mode(SourceDialogMode::Manual),
             SourceControl::Discovery => self.set_mode(SourceDialogMode::Discovery),
             SourceControl::Agent => self.set_mode(SourceDialogMode::Ai),
@@ -1469,22 +1480,26 @@ impl SourceDialog {
 
 impl Component for SourceDialog {
     type Hit = SourceHit;
-    type Open = ();
+    type Open = SourceOpen;
 
-    fn open(&mut self, _params: (), ctx: &mut Ctx<'_>) {
+    fn open(&mut self, params: SourceOpen, ctx: &mut Ctx<'_>) {
         // `Action::OpenSource` used `get_or_insert_with`: reopening kept the
         // draft, the discovered list and any proposal under review.
         self.open = true;
-        if !ctx.sources.is_empty() {
-            self.state.mode = SourceDialogMode::Existing;
-            self.state.control = SourceControl::Input;
-            self.state.controls_focused = false;
-            self.state.existing_selected = self
-                .state
-                .existing_selected
-                .min(ctx.sources.len().saturating_sub(1));
-            self.state.confirm_remove = false;
-        }
+        let existing = params == SourceOpen::Existing && !ctx.sources.is_empty();
+        self.state.mode = if existing {
+            SourceDialogMode::Existing
+        } else {
+            SourceDialogMode::Manual
+        };
+        self.state.control = SourceControl::Input;
+        self.state.controls_focused = false;
+        self.state.existing_selected = self
+            .state
+            .existing_selected
+            .min(ctx.sources.len().saturating_sub(1));
+        self.state.confirm_remove = false;
+        self.state.return_to_existing = false;
         self.scroll_focused = false;
         self.geometry = SourceGeometry::default();
         self.seed_surface();
@@ -1512,6 +1527,32 @@ impl Component for SourceDialog {
                 {
                     clear_path_completion(&mut self.state);
                     self.state.control = SourceControl::Input;
+                    return Outcome::Consumed;
+                }
+                if self.state.mode != SourceDialogMode::Existing
+                    && self.state.return_to_existing
+                    && !ctx.sources.is_empty()
+                {
+                    if self.state.discovery.scanning
+                        && self.discovery_queued() < MAX_DISCOVERY_REQUESTS
+                    {
+                        let generation = self.state.discovery.generation;
+                        let _ = self.outbox.push(SourceRequest::Discovery(
+                            DiscoveryUiRequest::Cancel { generation },
+                        ));
+                    }
+                    if !matches!(
+                        self.state.ai.stage,
+                        SourceAiStage::Input | SourceAiStage::Error
+                    ) && self.ai_queued() < MAX_SOURCE_AI_REQUESTS
+                    {
+                        let generation = self.state.ai.generation;
+                        let _ = self
+                            .outbox
+                            .push(SourceRequest::Ai(SourceAiRequest::Cancel { generation }));
+                    }
+                    self.set_mode(SourceDialogMode::Existing);
+                    self.scroll_focused = false;
                     return Outcome::Consumed;
                 }
                 if self.state.discovery.scanning && self.discovery_queued() < MAX_DISCOVERY_REQUESTS
@@ -1545,6 +1586,7 @@ impl Component for SourceDialog {
                     self.state.mode = SourceDialogMode::Manual;
                     self.state.control = SourceControl::Input;
                     self.state.controls_focused = false;
+                    self.state.return_to_existing = false;
                 }
                 self.state.existing_selected = self
                     .state
@@ -1575,7 +1617,7 @@ impl Component for SourceDialog {
 
     fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
         if self.state.mode == SourceDialogMode::Existing {
-            vec!["Restart", "Remove"]
+            vec!["Add source", "Restart", "Remove"]
         } else {
             Vec::new()
         }
@@ -1586,8 +1628,12 @@ impl Component for SourceDialog {
             return Outcome::Ignored;
         }
         match index {
-            0 => self.submit_management(false, ctx),
-            1 => self.submit_management(true, ctx),
+            0 => {
+                self.state.return_to_existing = !ctx.sources.is_empty();
+                self.set_mode(SourceDialogMode::Manual);
+            }
+            1 => self.submit_management(false, ctx),
+            2 => self.submit_management(true, ctx),
             _ => return Outcome::Ignored,
         }
         Outcome::Consumed
@@ -1655,20 +1701,14 @@ fn render_source(
     let styles = DialogStyles::new(theme);
     let agent_label = if ascii { "Agent" } else { "🧠 Agent" };
 
-    // §8.6: the four modes are a segmented control in the header, not buttons
-    // in the action row, so the primary action never shifts them sideways.
-    let mode_controls = [
-        Control::Existing,
-        Control::Manual,
-        Control::Discovery,
-        Control::Agent,
-    ];
-    let mode_labels = ["Existing", "Manual", "Discover", agent_label];
+    // §8.6: Add source's three methods are a segmented control in the header,
+    // not buttons in the action row. Sources is a separate list surface.
+    let mode_controls = [Control::Manual, Control::Discovery, Control::Agent];
+    let mode_labels = ["Manual", "Discover", agent_label];
     let active_mode = match dialog.mode {
-        Mode::Existing => 0,
-        Mode::Manual => 1,
-        Mode::Discovery => 2,
-        Mode::Ai => 3,
+        Mode::Existing | Mode::Manual => 0,
+        Mode::Discovery => 1,
+        Mode::Ai => 2,
     };
 
     let discovery_indices = filtered_discovery_indices(&dialog.discovery);
@@ -1800,7 +1840,11 @@ fn render_source(
         _ => "Open",
     };
     let mut action_controls = if dialog.mode == Mode::Existing {
-        vec![(Control::Restart, "Restart"), (Control::Remove, "Remove")]
+        vec![
+            (Control::Add, "Add source"),
+            (Control::Restart, "Restart"),
+            (Control::Remove, "Remove"),
+        ]
     } else {
         vec![(Control::Input, primary)]
     };
@@ -1810,14 +1854,28 @@ fn render_source(
     let action_labels: Vec<&str> = action_controls.iter().map(|(_, label)| *label).collect();
 
     // Stable LongContent budgets: outer size is policy-only, never async
-    // counts. Header 1 (the Existing/Manual/Discover/Agent segmented control, always
-    // present), body minimum 3 useful rows, message 2 and no help row, actions
+    // counts. The Add source dialog has one header row for its
+    // Manual/Discover/Agent segmented control; Sources is a list and has no
+    // mode header. Body minimum 3 useful rows, message 2 and no help row, actions
     // from the stable width budget so the frame and sticky tail origins are
     // identical across manual/discovery/loading/proposal/error states.
     // Hand-rolled row assignment below is presentation-only folding, never
     // query membership (AGENTS.md).
     let spec = source_spec_for(area);
-    let Ok(resolved) = resolve_dialog(area, &spec, 1, &action_labels, Some(0), None) else {
+    let header_rows = usize::from(dialog.mode != Mode::Existing);
+    let default_action = if dialog.mode == Mode::Existing {
+        Some(1)
+    } else {
+        Some(0)
+    };
+    let Ok(resolved) = resolve_dialog(
+        area,
+        &spec,
+        header_rows,
+        &action_labels,
+        default_action,
+        None,
+    ) else {
         // Below the floor the tiny fallback owns the frame; stay open with
         // nothing drawn, as the palette does.
         return this.record(
@@ -1834,7 +1892,12 @@ fn render_source(
     };
     // Shared frame so geometry and paint share one definition; compactness
     // comes from the geometry, never recomputed from the frame.
-    render_responsive_frame(frame, &resolved, "Sources · Add source", ctx.active, theme);
+    let title = if dialog.mode == Mode::Existing {
+        "Sources"
+    } else {
+        "Add source"
+    };
+    render_responsive_frame(frame, &resolved, title, ctx.active, theme);
     let mut surface = Surface {
         popup: resolved.frame,
         interior: resolved.interior,
@@ -1849,21 +1912,23 @@ fn render_source(
     let action_geom = resolved.actions.clone();
     let roomy = !resolved.compact;
 
-    let focused_mode = mode_controls
-        .iter()
-        .position(|control| *control == dialog.control);
-    for (index, rect) in render_segmented_control(
-        frame,
-        resolved.header,
-        &mode_labels,
-        active_mode,
-        focused_mode,
-        theme,
-    )
-    .into_iter()
-    .enumerate()
-    {
-        geometry.controls.push((rect, mode_controls[index]));
+    if dialog.mode != Mode::Existing {
+        let focused_mode = mode_controls
+            .iter()
+            .position(|control| *control == dialog.control);
+        for (index, rect) in render_segmented_control(
+            frame,
+            resolved.header,
+            &mode_labels,
+            active_mode,
+            focused_mode,
+            theme,
+        )
+        .into_iter()
+        .enumerate()
+        {
+            geometry.controls.push((rect, mode_controls[index]));
+        }
     }
 
     let body = resolved.body.viewport;
@@ -1900,8 +1965,7 @@ fn render_source(
                     0,
                 );
                 frame.render_widget(
-                    Paragraph::new("Existing sources")
-                        .style(styles.label.add_modifier(Modifier::BOLD)),
+                    Paragraph::new("Sources").style(styles.label.add_modifier(Modifier::BOLD)),
                     rects.heading,
                 );
                 if rects.count.width > 0 {
@@ -2509,10 +2573,10 @@ fn render_source(
     let focused_action = action_controls
         .iter()
         .position(|(control, _)| *control == dialog.control);
-    let destructive = [1usize];
+    let destructive = [2usize];
     let action_row = ActionRow {
         labels: &action_labels,
-        default: Some(0),
+        default: default_action,
         destructive: if dialog.mode == Mode::Existing {
             &destructive
         } else {

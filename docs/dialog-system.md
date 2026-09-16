@@ -357,7 +357,7 @@ the longest option is as live as the count.
 | Enrichment | `e` | L | The step list and its message row; the steps themselves are edited in the two dialogs below (§12.5). |
 | Enrichment step editor (Enrichment child) | Alt-A / Alt-E | L (child) | Expression field, input and output panes. The one true `OpenChild` (§10). |
 | External command | Alt-C, or Edit on a command row | L | Five fields, two of them multi-line, and a notes pane. Opened from Enrichment and *replaces* it (§10); it is not a child. |
-| Sources / Add source (four modes) | `n` | L | Existing sources use a list plus full-status pane and Restart/Remove actions; Manual/Discover/Agent keep their suggestions/candidates/proposal panes. Live lists reserve their rows (§5.2.1). |
+| Sources / Add source | `N` / `n` | L | Sources is an existing-source list plus full-status pane and Restart/Remove/Add source actions. Add source is a separate Manual/Discover/Agent dialog. Live lists reserve their rows (§5.2.1). |
 | Storage | `S` | L | Six-column entry list; rows are long. |
 | Settings | `,` | L | Three sections plus an effective-values pane. Scrolls instead of hiding. |
 | Help | `?` | L | Two-column reference. |
@@ -632,12 +632,12 @@ verb that creates something (`Add`, `Save`, `Open`).
 
 ### 8.6 Segmented control (modes)
 
-Header-only. `␣Existing␣│␣Manual␣│␣Discover␣│␣🧠 Agent␣` starting at `content.x`.
+Header-only. `␣Manual␣│␣Discover␣│␣🧠 Agent␣` starting at `content.x`.
 Left/Right (and click) switch modes when the control is focused; Tab reaches it
 like any control. A segment label may carry a §8.10 mnemonic (`&Search`), drawn
 as an underline, so Alt plus that letter selects the segment from anywhere in
 the dialog — including from inside a text field, which is why the Filter
-dialog's tabs use it. Used by Sources (`Existing │ Manual │ Discover │ 🧠 Agent`),
+dialog's tabs use it. Used by Add source (`Manual │ Discover │ 🧠 Agent`),
 Investigation (`New │ Saved`) and Filter (`Search │ Advanced`, §12.1).
 Enrichment's old `Steps │ Editor` toggle is gone: the step list and the step
 editor are two layers (§12.5, §12.5a), not two modes of one.
@@ -668,7 +668,7 @@ scrollable pane, that pane; over an anchored popup, the popup.
 
 Every dialog that has an action row declares **one default action**. It is
 the verb the dialog exists for — `Apply` for the editors and Time, `Save` for
-the step editor and Settings, `Restart` for Sources/Existing and `Open` for its
+the step editor and Settings, `Restart` for Sources and `Open` for Add source's
 Manual/Discover modes, `Go to` for Bookmarks,
 `Pin` for Fields, `Submit`/`Start`/`Send` for the agent dialogs. A dialog
 without an action row (Help) has no default and Enter is inert in it. A
@@ -1550,7 +1550,7 @@ After, 54x16 (52 × 16):
 └─────────────────────────────────────────────────┘
 ```
 
-### 12.7 Sources / Add source `n` — class L, four modes
+### 12.7 Sources `N` and Add source `n` — class L, separate dialogs
 
 Before (manual; 100% × 24; 16 empty rows; caps label; boxed state; two mode
 switchers in the button row):
@@ -1568,14 +1568,13 @@ switchers in the button row):
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-After — Existing, 100x30. This is the opening mode when the workspace has
-sources; stopped/error/not-acquiring sources remain selectable and their full
-diagnostic wraps in the status pane. Restart is the default; Remove is
-destructive and requires the second press:
+After — Sources, 100x30. Stopped/error/not-acquiring sources remain selectable
+and their full diagnostic wraps in the status pane. Restart acts on the
+highlighted source and is the default; Remove is destructive and requires the
+second press. Add source transitions to the separate dialog below:
 
 ```
-┌ Sources · Add source ──────────────────────────────────────────────────────────────┐
-│  Existing │ Manual │ Discover │ 🧠 Agent                                           │
+┌ Sources ───────────────────────────────────────────────────────────────────────────┐
 │  Existing sources                                                        2         │
 │    › api.log        Running: 42 records                                             │
 │      shell command  not acquiring: remembered commands never start…                 │
@@ -1586,7 +1585,7 @@ destructive and requires the second press:
 │    Status: not acquiring: remembered commands never start automatically; use        │
 │    Restart for an explicit launch                                                   │
 │  ○  Ready     select a source to inspect its complete status                        │
-│  [ Restart ]  [ Remove ]                                                            │
+│  [ Add source ]  [ Restart ]  [ Remove ]                                             │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1595,7 +1594,7 @@ After — Manual, 100x30 (86 × 14 with two suggestions; 86 × 11 with none):
 ```
 ┌ Add source ────────────────────────────────────────────────────────────────────────┐
 │                                                                                    │
-│   Existing │ Manual │ Discover │ 🧠 Agent                                          │
+│   Manual │ Discover │ 🧠 Agent                                                     │
 │                                                                                    │
 │  Kind         ● File   ○ Command                                                   │
 │  Path         /var/log/app▁                                                        │
@@ -1620,7 +1619,7 @@ After — Discover, 100x30 (86 × 17):
 ```
 ┌ Add source ────────────────────────────────────────────────────────────────────────┐
 │                                                                                    │
-│   Existing │ Manual │ Discover │ 🧠 Agent                                          │
+│   Manual │ Discover │ 🧠 Agent                                                     │
 │                                                                                    │
 │  Filter       ▁                                                                    │
 │                                                                                    │
@@ -1647,7 +1646,7 @@ After — 🧠 Agent, 100x30 (86 × 15 before a proposal):
 ```
 ┌ Add source ────────────────────────────────────────────────────────────────────────┐
 │                                                                                    │
-│   Existing │ Manual │ Discover │ 🧠 Agent                                          │
+│   Manual │ Discover │ 🧠 Agent                                                     │
 │                                                                                    │
 │  Describe     Follow the nginx access log for the api container▁                   │
 │               ▁                                                                    │
@@ -1672,7 +1671,7 @@ After, 54x16 (Manual; 52 × 10):
 
 ```
 ┌ Add source ─────────────────────────────────────┐
-│   Existing │ Manual │ Discover │ 🧠 Agent       │
+│   Manual │ Discover │ 🧠 Agent                  │
 │  Kind      ● File   ○ Command                   │
 │  Path      /var/log/app▁                        │
 │  Suggestions                          2 matches │

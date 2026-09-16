@@ -396,6 +396,7 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ("V", "View summary: everything applied to this view".into()),
                 ("r", "Recipes".into()),
                 ("n", "Add source".into()),
+                ("N", "Sources: status, restart and remove".into()),
                 ("S", "Storage".into()),
                 ("A", format!("Ask {agent} for a filter or enrichment")),
                 ("I", format!("{agent} investigation")),

@@ -13,17 +13,6 @@ from test_enrichment_chain_pty import stop
 from test_lvu_pty import PtyApp, isolated_environment
 
 
-def click_text(app: PtyApp, text: str) -> None:
-    app.drain()
-    for y, row in enumerate(app.screen.display):
-        if text in row:
-            x = row.index(text)
-            app.send(f"\x1b[<0;{x + 1};{y + 1}M".encode())
-            app.send(f"\x1b[<0;{x + 1};{y + 1}m".encode())
-            return
-    raise AssertionError(f"missing clickable text {text!r}\n{app.text()}")
-
-
 def launch(binary: pathlib.Path, capture: pathlib.Path, env: dict[str, str], *args: str) -> PtyApp:
     return PtyApp(
         binary,
@@ -66,23 +55,31 @@ def run(binary: pathlib.Path) -> None:
                 lambda text: "› All events" in text,
                 "remembered command has a selectable canonical view",
             )
+            # Lowercase n is always Add source; uppercase N manages existing
+            # sources and therefore acts on the highlighted row.
             app.send(b"n")
-            app.wait_for("Sources · Add source")
+            app.wait_for("Add source")
+            assert "Existing sources" not in app.text(), app.text()
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Add source" not in text, "Add source closes")
+            app.send(b"N")
+            app.wait_for("Sources")
             app.wait_for("Full status")
             app.wait_for("remembered commands never start automatically")
             app.wait_for("explicit")
             app.wait_for("launch")
 
-            click_text(app, "[ Restart ]")
+            app.send(b"R")
             app.wait_until(
                 lambda _text: launches.read_text().splitlines() == ["launch", "launch"],
                 "explicit restart launches the remembered command exactly once",
                 timeout=20,
             )
 
-            click_text(app, "[ Remove ]")
+            # Input -> Add source -> Restart -> Remove, then Enter twice.
+            app.send(b"\t\t\t\r")
             app.wait_for("Delete again to confirm")
-            click_text(app, "[ Remove ]")
+            app.send(b"\r")
             app.wait_until(
                 lambda text: "shell command" not in text and "not acquiring" not in text,
                 "removed source leaves the current workspace",

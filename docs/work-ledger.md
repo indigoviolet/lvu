@@ -3722,3 +3722,25 @@ moved to trash, and mise/Homebrew retained only v0.1.11. Tags, release records,
 captures and proof archives were preserved. Human Apple-silicon macOS and arm64
 Linux terminal acceptance, plus the paused volume/cold-query/slow-storage
 investigations, remain explicitly unverified.
+
+## 2026-09-16 — v0.1.12 separate Sources and Add source candidate
+
+Primary implemented the clarified source-dialog model without changing capture
+or persistence contracts. Lowercase `n` always opens Add source directly with
+Manual, Discover and Agent methods. Uppercase `N` opens Sources as an
+existing-source list; its highlighted row is the sole target of full status,
+Restart and confirmed Remove. `[ Add source ]` transitions to the separate
+creation screen, and Escape returns to Sources. The palette and Help expose
+both entry points.
+
+Primary preflight is green under the canonical validation lock: locked full
+Rust workspace, workspace all-target Clippy with `-D warnings`, focused
+key/palette/default/geometry coverage, five representative actual PTYs, and a
+fresh complete PTY matrix **84/84** in 211 seconds. The first matrix was
+preserved at 83/84: its sole failure screen already showed the correct path
+suggestion, but a test required the clipped `.log` suffix under a long matrix
+temporary path. The assertion now uses the visible stable stem plus `1 match`;
+the focused suite and fresh complete matrix passed. Logs:
+`primary-sol-scratch/v012-rust-workspace-r3.log`,
+`v012-clippy-pty.log`, and `v012-pty-matrix-r2.log`. Exact immutable release
+acceptance remains pending.

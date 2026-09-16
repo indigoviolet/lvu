@@ -99,12 +99,14 @@ enriching or cloning must not launch another capture. Explicit source admission
 and restart belong to the application/ingest lifecycle. Stdin gets a fresh source
 identity per attachment and cannot be restarted without a new reader.
 
-The unified Sources dialog is keyed by stable source identity rather than by a
-live capture handle. A remembered command or endpoint that restore deliberately
-does not launch still owns a selectable canonical All events view and an
-Existing row with its complete diagnostic. Restart registers the missing handle
-and canonical adapter view; Remove follows the same acknowledged controller path
-as the base-screen shortcut.
+The Sources dialog (`N`) is a list keyed by stable source identity rather than
+by a live capture handle. A remembered command or endpoint that restore
+deliberately does not launch still owns a selectable canonical All events view
+and a row with its complete diagnostic. Restart registers the missing handle
+and canonical adapter view; Remove follows the same acknowledged controller
+path as the base-screen shortcut. Add source is a separate dialog: `n` opens it
+directly, and the list's Add source action transitions to its
+Manual/Discover/Agent methods.
 
 Deletion removes membership, never captures. A derived view deletes
 durably through a fifth Delete mode with two-press confirmation; All events

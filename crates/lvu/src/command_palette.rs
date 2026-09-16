@@ -55,6 +55,7 @@ pub fn palette_geometry(
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CommandId {
     AddSource,
+    Sources,
     DiscoverSources,
     AskAiSource,
     SourceFileMode,
@@ -155,6 +156,7 @@ pub enum CommandId {
 
 pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::AddSource,
+    CommandId::Sources,
     CommandId::DiscoverSources,
     CommandId::AskAiSource,
     CommandId::SourceFileMode,
@@ -1230,11 +1232,20 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
         command(
             CommandId::AddSource,
             "Add source",
-            "Open the admitted source dialog",
+            "Choose how to add a new source",
             "Sources",
             &["new source", "file", "command"],
             Action::Open(crate::component::Open::Source),
             None,
+        ),
+        command(
+            CommandId::Sources,
+            "Sources",
+            "Inspect, restart or remove an existing source",
+            "Sources",
+            &["manage sources", "source status", "remove source"],
+            Action::Open(crate::component::Open::Sources),
+            view_reason,
         ),
         // One Filter dialog with two tabs (§12.1): `/` opens it on Search;
         // the Advanced row opens the same dialog on its other tab.
@@ -1843,6 +1854,7 @@ const SHORTCUT_CANDIDATES: &[(KeyCode, KeyModifiers, &str)] = &[
     (KeyCode::Char('A'), KeyModifiers::SHIFT, "A"),
     (KeyCode::Char('I'), KeyModifiers::SHIFT, "I"),
     (KeyCode::Char('n'), KeyModifiers::NONE, "n"),
+    (KeyCode::Char('N'), KeyModifiers::SHIFT, "N"),
     (KeyCode::Char('r'), KeyModifiers::NONE, "r"),
     (KeyCode::Char('t'), KeyModifiers::NONE, "t"),
     (KeyCode::Char('i'), KeyModifiers::NONE, "i"),
