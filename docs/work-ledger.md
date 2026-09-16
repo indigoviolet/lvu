@@ -3744,3 +3744,13 @@ the focused suite and fresh complete matrix passed. Logs:
 `primary-sol-scratch/v012-rust-workspace-r3.log`,
 `v012-clippy-pty.log`, and `v012-pty-matrix-r2.log`. Exact immutable release
 acceptance remains pending.
+
+The first clean exact attempt at `dca2f3a` preserved under
+`lvu-v012-dca2f3a-final-acceptance/release-gate-dca2f3a72f1f-bb92ff09f08c47dda83864b0e96475e4/`
+passed workspace tests, Clippy, bridge checks and pinned binary builds, then
+stopped at PTY 83/84. The sole failure was test synchronization: adding the
+Sources palette row changed the retained list position, and the palette-colour
+suite stopped scrolling upward when Adapt appeared even though the runnable
+Recipes row remained just above the viewport. It now waits for both rows in
+the same viewport. The focused palette suite and a fresh full matrix passed
+84/84; no product code or timeout changed. A fresh exact run remains required.

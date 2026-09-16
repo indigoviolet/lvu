@@ -233,7 +233,10 @@ def run_theme(binary: pathlib.Path, theme: str, evidence: pathlib.Path) -> None:
         # viewport at its bottom rows; walk selection back to the top so the
         # first rows paint before waiting on them.
         for _ in range(100):
-            if "Adapt suggested recipe" in app.text():
+            text = app.text()
+            if "Adapt suggested recipe" in text and any(
+                line.count("Recipes") >= 2 for line in text.splitlines()
+            ):
                 break
             app.send(b"\x1b[A")
             app.drain()
@@ -244,7 +247,7 @@ def run_theme(binary: pathlib.Path, theme: str, evidence: pathlib.Path) -> None:
         # Reject row must carry its reason where it paints.
         top_view = app.wait_until(
             lambda text: "Adapt suggested recipe" in text
-            and text.count("Recipes") >= 2,
+            and any(line.count("Recipes") >= 2 for line in text.splitlines()),
             "mixed long and short recipe command rows (top)",
         )
         assert_mixed_recipe_columns(top_view)
