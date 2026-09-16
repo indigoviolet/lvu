@@ -1,6 +1,6 @@
 # Installation and distribution
 
-Current release: **v0.1.12**, published from `6df3ee8` with Linux x86_64/arm64
+Current release: **v0.1.13**, published from `eaff741` with Linux x86_64/arm64
 and Apple-silicon macOS archives. Intel Macs and Windows are unsupported.
 Exact-source, CI archive, Homebrew, mise and installed Linux acceptance are
 recorded in the [work ledger](work-ledger.md). Existing release archives and
@@ -12,11 +12,11 @@ The older installation evidence below is historical. See the
 
 ## What is verified
 
-- **v0.1.12 source and installed runtime.** Exact acceptance passed the full Rust
-  workspace, Clippy, 110 bridge tests, 84 PTY suites and ten shared-capture and
+- **v0.1.13 source and installed runtime.** Exact acceptance passed the full Rust
+  workspace, Clippy, 110 bridge tests, 85 PTY suites and ten shared-capture and
   remote-union proof stages. Release CI built and executed all three archives.
   The official x86_64 archive passed checksum/resource/helper/bridge checks and
-  the focused split-dialog PTY outside the checkout; pinned mise (including
+  the Docker service/container PTY outside the checkout; pinned mise (including
   attestations/provenance) and Homebrew installs both passed.
 - **v0.1.2 archives and installed runtime.** Release run `34303930416` built
   and executed all four archives. API digests, downloaded files and SHA256SUMS

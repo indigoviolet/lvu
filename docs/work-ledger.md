@@ -3852,3 +3852,41 @@ when the stated `TERM=xterm-256color` precondition was supplied. The suite now
 sets that precondition itself instead of depending on its caller. Failed gate
 evidence remains under `lvu-v013-46222c0-final-acceptance/`; a new commit-bound
 exact run is required.
+
+### v0.1.13 accepted, published and installed — 2026-09-16
+
+Exact source `eaff741a570a1cc61ffb1ba2f9b46e1f12691697`, tree
+`875a5d94959e71073cb04a997edc5f98e7caa641`, passed locked workspace tests,
+all-target Clippy, 110 bridge tests, **85/85** actual PTYs, two-window shared
+capture, both sequential restart/no-replay proofs and all seven remote-union
+proof families. Accepted app/TUI hashes are `2d3e7b50f25d…` and
+`333d6729d6bb…`; accepted record SHA-256 is
+`3e47a85d3c22cda933987dd01d27c40924150ef5c7f1723067e2e4a7e2010dfb`.
+
+Annotated tag object `04bb59e226f2d4fcd4d43b4320130abbfd799dd6`
+peels locally and remotely to that source. Release run `35076669252` built,
+executed and uploaded exactly Linux x86_64, Linux arm64 and Apple-silicon
+macOS. Archive SHA-256 values are macOS arm64
+`3aa7d1cec2c610f45fceada5624f99128f77fe9bc2e3d2faf853984feadb793a`,
+Linux arm64 `3fa303a456699e97e74a41ec4f89553e197838dc432b95ea3e4a866bd667104a`
+and Linux x86_64
+`903a656f179a47fe2d7d37e78df2dfaabc3a180bdd4d6a4187c1ccb573d0904e`.
+Tap commit `c428cf153cd37543c62141be84ecf3aece252c8e` passed style and strict
+audit and was pushed before publication. Release `389774846` became public at
+09:13:29 UTC with only those three archives plus `SHA256SUMS`.
+
+Homebrew upgraded to 0.1.13, removed its superseded 0.1.12 cellar and passed
+the formula test. Pinned mise installed 0.1.13 after verifying checksum,
+GitHub artifact attestations and SLSA provenance. The official x86_64 archive
+resolved both resources, compiled a real Polars expression without modifying
+its install tree, and completed a live bridge capabilities exchange against
+ready providers. Its installed-binary Docker PTY selected and started both the
+Compose aggregate and retained individual container from an environment-routed
+controlled Docker executable. `versions/latest` points to v0.1.13; its binary
+SHA-256 is `b8ecf405b02bf0f5f3b04d190af582770e4bd5563f73f65b6dfd7f3a68562d10`
+and its 944-file manifest digest is
+`f24e99e7504df72247199e160f9d5a9f8cb2470241f5962964b349568be70117`.
+No process used the superseded repository-local v0.1.12 install, so it was
+moved to trash and remains recoverable. Human Apple-silicon macOS and arm64
+Linux terminal acceptance, plus the paused volume/cold-query/slow-storage
+investigations, remain explicitly unverified.

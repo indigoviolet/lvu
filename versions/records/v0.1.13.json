@@ -1,0 +1,41 @@
+{
+  "version": "v0.1.13",
+  "source_tag": "v0.1.13",
+  "source_commit": "eaff741a570a1cc61ffb1ba2f9b46e1f12691697",
+  "tag_object": "04bb59e226f2d4fcd4d43b4320130abbfd799dd6",
+  "remote_peel": "eaff741a570a1cc61ffb1ba2f9b46e1f12691697",
+  "release_id": 389774846,
+  "release_draft": false,
+  "published_at": "2026-09-16T09:13:29Z",
+  "release_workflow": {
+    "run": 35076669252,
+    "conclusion": "success",
+    "head_sha": "eaff741a570a1cc61ffb1ba2f9b46e1f12691697"
+  },
+  "tap_commit": "c428cf153cd37543c62141be84ecf3aece252c8e",
+  "archive": "lvu-0.1.13-x86_64-unknown-linux-musl.tar.gz",
+  "archive_sha256": "903a656f179a47fe2d7d37e78df2dfaabc3a180bdd4d6a4187c1ccb573d0904e",
+  "archive_bytes": 29492334,
+  "tree_manifest_sha256": "f24e99e7504df72247199e160f9d5a9f8cb2470241f5962964b349568be70117",
+  "tree_manifest_entries": 944,
+  "binary_sha256": "b8ecf405b02bf0f5f3b04d190af582770e4bd5563f73f65b6dfd7f3a68562d10",
+  "accepted_record": {
+    "path": "/mnt/HC_Volume_106796581/lvu-build/lvu-v013-eaff741-final-acceptance/release-gate-eaff741a570a-96bd1c4fd58048b49cee7f0187529b2f/accepted.json",
+    "sha256": "3e47a85d3c22cda933987dd01d27c40924150ef5c7f1723067e2e4a7e2010dfb",
+    "result": "passed",
+    "pty_passed": "85/85",
+    "proof_count": 10
+  },
+  "previous_latest": "v0.1.12",
+  "acceptance": [
+    "Three CI archives built, executed and matched SHA256SUMS",
+    "Pinned mise install verified checksum, GitHub attestations and SLSA provenance",
+    "Homebrew upgraded to 0.1.13 and its formula test passed",
+    "Official archive helper compiled a real Polars expression and bridge answered live capabilities",
+    "Installed Docker PTY started both Compose-service and individual-container sources"
+  ],
+  "known_limitations": [
+    "Apple-silicon macOS and arm64 Linux human interactive acceptance remain unverified",
+    "Volume-backed full soak, cold-query latency and slow-storage autosave investigations remain paused/unaccepted"
+  ]
+}
