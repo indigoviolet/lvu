@@ -3754,3 +3754,30 @@ suite stopped scrolling upward when Adapt appeared even though the runnable
 Recipes row remained just above the viewport. It now waits for both rows in
 the same viewport. The focused palette suite and a fresh full matrix passed
 84/84; no product code or timeout changed. A fresh exact run remains required.
+
+### v0.1.12 accepted, published and installed — 2026-09-16
+
+Exact source `6df3ee8ad98a1a5aef7e073934b9e5b7bed4bdb9`, tree
+`90f79832652c91f970e58bd08d665995cb8f7de9`, passed locked workspace tests,
+all-target Clippy, bridge checks, 84/84 PTYs, two-window shared capture,
+sequential exact restart/no-replay and all remote-union proof families.
+Accepted app/TUI hashes are `f62ec630129d…` and `333d6729d6bb…`; accepted
+record SHA-256 is
+`bee6d12bb52fa57d2a89fe8a14a5529646d10c32bfb21f789b951be51ae8dbb8`.
+
+Annotated tag object `a25d12dc8b48fb6eb49af2b4892f38aa325bb46c`
+peels to that source. Release run `35058218394` built and executed exactly
+Linux x86_64, Linux arm64 and Apple-silicon macOS. Archive SHA-256 values are
+macOS arm64 `49dbfaa2d431dc8e7ccf43ec2ad0e5494334966563f755e8c15d570013b491d6`,
+Linux arm64 `332bba4a2e4891aa0e346c493f202ea2e002dc25508e876366f87a75f002997c`
+and Linux x86_64 `afba196ebba337e54419f00596d07e130341988d0560e141e49bdf501fe89cd5`.
+Tap commit `dca324622d60ccbfea7645e12b23e0be7d2d0241` passed style/strict audit and
+was pushed before publication. The release became public at 05:21:24 UTC.
+
+Homebrew upgraded and passed its formula test. Pinned mise verified checksum,
+GitHub artifact attestations and SLSA provenance. The official archive resolved
+both resources, compiled a real helper expression, completed a live bridge
+capabilities exchange, and passed the installed split-dialog PTY from `/tmp`.
+`versions/latest` points to v0.1.12; only v0.1.12 binaries remain locally.
+Human macOS/arm64 Linux interactive acceptance and the paused long-running
+investigations remain explicitly unverified.
