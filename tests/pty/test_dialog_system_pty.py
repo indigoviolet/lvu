@@ -179,6 +179,7 @@ def run(binary: pathlib.Path) -> None:
         )
         try:
             app.wait_for("event 39 ready")
+            app.wait_for("raw view", timeout=10.0)
 
             # --- wide: a one-field prompt stays a prompt -----------------
             app.send(b"/")

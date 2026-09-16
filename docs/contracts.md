@@ -57,6 +57,13 @@ only after acknowledgement. It does not delete source metadata, journal bytes,
 capture directories, bookmarks, recipes or proof data; reconnecting the same
 source may therefore reuse its durable capture and identity.
 
+A remembered source that is intentionally not acquiring retains its stable
+source ID and canonical All events view in the UI. Management actions address
+that source ID directly: Restart may attach the missing handle without creating
+a second identity, and acknowledged Remove must delete both view membership and
+the source header and durably drop worker session membership. It never deletes
+the retained journal.
+
 Shared-capture control protocol version 2 adds acknowledged `DeleteView` and
 `RemoveSource` methods. A version mismatch is an explicit refusal; peers never
 infer compatibility or silently omit a destructive request.

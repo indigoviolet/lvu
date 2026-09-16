@@ -311,8 +311,19 @@ def exercise_theme(
                     "source",
                     b"n",
                     "Add source",
-                    ("Open",),
+                    ("Restart", "Remove"),
                 )
+                manual_x, manual_y = locate(source_form, "Manual")
+                start = len(app.transcript)
+                click(app, manual_x + 2, manual_y)
+                source_form = wait_frame(
+                    app,
+                    lambda text: "Path" in text and "[ Open ]" in text,
+                    "manual source form",
+                    start,
+                )
+                assert_form_contract(source_form, ("Open",))
+                record(evidence, theme, "source-manual", app, start, source_form)
                 assert_input_focus(app, expected["input"])
                 assert "[ Complete path ]" not in source_form
                 # §8.6/§8.4: the three modes are a segmented control and the two

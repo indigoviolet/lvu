@@ -770,7 +770,7 @@ fn adopted_dialogs_use_responsive_frames_and_stay_on_screen_in_both_themes() {
 
 #[test]
 fn add_source_keeps_every_mode_reachable_and_its_review_bounded() {
-    // §12.7: the three modes are a segmented control, the kinds are radios, and
+    // §12.7: the four modes are a segmented control, the kinds are radios, and
     // the dialog keeps one primary action. Every control stays clickable.
     use lvu::components::source::SourceControl;
 
@@ -778,6 +778,22 @@ fn add_source_keeps_every_mode_reachable_and_its_review_bounded() {
         let (provider, mut app) = demo();
         draw(&provider, &mut app, width, height, Theme::TERMINAL);
         app.handle(Action::Open(Open::Source), &provider);
+        draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        let manual = app
+            .layers
+            .source
+            .control_rects()
+            .iter()
+            .find_map(|(rect, control)| (*control == SourceControl::Manual).then_some(*rect))
+            .expect("Manual mode hitbox");
+        app.handle(
+            Action::Raw(RawEvent::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                manual.x,
+                manual.y,
+            ))),
+            &provider,
+        );
         let buffer = draw(&provider, &mut app, width, height, Theme::TERMINAL);
         let rendered = screen(&buffer);
         let surface = app.hit_regions.selection_modal.expect("source surface");
@@ -1671,6 +1687,24 @@ fn add_source_keeps_one_rectangle_while_the_completion_list_changes() {
         let (provider, mut app) = demo();
         draw(&provider, &mut app, width, height, Theme::TERMINAL);
         app.handle(Action::Open(Open::Source), &provider);
+        draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        let manual = app
+            .layers
+            .source
+            .control_rects()
+            .iter()
+            .find_map(|(rect, control)| {
+                (*control == lvu::components::source::SourceControl::Manual).then_some(*rect)
+            })
+            .expect("Manual mode hitbox");
+        app.handle(
+            Action::Raw(RawEvent::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                manual.x,
+                manual.y,
+            ))),
+            &provider,
+        );
         draw(&provider, &mut app, width, height, Theme::TERMINAL);
         rects.push((
             "opened",

@@ -68,10 +68,21 @@ pub enum SourceRequest {
     Discovery(DiscoveryUiRequest),
     PathCompletion(PathCompletionRequest),
     Ai(SourceAiRequest),
+    Manage(SourceManagementRequest),
+}
+
+/// Existing-source action emitted independently of the active view. This is
+/// what lets stopped/error/not-acquiring sources remain manageable even when
+/// their capture handle is absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceManagementRequest {
+    Restart { source_id: String },
+    Remove { source_id: String },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SourceDialogMode {
+    Existing,
     #[default]
     Manual,
     Discovery,
@@ -82,17 +93,29 @@ pub enum SourceDialogMode {
 pub enum SourceControl {
     #[default]
     Input,
+    Existing,
     Manual,
     Discovery,
     Agent,
     File,
     Command,
     Refresh,
+    Restart,
+    Remove,
 }
 
 impl SourceControl {
     pub(crate) fn visible(mode: SourceDialogMode, kind: SourceKind) -> &'static [Self] {
         match mode {
+            SourceDialogMode::Existing => &[
+                Self::Input,
+                Self::Existing,
+                Self::Manual,
+                Self::Discovery,
+                Self::Agent,
+                Self::Restart,
+                Self::Remove,
+            ],
             SourceDialogMode::Manual if kind == SourceKind::File => &[
                 Self::Input,
                 Self::Manual,
@@ -180,6 +203,10 @@ pub struct SourceDialogState {
     pub discovery: DiscoveryDialogState,
     pub path_completion: PathCompletionState,
     pub ai: SourceAiDialogState,
+    pub existing_selected: usize,
+    pub existing_scroll: usize,
+    pub existing_scroll_limit: usize,
+    pub confirm_remove: bool,
 }
 
 impl Default for SourceDialogState {
@@ -194,6 +221,10 @@ impl Default for SourceDialogState {
             discovery: DiscoveryDialogState::default(),
             path_completion: PathCompletionState::default(),
             ai: SourceAiDialogState::default(),
+            existing_selected: 0,
+            existing_scroll: 0,
+            existing_scroll_limit: 0,
+            confirm_remove: false,
         }
     }
 }
@@ -204,6 +235,7 @@ pub enum SourceHit {
     Control(SourceControl),
     PathCompletion(usize),
     Discovery(usize),
+    Existing(usize),
     /// The scrollable status or proposal pane.
     Scroll,
 }
@@ -215,6 +247,7 @@ struct SourceGeometry {
     controls: Vec<(Rect, SourceControl)>,
     path_completion_rows: Vec<(Rect, usize)>,
     discovery_rows: Vec<(Rect, usize)>,
+    existing_rows: Vec<(Rect, usize)>,
     scroll: Option<Rect>,
 }
 
@@ -343,6 +376,10 @@ impl SourceDialog {
 
     pub fn take_ai(&mut self) -> Vec<SourceAiRequest> {
         self.outbox.take_where(ai)
+    }
+
+    pub fn take_management(&mut self) -> Vec<SourceManagementRequest> {
+        self.outbox.take_where(management)
     }
 
     // ---- completions -----------------------------------------------------
@@ -527,6 +564,7 @@ impl SourceDialog {
             return None;
         }
         Some(match self.state.mode {
+            SourceDialogMode::Existing => return None,
             SourceDialogMode::Manual => SourceField::Manual,
             SourceDialogMode::Discovery => SourceField::Discovery,
             SourceDialogMode::Ai
@@ -608,6 +646,13 @@ fn path_completion(request: SourceRequest) -> Result<PathCompletionRequest, Sour
 fn ai(request: SourceRequest) -> Result<SourceAiRequest, SourceRequest> {
     match request {
         SourceRequest::Ai(request) => Ok(request),
+        other => Err(other),
+    }
+}
+
+fn management(request: SourceRequest) -> Result<SourceManagementRequest, SourceRequest> {
+    match request {
+        SourceRequest::Manage(request) => Ok(request),
         other => Err(other),
     }
 }
@@ -832,6 +877,50 @@ impl SourceDialog {
             .min(self.state.discovery.status_scroll_limit);
     }
 
+    fn move_existing(&mut self, delta: i32, ctx: &Ctx<'_>) {
+        if ctx.sources.is_empty() {
+            self.state.existing_selected = 0;
+            self.state.confirm_remove = false;
+            return;
+        }
+        let next = self
+            .state
+            .existing_selected
+            .saturating_add_signed(delta as isize)
+            .min(ctx.sources.len() - 1);
+        if next != self.state.existing_selected {
+            self.state.confirm_remove = false;
+            self.state.existing_scroll = 0;
+        }
+        self.state.existing_selected = next;
+    }
+
+    fn submit_management(&mut self, remove: bool, ctx: &mut Ctx<'_>) {
+        let Some(source) = ctx.sources.get(self.state.existing_selected) else {
+            self.state.error = Some("no existing source selected".into());
+            return;
+        };
+        if remove && !self.state.confirm_remove {
+            self.state.confirm_remove = true;
+            self.state.error = None;
+            return;
+        }
+        let request = if remove {
+            self.state.confirm_remove = false;
+            SourceManagementRequest::Remove {
+                source_id: source.id.clone(),
+            }
+        } else {
+            self.state.confirm_remove = false;
+            SourceManagementRequest::Restart {
+                source_id: source.id.clone(),
+            }
+        };
+        if self.outbox.push(SourceRequest::Manage(request)).is_err() {
+            self.state.error = Some("source action queue is full".into());
+        }
+    }
+
     fn submit_discovered_source(&mut self) {
         let indices = filtered_discovery_indices(&self.state.discovery);
         let Some(index) = indices.get(self.state.discovery.selected).copied() else {
@@ -962,6 +1051,7 @@ impl SourceDialog {
 
     fn submit(&mut self, ctx: &mut Ctx<'_>) {
         match self.state.mode {
+            SourceDialogMode::Existing => self.submit_management(false, ctx),
             SourceDialogMode::Discovery => self.submit_discovered_source(),
             SourceDialogMode::Ai => self.submit_source_ai(ctx),
             SourceDialogMode::Manual => self.submit_source(),
@@ -974,6 +1064,7 @@ impl SourceDialog {
         self.state.mode = mode;
         self.state.control = SourceControl::Input;
         self.state.controls_focused = false;
+        self.state.confirm_remove = false;
         clear_path_completion(&mut self.state);
         self.drop_path_completions();
         if mode == SourceDialogMode::Discovery && self.state.discovery.generation == 0 {
@@ -983,8 +1074,10 @@ impl SourceDialog {
 
     fn toggle_discovery(&mut self) {
         let mode = match self.state.mode {
-            SourceDialogMode::Manual => SourceDialogMode::Discovery,
-            SourceDialogMode::Discovery | SourceDialogMode::Ai => SourceDialogMode::Manual,
+            SourceDialogMode::Discovery => SourceDialogMode::Manual,
+            SourceDialogMode::Existing | SourceDialogMode::Manual | SourceDialogMode::Ai => {
+                SourceDialogMode::Discovery
+            }
         };
         self.set_mode(mode);
     }
@@ -1009,7 +1102,8 @@ impl SourceDialog {
     }
 
     fn move_source_mode(&mut self, delta: i32) {
-        const MODES: [SourceDialogMode; 3] = [
+        const MODES: [SourceDialogMode; 4] = [
+            SourceDialogMode::Existing,
             SourceDialogMode::Manual,
             SourceDialogMode::Discovery,
             SourceDialogMode::Ai,
@@ -1023,6 +1117,7 @@ impl SourceDialog {
             .unwrap_or(0);
         self.state.mode = MODES[(index as i32 + delta).rem_euclid(MODES.len() as i32) as usize];
         self.state.control = match self.state.mode {
+            SourceDialogMode::Existing => SourceControl::Existing,
             SourceDialogMode::Manual => SourceControl::Manual,
             SourceDialogMode::Discovery => SourceControl::Discovery,
             SourceDialogMode::Ai => SourceControl::Agent,
@@ -1051,12 +1146,15 @@ impl SourceDialog {
     fn activate(&mut self, ctx: &mut Ctx<'_>) {
         match self.state.control {
             SourceControl::Input => self.submit(ctx),
+            SourceControl::Existing => self.set_mode(SourceDialogMode::Existing),
             SourceControl::Manual => self.set_mode(SourceDialogMode::Manual),
             SourceControl::Discovery => self.set_mode(SourceDialogMode::Discovery),
             SourceControl::Agent => self.set_mode(SourceDialogMode::Ai),
             SourceControl::File => self.select_kind(SourceKind::File),
             SourceControl::Command => self.select_kind(SourceKind::Command),
             SourceControl::Refresh => self.start_discovery_scan(),
+            SourceControl::Restart => self.submit_management(false, ctx),
+            SourceControl::Remove => self.submit_management(true, ctx),
         }
     }
 
@@ -1067,8 +1165,16 @@ impl SourceDialog {
     }
 
     /// `Action::ModalVertical` for this focus, unchanged.
-    fn modal_vertical(&mut self, delta: i32) {
+    fn modal_vertical(&mut self, delta: i32, ctx: &Ctx<'_>) {
         match self.state.mode {
+            SourceDialogMode::Existing if self.scroll_focused => {
+                self.state.existing_scroll = self
+                    .state
+                    .existing_scroll
+                    .saturating_add_signed(delta as isize)
+                    .min(self.state.existing_scroll_limit);
+            }
+            SourceDialogMode::Existing => self.move_existing(delta, ctx),
             SourceDialogMode::Discovery if self.scroll_focused => {
                 self.scroll_discovery_status(delta)
             }
@@ -1242,8 +1348,14 @@ impl SourceDialog {
             KeyCode::Char('r') if control => self.start_discovery_scan(),
             KeyCode::Char('f') if alt => self.select_kind(SourceKind::File),
             KeyCode::Char('c') if alt => self.select_kind(SourceKind::Command),
-            KeyCode::Down => self.modal_vertical(1),
-            KeyCode::Up => self.modal_vertical(-1),
+            KeyCode::Delete if self.state.mode == SourceDialogMode::Existing => {
+                self.submit_management(true, ctx)
+            }
+            KeyCode::Char('R') if self.state.mode == SourceDialogMode::Existing => {
+                self.submit_management(false, ctx)
+            }
+            KeyCode::Down => self.modal_vertical(1, ctx),
+            KeyCode::Up => self.modal_vertical(-1, ctx),
             KeyCode::Left => self.move_source_mode(-1),
             KeyCode::Right => self.move_source_mode(1),
             KeyCode::Tab | KeyCode::BackTab => self.toggle_control_focus(),
@@ -1260,10 +1372,18 @@ impl SourceDialog {
 
     /// `Action::ScrollHoveredDialog` for this focus.
     fn scroll_hovered(&mut self, delta: i32) {
-        if self.state.mode == SourceDialogMode::Ai {
-            self.move_path_completion(delta);
-        } else {
-            self.scroll_discovery_status(delta);
+        match self.state.mode {
+            SourceDialogMode::Existing => {
+                self.state.existing_scroll = self
+                    .state
+                    .existing_scroll
+                    .saturating_add_signed(delta as isize)
+                    .min(self.state.existing_scroll_limit)
+            }
+            SourceDialogMode::Ai => self.move_path_completion(delta),
+            SourceDialogMode::Manual | SourceDialogMode::Discovery => {
+                self.scroll_discovery_status(delta)
+            }
         }
     }
 
@@ -1302,6 +1422,23 @@ impl SourceDialog {
                 _ => {}
             }
         }
+        if self.state.mode == SourceDialogMode::Existing {
+            if pressed && let Some(SourceHit::Existing(index)) = hit {
+                if index != self.state.existing_selected {
+                    self.state.confirm_remove = false;
+                    self.state.existing_scroll = 0;
+                }
+                self.state.existing_selected = index;
+                self.state.control = SourceControl::Input;
+                self.state.controls_focused = false;
+            }
+            match kind {
+                MouseEventKind::ScrollUp => self.move_existing(-1, ctx),
+                MouseEventKind::ScrollDown => self.move_existing(1, ctx),
+                _ => {}
+            }
+            return Outcome::Consumed;
+        }
         if self.state.mode != SourceDialogMode::Discovery {
             return Outcome::Consumed;
         }
@@ -1334,10 +1471,20 @@ impl Component for SourceDialog {
     type Hit = SourceHit;
     type Open = ();
 
-    fn open(&mut self, _params: (), _ctx: &mut Ctx<'_>) {
+    fn open(&mut self, _params: (), ctx: &mut Ctx<'_>) {
         // `Action::OpenSource` used `get_or_insert_with`: reopening kept the
         // draft, the discovered list and any proposal under review.
         self.open = true;
+        if !ctx.sources.is_empty() {
+            self.state.mode = SourceDialogMode::Existing;
+            self.state.control = SourceControl::Input;
+            self.state.controls_focused = false;
+            self.state.existing_selected = self
+                .state
+                .existing_selected
+                .min(ctx.sources.len().saturating_sub(1));
+            self.state.confirm_remove = false;
+        }
         self.scroll_focused = false;
         self.geometry = SourceGeometry::default();
         self.seed_surface();
@@ -1348,6 +1495,7 @@ impl Component for SourceDialog {
             Event::Key(key) => self.key(key, ctx),
             Event::Paste(text) => {
                 match self.state.mode {
+                    SourceDialogMode::Existing => {}
                     SourceDialogMode::Discovery => self.append_discovery_query(&text),
                     SourceDialogMode::Ai => self.append_ai(&text),
                     SourceDialogMode::Manual => self.append_source(&text),
@@ -1391,6 +1539,19 @@ impl Component for SourceDialog {
                 Outcome::Close
             }
             Event::Command(id) => self.command(id),
+            Event::View(crate::component::ViewEvent::SourceRemoved { .. }) => {
+                self.state.confirm_remove = false;
+                if ctx.sources.is_empty() {
+                    self.state.mode = SourceDialogMode::Manual;
+                    self.state.control = SourceControl::Input;
+                    self.state.controls_focused = false;
+                }
+                self.state.existing_selected = self
+                    .state
+                    .existing_selected
+                    .min(ctx.sources.len().saturating_sub(1));
+                Outcome::Consumed
+            }
             Event::View(_) | Event::Resize => Outcome::Ignored,
         }
     }
@@ -1403,13 +1564,33 @@ impl Component for SourceDialog {
                     shortcut: self.open.then(|| source_command_shortcut(*id)).flatten(),
                     ..*spec
                 },
-                unavailable_reason: (!self.open).then_some("open Add source first"),
+                unavailable_reason: (!self.open).then_some("open the dialog first"),
             })
             .collect()
     }
 
     fn surface(&self) -> Surface {
         self.surface
+    }
+
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        if self.state.mode == SourceDialogMode::Existing {
+            vec!["Restart", "Remove"]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        if self.state.mode != SourceDialogMode::Existing {
+            return Outcome::Ignored;
+        }
+        match index {
+            0 => self.submit_management(false, ctx),
+            1 => self.submit_management(true, ctx),
+            _ => return Outcome::Ignored,
+        }
+        Outcome::Consumed
     }
 
     fn hit(&self, point: (u16, u16)) -> Option<SourceHit> {
@@ -1432,6 +1613,11 @@ impl Component for SourceDialog {
             .or_else(|| {
                 geometry.controls.iter().find_map(|(rect, control)| {
                     contains(*rect, point).then_some(SourceHit::Control(*control))
+                })
+            })
+            .or_else(|| {
+                geometry.existing_rows.iter().find_map(|(rect, index)| {
+                    contains(*rect, point).then_some(SourceHit::Existing(*index))
                 })
             })
             .or_else(|| {
@@ -1469,14 +1655,20 @@ fn render_source(
     let styles = DialogStyles::new(theme);
     let agent_label = if ascii { "Agent" } else { "🧠 Agent" };
 
-    // §8.6: the three modes are a segmented control in the header, not buttons
+    // §8.6: the four modes are a segmented control in the header, not buttons
     // in the action row, so the primary action never shifts them sideways.
-    let mode_controls = [Control::Manual, Control::Discovery, Control::Agent];
-    let mode_labels = ["Manual", "Discover", agent_label];
+    let mode_controls = [
+        Control::Existing,
+        Control::Manual,
+        Control::Discovery,
+        Control::Agent,
+    ];
+    let mode_labels = ["Existing", "Manual", "Discover", agent_label];
     let active_mode = match dialog.mode {
-        Mode::Manual => 0,
-        Mode::Discovery => 1,
-        Mode::Ai => 2,
+        Mode::Existing => 0,
+        Mode::Manual => 1,
+        Mode::Discovery => 2,
+        Mode::Ai => 3,
     };
 
     let discovery_indices = filtered_discovery_indices(&dialog.discovery);
@@ -1538,6 +1730,14 @@ fn render_source(
             MessageState::Error,
             dialog.error.clone().unwrap_or_default(),
         ),
+        Mode::Existing if dialog.confirm_remove => (
+            MessageState::Updating,
+            "press Remove or Delete again to confirm; captured data stays on disk".into(),
+        ),
+        Mode::Existing => (
+            MessageState::Ready,
+            "select a source to inspect its complete status, restart it, or remove it".into(),
+        ),
         Mode::Ai => {
             let (label, _) = source_ai_status(dialog.ai.stage, theme);
             let state = match label {
@@ -1591,6 +1791,7 @@ fn render_source(
         _ => None,
     };
     let primary = match dialog.mode {
+        Mode::Existing => "Restart",
         Mode::Ai => match dialog.ai.stage {
             SourceAiStage::Input | SourceAiStage::Error => "Request proposal",
             SourceAiStage::Proposal => multi_start.as_deref().unwrap_or("Start reviewed source"),
@@ -1598,14 +1799,18 @@ fn render_source(
         },
         _ => "Open",
     };
-    let mut action_controls = vec![(Control::Input, primary)];
+    let mut action_controls = if dialog.mode == Mode::Existing {
+        vec![(Control::Restart, "Restart"), (Control::Remove, "Remove")]
+    } else {
+        vec![(Control::Input, primary)]
+    };
     if dialog.mode == Mode::Discovery {
         action_controls.push((Control::Refresh, "Rescan"));
     }
     let action_labels: Vec<&str> = action_controls.iter().map(|(_, label)| *label).collect();
 
     // Stable LongContent budgets: outer size is policy-only, never async
-    // counts. Header 1 (the Manual/Discover/Agent segmented control, always
+    // counts. Header 1 (the Existing/Manual/Discover/Agent segmented control, always
     // present), body minimum 3 useful rows, message 2 and no help row, actions
     // from the stable width budget so the frame and sticky tail origins are
     // identical across manual/discovery/loading/proposal/error states.
@@ -1629,7 +1834,7 @@ fn render_source(
     };
     // Shared frame so geometry and paint share one definition; compactness
     // comes from the geometry, never recomputed from the frame.
-    render_responsive_frame(frame, &resolved, "Add source", ctx.active, theme);
+    render_responsive_frame(frame, &resolved, "Sources · Add source", ctx.active, theme);
     let mut surface = Surface {
         popup: resolved.frame,
         interior: resolved.interior,
@@ -1669,6 +1874,138 @@ fn render_source(
     // field and pane stays reachable either way.
     let gap = u16::from(roomy);
     match dialog.mode {
+        Mode::Existing => {
+            let details_rows = 5u16.min(body.height.saturating_sub(2));
+            let list_area = Rect::new(
+                body.x,
+                body.y,
+                body.width,
+                body.height.saturating_sub(details_rows),
+            );
+            let selected = dialog
+                .existing_selected
+                .min(ctx.sources.len().saturating_sub(1));
+            if list_area.height > 0 {
+                let total = ctx.sources.len();
+                let count = if total == 0 {
+                    "none".to_owned()
+                } else {
+                    total.to_string()
+                };
+                let rects = plan_list(
+                    list_area,
+                    u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
+                    total.max(1),
+                    (!ctx.sources.is_empty()).then_some(selected),
+                    0,
+                );
+                frame.render_widget(
+                    Paragraph::new("Existing sources")
+                        .style(styles.label.add_modifier(Modifier::BOLD)),
+                    rects.heading,
+                );
+                if rects.count.width > 0 {
+                    frame.render_widget(
+                        Paragraph::new(count)
+                            .style(styles.description)
+                            .right_aligned(),
+                        rects.count,
+                    );
+                }
+                if ctx.sources.is_empty() {
+                    frame.render_widget(
+                        Paragraph::new("No sources in this workspace").style(styles.unavailable),
+                        rects.viewport,
+                    );
+                }
+                for (offset, row) in rects.row_rects.iter().copied().enumerate() {
+                    let index = rects.first_row.saturating_add(offset);
+                    let Some(source) = ctx.sources.get(index) else {
+                        continue;
+                    };
+                    let chosen = index == selected;
+                    let marker = if chosen {
+                        if ascii { "> " } else { "› " }
+                    } else {
+                        "  "
+                    };
+                    frame.render_widget(
+                        Paragraph::new(truncated(
+                            &format!("{marker}{}  {}", source.name, source.health),
+                            usize::from(row.width),
+                        ))
+                        .style(if chosen {
+                            styles.selection
+                        } else {
+                            styles.description
+                        }),
+                        row,
+                    );
+                    geometry.existing_rows.push((row, index));
+                }
+                if let Some(bar) = rects.scrollbar {
+                    render_scrollbar(
+                        frame,
+                        bar,
+                        rects.first_row,
+                        total.saturating_sub(rects.row_rects.len().max(1)),
+                        theme,
+                        ascii,
+                    );
+                    surface.scrollable = true;
+                }
+            }
+
+            let details_area = Rect::new(
+                body.x,
+                list_area.bottom(),
+                body.width,
+                body.bottom().saturating_sub(list_area.bottom()),
+            );
+            if details_area.height > 0 {
+                let logical = ctx.sources.get(selected).map_or_else(
+                    || vec!["No source selected".to_owned()],
+                    |source| {
+                        vec![
+                            format!("Name: {}", source.name),
+                            format!("Source ID: {}", source.id),
+                            format!("Status: {}", source.health),
+                        ]
+                    },
+                );
+                let wrapped = wrap_pane_lines(details_area, &logical);
+                let total = wrapped.len().max(1);
+                let rects = plan_list(details_area, 0, total, None, dialog.existing_scroll);
+                frame.render_widget(
+                    Paragraph::new("Full status").style(if this.scroll_focused {
+                        styles.shortcut.add_modifier(Modifier::BOLD)
+                    } else {
+                        styles.label.add_modifier(Modifier::BOLD)
+                    }),
+                    rects.heading,
+                );
+                let limit = total.saturating_sub(rects.row_rects.len());
+                let scroll = rects.first_row.min(limit);
+                for (offset, row) in rects.row_rects.iter().copied().enumerate() {
+                    let Some(line) = wrapped.get(scroll.saturating_add(offset)) else {
+                        continue;
+                    };
+                    frame.render_widget(
+                        Paragraph::new(truncated(line, usize::from(row.width)))
+                            .style(styles.description),
+                        row,
+                    );
+                }
+                if let Some(bar) = rects.scrollbar {
+                    render_scrollbar(frame, bar, scroll, limit, theme, ascii);
+                    surface.scrollable = true;
+                }
+                geometry.scroll = (limit > 0).then_some(details_area);
+                this.state.existing_scroll_limit = limit;
+                this.state.existing_scroll = scroll;
+                this.state.existing_selected = selected;
+            }
+        }
         Mode::Manual => {
             let label_width = u16::try_from(UnicodeWidthStr::width("Command")).unwrap_or(7);
             // §8.4: File/Command is a choice between two kinds, not two actions.
@@ -2172,10 +2509,15 @@ fn render_source(
     let focused_action = action_controls
         .iter()
         .position(|(control, _)| *control == dialog.control);
+    let destructive = [1usize];
     let action_row = ActionRow {
         labels: &action_labels,
         default: Some(0),
-        destructive: &[],
+        destructive: if dialog.mode == Mode::Existing {
+            &destructive
+        } else {
+            &[]
+        },
         focused: focused_action,
     };
     for (index, rect) in action_geom.buttons.iter().copied() {

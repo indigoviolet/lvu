@@ -813,6 +813,7 @@ fn long_unicode_editor_uses_scrolled_input_surface_and_keeps_footer_clear() {
 fn long_source_path_scrolls_inside_padded_body_above_footer() {
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Source), &provider);
+    source_mode(&mut app, &provider, SourceDialogMode::Manual);
     let path = format!("/tmp/{}/visible.log", "長い path ".repeat(20));
     for character in path.chars() {
         app.handle(raw_char(character), &provider);
@@ -830,6 +831,61 @@ fn long_source_path_scrolls_inside_padded_body_above_footer() {
     assert!(rendered.contains("🧠"), "{rendered}");
     assert!(cursor.x > 1, "body keeps a horizontal padding cell");
     assert!(cursor.y < 10, "cursor must stay above the reserved footer");
+}
+
+#[test]
+fn sources_dialog_exposes_full_failure_and_manages_source_by_stable_id() {
+    let provider = EmptyProvider;
+    let source_id = "remembered-command";
+    let health = "not acquiring: remembered commands never start automatically; use Restart for an explicit launch";
+    let mut app = App::new(
+        vec![SourceItem {
+            id: source_id.into(),
+            name: "command with a very long diagnostic".into(),
+            health: health.into(),
+        }],
+        vec![ViewItem {
+            id: "command-view".into(),
+            source_id: source_id.into(),
+            name: "All events".into(),
+        }],
+        false,
+    );
+    app.handle(Action::Open(Open::Source), &provider);
+    assert_eq!(app.layers.source.state().mode, SourceDialogMode::Existing);
+    let output = render(&provider, &mut app, 90, 24);
+    assert!(output.contains("Sources"), "{output}");
+    assert!(
+        output.contains("remembered commands never start automatically"),
+        "full status must wrap instead of being lost in the sidebar: {output}"
+    );
+    assert!(
+        output.contains("Restart for an explicit launch"),
+        "{output}"
+    );
+
+    app.handle(raw_key(KeyCode::Char('R')), &provider);
+    assert_eq!(
+        app.take_source_management_requests(),
+        vec![lvu::components::source::SourceManagementRequest::Restart {
+            source_id: source_id.into()
+        }]
+    );
+
+    app.handle(raw_key(KeyCode::Delete), &provider);
+    assert!(app.take_source_management_requests().is_empty());
+    app.handle(raw_key(KeyCode::Delete), &provider);
+    assert_eq!(
+        app.take_source_management_requests(),
+        vec![lvu::components::source::SourceManagementRequest::Remove {
+            source_id: source_id.into()
+        }]
+    );
+
+    assert_eq!(app.remove_source_views(source_id), vec!["command-view"]);
+    assert!(app.sources.is_empty());
+    assert!(app.views().is_empty());
+    assert_eq!(app.layers.source.state().mode, SourceDialogMode::Manual);
 }
 
 fn render<P: RowProvider>(provider: &P, app: &mut App, width: u16, height: u16) -> String {
@@ -1033,6 +1089,7 @@ fn source_activate<P: RowProvider>(app: &mut App, provider: &P, control: SourceC
 
 fn source_mode<P: RowProvider>(app: &mut App, provider: &P, mode: SourceDialogMode) {
     let control = match mode {
+        SourceDialogMode::Existing => SourceControl::Existing,
         SourceDialogMode::Manual => SourceControl::Manual,
         SourceDialogMode::Discovery => SourceControl::Discovery,
         SourceDialogMode::Ai => SourceControl::Agent,

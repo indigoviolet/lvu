@@ -8,7 +8,6 @@ import pathlib
 import re
 import sys
 import tempfile
-import time
 
 from test_enrichment_chain_pty import stop, open_step_editor, paste, close_editor
 from test_lvu_pty import PtyApp
@@ -65,6 +64,7 @@ def run(binary: pathlib.Path) -> None:
             # Details from the selected 503 record while the tree is opening.
             app.wait_for("bad � byte")
             app.wait_for("raw view")
+            app.assert_remains("bad � byte", "query pending", duration=0.25)
 
             # Details: the JSON record is a tree; `http` is collapsed to its
             # summary until Enter opens it, and Left climbs back out.
@@ -94,7 +94,7 @@ def run(binary: pathlib.Path) -> None:
             # Tab back into Details for the tree cursor below; the cursor
             # starts on the first row.
             app.send(b"\t")
-            time.sleep(0.1)
+            app.assert_remains("Selected event details", "impossible focus sentinel", duration=0.15)
             app.send(b"\x1b[B\x1b[B")  # cursor to `http`
             app.send(b"\r")
             app.wait_for("status: 503")

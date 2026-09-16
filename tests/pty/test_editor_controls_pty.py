@@ -78,6 +78,11 @@ def run(binary, arguments=None, environment=None):
 
         app.send(b"n")
         source = app.wait_for("Add source")
+        assert "Existing sources" in source and "[ Restart ]" in source, source
+        # Existing source management is the default when sources already
+        # exist. Move to Manual before exercising its path editor.
+        app.send(b"\t\t\r")
+        source = app.wait_for("Path")
         # Add source has never had an Open control in any revision; the word used
         # to survive on screen as residue from an earlier frame, which the scrim
         # now repaints. Assert the controls this dialog actually has. `[ Open ]`

@@ -4919,8 +4919,32 @@ impl App {
         self.source_controls.drain(..).collect()
     }
 
+    /// Queue source control by stable source identity, including sources that
+    /// currently have no live view/handle. The unified Sources dialog uses
+    /// this path; base-screen shortcuts resolve their active view to the same
+    /// identity before calling it.
+    pub fn queue_source_control(&mut self, source_id: String, restart: bool) -> bool {
+        if self.source_controls.len() >= 8
+            || self
+                .source_controls
+                .iter()
+                .any(|request| request.source_id == source_id)
+        {
+            return false;
+        }
+        self.source_controls
+            .push_back(SourceControlRequest { source_id, restart });
+        true
+    }
+
     pub fn take_source_requests(&mut self) -> Vec<SourceLaunchRequest> {
         self.layers.source.take_launches()
+    }
+
+    pub fn take_source_management_requests(
+        &mut self,
+    ) -> Vec<crate::components::source::SourceManagementRequest> {
+        self.layers.source.take_management()
     }
 
     pub fn take_discovery_requests(&mut self) -> Vec<DiscoveryUiRequest> {
@@ -5514,6 +5538,11 @@ impl App {
                 .prune_where_identity_contains(&format!(":{view_id}:"));
         }
         self.views.items.retain(|view| view.source_id != source_id);
+        // Source headers are a separate list from their views. Leaving the
+        // header behind creates an unselectable ghost even though durable
+        // removal succeeded; both lists change on the same acknowledged UI
+        // transaction.
+        self.sources.retain(|source| source.id != source_id);
         if self.views.items.is_empty() {
             self.views.selected = 0;
         } else {
@@ -5530,6 +5559,19 @@ impl App {
 
     pub fn take_source_removals(&mut self) -> Vec<String> {
         self.source_removals.drain(..).collect()
+    }
+
+    /// Queue a source removal already confirmed by its owning surface. The
+    /// Sources dialog performs its own two-press confirmation and is bounded
+    /// by the component outbox; the controller re-validates dependencies
+    /// before touching capture or durable state.
+    pub fn queue_source_removal(&mut self, source_id: String) -> bool {
+        if self.source_removals.len() >= 8 || self.source_removals.contains(&source_id) {
+            return false;
+        }
+        self.pending_source_remove = None;
+        self.source_removals.push_back(source_id);
+        true
     }
 
     pub fn pending_source_remove(&self) -> Option<&str> {
@@ -8133,25 +8175,15 @@ impl App {
                 }
             }
             Action::StopCapture | Action::RestartCapture => {
-                if matches!(self.focus, Focus::Logs | Focus::Selector)
-                    && let Some(view) = self.views.items.get(self.views.selected)
+                let source_id = matches!(self.focus, Focus::Logs | Focus::Selector)
+                    .then(|| self.views.items.get(self.views.selected))
+                    .flatten()
+                    .map(|view| view.source_id.clone());
+                if let Some(source_id) = source_id
+                    && !self.queue_source_control(source_id, action == Action::RestartCapture)
                 {
-                    if self.source_controls.len() < 8 {
-                        if !self
-                            .source_controls
-                            .iter()
-                            .any(|request| request.source_id == view.source_id)
-                        {
-                            self.source_controls.push_back(SourceControlRequest {
-                                source_id: view.source_id.clone(),
-                                restart: action == Action::RestartCapture,
-                            });
-                        }
-                    } else {
-                        self.action_notice = Some(
-                            "source control queue full; retry after pending work settles".into(),
-                        );
-                    }
+                    self.action_notice =
+                        Some("source control queue full; retry after pending work settles".into());
                 }
             }
             Action::RemoveSource => {

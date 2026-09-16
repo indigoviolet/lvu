@@ -48,10 +48,11 @@ def ask_and_read_message(app: PtyApp, needle: str, description: str) -> str:
     # workspace to go quiescent (initial query settled, full membership
     # painted) before opening it.
     app.wait_until(
-        lambda text: "query pending" not in text and "probe 11" in text,
+        lambda text: "raw view" in text and "query pending" not in text and "probe 11" in text,
         "workspace quiescent before Ask",
         timeout=15.0,
     )
+    app.assert_remains("raw view", "query pending", duration=0.25)
     app.send(b"A")
     app.wait_for("Request")
     app.send(b"only errors")

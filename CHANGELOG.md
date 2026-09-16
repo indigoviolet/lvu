@@ -4,6 +4,24 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## v0.1.11 — 2026-09-16
+
+### Features
+
+- Merge source management into the Add source dialog. Its Existing tab lists
+  every source, shows the complete wrapped health diagnostic, and provides
+  explicit Restart and confirmed Remove actions without requiring a live view.
+
+### Fixes
+
+- Keep remembered command and endpoint sources selectable through their stable
+  All events view while they await an explicit restart.
+- Remove an acknowledged source header immediately and durably remove stopped
+  worker-owned sources from the remembered session, so neither the current UI
+  nor a later lvu launch resurrects them. Captured journals remain on disk.
+- Treat an explicitly selected stopped discovery candidate as a start, not as
+  an already-running duplicate.
+
 ## v0.1.10 — 2026-09-15
 
 ### Features

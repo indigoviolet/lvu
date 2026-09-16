@@ -784,6 +784,10 @@ struct Composition {
     starts_rx: mpsc::Receiver<StartResult>,
     sources: HashMap<SourceId, String>,
     definitions: HashMap<SourceId, SourceDefinition>,
+    /// Remembered definitions represented in the UI but not registered with
+    /// an acquisition handle yet. They reuse their stable identity/view when
+    /// explicitly started instead of being mistaken for a live duplicate.
+    unacquired_sources: HashSet<SourceId>,
     pending_starts: HashSet<SourceId>,
     /// Definitions behind `pending_starts`, updated at the same three sites
     /// (one spawn, two settlements). Admission compares acquisitions against
@@ -886,6 +890,7 @@ struct Composition {
 impl Composition {
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
+        changed |= self.handle_source_management(app);
         changed |= self.handle_source_controls(app, adapter);
         changed |= self.handle_settings(app);
         changed |= self.handle_storage(app, adapter);
@@ -1031,6 +1036,7 @@ impl Composition {
                     let origin = started.origin.clone().expect("dynamic start origin");
                     match register_started(adapter, app, &mut self.sources, started) {
                         Ok(view_id) => {
+                            self.unacquired_sources.remove(&source_id);
                             self.definitions.insert(source_id, definition.clone());
                             if !self
                                 .session_sources
@@ -3289,6 +3295,36 @@ impl Composition {
         changed
     }
 
+    fn register_restarted_source(
+        &mut self,
+        app: &mut App,
+        adapter: &NativeViewAdapter,
+        source_id: SourceId,
+        handle: lvu_shared::AnySourceHandle,
+    ) -> Result<Option<String>, String> {
+        let canonical = view_id(source_id);
+        let needs_canonical_registration = adapter.status(&canonical).is_none();
+        adapter
+            .register_source(handle)
+            .map_err(|error| format!("register restarted source: {error}"))?;
+        if needs_canonical_registration
+            && let Err(error) = adapter.register_view(&canonical, vec![source_id])
+        {
+            adapter.rollback_source_registration(source_id, &canonical);
+            return Err(format!("register restarted view: {error}"));
+        }
+        self.unacquired_sources.remove(&source_id);
+        app.update_source_health(&source_id.0.to_string(), "starting/indexing".into());
+        let warning = needs_canonical_registration.then(|| {
+            self.definitions
+                .get(&source_id)
+                .cloned()
+                .and_then(|definition| self.request_restore(app, definition).err())
+        });
+        let warning = warning.flatten();
+        Ok(warning)
+    }
+
     fn handle_source_controls(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
         let mut changed = false;
         let mut completed = Vec::new();
@@ -3319,14 +3355,20 @@ impl Composition {
                 .get(&id)
                 .map_or_else(|| id.0.to_string(), |definition| definition.name.clone());
             app.action_notice = Some(match result {
-                Ok(Some(handle)) => match adapter
-                    .register_source(lvu_shared::AnySourceHandle::Local(handle.clone()))
-                {
-                    Ok(()) => format!("{name}: capture restarted; existing views retained"),
+                Ok(Some(handle)) => match self.register_restarted_source(
+                    app,
+                    adapter,
+                    id,
+                    lvu_shared::AnySourceHandle::Local(handle.clone()),
+                ) {
+                    Ok(None) => format!("{name}: capture restarted; existing views retained"),
+                    Ok(Some(warning)) => format!(
+                        "{name}: capture restarted; existing views retained; restore: {warning}"
+                    ),
                     Err(error) => {
                         // A launched capture remains manager-owned until graceful cleanup settles.
                         let (sender, result) = tokio::sync::oneshot::channel();
-                        let message = format!("register restarted source: {error}");
+                        let message = error;
                         let worker = self.runtime.spawn(async move {
                             let stopped = handle.stop().await;
                             let diagnostic = match stopped {
@@ -3382,12 +3424,15 @@ impl Composition {
                 .map_or_else(|| id.0.to_string(), |definition| definition.name.clone());
             app.action_notice = Some(match result {
                 Ok(SharedControlOutcome::Restarted { handle }) => {
-                    match adapter.register_source(handle) {
-                        Ok(()) => {
+                    match self.register_restarted_source(app, adapter, id, handle) {
+                        Ok(None) => {
                             format!("{name}: capture restarted; existing views retained")
                         }
+                        Ok(Some(warning)) => format!(
+                            "{name}: capture restarted; existing views retained; restore: {warning}"
+                        ),
                         Err(error) => {
-                            let message = format!("register restarted source: {error}");
+                            let message = error;
                             if let Some(shared) = self.shared.clone() {
                                 let (sender, result) = tokio::sync::oneshot::channel();
                                 let worker = self.runtime.spawn(async move {
@@ -3449,7 +3494,11 @@ impl Composition {
             // else (including stdin, which the worker refuses) stays on
             // the local manager path below. Routing decides once here by
             // session ownership, so the two job maps never double-drive.
-            if let Some(shared) = self.shared.clone().filter(|shared| shared.owns_source(id)) {
+            if let Some(shared) = self
+                .shared
+                .clone()
+                .filter(|_| shared_capture::worker_route(true, &definition))
+            {
                 let (sender, result) = tokio::sync::oneshot::channel();
                 let restart = request.restart;
                 let worker = self.runtime.spawn(async move {
@@ -3613,6 +3662,29 @@ fn stats_type(kind: lvu::field_stats::ValueType) -> lvu_view::StatsType {
 }
 
 impl Composition {
+    fn handle_source_management(&mut self, app: &mut App) -> bool {
+        let requests = app.take_source_management_requests();
+        let changed = !requests.is_empty();
+        for request in requests {
+            match request {
+                lvu::components::source::SourceManagementRequest::Restart { source_id } => {
+                    if !app.queue_source_control(source_id, true) {
+                        app.action_notice = Some(
+                            "source control queue full; retry after pending work settles".into(),
+                        );
+                    }
+                }
+                lvu::components::source::SourceManagementRequest::Remove { source_id } => {
+                    if !app.queue_source_removal(source_id) {
+                        app.action_notice =
+                            Some("source removal queue full or already pending".into());
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// Whole-view statistics for the field the Fields dialog is describing.
     ///
     /// The dialog shows a sampled answer instantly; this asks for the same
@@ -4989,14 +5061,22 @@ impl Composition {
                 .filter_map(|id| Uuid::parse_str(id).ok())
                 .map(lvu_core::ViewId)
                 .collect();
-            let stop_needed = self.source_capture_running(source_id);
+            let definition = self.definitions.get(&source_id).cloned();
+            let worker_session_stop = definition.as_ref().is_some_and(|definition| {
+                self.shared.is_some() && shared_capture::worker_route(true, definition)
+            });
+            // A remembered worker-owned command/endpoint has no live handle,
+            // but removal must still ask the worker to drop its durable
+            // session member. Otherwise the local UI disappears only until
+            // the worker rewrites the stale set (or the next restart).
+            let stop_needed = self.source_capture_running(source_id) || worker_session_stop;
             if stop_needed {
                 if self.source_controls.len() + self.shared_controls.len() >= 8 {
                     app.action_notice =
                         Some("source control limit reached; retry after pending operations".into());
                     continue;
                 }
-                let Some(definition) = self.definitions.get(&source_id).cloned() else {
+                let Some(definition) = definition else {
                     app.action_notice = Some("source definition is unavailable".into());
                     continue;
                 };
@@ -5005,11 +5085,7 @@ impl Composition {
                 // observed through the control maps (see
                 // progress_source_removes); the stop notice it writes is
                 // replaced by the removal notice below.
-                if let Some(shared) = self
-                    .shared
-                    .clone()
-                    .filter(|shared| shared.owns_source(source_id))
-                {
+                if let Some(shared) = self.shared.clone().filter(|_| worker_session_stop) {
                     let (sender, result) = tokio::sync::oneshot::channel();
                     let worker = self.runtime.spawn(async move {
                         let outcome = match shared.stop_source(source_id).await {
@@ -5205,6 +5281,7 @@ impl Composition {
         debug_assert_eq!(removed_ids.len(), pending.views.len());
         self.sources.remove(&source_id);
         self.definitions.remove(&source_id);
+        self.unacquired_sources.remove(&source_id);
         self.session_sources.retain(|value| value.id != source_id);
         self.record_session(app);
         self.recent_sources
@@ -5457,6 +5534,13 @@ impl Composition {
         }
         if let Some(live) = self.definitions.get(&definition.id) {
             return match compare_definitions(cache, live, definition, &self.cwd) {
+                AcquisitionRelation::Exact if self.unacquired_sources.contains(&definition.id) => {
+                    if self.pending_definitions.contains_key(&definition.id) {
+                        SourceAdmission::Refuse("source is already starting".into())
+                    } else {
+                        SourceAdmission::Admit
+                    }
+                }
                 AcquisitionRelation::Exact => SourceAdmission::Present {
                     live_id: definition.id,
                 },
@@ -8573,6 +8657,7 @@ async fn run() -> Result<(), String> {
     let mut unresumed = 0_usize;
     let mut source_ids = HashMap::new();
     let mut definitions = HashMap::new();
+    let mut unacquired_sources = HashSet::new();
     let mut session_sources = Vec::new();
     // Stdin definitions started window-locally, sent to the worker after
     // every acquisition below so one refused note cannot disturb a start.
@@ -8620,12 +8705,32 @@ async fn run() -> Result<(), String> {
                 // of a source the user still has. They belong in the
                 // sidebar, not in a refusal to start.
                 unresumed += 1;
-                app.sources.push(SourceItem {
-                    id: plan.definition.id.0.to_string(),
-                    name: plan.definition.name.clone(),
-                    health: format!("not acquiring: {error}"),
-                });
-                session_sources.push(plan.definition);
+                let definition = plan.definition;
+                let source_id = definition.id;
+                let ui_id = source_id.0.to_string();
+                let canonical = view_id(source_id);
+                // A remembered source without a live handle still owns a
+                // selectable canonical view. The view intentionally has no
+                // adapter registration until explicit Restart supplies a
+                // handle; meanwhile it is the stable UI/control identity for
+                // full diagnostics and durable removal.
+                app.add_source_view(
+                    SourceItem {
+                        id: ui_id.clone(),
+                        name: definition.name.clone(),
+                        health: format!("not acquiring: {error}"),
+                    },
+                    ViewItem {
+                        id: canonical.clone(),
+                        source_id: ui_id.clone(),
+                        name: memory::CANONICAL_VIEW_NAME.into(),
+                    },
+                );
+                app.set_view_role(&canonical, lvu::ViewRole::Canonical);
+                source_ids.insert(source_id, ui_id);
+                definitions.insert(source_id, definition.clone());
+                unacquired_sources.insert(source_id);
+                session_sources.push(definition);
                 continue;
             }
         };
@@ -8701,6 +8806,7 @@ async fn run() -> Result<(), String> {
         starts_rx,
         sources: source_ids,
         definitions,
+        unacquired_sources: unacquired_sources.clone(),
         pending_starts: HashSet::new(),
         pending_definitions: HashMap::new(),
         source_controls: HashMap::new(),
@@ -8778,6 +8884,7 @@ async fn run() -> Result<(), String> {
     for definition in composition
         .definitions
         .values()
+        .filter(|definition| !unacquired_sources.contains(&definition.id))
         .cloned()
         .collect::<Vec<_>>()
     {
@@ -10837,6 +10944,7 @@ mod tests {
             starts_rx,
             sources: HashMap::<SourceId, String>::new(),
             definitions: HashMap::new(),
+            unacquired_sources: HashSet::new(),
             pending_starts: HashSet::new(),
             pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),
@@ -11422,6 +11530,40 @@ mod tests {
             other => panic!("unsupported schema must refuse, got {other:?}"),
         };
         assert!(message.contains("schema"), "{message}");
+        let _ = composition.memory.stop();
+        let _ = manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn remembered_unacquired_definition_is_admitted_once_for_explicit_start() {
+        let BatchFixture {
+            directory: _directory,
+            app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        let definition = batch_command(49, lvu_core::RestartPolicy::Never);
+        composition
+            .definitions
+            .insert(definition.id, definition.clone());
+        composition
+            .sources
+            .insert(definition.id, "remembered".into());
+        composition.unacquired_sources.insert(definition.id);
+        let mut cache = super::PathIdentityCache::default();
+        assert!(matches!(
+            composition.source_admission(&app, &definition, &mut cache),
+            SourceAdmission::Admit
+        ));
+
+        composition
+            .pending_definitions
+            .insert(definition.id, definition.clone());
+        let message = match composition.source_admission(&app, &definition, &mut cache) {
+            SourceAdmission::Refuse(message) => message,
+            other => panic!("second explicit start must not duplicate, got {other:?}"),
+        };
+        assert!(message.contains("already starting"), "{message}");
         let _ = composition.memory.stop();
         let _ = manager.shutdown().await;
     }
@@ -12527,6 +12669,7 @@ for line in sys.stdin:
             starts_rx,
             sources: HashMap::<SourceId, String>::new(),
             definitions: HashMap::new(),
+            unacquired_sources: HashSet::new(),
             pending_starts: HashSet::new(),
             pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),
@@ -12663,6 +12806,7 @@ for line in sys.stdin:
             starts_rx,
             sources: HashMap::new(),
             definitions: HashMap::new(),
+            unacquired_sources: HashSet::new(),
             pending_starts: HashSet::new(),
             pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),

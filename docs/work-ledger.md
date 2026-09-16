@@ -3638,3 +3638,46 @@ was moved to the desktop trash and remains recoverable; small release records
 were retained. Human Apple-silicon macOS and arm64 Linux terminal acceptance,
 plus the paused volume/cold-query/slow-storage investigations, remain
 explicitly unverified.
+
+## 2026-09-16 — v0.1.11 Sources lifecycle candidate
+
+Primary implemented the reported stopped-command lifecycle on the integration
+branch. Remembered command/endpoint definitions now retain a selectable
+canonical All events view without auto-launching. `n` opens one Sources / Add
+source dialog whose Existing tab shows the full wrapped health text and offers
+source-ID-scoped Restart and two-press Remove. A successful removal drops both
+the view and source-header lists and asks the shared worker to remove even a
+non-live remembered definition from its durable session; journals remain.
+Discovery now admits an explicitly selected unacquired definition exactly once
+instead of treating its UI presence as a live duplicate.
+
+Focused evidence on the primary target under the canonical validation lock:
+source UI tests 12/12; app source/controller tests 44/44 before the admission
+regression addition; the new stopped-definition admission test passed; and four
+actual PTYs passed (`test_sources_dialog_pty`, `test_resume_sources_pty`,
+`test_source_control_pty`, `test_delete_sources_views_pty`). The new PTY proves
+selectability, full failure text, one explicit command restart, immediate UI
+removal, durable absence after reopening, and retained journal data. Full
+workspace, Clippy and complete PTY/release acceptance remain to be run against
+the immutable candidate.
+
+Primary preflight is now green. Locked `cargo test --workspace` passed (among
+the full set: 215 app tests, 148 shared-worker tests, and the new stopped-source
+admission test); workspace all-target Clippy with `-D warnings` passed; bridge
+typecheck/build and 110/110 tests passed; fresh app/TUI binaries then passed the
+complete actual PTY matrix **84/84** in 213 seconds. Durable logs are
+`primary-sol-scratch/v011-rust-workspace-r4.log`,
+`v011-clippy-bridge-pty-r7.log`, `v011-bridge-pty-r8.log` (the preserved failed
+matrix), and `v011-pty-matrix-r16.log`.
+
+The failed matrix was not waived or overwritten. Six suites still assumed `n`
+opened directly on Manual instead of the new Existing tab and were updated to
+choose Manual before editing. Bridge/Filter/Fields/View Summary failures were
+startup-frame synchronization: their screens showed pending work or a focus
+handoff rather than wrong product state, and stable readiness/focus waits now
+pass. The hidden `--shared` diagnostic already calls `drain_and_detach`; its old
+test raced to assert that the socket still existed after the drain. It now
+verifies two complete clean diagnostic lifetimes, while the same suite's
+ordinary sequential reopen still proves byte-prefix extension, exact stable
+IDs and no replay. A fresh full matrix after those corrections passed 84/84.
+The immutable exact-source release proof remains pending.

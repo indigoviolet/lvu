@@ -85,6 +85,7 @@ def run(binary):
             # Rows can paint while the initial raw-view work is still pending;
             # the empty-summary assertion describes the settled view.
             app.wait_for("raw view")
+            app.assert_remains("raw view", "pending", duration=0.25)
 
             # A canonical view with nothing applied: every operation row is a
             # dash and the view row says the definition is fixed.

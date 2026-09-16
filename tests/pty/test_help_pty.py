@@ -81,8 +81,9 @@ def run(binary: pathlib.Path) -> None:
         # they stay activatable by click and by Ctrl-D, just not as buttons.
         assert "Manual" in source and "Discover" in source, source
         assert "│" in source, "the modes are a segmented control"
-        assert "[ Open ]" in source, "the dialog still has a primary action"
-        assert "Enter Open" not in source
+        assert "Existing sources" in source, source
+        assert "[ Restart ]" in source and "[ Remove ]" in source, source
+        assert "Enter Restart" not in source
         # Dialogs present actions, not a shortcut inventory; bindings live in Help.
         for hint in ("Ctrl-D Discover", "Ctrl-A 🧠", "Alt-F file"):
             assert hint not in source, f"shortcut hint {hint!r} leaked into the source body"

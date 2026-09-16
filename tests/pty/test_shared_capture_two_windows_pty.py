@@ -223,25 +223,28 @@ def run(binary: pathlib.Path) -> None:
     capture = root / "capture"
     socket, log = shared_worker_paths(capture)
 
-    # Window A cold-attaches: elects and spawns the worker, drains, exits
-    # with the pending-seam report (no session yet, by explicit design).
+    # The hidden diagnostic deliberately calls drain_and_detach before it
+    # reports the seam. Each invocation therefore proves a complete bounded
+    # worker lifetime; ordinary concurrent sharing is covered by the real
+    # session and socket tests, not by racing this already-detached command.
     first = launch(binary, root, capture)
     first.wait_for(SEAM_MESSAGE, timeout=20)
     assert first.wait_exit(timeout=15) == 1
     first.close()
-    assert socket.exists(), "worker socket missing after first window"
+    first_log = wait_clean_shutdown(capture, "diagnostic A")
     sessions = serving_sessions(log)
     assert len(sessions) == 1, f"expected one elected worker, log shows: {sessions}"
+    assert "clean shutdown" in first_log
 
-    # Window B attaches to the SAME worker: no second election, same drain.
+    # A later invocation elects a fresh worker after the first clean lifetime.
     second = launch(binary, root, capture)
     second.wait_for(SEAM_MESSAGE, timeout=20)
     assert second.wait_exit(timeout=15) == 1
     second.close()
-    assert serving_sessions(log) == sessions, "second window must not elect again"
+    wait_clean_shutdown(capture, "diagnostic B")
+    assert len(serving_sessions(log)) == 2, "second diagnostic lifetime was not recorded"
 
-    # Both windows detached: the worker notices the empty audience past
-    # grace and unlinks its socket after a clean shutdown.
+    # Both diagnostic lifetimes detached cleanly and unlinked their socket.
     deadline = time.monotonic() + 30
     while socket.exists() and time.monotonic() < deadline:
         time.sleep(0.1)

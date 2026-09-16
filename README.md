@@ -94,10 +94,13 @@ are added to the remembered set rather than replacing it. `--resume` selects
 this behavior explicitly. `--fresh` starts with nothing acquired; it deletes
 nothing, and every capture and saved view stays in the workspace.
 
-With no source and nothing to resume, lvu opens the Add source dialog: Tab
-completes paths, Ctrl-D discovers processes/open files, project files,
-Docker containers and remembered sources, naming every category checked and
-which produced no results. Nothing starts capturing until you choose it.
+`n` opens the unified Sources / Add source dialog. Existing sources remain
+listed even when stopped or waiting for an explicit launch; select one to read
+its complete status, restart it or remove it from the workspace. The Manual tab
+opens files or commands, while Discover checks processes/open files, project
+files, Docker containers and remembered sources, naming every category checked
+and which produced no results. With no source and nothing to resume this dialog
+opens automatically. Nothing starts capturing until you choose it.
 
 In the viewer:
 
@@ -109,6 +112,7 @@ In the viewer:
 | `i` | Fields: the record's structure with types and sample values; one key pins, filters, colours, folds or correlates a field |
 | `d` | Details: the selected record as a tree beside the log |
 | `b` / `B` | Bookmark the selected record / open bookmarks and notes; `Open in All events` stays there, while `Inspect context` returns with `o` |
+| `n` | Sources: inspect full health, restart or remove existing sources, and add sources manually, by discovery or with assistance |
 | `v` | Views: new, cloned, merged and deleted views over open sources (Alt-E selects Delete; Enter arms, Enter confirms) |
 | `Delete` | Remove the selected source from the workspace after confirmation; captured data stays on disk |
 | `r` | Recipes: save, apply, export and review a view's setup |

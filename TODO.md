@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.10**. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.10**. A **v0.1.11 candidate** is under validation. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -33,5 +33,6 @@ holds.
 
 ## Ready for the next release
 
-None. The acknowledged deletion, explicit discovery/Docker and assistance
-diagnostic changes shipped in v0.1.10.
+| Status | Work |
+| --- | --- |
+| **Working** | v0.1.11 unified Sources dialog and stopped-source lifecycle: selectable remembered sources, complete diagnostics, explicit restart, immediate acknowledged removal and durable non-resurrection. Focused Rust and real PTY restart/remove/reopen coverage is green; full release acceptance remains. |

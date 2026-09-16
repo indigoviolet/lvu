@@ -97,11 +97,18 @@ enriching or cloning must not launch another capture. Explicit source admission
 and restart belong to the application/ingest lifecycle. Stdin gets a fresh source
 identity per attachment and cannot be restarted without a new reader.
 
+The unified Sources dialog is keyed by stable source identity rather than by a
+live capture handle. A remembered command or endpoint that restore deliberately
+does not launch still owns a selectable canonical All events view and an
+Existing row with its complete diagnostic. Restart registers the missing handle
+and canonical adapter view; Remove follows the same acknowledged controller path
+as the base-screen shortcut.
+
 Deletion removes membership, never captures. A derived view deletes
 durably through a fifth Delete mode with two-press confirmation; All events
 is refused (deleted only with its source) as are views still used by a
 surviving union, with the union named. A source removes from the
-sidebar/workspace via Delete or the palette after the same two-press
+sidebar/workspace via the Sources dialog, Delete or the palette after the same two-press
 confirmation: capture stops, session restore drops it, and its owned views
 delete only after durable acknowledgement. The UI removes either only on
 that acknowledgement; queue saturation, worker loss and optimistic conflicts

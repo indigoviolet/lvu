@@ -37,7 +37,7 @@ def run(binary: pathlib.Path) -> None:
             app.send(b"x")
             app.wait_until(lambda text: "PRESS ANY KEY" not in text, "Any key enters the app")
             assert "hidden-paste" not in app.text()
-            assert "x" not in app.text().split("Kind:", 1)[-1].split("Tab", 1)[0], "dismissal key leaked into source draft"
+            assert "path to a log file" in app.text(), "dismissal key leaked into source draft"
             app.send(b"\x03")
             assert app.wait_exit(timeout=8) == 0
             app.assert_restored()
