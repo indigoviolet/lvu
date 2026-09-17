@@ -2694,6 +2694,17 @@ impl Composition {
         };
         let generated_view_id = view_id.0.to_string();
         let origin_view_id = frozen.origin_view_id.0.to_string();
+        // Loading a working view first restores its desired definition and
+        // then lets the normal query pipeline accept it.  Until that query
+        // settles, `auto_setup_config` still describes the old/default
+        // applied state; treating its hash as an edit would permanently drop
+        // a valid receipt on every restart.  Keep the receipt pending and
+        // retry when memory restoration removes these identities below.
+        if self.memory_restoring.contains(&view_id)
+            || self.memory_restoring.contains(&frozen.origin_view_id)
+        {
+            return false;
+        }
         let (Some(before), Some(applied)) = (
             app.views.auto_setup_config(&origin_view_id),
             app.views.auto_setup_config(&generated_view_id),
@@ -5812,7 +5823,7 @@ impl Composition {
         app.action_notice = Some(format!("source removal failed: {error}"));
     }
 
-    fn queue_memory_saves(&mut self, app: &App, force: bool) -> bool {
+    fn queue_memory_saves(&mut self, app: &mut App, force: bool) -> bool {
         const AUTOSAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
         let mut changed = false;
         for view in app.views().to_vec() {
@@ -5838,9 +5849,6 @@ impl Composition {
             if self.memory_deferred.contains_key(&memory_view_id) {
                 continue;
             }
-            let Some(definition) = self.definitions.get(&source_id) else {
-                continue;
-            };
             if !self.memory_ready.contains(&source_id) {
                 continue;
             }
@@ -5851,7 +5859,16 @@ impl Composition {
                     continue;
                 }
                 self.memory_restoring.remove(&memory_view_id);
+                // A durable automatic-setup receipt can only be compared
+                // after both its canonical and generated views have reached
+                // their accepted restored definitions.  The retry is cheap
+                // and keyed by source; it is a no-op without a pending
+                // receipt.
+                self.try_restore_auto_setup_receipt(app, source_id);
             }
+            let Some(definition) = self.definitions.get(&source_id) else {
+                continue;
+            };
             let Some(state) = app.persistent_view_state(&view.id) else {
                 continue;
             };
