@@ -748,8 +748,23 @@ time.sleep(60)
     );
     assert!(blocked.stderr_snapshot().len() <= 2048);
     let descendant: u32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
-    let status = fs::read_to_string(format!("/proc/{descendant}/status")).unwrap_or_default();
-    assert!(status.is_empty() || status.contains("State:\tZ"));
+    // `kill(2)` queues SIGKILL for the whole process group; it does not wait
+    // for an orphaned descendant to be scheduled and publish its terminal
+    // state. The direct child is already synchronously reaped by `reset`, so
+    // give the kernel one small, bounded scheduling window before inspecting
+    // the independently adopted descendant.
+    let descendant_deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let status = fs::read_to_string(format!("/proc/{descendant}/status")).unwrap_or_default();
+        if status.is_empty() || status.contains("State:\tZ") {
+            break;
+        }
+        assert!(
+            Instant::now() < descendant_deadline,
+            "descendant {descendant} remained live after process-group kill:\n{status}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 
     let framed = fixture(&t);
     let mut cancellable = runner(&framed, "hang", Duration::from_secs(2));
