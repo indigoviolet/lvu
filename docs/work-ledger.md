@@ -3929,3 +3929,16 @@ worktrees. It preserved the primary target, compiler cache, captures, proof
 archives and releases; the large build volume had 36 GiB free before the final
 matrix and the root filesystem had 13 GiB free. The foreign `mise.toml` edits
 remain unstaged and byte-untouched.
+
+The first immutable v0.1.14 candidate, source `c7d9d1374acea83b1e6934b100e8487fe4201a8b`
+and tree `6c94a3df0dd261cc57cde874b6538f52ef08719b`, passed the locked formatting,
+workspace-test, all-target Clippy and 118/118 bridge stages. Reproducible app
+and TUI SHA-256 values were `2cbf5d7278a0c764f254a818ccf4533d2ab10411aaa7d66170a4bf56df4b53df`
+and `3e2bbd9721ddbadd2df8538da7edfe81808329309ddcf2326df89c17a959af1e`.
+Its PTY matrix stopped at **84/86**, so no acceptance record or tag was made.
+One assertion searched raw screen rows for `start Paseo` even when the terminal
+correctly wrapped the two words; the other sampled Filter before its initial
+query had settled. The tests now inspect normalized dialog prose and wait for
+the semantic settled message. Failed-candidate evidence remains under
+`lvu-v014-c7d9d13-final-acceptance/release-gate-c7d9d1374ace-a4a51df1a0b648cd86b66d663af30983`
+on the build volume; the corrected commit requires a complete new exact run.

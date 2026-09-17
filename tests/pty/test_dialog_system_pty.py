@@ -200,7 +200,7 @@ def run(binary: pathlib.Path) -> None:
             assert_backdrop_is_scrimmed(app, bounds)
 
             # §7.4: one message row, one vocabulary, no `Label:` stutter.
-            screen = app.text()
+            screen = app.wait_for("No filter every record is shown", timeout=10.0)
             assert "No filter every record is shown" in screen, screen
             assert "Applied  No filter applied." not in screen, screen
             app.send(b"\x1b")

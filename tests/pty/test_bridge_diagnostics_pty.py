@@ -65,6 +65,26 @@ def ask_and_read_message(app: PtyApp, needle: str, description: str) -> str:
     )
 
 
+def normalized_dialog_text(screen: str, title: str) -> str:
+    """Return dialog prose with terminal line wrapping treated as whitespace."""
+    marker = f"┌ {title}"
+    lines = screen.splitlines()
+    for index, header in enumerate(lines):
+        if marker not in header:
+            continue
+        left = header.index(marker)
+        right = header.find("┐", left)
+        if right < 0:
+            return ""
+        interior = []
+        for line in lines[index + 1:]:
+            if len(line) > left and line[left] == "└":
+                break
+            interior.append(line[left + 1:right].replace("│", " "))
+        return " ".join("\n".join(interior).split())
+    return ""
+
+
 def assert_workspace_still_works(app: PtyApp) -> None:
     """Everything that is not 🧠 keeps working after the failure."""
     app.send(b"\x1b")
@@ -117,8 +137,9 @@ def case(binary: pathlib.Path, root: pathlib.Path, source: pathlib.Path,
         # startup tests allow — never the 3s interactive default.
         app.wait_for("probe 00", timeout=15.0)
         message = ask_and_read_message(app, needles[0], f"{label} diagnostic")
+        diagnostic = normalized_dialog_text(message, "Ask 🧠")
         for needle in needles:
-            assert needle in message, f"{label}: missing {needle!r} in\n{message}"
+            assert needle in diagnostic, f"{label}: missing {needle!r} in\n{message}"
         # The retired message must not come back for any of these.
         assert "bridge is not running" not in message, message
         assert_workspace_still_works(app)
