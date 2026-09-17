@@ -8387,6 +8387,10 @@ fn save_settings_request(
             mode: value.mode,
             thinking: value.thinking,
         },
+        // The Settings screen does not expose automatic sampling yet. Preserve
+        // the explicit opt-in rather than clearing it when another setting is
+        // saved.
+        automatic_setup: applied.settings.automatic_setup.clone(),
         appearance: settings::AppearanceSettings {
             theme: match value.theme {
                 ThemeId::Terminal => settings::Theme::Terminal,

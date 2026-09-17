@@ -10,6 +10,11 @@ PgUp/PgDn/Home/End bindings, semantic roles) are §8, with the three that had
 no other home in §8.15. An implementer should be able to build every surface
 from this document without further interpretation.
 
+This document owns visual anatomy and geometry. [Dialog flow grammar](dialog-grammar.md)
+owns the semantic order of object, operation, parameters, review and submit.
+Both contracts apply to every dialog; a visually valid surface can still have
+an invalid flow order.
+
 Evidence: the screens quoted in §1 and §12 were taken from real-PTY runs of
 every dialog at 140x40, 100x30, 80x24 and 54x16 (empty workspace) and from a
 populated-state `TestBackend` audit; cell-style dumps and WCAG contrast
