@@ -103,6 +103,11 @@ struct AiStart {
     thinking: String,
     /// Which bounded sample this request was prepared against.
     tier: SampleTier,
+    /// Present only for background automatic setup. Keeping the target on the
+    /// same bounded worker lifecycle as Ask prevents two agent sessions from
+    /// competing while still letting explicit Ask requests take admission
+    /// priority.
+    auto_setup: Option<auto_setup::AutoSetupAnalysis>,
 }
 
 enum AiWork {
@@ -1988,6 +1993,7 @@ impl Composition {
                         mode,
                         thinking,
                         tier,
+                        auto_setup: None,
                     };
                     match adapter.start_assistance_preparation(
                         &view_id,
@@ -2021,6 +2027,7 @@ impl Composition {
                 AskAiRequest::Cancel { generation } => self.cancel_ai(generation),
             }
         }
+        changed |= self.start_auto_setup_agent(app, adapter);
         self.poll_agent_events(app, &mut changed);
         let Some(work) = self.active_ai.take() else {
             return changed;
@@ -2219,6 +2226,24 @@ impl Composition {
                     changed = true;
                 }
                 Some(Ok(proposal)) => {
+                    if let Some(analysis) = &start.auto_setup {
+                        let current_data_revision = self
+                            .auto_setup_data_revision(&analysis.request.source_id)
+                            .unwrap_or_else(|| "source-unavailable".into());
+                        let result = if proposal.needs_more_data {
+                            Err("agent needs more log data; analyze again after more records arrive"
+                                .into())
+                        } else {
+                            auto_setup::decode_auto_setup_proposal(&proposal)
+                        };
+                        if let Err(error) =
+                            self.auto_setup
+                                .complete(app, analysis, &current_data_revision, result)
+                        {
+                            finish_ai_error(app, &start, error);
+                        }
+                        return true;
+                    }
                     let expression = if start.kind == AskAiKind::Recipe {
                         let expected = app.view_source_ids(&start.view_id);
                         if expected.is_empty() {
@@ -2312,6 +2337,97 @@ impl Composition {
             },
         }
         changed
+    }
+
+    fn start_auto_setup_agent(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
+        if self.active_ai.is_some() || self.ai_session_busy {
+            return false;
+        }
+        let Some(status) = app.auto_setup_status().cloned() else {
+            return false;
+        };
+        if !matches!(
+            status.stage,
+            lvu::AutoSetupStage::Sampling | lvu::AutoSetupStage::WaitingForRows
+        ) {
+            return false;
+        }
+        let rows = adapter.page(&status.origin_view_id, ViewportRequest { start: 0, len: 0 });
+        if rows.total == 0 {
+            return app.set_auto_setup_status(lvu::AutoSetupStatus {
+                stage: lvu::AutoSetupStage::WaitingForRows,
+                detail: "waiting for the first captured record; raw view remains usable".into(),
+                ..status
+            });
+        }
+        let Some(data_revision) = self.auto_setup_data_revision(&status.source_id) else {
+            app.set_auto_setup_status(lvu::AutoSetupStatus {
+                stage: lvu::AutoSetupStage::Unavailable,
+                detail: "source acquisition is unavailable; raw view kept".into(),
+                ..status
+            });
+            return true;
+        };
+        let Some(analysis) = self.auto_setup.take_analysis(app, data_revision.clone()) else {
+            return false;
+        };
+        if let Some(error) = self.agent_error.clone() {
+            let _ = self
+                .auto_setup
+                .complete(app, &analysis, &data_revision, Err(error));
+            return true;
+        }
+        let settings = &self.applied_settings.settings.paseo;
+        let start = AiStart {
+            generation: u64::MAX,
+            view_id: analysis.request.origin_view_id.clone(),
+            definition_revision: analysis.request.definition_revision,
+            kind: AskAiKind::Enrichment,
+            instruction: "Inspect this bounded typed log sample and propose only useful native enrichments, pinned enrichment outputs, value-based colour rules, and run/filter grouping. Prefer a small setup; return an empty setup when no transformation is justified. Never propose commands, filters, source changes, or time windows.".into(),
+            provider: settings.provider.clone(),
+            mode: settings.mode.clone(),
+            thinking: settings.thinking.clone(),
+            tier: SampleTier::Standard,
+            auto_setup: Some(analysis.clone()),
+        };
+        match adapter.start_assistance_preparation(
+            &start.view_id,
+            self.snapshot_root.join("automatic-setup"),
+            SampleTier::Standard.limits(),
+        ) {
+            Ok(job) => {
+                self.active_ai = Some(AiWork::Sampling {
+                    start,
+                    job,
+                    cancelled: false,
+                });
+            }
+            Err(error) => {
+                let _ = self.auto_setup.complete(
+                    app,
+                    &analysis,
+                    &data_revision,
+                    Err(format!("assistance preparation: {error}")),
+                );
+            }
+        }
+        true
+    }
+
+    /// Acquisition generation is the data-identity fence for automatic
+    /// setup. Appended records intentionally do not stale row-separable
+    /// enrichments; replacing or restarting the capture does.
+    fn auto_setup_data_revision(&self, source_id: &str) -> Option<String> {
+        let source_id = SourceId(Uuid::parse_str(source_id).ok()?);
+        self.shared
+            .as_ref()
+            .and_then(|shared| shared.source_progress(source_id))
+            .or_else(|| {
+                self.manager
+                    .source(source_id)
+                    .map(|handle| handle.progress())
+            })
+            .map(|progress| progress.generation.to_string())
     }
 
     fn handle_investigation(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
@@ -3184,10 +3300,14 @@ impl Composition {
         context: PreparedAiContext,
         session_id: String,
     ) {
-        let kind = match start.kind {
-            AskAiKind::Filter => ProposalKind::Filter,
-            AskAiKind::Enrichment => ProposalKind::Enrichment,
-            AskAiKind::Recipe => ProposalKind::View,
+        let kind = if start.auto_setup.is_some() {
+            ProposalKind::AutoSetup
+        } else {
+            match start.kind {
+                AskAiKind::Filter => ProposalKind::Filter,
+                AskAiKind::Enrichment => ProposalKind::Enrichment,
+                AskAiKind::Recipe => ProposalKind::View,
+            }
         };
         let Some(host) = &self.agent else {
             self.ai_session_busy = false;
@@ -6460,6 +6580,16 @@ fn remaining(deadline: std::time::Instant) -> Duration {
 }
 
 fn finish_ai_error(app: &mut App, start: &AiStart, message: String) {
+    if let Some(analysis) = &start.auto_setup {
+        app.set_auto_setup_status(lvu::AutoSetupStatus {
+            source_id: analysis.request.source_id.clone(),
+            origin_view_id: analysis.request.origin_view_id.clone(),
+            object_name: analysis.request.object_name.clone(),
+            stage: lvu::AutoSetupStage::Unavailable,
+            detail: format!("{message}; raw view kept"),
+        });
+        return;
+    }
     app.finish_ask_ai(
         start.generation,
         &start.view_id,
@@ -12249,6 +12379,7 @@ mod tests {
             provider: "fixture".into(),
             mode: "default".into(),
             thinking: "default".into(),
+            auto_setup: None,
         };
         // The producer's field order may differ from Value's sorted map order.
         let inline = r#"{"version":1,"samples":[{"fields":{"observed_at":{"kind":"datetime","integer":"1700000000000000001","unit":"ns","timezone":"UTC"},"optional":null}}],"coverage":{"admitted_rows":1,"omitted_rows":5}}"#;
@@ -12536,6 +12667,7 @@ for line in sys.stdin:
             provider: "fixture".into(),
             mode: "fixture".into(),
             thinking: "fixture".into(),
+            auto_setup: None,
         };
         let starting = host
             .start_session("fixture", directory.path(), None, None, None)

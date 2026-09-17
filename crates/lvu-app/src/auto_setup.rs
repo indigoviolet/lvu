@@ -252,6 +252,13 @@ impl AutoSetupCoordinator {
     /// owned at a time; queue pressure is explicit and raw browsing continues.
     pub fn sync(&mut self, app: &mut App) -> bool {
         let mut changed = false;
+        if let (Some(active), Some(status)) = (&self.active, app.auto_setup_status())
+            && status.stage == AutoSetupStage::Unavailable
+            && status.origin_view_id == active.request.origin_view_id
+        {
+            self.active = None;
+            changed = true;
+        }
         for request in app.take_auto_setup_requests() {
             changed = true;
             if self.active.is_some() || self.pending.len() >= MAX_PENDING_ANALYSES {
