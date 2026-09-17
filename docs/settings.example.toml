@@ -8,6 +8,12 @@ provider = "codex/gpt-5.6-luna"
 mode = "full-access"
 thinking = "medium"
 
+# Automatic setup can send a bounded sample from each newly opened log source
+# to the configured provider. Upgrades and new installations leave it disabled
+# until this policy is changed explicitly.
+[automatic_setup]
+policy = "disabled" # disabled, automatic-on-new-source
+
 [appearance]
 theme = "terminal" # terminal, love-dark, love-light, dracula, nord, gruvbox-dark
 display_zone = "Z" # zone timestamps are shown in: Z or a fixed offset such as +02:00; no DST

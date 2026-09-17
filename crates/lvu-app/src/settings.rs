@@ -80,6 +80,12 @@ pub fn resolve_paths_with(
 pub struct Settings {
     pub schema_version: u32,
     pub paseo: PaseoSettings,
+    /// Policy for agent-assisted setup of newly opened log sources. Missing in
+    /// older settings files means disabled: automatic analysis may send a
+    /// bounded log sample to the configured provider, so upgrades never opt a
+    /// user in silently.
+    #[serde(default)]
+    pub automatic_setup: AutomaticSetupSettings,
     pub appearance: AppearanceSettings,
     pub cache: CacheSettings,
     /// Durable-storage governance. Absent in files written before this
@@ -95,6 +101,21 @@ pub struct PaseoSettings {
     pub provider: String,
     pub mode: String,
     pub thinking: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomaticSetupSettings {
+    #[serde(default)]
+    pub policy: AutomaticSetupPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutomaticSetupPolicy {
+    #[default]
+    Disabled,
+    AutomaticOnNewSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -210,6 +231,7 @@ impl Default for Settings {
                 mode: "full-access".into(),
                 thinking: "medium".into(),
             },
+            automatic_setup: AutomaticSetupSettings::default(),
             appearance: AppearanceSettings {
                 theme: Theme::Terminal,
                 display_zone: default_display_zone(),
@@ -426,6 +448,7 @@ pub struct EffectiveSettings {
     pub provider: EffectiveValue<String>,
     pub mode: EffectiveValue<String>,
     pub thinking: EffectiveValue<String>,
+    pub automatic_setup_policy: EffectiveValue<AutomaticSetupPolicy>,
     pub delight_enabled: EffectiveValue<bool>,
     pub reduced_motion: EffectiveValue<bool>,
     pub ascii: EffectiveValue<bool>,
@@ -465,6 +488,12 @@ impl LoadedSettings {
                 &settings.paseo.thinking,
                 &base,
             )?,
+            // There is deliberately no environment override: opting into
+            // automatic log sampling is a durable, inspectable user choice.
+            automatic_setup_policy: EffectiveValue {
+                value: settings.automatic_setup.policy,
+                source: base.clone(),
+            },
             delight_enabled: effective_presence(
                 &mut lookup,
                 ENV_NO_DELIGHT,
@@ -787,5 +816,84 @@ fn effective_presence(
             value: when_present,
             source: ValueSource::Environment(name),
         }
+    }
+}
+
+#[cfg(test)]
+mod automatic_setup_tests {
+    use super::*;
+
+    const LEGACY_SETTINGS: &str = r#"
+schema_version = 1
+
+[paseo]
+provider = "fixture"
+mode = "full-access"
+thinking = "medium"
+
+[appearance]
+theme = "terminal"
+display_zone = "Z"
+delight_enabled = true
+reduced_motion = false
+ascii = false
+
+[cache.memory]
+rows_mib = 4
+membership_mib = 256
+
+[cache.disk]
+total_mib = 5120
+index_per_source_mib = 256
+"#;
+
+    #[test]
+    fn older_settings_default_automatic_setup_to_disabled() {
+        let settings: Settings = toml::from_str(LEGACY_SETTINGS).unwrap();
+        assert_eq!(
+            settings.automatic_setup.policy,
+            AutomaticSetupPolicy::Disabled
+        );
+        let validated = settings.validate().unwrap();
+        let loaded = LoadedSettings {
+            validated,
+            origin: SettingsOrigin::GlobalFile,
+        };
+        let effective = loaded.effective_with(|_| None).unwrap();
+        assert_eq!(
+            effective.automatic_setup_policy,
+            EffectiveValue {
+                value: AutomaticSetupPolicy::Disabled,
+                source: ValueSource::GlobalFile,
+            }
+        );
+    }
+
+    #[test]
+    fn automatic_on_new_source_round_trips_canonically() {
+        let mut settings: Settings = toml::from_str(LEGACY_SETTINGS).unwrap();
+        settings.automatic_setup.policy = AutomaticSetupPolicy::AutomaticOnNewSource;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.toml");
+        save_settings(&path, &settings).unwrap();
+        let loaded = load_settings(&path).unwrap();
+        assert_eq!(
+            loaded.validated.settings.automatic_setup.policy,
+            AutomaticSetupPolicy::AutomaticOnNewSource
+        );
+        let saved = fs::read_to_string(path).unwrap();
+        assert!(saved.contains("[automatic_setup]"));
+        assert!(saved.contains("policy = \"automatic-on-new-source\""));
+    }
+
+    #[test]
+    fn unknown_automatic_setup_policy_is_rejected_without_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.toml");
+        let malformed =
+            format!("{LEGACY_SETTINGS}\n[automatic_setup]\npolicy = \"future-policy\"\n");
+        fs::write(&path, &malformed).unwrap();
+        assert!(matches!(load_settings(&path), Err(SettingsError::Toml(_))));
+        assert_eq!(fs::read_to_string(path).unwrap(), malformed);
     }
 }

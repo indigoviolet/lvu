@@ -52,6 +52,15 @@ pub const MAX_COMMAND_ATTEMPT_RESULT_BYTES: usize = 256 * 1024;
 pub const MAX_COMMAND_ATTEMPT_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 pub const MAX_COMMAND_ATTEMPT_BATCH_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_SCOPE_COMPONENT_BYTES: usize = 128;
+/// One terminal automatic-setup receipt per source and policy version. The
+/// controller only needs recent policy generations; retaining a bounded
+/// history prevents a future policy counter from growing the workspace
+/// without limit.
+pub const MAX_AUTOMATIC_SETUP_RECEIPTS_PER_SOURCE: usize = 16;
+pub const MAX_AUTOMATIC_SETUP_RECEIPTS: usize = 4_096;
+pub const MAX_AUTOMATIC_SETUP_RECEIPT_BYTES: usize = 16 * 1024;
+pub const MAX_AUTOMATIC_SETUP_DIAGNOSTIC_BYTES: usize = 1_024;
+const SHA256_HEX_BYTES: usize = 64;
 const MAX_LEGACY_DATABASE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_BACKUP_DURATION: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,6 +198,9 @@ fn migrate_connection(conn: &Connection) -> Result<(), MemoryError> {
         migrate_v2(conn)?;
     }
     if version < 3 {
+        // Ordered source membership changes the meaning of a working view.
+        // Older applications must refuse schema 3 rather than saving a
+        // single-source interpretation over persisted membership.
         conn.pragma_update(None, "user_version", 3)?;
     }
     if version < 4 {
@@ -200,6 +212,7 @@ fn migrate_connection(conn: &Connection) -> Result<(), MemoryError> {
     if version < 6 {
         migrate_v6(conn)?;
     }
+    ensure_automatic_setup_receipts(conn)?;
     Ok(())
 }
 
@@ -1333,6 +1346,59 @@ pub struct CommandAttemptRecord {
     pub state: StoredCommandAttempt,
 }
 
+/// Current automatic log-setup policy contract. A new behavior that should be
+/// tried once for an already seen source gets a new policy version rather than
+/// deleting or silently reinterpreting an old receipt.
+pub const AUTOMATIC_SETUP_POLICY_VERSION: u32 = 1;
+pub const AUTOMATIC_SETUP_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticSetupOutcome {
+    Applied,
+    NoChanges,
+    Unavailable,
+    Rejected,
+    Failed,
+    Reverted,
+}
+
+/// The immutable application state against which an automatic proposal was
+/// prepared. These are evidence/fences, not a copy of any sampled log data.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomaticSetupFrozenRevision {
+    pub origin_view_id: ViewId,
+    pub persisted_view_version: u64,
+    pub accepted_revision: u64,
+    pub source_generation: u64,
+    pub data_revision: u64,
+}
+
+/// One bounded terminal result for a source and automatic-setup policy.
+///
+/// Applied setup creates a derived view. `created_view_id` and
+/// `applied_config_sha256` let the controller remove exactly that view only
+/// while its configuration still matches what automation installed. Manual
+/// edits therefore make revert fail closed instead of erasing user work.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomaticSetupReceipt {
+    pub schema_version: u32,
+    pub source_id: SourceId,
+    pub policy_version: u32,
+    pub outcome: AutomaticSetupOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_config_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_view_id: Option<ViewId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen: Option<AutomaticSetupFrozenRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    pub recorded_at_unix_nanos: i64,
+}
+
 pub struct WorkspaceStore {
     conn: Connection,
     root: PathBuf,
@@ -1736,31 +1802,7 @@ impl WorkspaceStore {
         conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
         conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > DB_SCHEMA_VERSION {
-            return Err(MemoryError::FutureDatabase(version));
-        }
-        if version == 0 {
-            migrate_v1(&conn)?;
-        }
-        if version < 2 {
-            migrate_v2(&conn)?;
-        }
-        if version < 3 {
-            // Ordered source membership changes the meaning of a working view.
-            // Older applications must refuse this database rather than saving
-            // a single-source interpretation over the persisted membership.
-            conn.pragma_update(None, "user_version", 3)?;
-        }
-        if version < 4 {
-            migrate_v4(&conn)?;
-        }
-        if version < 5 {
-            migrate_v5(&conn)?;
-        }
-        if version < 6 {
-            migrate_v6(&conn)?;
-        }
+        migrate_connection(&conn)?;
         let store = Self {
             conn,
             root,
@@ -1772,6 +1814,236 @@ impl WorkspaceStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn get_automatic_setup_receipt(
+        &self,
+        source_id: SourceId,
+        policy_version: u32,
+    ) -> Result<Option<AutomaticSetupReceipt>, MemoryError> {
+        validate_policy_version(policy_version)?;
+        self.conn
+            .query_row(
+                "SELECT receipt_json,recorded_at_unix_nanos \
+                 FROM automatic_setup_receipts \
+                 WHERE source_id=?1 AND policy_version=?2",
+                params![source_id.0.to_string(), i64::from(policy_version)],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .map(|(bytes, recorded_at)| {
+                decode_automatic_setup_receipt(
+                    &source_id.0.to_string(),
+                    i64::from(policy_version),
+                    &bytes,
+                    recorded_at,
+                )
+            })
+            .transpose()
+    }
+
+    /// Loads a bounded policy history for one source, newest first.
+    pub fn automatic_setup_receipts_for_source(
+        &self,
+        source_id: SourceId,
+        limit: u32,
+    ) -> Result<Vec<AutomaticSetupReceipt>, MemoryError> {
+        if limit == 0 || limit as usize > MAX_AUTOMATIC_SETUP_RECEIPTS_PER_SOURCE {
+            return Err(MemoryError::InvalidData(format!(
+                "automatic setup receipt limit must be 1..={MAX_AUTOMATIC_SETUP_RECEIPTS_PER_SOURCE}"
+            )));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT source_id,policy_version,receipt_json,recorded_at_unix_nanos \
+             FROM automatic_setup_receipts WHERE source_id=?1 \
+             ORDER BY recorded_at_unix_nanos DESC,policy_version DESC LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![source_id.0.to_string(), limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(source, policy, bytes, recorded_at)| {
+                decode_automatic_setup_receipt(&source, policy, &bytes, recorded_at)
+            })
+            .collect()
+    }
+
+    /// Lists a bounded workspace-wide receipt page, newest first. This is for
+    /// diagnostics and maintenance; normal controllers use the keyed lookup.
+    pub fn list_automatic_setup_receipts(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<AutomaticSetupReceipt>, MemoryError> {
+        check_limit(limit)?;
+        let mut statement = self.conn.prepare(
+            "SELECT source_id,policy_version,receipt_json,recorded_at_unix_nanos \
+             FROM automatic_setup_receipts \
+             ORDER BY recorded_at_unix_nanos DESC,source_id,policy_version DESC LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(source, policy, bytes, recorded_at)| {
+                decode_automatic_setup_receipt(&source, policy, &bytes, recorded_at)
+            })
+            .collect()
+    }
+
+    /// Inserts or replaces the one terminal outcome for this source/policy.
+    /// Replacement is explicit controller behavior (for example Analyze
+    /// again); ordinary restart only reads the existing receipt.
+    pub fn upsert_automatic_setup_receipt(
+        &self,
+        receipt: &AutomaticSetupReceipt,
+    ) -> Result<(), MemoryError> {
+        let bytes = encode_automatic_setup_receipt(receipt)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let existing: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM automatic_setup_receipts \
+             WHERE source_id=?1 AND policy_version=?2)",
+            params![
+                receipt.source_id.0.to_string(),
+                i64::from(receipt.policy_version)
+            ],
+            |row| row.get(0),
+        )?;
+        if !existing {
+            let total: i64 =
+                tx.query_row("SELECT COUNT(*) FROM automatic_setup_receipts", [], |row| {
+                    row.get(0)
+                })?;
+            if usize::try_from(total).unwrap_or(usize::MAX) >= MAX_AUTOMATIC_SETUP_RECEIPTS {
+                return Err(MemoryError::InvalidData(format!(
+                    "automatic setup receipt capacity is {MAX_AUTOMATIC_SETUP_RECEIPTS}"
+                )));
+            }
+            let for_source: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM automatic_setup_receipts WHERE source_id=?1",
+                [receipt.source_id.0.to_string()],
+                |row| row.get(0),
+            )?;
+            if usize::try_from(for_source).unwrap_or(usize::MAX)
+                >= MAX_AUTOMATIC_SETUP_RECEIPTS_PER_SOURCE
+            {
+                return Err(MemoryError::InvalidData(format!(
+                    "automatic setup retains at most {MAX_AUTOMATIC_SETUP_RECEIPTS_PER_SOURCE} policy receipts per source"
+                )));
+            }
+        }
+        tx.execute(
+            "INSERT INTO automatic_setup_receipts(\
+                source_id,policy_version,receipt_json,recorded_at_unix_nanos) \
+             VALUES(?1,?2,?3,?4) \
+             ON CONFLICT(source_id,policy_version) DO UPDATE SET \
+                receipt_json=excluded.receipt_json,\
+                recorded_at_unix_nanos=excluded.recorded_at_unix_nanos",
+            params![
+                receipt.source_id.0.to_string(),
+                i64::from(receipt.policy_version),
+                bytes,
+                receipt.recorded_at_unix_nanos
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Marks an applied receipt reverted only when the caller names the exact
+    /// generated view and configuration it has just safely removed. A manual
+    /// edit or replacement receipt therefore conflicts instead of being lost.
+    pub fn mark_automatic_setup_reverted(
+        &self,
+        source_id: SourceId,
+        policy_version: u32,
+        expected_view_id: ViewId,
+        expected_config_sha256: &str,
+        recorded_at_unix_nanos: i64,
+    ) -> Result<bool, MemoryError> {
+        validate_policy_version(policy_version)?;
+        validate_sha256(
+            "expected automatic setup configuration hash",
+            expected_config_sha256,
+        )?;
+        if recorded_at_unix_nanos < 0 {
+            return Err(MemoryError::InvalidData(
+                "automatic setup receipt time must be non-negative".into(),
+            ));
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let stored: Option<(Vec<u8>, i64)> = tx
+            .query_row(
+                "SELECT receipt_json,recorded_at_unix_nanos \
+                 FROM automatic_setup_receipts \
+                 WHERE source_id=?1 AND policy_version=?2",
+                params![source_id.0.to_string(), i64::from(policy_version)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((old_bytes, old_recorded_at)) = stored else {
+            return Ok(false);
+        };
+        let mut receipt = decode_automatic_setup_receipt(
+            &source_id.0.to_string(),
+            i64::from(policy_version),
+            &old_bytes,
+            old_recorded_at,
+        )?;
+        if receipt.outcome == AutomaticSetupOutcome::Reverted {
+            return Ok(false);
+        }
+        if receipt.outcome != AutomaticSetupOutcome::Applied
+            || receipt.created_view_id != Some(expected_view_id)
+            || receipt.applied_config_sha256.as_deref() != Some(expected_config_sha256)
+        {
+            return Err(MemoryError::Conflict);
+        }
+        receipt.outcome = AutomaticSetupOutcome::Reverted;
+        receipt.recorded_at_unix_nanos = recorded_at_unix_nanos;
+        let new_bytes = encode_automatic_setup_receipt(&receipt)?;
+        let changed = tx.execute(
+            "UPDATE automatic_setup_receipts \
+             SET receipt_json=?3,recorded_at_unix_nanos=?4 \
+             WHERE source_id=?1 AND policy_version=?2 AND receipt_json=?5",
+            params![
+                source_id.0.to_string(),
+                i64::from(policy_version),
+                &new_bytes,
+                recorded_at_unix_nanos,
+                &old_bytes
+            ],
+        )?;
+        if changed != 1 {
+            return Err(MemoryError::Conflict);
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn remove_automatic_setup_receipt(
+        &self,
+        source_id: SourceId,
+        policy_version: u32,
+    ) -> Result<bool, MemoryError> {
+        validate_policy_version(policy_version)?;
+        Ok(self.conn.execute(
+            "DELETE FROM automatic_setup_receipts WHERE source_id=?1 AND policy_version=?2",
+            params![source_id.0.to_string(), i64::from(policy_version)],
+        )? == 1)
     }
 
     pub fn save_recipe(
@@ -3097,6 +3369,25 @@ fn migrate_v6(conn: &Connection) -> Result<(), MemoryError> {
     Ok(())
 }
 
+/// Additive auxiliary state deliberately does not advance `user_version`.
+/// Readers predating automatic setup ignore an unknown table and SQLite keeps
+/// it byte-for-byte while they edit ordinary workspace rows. New readers still
+/// validate every receipt before using it, so downgrade access does not turn a
+/// malformed or future receipt into a silent reset.
+fn ensure_automatic_setup_receipts(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automatic_setup_receipts(\
+            source_id TEXT NOT NULL CHECK(length(source_id) = 36),\
+            policy_version INTEGER NOT NULL CHECK(policy_version BETWEEN 1 AND 4294967295),\
+            receipt_json BLOB NOT NULL CHECK(length(receipt_json) BETWEEN 1 AND 16384),\
+            recorded_at_unix_nanos INTEGER NOT NULL CHECK(recorded_at_unix_nanos >= 0),\
+            PRIMARY KEY(source_id,policy_version));\
+         CREATE INDEX IF NOT EXISTS automatic_setup_receipts_recent_idx \
+            ON automatic_setup_receipts(recorded_at_unix_nanos DESC,source_id,policy_version);",
+    )?;
+    Ok(())
+}
+
 /// Adds one bookmark to a source's set, keeping both notes when the record is
 /// already marked with a different one.
 fn merge_bookmark(bookmarks: &mut Vec<StoredBookmark>, incoming: StoredBookmark) {
@@ -3618,6 +3909,125 @@ fn to_i64(value: u64) -> Result<i64, MemoryError> {
     i64::try_from(value)
         .map_err(|_| MemoryError::InvalidData("integer exceeds SQLite range".into()))
 }
+
+fn validate_policy_version(policy_version: u32) -> Result<(), MemoryError> {
+    if policy_version == 0 {
+        return Err(MemoryError::InvalidData(
+            "automatic setup policy version must be positive".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(label: &str, value: &str) -> Result<(), MemoryError> {
+    if value.len() != SHA256_HEX_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(MemoryError::InvalidData(format!(
+            "{label} must be a lowercase SHA-256 digest"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_automatic_setup_receipt(receipt: &AutomaticSetupReceipt) -> Result<(), MemoryError> {
+    if receipt.schema_version != AUTOMATIC_SETUP_RECEIPT_SCHEMA_VERSION {
+        return Err(MemoryError::InvalidData(format!(
+            "unsupported automatic setup receipt schema version {}",
+            receipt.schema_version
+        )));
+    }
+    validate_policy_version(receipt.policy_version)?;
+    if receipt.recorded_at_unix_nanos < 0 {
+        return Err(MemoryError::InvalidData(
+            "automatic setup receipt time must be non-negative".into(),
+        ));
+    }
+    for (label, hash) in [
+        ("automatic setup proposal hash", &receipt.proposal_sha256),
+        (
+            "automatic setup configuration hash",
+            &receipt.applied_config_sha256,
+        ),
+    ] {
+        if let Some(hash) = hash {
+            validate_sha256(label, hash)?;
+        }
+    }
+    if receipt.diagnostic.as_ref().is_some_and(|diagnostic| {
+        diagnostic.len() > MAX_AUTOMATIC_SETUP_DIAGNOSTIC_BYTES || diagnostic.contains('\0')
+    }) {
+        return Err(MemoryError::InvalidData(format!(
+            "automatic setup diagnostic must be at most {MAX_AUTOMATIC_SETUP_DIAGNOSTIC_BYTES} bytes and contain no NUL"
+        )));
+    }
+    match receipt.outcome {
+        AutomaticSetupOutcome::Applied | AutomaticSetupOutcome::Reverted => {
+            if receipt.proposal_sha256.is_none()
+                || receipt.applied_config_sha256.is_none()
+                || receipt.created_view_id.is_none()
+                || receipt.frozen.is_none()
+            {
+                return Err(MemoryError::InvalidData(
+                    "applied automatic setup receipt requires proposal/configuration hashes, created view, and frozen revision evidence".into(),
+                ));
+            }
+        }
+        _ => {
+            if receipt.applied_config_sha256.is_some() || receipt.created_view_id.is_some() {
+                return Err(MemoryError::InvalidData(
+                    "unapplied automatic setup receipt cannot name an applied configuration or created view".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_automatic_setup_receipt(receipt: &AutomaticSetupReceipt) -> Result<Vec<u8>, MemoryError> {
+    validate_automatic_setup_receipt(receipt)?;
+    let bytes = serde_json::to_vec(receipt).map_err(invalid)?;
+    if bytes.len() > MAX_AUTOMATIC_SETUP_RECEIPT_BYTES {
+        return Err(MemoryError::InvalidData(format!(
+            "automatic setup receipt exceeds {MAX_AUTOMATIC_SETUP_RECEIPT_BYTES} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn decode_automatic_setup_receipt(
+    source_id: &str,
+    policy_version: i64,
+    bytes: &[u8],
+    recorded_at_unix_nanos: i64,
+) -> Result<AutomaticSetupReceipt, MemoryError> {
+    if bytes.len() > MAX_AUTOMATIC_SETUP_RECEIPT_BYTES {
+        return Err(MemoryError::InvalidData(format!(
+            "automatic setup receipt exceeds {MAX_AUTOMATIC_SETUP_RECEIPT_BYTES} bytes"
+        )));
+    }
+    let source_id =
+        SourceId(Uuid::parse_str(source_id).map_err(|error| {
+            MemoryError::InvalidData(format!("invalid receipt source: {error}"))
+        })?);
+    let policy_version = u32::try_from(policy_version).map_err(|_| {
+        MemoryError::InvalidData("automatic setup policy version is out of range".into())
+    })?;
+    let receipt: AutomaticSetupReceipt = serde_json::from_slice(bytes).map_err(invalid)?;
+    validate_automatic_setup_receipt(&receipt)?;
+    if receipt.source_id != source_id
+        || receipt.policy_version != policy_version
+        || receipt.recorded_at_unix_nanos != recorded_at_unix_nanos
+    {
+        return Err(MemoryError::InvalidData(
+            "automatic setup receipt does not match its durable key/evidence".into(),
+        ));
+    }
+    Ok(receipt)
+}
+
 fn invalid(e: serde_json::Error) -> MemoryError {
     MemoryError::InvalidData(e.to_string())
 }

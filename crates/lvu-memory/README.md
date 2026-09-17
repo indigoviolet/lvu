@@ -9,7 +9,17 @@ An application-owned workspace directory contains `workspace.sqlite3` and a
 `recipes/` directory. Recipe paths are derived only from `RecipeId` UUIDs, never
 from user-visible names. TOML is authoritative for explicit recipe saves/imports;
 SQLite is authoritative for working view drafts, applied state, navigation,
-source observations, usage, and suggestion outcomes.
+source observations, usage, suggestion outcomes, and bounded automatic-setup
+receipts. A receipt stores only source/view identities, revision evidence,
+configuration digests, terminal outcome and a bounded diagnostic; it never
+stores the sampled records or raw log data. Its source/policy key prevents an
+automatic analysis from rerunning on every restart, while its generated-view
+identity and configuration digest make revert fail closed after a manual edit.
+
+Automatic-setup receipts use an additive auxiliary table rather than advancing
+the workspace schema. Older binaries ignore and preserve that table. New readers
+validate the JSON schema, durable key and bounds before use, and report malformed
+or future receipts without deleting or rewriting them.
 
 An explicit recipe save takes the recipe-directory publication lock, validates
 the immutable revision against SQLite, starts an immediate transaction, compares
