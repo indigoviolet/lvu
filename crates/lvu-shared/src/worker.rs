@@ -1999,6 +1999,106 @@ impl WorkerService {
         }
     }
 
+    pub async fn mediated_get_automatic_setup_receipt(
+        &self,
+        request_id: String,
+        source_id: SourceId,
+        policy_version: u32,
+    ) -> StoreEvent {
+        match self
+            .with_store(move |store| {
+                store
+                    .get_automatic_setup_receipt(source_id, policy_version)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+        {
+            Ok(receipt) => StoreEvent::AutomaticSetupReceiptLoaded {
+                request_id,
+                source_id,
+                policy_version,
+                receipt,
+            },
+            Err(reason) => StoreEvent::AutomaticSetupReceiptFailed {
+                request_id,
+                source_id,
+                policy_version,
+                operation: AutomaticSetupReceiptOperation::Load,
+                reason,
+            },
+        }
+    }
+
+    pub async fn mediated_upsert_automatic_setup_receipt(
+        &self,
+        request_id: String,
+        receipt: lvu_memory::AutomaticSetupReceipt,
+    ) -> StoreEvent {
+        let source_id = receipt.source_id;
+        let policy_version = receipt.policy_version;
+        match self
+            .with_store(move |store| {
+                store
+                    .upsert_automatic_setup_receipt(&receipt)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+        {
+            Ok(()) => StoreEvent::AutomaticSetupReceiptStored {
+                request_id,
+                source_id,
+                policy_version,
+            },
+            Err(reason) => StoreEvent::AutomaticSetupReceiptFailed {
+                request_id,
+                source_id,
+                policy_version,
+                operation: AutomaticSetupReceiptOperation::Upsert,
+                reason,
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mediated_mark_automatic_setup_reverted(
+        &self,
+        request_id: String,
+        source_id: SourceId,
+        policy_version: u32,
+        expected_view_id: lvu_core::ViewId,
+        expected_config_sha256: String,
+        recorded_at_unix_nanos: i64,
+    ) -> StoreEvent {
+        match self
+            .with_store(move |store| {
+                store
+                    .mark_automatic_setup_reverted(
+                        source_id,
+                        policy_version,
+                        expected_view_id,
+                        &expected_config_sha256,
+                        recorded_at_unix_nanos,
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .await
+        {
+            Ok(changed) => StoreEvent::AutomaticSetupReceiptReverted {
+                request_id,
+                source_id,
+                policy_version,
+                changed,
+            },
+            Err(reason) => StoreEvent::AutomaticSetupReceiptFailed {
+                request_id,
+                source_id,
+                policy_version,
+                operation: AutomaticSetupReceiptOperation::Revert,
+                reason,
+            },
+        }
+    }
+
     /// Admit one union commit attempt and settle it against live fences:
     /// `commit` decides (immediate answer or a verify epoch), a `Verify`
     /// observes current fences under held publication guards and settles
@@ -2196,6 +2296,42 @@ impl WorkerService {
                 request_id,
                 window_id: _,
             } => self.mediated_recent(request_id).await,
+            StoreMethod::GetAutomaticSetupReceipt {
+                request_id,
+                window_id: _,
+                source_id,
+                policy_version,
+            } => {
+                self.mediated_get_automatic_setup_receipt(request_id, source_id, policy_version)
+                    .await
+            }
+            StoreMethod::UpsertAutomaticSetupReceipt {
+                request_id,
+                window_id: _,
+                receipt,
+            } => {
+                self.mediated_upsert_automatic_setup_receipt(request_id, receipt)
+                    .await
+            }
+            StoreMethod::MarkAutomaticSetupReverted {
+                request_id,
+                window_id: _,
+                source_id,
+                policy_version,
+                expected_view_id,
+                expected_config_sha256,
+                recorded_at_unix_nanos,
+            } => {
+                self.mediated_mark_automatic_setup_reverted(
+                    request_id,
+                    source_id,
+                    policy_version,
+                    expected_view_id,
+                    expected_config_sha256,
+                    recorded_at_unix_nanos,
+                )
+                .await
+            }
             StoreMethod::ListRecipes {
                 request_id,
                 window_id: _,
@@ -2339,6 +2475,41 @@ fn store_failure(method: StoreMethod, reason: String, worker_session: &str) -> S
             reason,
         },
         StoreMethod::Recent { request_id, .. } => StoreEvent::RecentFailed { request_id, reason },
+        StoreMethod::GetAutomaticSetupReceipt {
+            request_id,
+            source_id,
+            policy_version,
+            ..
+        } => StoreEvent::AutomaticSetupReceiptFailed {
+            request_id,
+            source_id,
+            policy_version,
+            operation: AutomaticSetupReceiptOperation::Load,
+            reason,
+        },
+        StoreMethod::UpsertAutomaticSetupReceipt {
+            request_id,
+            receipt,
+            ..
+        } => StoreEvent::AutomaticSetupReceiptFailed {
+            request_id,
+            source_id: receipt.source_id,
+            policy_version: receipt.policy_version,
+            operation: AutomaticSetupReceiptOperation::Upsert,
+            reason,
+        },
+        StoreMethod::MarkAutomaticSetupReverted {
+            request_id,
+            source_id,
+            policy_version,
+            ..
+        } => StoreEvent::AutomaticSetupReceiptFailed {
+            request_id,
+            source_id,
+            policy_version,
+            operation: AutomaticSetupReceiptOperation::Revert,
+            reason,
+        },
         StoreMethod::ListRecipes {
             request_id, meta, ..
         }
@@ -2449,6 +2620,41 @@ fn store_timeout(method: &StoreMethod, timeout: std::time::Duration) -> StoreEve
         },
         StoreMethod::Recent { request_id, .. } => StoreEvent::RecentFailed {
             request_id: request_id.clone(),
+            reason,
+        },
+        StoreMethod::GetAutomaticSetupReceipt {
+            request_id,
+            source_id,
+            policy_version,
+            ..
+        } => StoreEvent::AutomaticSetupReceiptFailed {
+            request_id: request_id.clone(),
+            source_id: *source_id,
+            policy_version: *policy_version,
+            operation: AutomaticSetupReceiptOperation::Load,
+            reason,
+        },
+        StoreMethod::UpsertAutomaticSetupReceipt {
+            request_id,
+            receipt,
+            ..
+        } => StoreEvent::AutomaticSetupReceiptFailed {
+            request_id: request_id.clone(),
+            source_id: receipt.source_id,
+            policy_version: receipt.policy_version,
+            operation: AutomaticSetupReceiptOperation::Upsert,
+            reason,
+        },
+        StoreMethod::MarkAutomaticSetupReverted {
+            request_id,
+            source_id,
+            policy_version,
+            ..
+        } => StoreEvent::AutomaticSetupReceiptFailed {
+            request_id: request_id.clone(),
+            source_id: *source_id,
+            policy_version: *policy_version,
+            operation: AutomaticSetupReceiptOperation::Revert,
             reason,
         },
         StoreMethod::ListRecipes {
@@ -3777,6 +3983,9 @@ mod tests {
                 | StoreMethod::DeleteView { request_id, .. }
                 | StoreMethod::RemoveSource { request_id, .. }
                 | StoreMethod::Recent { request_id, .. }
+                | StoreMethod::GetAutomaticSetupReceipt { request_id, .. }
+                | StoreMethod::UpsertAutomaticSetupReceipt { request_id, .. }
+                | StoreMethod::MarkAutomaticSetupReverted { request_id, .. }
                 | StoreMethod::ListRecipes { request_id, .. }
                 | StoreMethod::RecipeHistory { request_id, .. }
                 | StoreMethod::SaveRecipe { request_id, .. }

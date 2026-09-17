@@ -42,10 +42,10 @@ pub use feed::{DEFAULT_FEED_INTERVAL, feed_once, serve_feed};
 pub use frame::{FrameDecoder, FrameError, decode_frame, encode_frame};
 pub use lifetime::{ViewerAdmission, ViewerSet};
 pub use protocol::{
-    PROTOCOL_VERSION, ProtocolError, RequestMeta, SourceSummary, StoreEvent, StoreMethod,
-    SuggestionContextShape, SuggestionOutcomeShape, WorkerEvent, WorkerRequest,
-    base64_decode_bounded, base64_encode, check_stdin_chunk_base64, check_stdin_open,
-    check_store_size, decoded_base64_len, validate_inbound,
+    AutomaticSetupReceiptOperation, PROTOCOL_VERSION, ProtocolError, RequestMeta, SourceSummary,
+    StoreEvent, StoreMethod, SuggestionContextShape, SuggestionOutcomeShape, WorkerEvent,
+    WorkerRequest, base64_decode_bounded, base64_encode, check_stdin_chunk_base64,
+    check_stdin_open, check_store_size, decoded_base64_len, validate_inbound,
 };
 pub use remote::{AnySourceHandle, RemoteConfig, RemoteSourceHandle};
 pub use session::SaveBases;

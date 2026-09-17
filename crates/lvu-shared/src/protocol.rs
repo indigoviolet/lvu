@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 /// Wire protocol version. A window refuses a worker on mismatch with an
 /// explicit error rather than guessing field meanings.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Lifecycle and acquisition traffic: window to worker.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -255,6 +255,26 @@ pub enum StoreMethod {
         request_id: String,
         window_id: String,
     },
+    GetAutomaticSetupReceipt {
+        request_id: String,
+        window_id: String,
+        source_id: lvu_core::SourceId,
+        policy_version: u32,
+    },
+    UpsertAutomaticSetupReceipt {
+        request_id: String,
+        window_id: String,
+        receipt: lvu_memory::AutomaticSetupReceipt,
+    },
+    MarkAutomaticSetupReverted {
+        request_id: String,
+        window_id: String,
+        source_id: lvu_core::SourceId,
+        policy_version: u32,
+        expected_view_id: lvu_core::ViewId,
+        expected_config_sha256: String,
+        recorded_at_unix_nanos: i64,
+    },
     ListRecipes {
         request_id: String,
         window_id: String,
@@ -359,6 +379,9 @@ impl StoreMethod {
             | StoreMethod::DeleteView { window_id, .. }
             | StoreMethod::RemoveSource { window_id, .. }
             | StoreMethod::Recent { window_id, .. }
+            | StoreMethod::GetAutomaticSetupReceipt { window_id, .. }
+            | StoreMethod::UpsertAutomaticSetupReceipt { window_id, .. }
+            | StoreMethod::MarkAutomaticSetupReverted { window_id, .. }
             | StoreMethod::ListRecipes { window_id, .. }
             | StoreMethod::RecipeHistory { window_id, .. }
             | StoreMethod::SaveRecipe { window_id, .. }
@@ -383,6 +406,9 @@ impl StoreMethod {
             | StoreMethod::DeleteView { request_id, .. }
             | StoreMethod::RemoveSource { request_id, .. }
             | StoreMethod::Recent { request_id, .. }
+            | StoreMethod::GetAutomaticSetupReceipt { request_id, .. }
+            | StoreMethod::UpsertAutomaticSetupReceipt { request_id, .. }
+            | StoreMethod::MarkAutomaticSetupReverted { request_id, .. }
             | StoreMethod::ListRecipes { request_id, .. }
             | StoreMethod::RecipeHistory { request_id, .. }
             | StoreMethod::SaveRecipe { request_id, .. }
@@ -470,6 +496,30 @@ pub enum StoreEvent {
         request_id: String,
         reason: String,
     },
+    AutomaticSetupReceiptLoaded {
+        request_id: String,
+        source_id: lvu_core::SourceId,
+        policy_version: u32,
+        receipt: Option<lvu_memory::AutomaticSetupReceipt>,
+    },
+    AutomaticSetupReceiptStored {
+        request_id: String,
+        source_id: lvu_core::SourceId,
+        policy_version: u32,
+    },
+    AutomaticSetupReceiptReverted {
+        request_id: String,
+        source_id: lvu_core::SourceId,
+        policy_version: u32,
+        changed: bool,
+    },
+    AutomaticSetupReceiptFailed {
+        request_id: String,
+        source_id: lvu_core::SourceId,
+        policy_version: u32,
+        operation: AutomaticSetupReceiptOperation,
+        reason: String,
+    },
     Recipes {
         request_id: String,
         meta: RequestMeta,
@@ -527,6 +577,14 @@ pub enum StoreEvent {
     Fatal {
         reason: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticSetupReceiptOperation {
+    Load,
+    Upsert,
+    Revert,
 }
 
 /// Field-identical to `union_commit::StatusAnswer`; collapses to it if that

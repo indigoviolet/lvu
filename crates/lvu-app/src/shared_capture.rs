@@ -68,7 +68,9 @@ use lvu_shared::{
     SuggestionOutcomeShape, WorkerClient,
 };
 
-use crate::memory::{Event as MemoryEvent, SaveRequest, SuggestionContext};
+use crate::memory::{
+    AutomaticSetupReceiptOperation, Event as MemoryEvent, SaveRequest, SuggestionContext,
+};
 
 /// Routing predicate for acquisition: a definition goes through the
 /// worker exactly when a shared session exists and the acquisition is
@@ -895,6 +897,156 @@ impl SharedStore {
         }
     }
 
+    pub async fn get_automatic_setup_receipt(
+        &self,
+        correlation_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+    ) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
+        let event = self
+            .client
+            .lock()
+            .await
+            .store(StoreMethod::GetAutomaticSetupReceipt {
+                request_id,
+                window_id: String::new(),
+                source_id,
+                policy_version,
+            })
+            .await?;
+        match event {
+            StoreEvent::AutomaticSetupReceiptLoaded {
+                source_id,
+                policy_version,
+                receipt,
+                ..
+            } => Ok(MemoryEvent::AutomaticSetupReceiptLoaded {
+                request_id: correlation_id,
+                source_id,
+                policy_version,
+                receipt: receipt.map(Box::new),
+            }),
+            StoreEvent::AutomaticSetupReceiptFailed {
+                source_id,
+                policy_version,
+                operation,
+                reason,
+                ..
+            } => Ok(MemoryEvent::AutomaticSetupReceiptFailed {
+                request_id: correlation_id,
+                source_id,
+                policy_version,
+                operation: app_receipt_operation(operation),
+                reason,
+            }),
+            unexpected => Err(unexpected_reply("get-automatic-setup-receipt", &unexpected)),
+        }
+    }
+
+    pub async fn upsert_automatic_setup_receipt(
+        &self,
+        correlation_id: u64,
+        receipt: lvu_memory::AutomaticSetupReceipt,
+    ) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
+        let event = self
+            .client
+            .lock()
+            .await
+            .store(StoreMethod::UpsertAutomaticSetupReceipt {
+                request_id,
+                window_id: String::new(),
+                receipt,
+            })
+            .await?;
+        match event {
+            StoreEvent::AutomaticSetupReceiptStored {
+                source_id,
+                policy_version,
+                ..
+            } => Ok(MemoryEvent::AutomaticSetupReceiptStored {
+                request_id: correlation_id,
+                source_id,
+                policy_version,
+            }),
+            StoreEvent::AutomaticSetupReceiptFailed {
+                source_id,
+                policy_version,
+                operation,
+                reason,
+                ..
+            } => Ok(MemoryEvent::AutomaticSetupReceiptFailed {
+                request_id: correlation_id,
+                source_id,
+                policy_version,
+                operation: app_receipt_operation(operation),
+                reason,
+            }),
+            unexpected => Err(unexpected_reply(
+                "upsert-automatic-setup-receipt",
+                &unexpected,
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mark_automatic_setup_reverted(
+        &self,
+        correlation_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+        expected_view_id: ViewId,
+        expected_config_sha256: String,
+        recorded_at_unix_nanos: i64,
+    ) -> Result<MemoryEvent, String> {
+        let request_id = self.take_request_id();
+        let event = self
+            .client
+            .lock()
+            .await
+            .store(StoreMethod::MarkAutomaticSetupReverted {
+                request_id,
+                window_id: String::new(),
+                source_id,
+                policy_version,
+                expected_view_id,
+                expected_config_sha256,
+                recorded_at_unix_nanos,
+            })
+            .await?;
+        match event {
+            StoreEvent::AutomaticSetupReceiptReverted {
+                source_id,
+                policy_version,
+                changed,
+                ..
+            } => Ok(MemoryEvent::AutomaticSetupReceiptReverted {
+                request_id: correlation_id,
+                source_id,
+                policy_version,
+                changed,
+            }),
+            StoreEvent::AutomaticSetupReceiptFailed {
+                source_id,
+                policy_version,
+                operation,
+                reason,
+                ..
+            } => Ok(MemoryEvent::AutomaticSetupReceiptFailed {
+                request_id: correlation_id,
+                source_id,
+                policy_version,
+                operation: app_receipt_operation(operation),
+                reason,
+            }),
+            unexpected => Err(unexpected_reply(
+                "mark-automatic-setup-reverted",
+                &unexpected,
+            )),
+        }
+    }
+
     /// Recipe catalogue lookup through the worker (enrichment flows use the
     /// same mediated path, so assistance capabilities are preserved).
     pub async fn list_recipes(
@@ -1085,6 +1237,20 @@ fn wire_meta(meta: &RecipeRequestMeta) -> lvu_shared::RequestMeta {
         request_id: meta.request_id,
         dialog_id: meta.dialog_id,
         dialog_revision: meta.dialog_revision,
+    }
+}
+
+fn app_receipt_operation(
+    operation: lvu_shared::AutomaticSetupReceiptOperation,
+) -> AutomaticSetupReceiptOperation {
+    match operation {
+        lvu_shared::AutomaticSetupReceiptOperation::Load => AutomaticSetupReceiptOperation::Load,
+        lvu_shared::AutomaticSetupReceiptOperation::Upsert => {
+            AutomaticSetupReceiptOperation::Upsert
+        }
+        lvu_shared::AutomaticSetupReceiptOperation::Revert => {
+            AutomaticSetupReceiptOperation::Revert
+        }
     }
 }
 

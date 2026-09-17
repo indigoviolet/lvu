@@ -5008,6 +5008,17 @@ impl Composition {
                 self.abort_source_remove(app, source_id, error);
             }
             MemoryEvent::Recent(values) => self.recent_sources = values,
+            MemoryEvent::AutomaticSetupReceiptLoaded { .. }
+            | MemoryEvent::AutomaticSetupReceiptStored { .. }
+            | MemoryEvent::AutomaticSetupReceiptReverted { .. } => {
+                // Receipt transport is available before the automatic-setup
+                // controller owns pending correlations. The upcoming policy
+                // wiring consumes these acknowledgements; there is no honest
+                // user-visible action to fabricate here meanwhile.
+            }
+            MemoryEvent::AutomaticSetupReceiptFailed { reason, .. } => {
+                memory_notice(app, format!("automatic setup receipt: {reason}"));
+            }
             MemoryEvent::Recipes(meta, values, candidates) => {
                 let mut items: Vec<_> = values
                     .into_iter()

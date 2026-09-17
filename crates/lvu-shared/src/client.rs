@@ -1284,6 +1284,10 @@ fn store_event_request_id(event: &StoreEvent) -> Option<&str> {
         | StoreEvent::SourceRemoveFailed { request_id, .. }
         | StoreEvent::Recent { request_id, .. }
         | StoreEvent::RecentFailed { request_id, .. }
+        | StoreEvent::AutomaticSetupReceiptLoaded { request_id, .. }
+        | StoreEvent::AutomaticSetupReceiptStored { request_id, .. }
+        | StoreEvent::AutomaticSetupReceiptReverted { request_id, .. }
+        | StoreEvent::AutomaticSetupReceiptFailed { request_id, .. }
         | StoreEvent::Recipes { request_id, .. }
         | StoreEvent::RecipeHistory { request_id, .. }
         | StoreEvent::RecipeSaved { request_id, .. }
@@ -1398,6 +1402,15 @@ fn set_store_window(method: &mut StoreMethod, window_id: &str) {
             window_id: slot, ..
         }
         | StoreMethod::Recent {
+            window_id: slot, ..
+        }
+        | StoreMethod::GetAutomaticSetupReceipt {
+            window_id: slot, ..
+        }
+        | StoreMethod::UpsertAutomaticSetupReceipt {
+            window_id: slot, ..
+        }
+        | StoreMethod::MarkAutomaticSetupReverted {
             window_id: slot, ..
         }
         | StoreMethod::ListRecipes {

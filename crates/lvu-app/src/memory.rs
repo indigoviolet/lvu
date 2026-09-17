@@ -14,8 +14,8 @@ use lvu::app::RecipeOutcome;
 use lvu::{PersistentViewState, RecipeRequestMeta};
 use lvu_core::{RecordId, SourceDefinition, SourceId, ViewId};
 use lvu_memory::{
-    DraftState, NavigationState, PresentationState, RecipeCandidate, RecipeFile, SavedRecipe,
-    SourceMetadata, SuggestionOutcome, WorkingView, WorkspaceStore,
+    AutomaticSetupReceipt, DraftState, NavigationState, PresentationState, RecipeCandidate,
+    RecipeFile, SavedRecipe, SourceMetadata, SuggestionOutcome, WorkingView, WorkspaceStore,
 };
 
 #[derive(Clone, Debug)]
@@ -78,6 +78,23 @@ enum Command {
         source_id: SourceId,
     },
     Recent,
+    GetAutomaticSetupReceipt {
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+    },
+    UpsertAutomaticSetupReceipt {
+        request_id: u64,
+        receipt: Box<AutomaticSetupReceipt>,
+    },
+    MarkAutomaticSetupReverted {
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+        expected_view_id: ViewId,
+        expected_config_sha256: String,
+        recorded_at_unix_nanos: i64,
+    },
     ListRecipes(RecipeRequestMeta, Option<SuggestionContext>),
     RecipeHistory(RecipeRequestMeta, lvu_core::RecipeId),
     SaveRecipe(
@@ -116,6 +133,30 @@ pub enum Event {
     SourceRemoveFailed(SourceId, String),
     Recent(Vec<SourceMetadata>),
     RecentFailed(String),
+    AutomaticSetupReceiptLoaded {
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+        receipt: Option<Box<AutomaticSetupReceipt>>,
+    },
+    AutomaticSetupReceiptStored {
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+    },
+    AutomaticSetupReceiptReverted {
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+        changed: bool,
+    },
+    AutomaticSetupReceiptFailed {
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+        operation: AutomaticSetupReceiptOperation,
+        reason: String,
+    },
     Recipes(
         RecipeRequestMeta,
         Vec<(RecipeFile, String)>,
@@ -127,6 +168,13 @@ pub enum Event {
     RecipeFailed(RecipeRequestMeta, String),
     SuggestionFailed(String),
     Fatal(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomaticSetupReceiptOperation {
+    Load,
+    Upsert,
+    Revert,
 }
 
 pub struct MemoryWorker {
@@ -199,6 +247,53 @@ impl MemoryWorker {
 
     pub fn recent(&self) -> Result<(), String> {
         self.tx.try_send(Command::Recent).map_err(queue_error)
+    }
+    pub fn get_automatic_setup_receipt(
+        &self,
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+    ) -> Result<(), String> {
+        self.tx
+            .try_send(Command::GetAutomaticSetupReceipt {
+                request_id,
+                source_id,
+                policy_version,
+            })
+            .map_err(queue_error)
+    }
+    pub fn upsert_automatic_setup_receipt(
+        &self,
+        request_id: u64,
+        receipt: AutomaticSetupReceipt,
+    ) -> Result<(), String> {
+        self.tx
+            .try_send(Command::UpsertAutomaticSetupReceipt {
+                request_id,
+                receipt: Box::new(receipt),
+            })
+            .map_err(queue_error)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_automatic_setup_reverted(
+        &self,
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+        expected_view_id: ViewId,
+        expected_config_sha256: String,
+        recorded_at_unix_nanos: i64,
+    ) -> Result<(), String> {
+        self.tx
+            .try_send(Command::MarkAutomaticSetupReverted {
+                request_id,
+                source_id,
+                policy_version,
+                expected_view_id,
+                expected_config_sha256,
+                recorded_at_unix_nanos,
+            })
+            .map_err(queue_error)
     }
     pub fn list_recipes(
         &self,
@@ -466,6 +561,60 @@ impl Memory {
             Memory::Shared(shared) => shared.recent(),
         }
     }
+    pub fn get_automatic_setup_receipt(
+        &self,
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+    ) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => {
+                worker.get_automatic_setup_receipt(request_id, source_id, policy_version)
+            }
+            Memory::Shared(shared) => {
+                shared.get_automatic_setup_receipt(request_id, source_id, policy_version)
+            }
+        }
+    }
+    pub fn upsert_automatic_setup_receipt(
+        &self,
+        request_id: u64,
+        receipt: AutomaticSetupReceipt,
+    ) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.upsert_automatic_setup_receipt(request_id, receipt),
+            Memory::Shared(shared) => shared.upsert_automatic_setup_receipt(request_id, receipt),
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_automatic_setup_reverted(
+        &self,
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+        expected_view_id: ViewId,
+        expected_config_sha256: String,
+        recorded_at_unix_nanos: i64,
+    ) -> Result<(), String> {
+        match self {
+            Memory::Local(worker) => worker.mark_automatic_setup_reverted(
+                request_id,
+                source_id,
+                policy_version,
+                expected_view_id,
+                expected_config_sha256,
+                recorded_at_unix_nanos,
+            ),
+            Memory::Shared(shared) => shared.mark_automatic_setup_reverted(
+                request_id,
+                source_id,
+                policy_version,
+                expected_view_id,
+                expected_config_sha256,
+                recorded_at_unix_nanos,
+            ),
+        }
+    }
     pub fn list_recipes(
         &self,
         meta: RecipeRequestMeta,
@@ -634,6 +783,62 @@ impl SharedMemory {
             return Err("shared store stopped".into());
         }
         self.tx.try_send(Command::Recent).map_err(queue_error)
+    }
+    fn get_automatic_setup_receipt(
+        &self,
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+    ) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::GetAutomaticSetupReceipt {
+                request_id,
+                source_id,
+                policy_version,
+            })
+            .map_err(queue_error)
+    }
+    fn upsert_automatic_setup_receipt(
+        &self,
+        request_id: u64,
+        receipt: AutomaticSetupReceipt,
+    ) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::UpsertAutomaticSetupReceipt {
+                request_id,
+                receipt: Box::new(receipt),
+            })
+            .map_err(queue_error)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn mark_automatic_setup_reverted(
+        &self,
+        request_id: u64,
+        source_id: SourceId,
+        policy_version: u32,
+        expected_view_id: ViewId,
+        expected_config_sha256: String,
+        recorded_at_unix_nanos: i64,
+    ) -> Result<(), String> {
+        if !self.accepted() {
+            return Err("shared store stopped".into());
+        }
+        self.tx
+            .try_send(Command::MarkAutomaticSetupReverted {
+                request_id,
+                source_id,
+                policy_version,
+                expected_view_id,
+                expected_config_sha256,
+                recorded_at_unix_nanos,
+            })
+            .map_err(queue_error)
     }
     fn list_recipes(
         &self,
@@ -822,6 +1027,7 @@ fn shared_worker(
         // undurable state.
         let mut failed: HashMap<ViewId, String> = HashMap::new();
         let mut recipe_failure: Option<String> = None;
+        let mut automatic_setup_receipt_failure: Option<String> = None;
         while let Ok(command) = commands.recv() {
             match command {
                 Command::Load(definition, view_id) => {
@@ -900,6 +1106,98 @@ fn shared_worker(
                         Ok(event) => event,
                         Err(error) => Event::RecentFailed(error),
                     };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::GetAutomaticSetupReceipt {
+                    request_id,
+                    source_id,
+                    policy_version,
+                } => {
+                    let event = match store
+                        .get_automatic_setup_receipt(request_id, source_id, policy_version)
+                        .await
+                    {
+                        Ok(event) => event,
+                        Err(reason) => Event::AutomaticSetupReceiptFailed {
+                            request_id,
+                            source_id,
+                            policy_version,
+                            operation: AutomaticSetupReceiptOperation::Load,
+                            reason,
+                        },
+                    };
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::UpsertAutomaticSetupReceipt {
+                    request_id,
+                    receipt,
+                } => {
+                    let (source_id, policy_version) = (receipt.source_id, receipt.policy_version);
+                    let event = match store
+                        .upsert_automatic_setup_receipt(request_id, *receipt)
+                        .await
+                    {
+                        Ok(event @ Event::AutomaticSetupReceiptStored { .. }) => {
+                            automatic_setup_receipt_failure = None;
+                            event
+                        }
+                        Ok(event) => event,
+                        Err(reason) => Event::AutomaticSetupReceiptFailed {
+                            request_id,
+                            source_id,
+                            policy_version,
+                            operation: AutomaticSetupReceiptOperation::Upsert,
+                            reason,
+                        },
+                    };
+                    if let Event::AutomaticSetupReceiptFailed { reason, .. } = &event {
+                        automatic_setup_receipt_failure =
+                            Some(format!("automatic setup receipt: {reason}"));
+                    }
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                }
+                Command::MarkAutomaticSetupReverted {
+                    request_id,
+                    source_id,
+                    policy_version,
+                    expected_view_id,
+                    expected_config_sha256,
+                    recorded_at_unix_nanos,
+                } => {
+                    let event = match store
+                        .mark_automatic_setup_reverted(
+                            request_id,
+                            source_id,
+                            policy_version,
+                            expected_view_id,
+                            expected_config_sha256,
+                            recorded_at_unix_nanos,
+                        )
+                        .await
+                    {
+                        Ok(event @ Event::AutomaticSetupReceiptReverted { .. }) => {
+                            automatic_setup_receipt_failure = None;
+                            event
+                        }
+                        Ok(event) => event,
+                        Err(reason) => Event::AutomaticSetupReceiptFailed {
+                            request_id,
+                            source_id,
+                            policy_version,
+                            operation: AutomaticSetupReceiptOperation::Revert,
+                            reason,
+                        },
+                    };
+                    if let Event::AutomaticSetupReceiptFailed { reason, .. } = &event {
+                        automatic_setup_receipt_failure =
+                            Some(format!("automatic setup receipt: {reason}"));
+                    }
                     if events.send(event).is_err() {
                         break;
                     }
@@ -1010,6 +1308,8 @@ fn shared_worker(
                     // everything accepted before this command.
                     let result = if let Some(error) = &recipe_failure {
                         Err(error.clone())
+                    } else if let Some(error) = &automatic_setup_receipt_failure {
+                        Err(error.clone())
                     } else if failed.is_empty() {
                         Ok(())
                     } else {
@@ -1074,6 +1374,7 @@ fn worker(
     let mut newest: HashMap<ViewId, u64> = HashMap::new();
     let mut failed: HashMap<ViewId, String> = HashMap::new();
     let mut recipe_failure: Option<String> = None;
+    let mut automatic_setup_receipt_failure: Option<String> = None;
     // One-entry lookahead so a Save can drain the Saves queued directly
     // behind it into a single commit instead of one commit per queued save.
     let mut stash: Option<Command> = None;
@@ -1465,6 +1766,102 @@ fn worker(
                     }
                 }
             },
+            Command::GetAutomaticSetupReceipt {
+                request_id,
+                source_id,
+                policy_version,
+            } => {
+                let event = match store.get_automatic_setup_receipt(source_id, policy_version) {
+                    Ok(receipt) => Event::AutomaticSetupReceiptLoaded {
+                        request_id,
+                        source_id,
+                        policy_version,
+                        receipt: receipt.map(Box::new),
+                    },
+                    Err(error) => Event::AutomaticSetupReceiptFailed {
+                        request_id,
+                        source_id,
+                        policy_version,
+                        operation: AutomaticSetupReceiptOperation::Load,
+                        reason: error.to_string(),
+                    },
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
+            Command::UpsertAutomaticSetupReceipt {
+                request_id,
+                receipt,
+            } => {
+                let (source_id, policy_version) = (receipt.source_id, receipt.policy_version);
+                let event = match store.upsert_automatic_setup_receipt(&receipt) {
+                    Ok(()) => {
+                        automatic_setup_receipt_failure = None;
+                        Event::AutomaticSetupReceiptStored {
+                            request_id,
+                            source_id,
+                            policy_version,
+                        }
+                    }
+                    Err(error) => {
+                        let reason = error.to_string();
+                        automatic_setup_receipt_failure =
+                            Some(format!("automatic setup receipt: {reason}"));
+                        Event::AutomaticSetupReceiptFailed {
+                            request_id,
+                            source_id,
+                            policy_version,
+                            operation: AutomaticSetupReceiptOperation::Upsert,
+                            reason,
+                        }
+                    }
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
+            Command::MarkAutomaticSetupReverted {
+                request_id,
+                source_id,
+                policy_version,
+                expected_view_id,
+                expected_config_sha256,
+                recorded_at_unix_nanos,
+            } => {
+                let event = match store.mark_automatic_setup_reverted(
+                    source_id,
+                    policy_version,
+                    expected_view_id,
+                    &expected_config_sha256,
+                    recorded_at_unix_nanos,
+                ) {
+                    Ok(changed) => {
+                        automatic_setup_receipt_failure = None;
+                        Event::AutomaticSetupReceiptReverted {
+                            request_id,
+                            source_id,
+                            policy_version,
+                            changed,
+                        }
+                    }
+                    Err(error) => {
+                        let reason = error.to_string();
+                        automatic_setup_receipt_failure =
+                            Some(format!("automatic setup receipt: {reason}"));
+                        Event::AutomaticSetupReceiptFailed {
+                            request_id,
+                            source_id,
+                            policy_version,
+                            operation: AutomaticSetupReceiptOperation::Revert,
+                            reason,
+                        }
+                    }
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
             Command::ListRecipes(meta, context) => match store.list_recipes(128) {
                 Ok(values) => {
                     let candidates = context.map_or_else(
@@ -1615,6 +2012,8 @@ fn worker(
             }
             Command::Flush(done) => {
                 let result = if let Some(error) = &recipe_failure {
+                    Err(error.clone())
+                } else if let Some(error) = &automatic_setup_receipt_failure {
                     Err(error.clone())
                 } else if failed.is_empty() {
                     Ok(())
@@ -2490,6 +2889,27 @@ mod tests {
                 follow: true,
                 ..PersistentViewState::default()
             },
+        }
+    }
+
+    fn automatic_setup_receipt(source_id: SourceId) -> AutomaticSetupReceipt {
+        AutomaticSetupReceipt {
+            schema_version: lvu_memory::AUTOMATIC_SETUP_RECEIPT_SCHEMA_VERSION,
+            source_id,
+            policy_version: lvu_memory::AUTOMATIC_SETUP_POLICY_VERSION,
+            outcome: lvu_memory::AutomaticSetupOutcome::Applied,
+            proposal_sha256: Some("11".repeat(32)),
+            applied_config_sha256: Some("22".repeat(32)),
+            created_view_id: Some(ViewId::new()),
+            frozen: Some(lvu_memory::AutomaticSetupFrozenRevision {
+                origin_view_id: ViewId::new(),
+                persisted_view_version: 3,
+                accepted_revision: 5,
+                source_generation: 7,
+                data_revision: 11,
+            }),
+            diagnostic: Some("installed Enhanced view".into()),
+            recorded_at_unix_nanos: 13,
         }
     }
 
@@ -3373,6 +3793,94 @@ mod tests {
     }
     struct AdmitAllShared;
 
+    #[test]
+    fn local_receipt_commands_round_trip_revert_and_survive_restart() {
+        let root = TempDir::new().unwrap();
+        let source_id = SourceId::new();
+        let receipt = automatic_setup_receipt(source_id);
+        let expected_view_id = receipt.created_view_id.unwrap();
+        let expected_hash = receipt.applied_config_sha256.clone().unwrap();
+        let mut worker = MemoryWorker::start(root.path().to_path_buf());
+
+        worker
+            .get_automatic_setup_receipt(1, source_id, receipt.policy_version)
+            .unwrap();
+        match worker.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Event::AutomaticSetupReceiptLoaded {
+                request_id: 1,
+                receipt: None,
+                ..
+            } => {}
+            other => panic!("expected empty receipt lookup, got {other:?}"),
+        }
+        worker
+            .upsert_automatic_setup_receipt(2, receipt.clone())
+            .unwrap();
+        assert!(matches!(
+            worker.rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Event::AutomaticSetupReceiptStored { request_id: 2, .. }
+        ));
+        worker.stop().unwrap();
+
+        let mut reopened = MemoryWorker::start(root.path().to_path_buf());
+        reopened
+            .get_automatic_setup_receipt(3, source_id, receipt.policy_version)
+            .unwrap();
+        match reopened.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Event::AutomaticSetupReceiptLoaded {
+                request_id: 3,
+                receipt: Some(stored),
+                ..
+            } => assert_eq!(*stored, receipt),
+            other => panic!("expected persisted receipt, got {other:?}"),
+        }
+        reopened
+            .mark_automatic_setup_reverted(
+                4,
+                source_id,
+                receipt.policy_version,
+                expected_view_id,
+                "33".repeat(32),
+                17,
+            )
+            .unwrap();
+        assert!(matches!(
+            reopened.rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Event::AutomaticSetupReceiptFailed {
+                request_id: 4,
+                operation: AutomaticSetupReceiptOperation::Revert,
+                ..
+            }
+        ));
+        assert!(
+            reopened.flush(Duration::from_secs(5)).1.is_err(),
+            "a consumed mutation failure must keep flush failing closed"
+        );
+        reopened
+            .mark_automatic_setup_reverted(
+                5,
+                source_id,
+                receipt.policy_version,
+                expected_view_id,
+                expected_hash,
+                17,
+            )
+            .unwrap();
+        assert!(matches!(
+            reopened.rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Event::AutomaticSetupReceiptReverted {
+                request_id: 5,
+                changed: true,
+                ..
+            }
+        ));
+        reopened
+            .flush(Duration::from_secs(5))
+            .1
+            .expect("matching mutation success clears the failure");
+        reopened.stop().unwrap();
+    }
+
     impl lvu_shared::AdmissionHook for AdmitAllShared {
         fn admit(&self, _definition: &SourceDefinition) -> lvu_shared::AdmissionVerdict {
             lvu_shared::AdmissionVerdict::Admit
@@ -3457,6 +3965,76 @@ mod tests {
             other => panic!("expected loaded, got {other:?}"),
         }
         memory.stop().expect("clean stop joins");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_memory_receipt_commands_acknowledge_exact_mutations() {
+        let root = TempDir::new().unwrap();
+        let store = shared_fixture(root.path(), 6214).await;
+        let mut memory = SharedMemory::wrap(store);
+        let source_id = SourceId::new();
+        let receipt = automatic_setup_receipt(source_id);
+        let expected_view_id = receipt.created_view_id.unwrap();
+        let expected_hash = receipt.applied_config_sha256.clone().unwrap();
+
+        memory
+            .upsert_automatic_setup_receipt(41, receipt.clone())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(matches!(
+            poll_until(&memory, deadline, |event| matches!(
+                event,
+                Event::AutomaticSetupReceiptStored { request_id: 41, .. }
+            ))
+            .await,
+            Event::AutomaticSetupReceiptStored { request_id: 41, .. }
+        ));
+        memory
+            .get_automatic_setup_receipt(42, source_id, receipt.policy_version)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match poll_until(&memory, deadline, |event| {
+            matches!(
+                event,
+                Event::AutomaticSetupReceiptLoaded { request_id: 42, .. }
+            )
+        })
+        .await
+        {
+            Event::AutomaticSetupReceiptLoaded {
+                receipt: Some(stored),
+                ..
+            } => assert_eq!(*stored, receipt),
+            other => panic!("expected shared receipt, got {other:?}"),
+        }
+        memory
+            .mark_automatic_setup_reverted(
+                43,
+                source_id,
+                receipt.policy_version,
+                expected_view_id,
+                expected_hash,
+                19,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(matches!(
+            poll_until(&memory, deadline, |event| matches!(
+                event,
+                Event::AutomaticSetupReceiptReverted {
+                    request_id: 43,
+                    changed: true,
+                    ..
+                }
+            ))
+            .await,
+            Event::AutomaticSetupReceiptReverted {
+                request_id: 43,
+                changed: true,
+                ..
+            }
+        ));
+        memory.stop().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
