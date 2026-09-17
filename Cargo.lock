@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "lvu-app"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "fs2",
  "libc",

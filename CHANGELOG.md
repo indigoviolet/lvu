@@ -4,7 +4,7 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
-## Unreleased
+## v0.1.14 — 2026-09-17
 
 ### Features
 
