@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 export const SCHEMA_VERSION = 1 as const;
-export const proposalKinds = ["source", "sources", "filter", "enrichment", "view"] as const;
+export const proposalKinds = ["source", "sources", "filter", "enrichment", "view", "auto_setup"] as const;
 export type ProposalKind = typeof proposalKinds[number];
 export interface ProposalRevision { data: string; definition: string; }
 // The wider sample tier (docs/larger-ask-sample.md) sends up to 96 KiB inline.
@@ -62,7 +62,58 @@ export const viewDefinitionSchema = z.object({
   enrichments: z.array(z.object({ id: boundedText(128), source: boundedText(16_384) }).strict()).max(32).optional(),
 }).strict();
 
-const definitions = { source: sourceDefinitionSchema, sources: sourcesDefinitionSchema, filter: filterDefinitionSchema, enrichment: enrichmentDefinitionSchema, view: viewDefinitionSchema } as const;
+export const MAX_AUTO_SETUP_ENRICHMENTS = 8;
+export const MAX_AUTO_SETUP_PINS = 8;
+export const MAX_AUTO_SETUP_COLOR_RULES = 16;
+const autoSetupOutput = boundedText(64).refine(
+  (value) => value !== "raw" && !value.startsWith("_lvu_") && /^[A-Za-z0-9_]+$/.test(value),
+  "invalid or protected enrichment output",
+);
+const autoSetupEnrichment = z.object({
+  id: boundedText(128),
+  output: autoSetupOutput,
+  expression: boundedText(16_384).describe("One Python expression returning pl.Expr, without an assignment or executable step"),
+}).strict();
+const ruleColor = z.enum(["red", "orange", "yellow", "green", "cyan", "blue", "purple", "magenta"]);
+const autoSetupColorRule = z.object({
+  column: autoSetupOutput,
+  value: z.string().max(4096),
+  color: ruleColor,
+}).strict();
+const autoSetupGrouping = z.object({
+  mode: z.enum(["run", "filter"]),
+  column: autoSetupOutput,
+}).strict();
+export const autoSetupDefinitionSchema = z.object({
+  schema_version: z.literal(1),
+  enrichments: z.array(autoSetupEnrichment).max(MAX_AUTO_SETUP_ENRICHMENTS),
+  pinned_columns: z.array(autoSetupOutput).max(MAX_AUTO_SETUP_PINS),
+  color_rules: z.array(autoSetupColorRule).max(MAX_AUTO_SETUP_COLOR_RULES),
+  grouping: autoSetupGrouping.nullable(),
+}).strict().superRefine((definition, context) => {
+  const ids = new Set<string>();
+  const outputs = new Set<string>();
+  for (const [index, enrichment] of definition.enrichments.entries()) {
+    if (ids.has(enrichment.id)) context.addIssue({ code: "custom", path: ["enrichments", index, "id"], message: "duplicate enrichment id" });
+    if (outputs.has(enrichment.output)) context.addIssue({ code: "custom", path: ["enrichments", index, "output"], message: "duplicate enrichment output" });
+    ids.add(enrichment.id);
+    outputs.add(enrichment.output);
+  }
+  const pins = new Set<string>();
+  for (const [index, column] of definition.pinned_columns.entries()) {
+    if (!outputs.has(column)) context.addIssue({ code: "custom", path: ["pinned_columns", index], message: "pin must name a proposed enrichment output" });
+    if (pins.has(column)) context.addIssue({ code: "custom", path: ["pinned_columns", index], message: "duplicate pinned column" });
+    pins.add(column);
+  }
+  for (const [index, rule] of definition.color_rules.entries()) {
+    if (!outputs.has(rule.column)) context.addIssue({ code: "custom", path: ["color_rules", index, "column"], message: "exact-value colour rule must name a proposed enrichment output" });
+  }
+  if (definition.grouping !== null && !outputs.has(definition.grouping.column)) {
+    context.addIssue({ code: "custom", path: ["grouping", "column"], message: "grouping must name a proposed enrichment output" });
+  }
+});
+
+const definitions = { source: sourceDefinitionSchema, sources: sourcesDefinitionSchema, filter: filterDefinitionSchema, enrichment: enrichmentDefinitionSchema, view: viewDefinitionSchema, auto_setup: autoSetupDefinitionSchema } as const;
 const base = z.object({ schema_version: z.literal(1), request_id: boundedText(128) });
 const sessionConfig = { provider: boundedText(256), cwd: path, mode_id: boundedText(128).optional(), thinking_option_id: boundedText(128).optional(), title: z.string().max(256).optional() };
 export const requestSchema = z.discriminatedUnion("method", [

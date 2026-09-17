@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_SOURCES_PER_PROPOSAL, parseJsonObject, parseProposal, proposalJsonSchema, requestSchema } from "../src/protocol.js";
+import { MAX_AUTO_SETUP_COLOR_RULES, MAX_AUTO_SETUP_ENRICHMENTS, MAX_AUTO_SETUP_PINS, MAX_SOURCES_PER_PROPOSAL, parseJsonObject, parseProposal, proposalJsonSchema, requestSchema } from "../src/protocol.js";
 
 const revision = { data: "data-4", definition: "definition-9" };
 const sourceId = "11111111-1111-4111-8111-111111111111";
@@ -9,6 +9,17 @@ const stageId = "33333333-3333-4333-8333-333333333333";
 const commonSource = { schema_version: 1, id: sourceId, name: "app", identity_hints: {}, retention: null };
 const fileSource = { ...commonSource, kind: "file", path: "/tmp/app.log", follow: true };
 const secondFileSource = { ...commonSource, id: sourceId2, name: "second", kind: "file", path: "/tmp/other.log", follow: false };
+const autoSetupEnrichments = [
+  { id: "level-stage", output: "level", expression: "pl.col('raw').str.extract(r'level=([A-Z]+)', 1)" },
+  { id: "request-stage", output: "request_id", expression: "pl.col('raw').str.extract(r'request=([^ ]+)', 1)" },
+];
+const autoSetupDefinition = {
+  schema_version: 1,
+  enrichments: autoSetupEnrichments,
+  pinned_columns: ["request_id"],
+  color_rules: [{ column: "level", value: "ERROR", color: "red" }],
+  grouping: { mode: "run", column: "request_id" },
+};
 
 describe("proposal validation", () => {
   it.each([
@@ -19,6 +30,7 @@ describe("proposal validation", () => {
     ["filter", { schema_version: 1, expression: "pl.col('status') >= 500" }],
     ["enrichment", { schema_version: 1, stages: [{ id: stageId, name: "parse", expressions: { request_id: "pl.col('raw').str.extract('(req-[0-9]+)')" } }] }],
     ["view", { schema_version: 1, id: viewId, name: "errors", source_ids: [sourceId], filter: null, recipe_stage_revisions: [] }],
+    ["auto_setup", autoSetupDefinition],
   ] as const)("accepts a concrete %s definition", (kind, definition) => {
     expect(parseProposal({ kind, definition, explanation: "A bounded proposal", originating_revision: revision }, kind, revision)).toMatchObject({ kind, definition, originating_revision: revision });
   });
@@ -32,6 +44,7 @@ describe("proposal validation", () => {
     ["filter", { schema_version: 1, expression: "" }],
     ["enrichment", { schema_version: 1, stages: [{ id: stageId, name: "empty", expressions: {} }] }],
     ["view", { schema_version: 1, id: viewId, name: "empty", source_ids: [], filter: null, recipe_stage_revisions: [] }],
+    ["auto_setup", { ...autoSetupDefinition, color_rules: [{ predicate: "ERROR", color: "red" }] }],
   ] as const)("rejects malformed %s definition", (kind, definition) => {
     expect(() => parseProposal({ kind, definition, explanation: "x", originating_revision: revision }, kind, revision)).toThrow();
   });
@@ -59,7 +72,7 @@ describe("proposal validation", () => {
     expect(proposalJsonSchema("source")).toMatchObject({ properties: { definition: { oneOf: expect.any(Array) } } });
   });
 
-  it.each(["source", "sources", "filter", "enrichment", "view"] as const)("binds %s proposal schemas to the expected revision", (kind) => {
+  it.each(["source", "sources", "filter", "enrichment", "view", "auto_setup"] as const)("binds %s proposal schemas to the expected revision", (kind) => {
     expect(proposalJsonSchema(kind, revision)).toMatchObject({
       properties: {
         originating_revision: {
@@ -96,6 +109,49 @@ describe("proposal validation", () => {
 
   it("rejects inline bulk data in inspection context", () => {
     expect(requestSchema.safeParse({ schema_version: 1, request_id: "x", method: "request_proposal", session_id: "s", kind: "filter", instruction: "x", originating_revision: revision, context: { manifest_path: "/tmp/manifest.json", dataset_paths: [], rows: [{ raw: "secret" }] } }).success).toBe(false);
+  });
+
+  it("accepts a deliberately empty automatic setup and preserves exact revisions", () => {
+    const definition = { schema_version: 1, enrichments: [], pinned_columns: [], color_rules: [], grouping: null };
+    const proposal = parseProposal({ kind: "auto_setup", definition, explanation: "No safe setup found", originating_revision: revision }, "auto_setup", revision);
+    expect(proposal).toMatchObject({ kind: "auto_setup", definition, originating_revision: revision });
+    expect(requestSchema.safeParse({ schema_version: 1, request_id: "auto", method: "request_proposal", session_id: "s", kind: "auto_setup", instruction: "Set up this log", originating_revision: revision, context: { manifest_path: "/tmp/manifest.json", dataset_paths: [] } }).success).toBe(true);
+  });
+
+  it("rejects duplicate automatic setup ids, outputs, and pins", () => {
+    for (const definition of [
+      { ...autoSetupDefinition, enrichments: [autoSetupEnrichments[0], { ...autoSetupEnrichments[1], id: "level-stage" }] },
+      { ...autoSetupDefinition, enrichments: [autoSetupEnrichments[0], { ...autoSetupEnrichments[1], output: "level" }] },
+      { ...autoSetupDefinition, pinned_columns: ["request_id", "request_id"] },
+    ]) expect(() => parseProposal({ kind: "auto_setup", definition, explanation: "bad", originating_revision: revision }, "auto_setup", revision)).toThrow();
+  });
+
+  it("bounds every automatic setup collection", () => {
+    const enrichments = Array.from({ length: MAX_AUTO_SETUP_ENRICHMENTS + 1 }, (_, index) => ({ id: `stage-${index}`, output: `field_${index}`, expression: "pl.lit(1)" }));
+    const pinEnrichments = Array.from({ length: MAX_AUTO_SETUP_PINS + 1 }, (_, index) => ({ id: `pin-stage-${index}`, output: `pin_${index}`, expression: "pl.lit(1)" }));
+    const colorRules = Array.from({ length: MAX_AUTO_SETUP_COLOR_RULES + 1 }, () => ({ column: "level", value: "x", color: "blue" }));
+    for (const definition of [
+      { ...autoSetupDefinition, enrichments, pinned_columns: [], color_rules: [], grouping: null },
+      { ...autoSetupDefinition, enrichments: pinEnrichments, pinned_columns: pinEnrichments.map(({ output }) => output), color_rules: [], grouping: null },
+      { ...autoSetupDefinition, color_rules: colorRules },
+    ]) expect(() => parseProposal({ kind: "auto_setup", definition, explanation: "too large", originating_revision: revision }, "auto_setup", revision)).toThrow();
+  });
+
+  it("rejects forbidden fields and malformed automatic setup forms", () => {
+    for (const definition of [
+      { ...autoSetupDefinition, filter: { expression: "pl.col('level') == 'ERROR'" } },
+      { ...autoSetupDefinition, enrichments: [{ ...autoSetupEnrichments[0], command: ["sh", "-c", "echo bad"] }] },
+      { ...autoSetupDefinition, enrichments: [{ ...autoSetupEnrichments[0], output: "raw" }] },
+      { ...autoSetupDefinition, enrichments: [{ ...autoSetupEnrichments[0], output: "_lvu_id" }] },
+      { ...autoSetupDefinition, pinned_columns: ["unproposed"] },
+      { ...autoSetupDefinition, color_rules: [{ column: "unproposed", value: "x", color: "red" }] },
+      { ...autoSetupDefinition, color_rules: [{ column: "level", value: "x", color: "black" }] },
+      { ...autoSetupDefinition, color_rules: [{ predicate: "ERROR", color: "red" }] },
+      { ...autoSetupDefinition, grouping: { mode: "auto" } },
+      { ...autoSetupDefinition, grouping: { mode: "run", column: "unproposed" } },
+      { ...autoSetupDefinition, grouping: { mode: "custom", column: "level" } },
+      { ...autoSetupDefinition, grouping: { mode: "filter", column: "level", token: "(?lvu:filter:v1:column:level)" } },
+    ]) expect(() => parseProposal({ kind: "auto_setup", definition, explanation: "bad", originating_revision: revision }, "auto_setup", revision)).toThrow();
   });
 });
 

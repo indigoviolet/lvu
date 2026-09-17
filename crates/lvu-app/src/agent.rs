@@ -66,6 +66,8 @@ pub enum ProposalKind {
     Filter,
     Enrichment,
     View,
+    #[serde(rename = "auto_setup")]
+    AutoSetup,
 }
 
 /// Bound on one multi-source proposal. This is a per-proposal bound, not proof
@@ -1188,6 +1190,7 @@ fn validate_definition(kind: ProposalKind, value: &Value) -> Result<(), HostErro
         ProposalKind::Sources => validate_sources_definition(object),
         ProposalKind::Enrichment => validate_enrichment_definition(object),
         ProposalKind::View => validate_view_definition(object),
+        ProposalKind::AutoSetup => validate_auto_setup_definition(object),
     };
     valid
         .then_some(())
@@ -1393,6 +1396,112 @@ fn validate_view_definition(object: &serde_json::Map<String, Value>) -> bool {
                             .is_some_and(|value| !value.is_empty() && value.len() <= 256)
                     })
             })
+}
+
+const MAX_AUTO_SETUP_ENRICHMENTS: usize = 8;
+const MAX_AUTO_SETUP_PINS: usize = 8;
+const MAX_AUTO_SETUP_COLOR_RULES: usize = 16;
+
+fn valid_auto_setup_output(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value != "raw"
+        && !value.starts_with("_lvu_")
+        && value
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn validate_auto_setup_definition(object: &serde_json::Map<String, Value>) -> bool {
+    if !exact_fields(
+        object,
+        &[
+            "schema_version",
+            "enrichments",
+            "pinned_columns",
+            "color_rules",
+            "grouping",
+        ],
+    ) {
+        return false;
+    }
+    let Some(enrichments) = object.get("enrichments").and_then(Value::as_array) else {
+        return false;
+    };
+    if enrichments.len() > MAX_AUTO_SETUP_ENRICHMENTS {
+        return false;
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut outputs = std::collections::HashSet::new();
+    if !enrichments.iter().all(|enrichment| {
+        let Some(enrichment) = enrichment.as_object() else {
+            return false;
+        };
+        exact_fields(enrichment, &["id", "output", "expression"])
+            && bounded_field(enrichment, "id", 128)
+            && enrichment["id"]
+                .as_str()
+                .is_some_and(|id| !id.chars().any(char::is_control) && ids.insert(id))
+            && enrichment["output"]
+                .as_str()
+                .is_some_and(|output| valid_auto_setup_output(output) && outputs.insert(output))
+            && bounded_field(enrichment, "expression", 16_384)
+    }) {
+        return false;
+    }
+    let Some(pins) = object.get("pinned_columns").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut unique_pins = std::collections::HashSet::new();
+    if pins.len() > MAX_AUTO_SETUP_PINS
+        || !pins.iter().all(|pin| {
+            pin.as_str()
+                .is_some_and(|pin| outputs.contains(pin) && unique_pins.insert(pin))
+        })
+    {
+        return false;
+    }
+    let Some(color_rules) = object.get("color_rules").and_then(Value::as_array) else {
+        return false;
+    };
+    if color_rules.len() > MAX_AUTO_SETUP_COLOR_RULES
+        || !color_rules.iter().all(|rule| {
+            rule.as_object().is_some_and(|rule| {
+                exact_fields(rule, &["column", "value", "color"])
+                    && rule["column"]
+                        .as_str()
+                        .is_some_and(|column| outputs.contains(column))
+                    && rule["value"]
+                        .as_str()
+                        .is_some_and(|value| value.len() <= 4096)
+                    && matches!(
+                        rule["color"].as_str(),
+                        Some(
+                            "red"
+                                | "orange"
+                                | "yellow"
+                                | "green"
+                                | "cyan"
+                                | "blue"
+                                | "purple"
+                                | "magenta"
+                        )
+                    )
+            })
+        })
+    {
+        return false;
+    }
+    object.get("grouping").is_some_and(|grouping| {
+        grouping.is_null()
+            || grouping.as_object().is_some_and(|grouping| {
+                exact_fields(grouping, &["mode", "column"])
+                    && matches!(grouping["mode"].as_str(), Some("run" | "filter"))
+                    && grouping["column"]
+                        .as_str()
+                        .is_some_and(|column| outputs.contains(column))
+            })
+    })
 }
 
 fn required_string(value: &Value, key: &str) -> Result<String, HostError> {
@@ -2779,5 +2888,152 @@ mod inline_recipe_tests {
         assert!(!validate_view_definition(definition.as_object().unwrap()));
         definition["enrichments"] = serde_json::json!([]);
         assert!(validate_view_definition(definition.as_object().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod auto_setup_tests {
+    use super::*;
+
+    fn definition() -> Value {
+        json!({
+            "schema_version": 1,
+            "enrichments": [
+                {"id": "level-stage", "output": "level", "expression": "pl.col('raw').str.extract(r'level=([A-Z]+)', 1)"},
+                {"id": "request-stage", "output": "request_id", "expression": "pl.col('raw').str.extract(r'request=([^ ]+)', 1)"}
+            ],
+            "pinned_columns": ["request_id"],
+            "color_rules": [{"column": "level", "value": "ERROR", "color": "red"}],
+            "grouping": {"mode": "run", "column": "request_id"}
+        })
+    }
+
+    #[test]
+    fn valid_and_empty_auto_setup_definitions_are_accepted() {
+        assert_eq!(
+            serde_json::to_value(ProposalKind::AutoSetup).unwrap(),
+            json!("auto_setup")
+        );
+        assert!(validate_definition(ProposalKind::AutoSetup, &definition()).is_ok());
+        assert!(
+            validate_definition(
+                ProposalKind::AutoSetup,
+                &json!({
+                    "schema_version": 1,
+                    "enrichments": [],
+                    "pinned_columns": [],
+                    "color_rules": [],
+                    "grouping": null
+                })
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn auto_setup_rejects_duplicate_ids_outputs_and_pins() {
+        let mut duplicate_id = definition();
+        duplicate_id["enrichments"][1]["id"] = json!("level-stage");
+        let mut duplicate_output = definition();
+        duplicate_output["enrichments"][1]["output"] = json!("level");
+        let mut duplicate_pin = definition();
+        duplicate_pin["pinned_columns"] = json!(["request_id", "request_id"]);
+        for candidate in [duplicate_id, duplicate_output, duplicate_pin] {
+            assert!(validate_definition(ProposalKind::AutoSetup, &candidate).is_err());
+        }
+    }
+
+    #[test]
+    fn auto_setup_bounds_each_collection() {
+        let mut enrichments = definition();
+        enrichments["enrichments"] = Value::Array(
+            (0..=MAX_AUTO_SETUP_ENRICHMENTS)
+                .map(|index| {
+                    json!({"id": format!("stage-{index}"), "output": format!("field_{index}"), "expression": "pl.lit(1)"})
+                })
+                .collect(),
+        );
+        enrichments["pinned_columns"] = json!([]);
+        enrichments["color_rules"] = json!([]);
+        enrichments["grouping"] = Value::Null;
+        let mut colors = definition();
+        colors["color_rules"] = Value::Array(
+            (0..=MAX_AUTO_SETUP_COLOR_RULES)
+                .map(|_| json!({"column": "level", "value": "x", "color": "blue"}))
+                .collect(),
+        );
+        for candidate in [enrichments, colors] {
+            assert!(validate_definition(ProposalKind::AutoSetup, &candidate).is_err());
+        }
+    }
+
+    #[test]
+    fn auto_setup_rejects_forbidden_or_malformed_shapes() {
+        let mut candidates = Vec::new();
+        let mut extra = definition();
+        extra["filter"] = json!({"expression": "pl.col('level') == 'ERROR'"});
+        candidates.push(extra);
+        let mut command = definition();
+        command["enrichments"][0]["command"] = json!(["sh", "-c", "echo bad"]);
+        candidates.push(command);
+        for output in ["raw", "_lvu_record_id", "bad-name"] {
+            let mut invalid = definition();
+            invalid["enrichments"][0]["output"] = json!(output);
+            candidates.push(invalid);
+        }
+        let mut pin = definition();
+        pin["pinned_columns"] = json!(["unproposed"]);
+        candidates.push(pin);
+        let mut predicate = definition();
+        predicate["color_rules"] = json!([{"predicate": "ERROR", "color": "red"}]);
+        candidates.push(predicate);
+        let mut bad_color = definition();
+        bad_color["color_rules"][0]["color"] = json!("black");
+        candidates.push(bad_color);
+        let mut foreign_color = definition();
+        foreign_color["color_rules"][0]["column"] = json!("unproposed");
+        candidates.push(foreign_color);
+        for grouping in [
+            json!({"mode": "auto"}),
+            json!({"mode": "run", "column": "unproposed"}),
+            json!({"mode": "custom", "column": "level"}),
+            json!({"mode": "filter", "column": "level", "token": "(?lvu:filter:v1:column:level)"}),
+        ] {
+            let mut invalid = definition();
+            invalid["grouping"] = grouping;
+            candidates.push(invalid);
+        }
+        for candidate in candidates {
+            assert!(
+                validate_definition(ProposalKind::AutoSetup, &candidate).is_err(),
+                "accepted invalid auto setup: {candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_setup_envelope_round_trips_the_exact_originating_revision() {
+        let revision = OriginatingRevision {
+            data: "source-generation:4:data:9".into(),
+            definition: "view:7".into(),
+        };
+        let wire = json!({"proposal": {
+            "kind": "auto_setup",
+            "definition": definition(),
+            "explanation": "Create typed level and request fields",
+            "originating_revision": revision,
+        }});
+        let proposal = validate_proposal(wire, ProposalKind::AutoSetup, &revision).unwrap();
+        assert_eq!(proposal.kind, ProposalKind::AutoSetup);
+        assert_eq!(proposal.originating_revision, revision);
+        let mut stale = proposal.originating_revision.clone();
+        stale.data.push_str(":stale");
+        let rejected = json!({"proposal": {
+            "kind": "auto_setup",
+            "definition": definition(),
+            "explanation": "stale",
+            "originating_revision": stale,
+        }});
+        assert!(validate_proposal(rejected, ProposalKind::AutoSetup, &revision).is_err());
     }
 }
