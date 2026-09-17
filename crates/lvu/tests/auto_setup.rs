@@ -1,0 +1,360 @@
+use lvu::{
+    Action, App, AutoSetupProposal, AutoSetupStage, ColorRule, EnrichmentDefinition,
+    QueryCompletion, QueryFailure, QueryPurpose, RuleColor, SourceItem, ViewItem, ViewRole,
+};
+use ratatui::{Terminal, backend::TestBackend};
+
+fn app_with_raw() -> (App, lvu::fixture::FixtureProvider) {
+    let (provider, _, _) = lvu::fixture::FixtureProvider::demo();
+    let mut app = App::new(
+        vec![SourceItem {
+            id: "source".into(),
+            name: "payments".into(),
+            health: "running".into(),
+        }],
+        vec![ViewItem {
+            id: "raw".into(),
+            source_id: "source".into(),
+            name: "All events".into(),
+        }],
+        false,
+    );
+    app.set_view_role("raw", ViewRole::Canonical);
+    (app, provider)
+}
+
+fn proposal() -> AutoSetupProposal {
+    AutoSetupProposal {
+        enrichments: vec![EnrichmentDefinition::expression(
+            "level-stage",
+            "level = pl.col('raw').str.extract('level=(\\w+)', 1)",
+        )],
+        pinned_columns: vec!["level".into()],
+        color_rules: vec![ColorRule::column_rule(
+            "level".into(),
+            "error".into(),
+            RuleColor::Red,
+        )],
+        grouping: lvu::grouping::run_rule("level"),
+        severity_column: Some("level".into()),
+        timestamp_column: None,
+    }
+}
+
+fn request(app: &mut App, provider: &lvu::fixture::FixtureProvider) -> lvu::AutoSetupRequest {
+    app.handle(Action::AnalyzeAutoSetup, provider);
+    app.take_auto_setup_requests()
+        .into_iter()
+        .next()
+        .expect("analysis request")
+}
+
+fn settle_candidate(app: &mut App, candidate: &str, succeed: bool) {
+    let fork = app.take_view_fork_requests();
+    assert_eq!(fork.len(), 1);
+    assert_eq!(fork[0].candidate_view_id, candidate);
+    assert!(app.begin_fork_query(candidate));
+    let mut queries = app.take_query_requests();
+    assert_eq!(queries.len(), 1);
+    let query = queries.remove(0);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: query.view_id,
+        generation: query.generation,
+        revision: query.revision,
+        purpose: query.purpose,
+        result: if succeed {
+            Ok(())
+        } else {
+            Err(QueryFailure {
+                purpose: query.purpose,
+                message: "controlled rejection".into(),
+            })
+        },
+    }));
+}
+
+fn install_enhanced(app: &mut App, provider: &lvu::fixture::FixtureProvider) -> String {
+    let analysis = request(app, provider);
+    let candidate = app
+        .apply_auto_setup_proposal(&analysis, proposal())
+        .expect("proposal admitted");
+    settle_candidate(app, &candidate, true);
+    let ready = app.take_ready_forks();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].candidate_view_id, candidate);
+    assert!(app.install_fork(&candidate));
+    candidate
+}
+
+#[test]
+fn raw_first_atomic_success_and_native_editor_state() {
+    let (mut app, provider) = app_with_raw();
+    let analysis = request(&mut app, &provider);
+    assert_eq!(app.active_view_id(), Some("raw"));
+    assert_eq!(app.views().len(), 1, "raw opens before analysis settles");
+    let candidate = app
+        .apply_auto_setup_proposal(&analysis, proposal())
+        .expect("proposal admitted");
+    assert_eq!(app.views().len(), 1, "candidate is not partially visible");
+    assert!(
+        app.views
+            .auto_setup_config("raw")
+            .unwrap()
+            .recipe
+            .enrichments
+            .is_empty()
+    );
+    settle_candidate(&mut app, &candidate, true);
+    assert_eq!(
+        app.views().len(),
+        1,
+        "query success still awaits persistence"
+    );
+    assert!(app.install_fork(&candidate));
+    assert_eq!(app.active_view_id(), Some(candidate.as_str()));
+    assert_eq!(app.views().len(), 2);
+    let state = app.view_state().expect("enhanced state");
+    assert_eq!(state.enrichments.len(), 1);
+    assert_eq!(state.pinned_columns, ["level"]);
+    assert_eq!(state.color_rules.len(), 1);
+    assert_eq!(state.grouping.applied, lvu::grouping::run_rule("level"));
+    assert_eq!(state.severity_column.as_deref(), Some("level"));
+    assert!(app.auto_setup_revert_available());
+}
+
+#[test]
+fn navigation_does_not_stale_analysis_and_late_success_does_not_steal_focus() {
+    let (mut app, provider) = app_with_raw();
+    let analysis = request(&mut app, &provider);
+    let candidate = app
+        .apply_auto_setup_proposal(&analysis, proposal())
+        .expect("proposal admitted");
+    app.handle(Action::ToggleFollow, &provider);
+    app.add_source_view(
+        SourceItem {
+            id: "other-source".into(),
+            name: "worker".into(),
+            health: "running".into(),
+        },
+        ViewItem {
+            id: "other-raw".into(),
+            source_id: "other-source".into(),
+            name: "All events".into(),
+        },
+    );
+    app.set_view_role("other-raw", ViewRole::Canonical);
+    app.select_view("other-raw");
+    settle_candidate(&mut app, &candidate, true);
+    assert!(app.install_fork(&candidate));
+    assert_eq!(app.active_view_id(), Some("other-raw"));
+    assert!(
+        app.action_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("current view kept"))
+    );
+}
+
+#[test]
+fn failures_and_invalid_proposals_keep_raw_last_good() {
+    let (mut app, provider) = app_with_raw();
+    let analysis = request(&mut app, &provider);
+    let mut invalid = proposal();
+    invalid.enrichments[0].command = Some(lvu_core::CommandDefinition {
+        program: lvu_core::CommandProgram::Exec {
+            executable: "false".into(),
+            args: Vec::new(),
+        },
+        cwd: None,
+        environment: Default::default(),
+        restart: lvu_core::RestartPolicy::Never,
+    });
+    assert!(app.apply_auto_setup_proposal(&analysis, invalid).is_err());
+    assert_eq!(app.views().len(), 1);
+    assert_eq!(app.active_view_id(), Some("raw"));
+
+    let analysis = request(&mut app, &provider);
+    let candidate = app
+        .apply_auto_setup_proposal(&analysis, proposal())
+        .expect("valid proposal");
+    settle_candidate(&mut app, &candidate, false);
+    assert!(app.take_ready_forks().is_empty());
+    assert_eq!(app.views().len(), 1);
+    assert!(
+        app.views
+            .auto_setup_config("raw")
+            .unwrap()
+            .recipe
+            .enrichments
+            .is_empty()
+    );
+}
+
+#[test]
+fn bounded_request_queue_refusal_keeps_raw_usable() {
+    let (mut app, provider) = app_with_raw();
+    app.handle(Action::AnalyzeAutoSetup, &provider);
+    app.handle(Action::AnalyzeAutoSetup, &provider);
+
+    assert_eq!(app.take_auto_setup_requests().len(), 1);
+    assert_eq!(app.active_view_id(), Some("raw"));
+    assert_eq!(app.views().len(), 1);
+    assert!(
+        app.action_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("already queued"))
+    );
+    assert_eq!(
+        app.auto_setup_status().map(|status| status.stage),
+        Some(AutoSetupStage::Sampling),
+        "the first admitted request remains authoritative"
+    );
+}
+
+#[test]
+fn persistence_refusal_discards_candidate_and_reports_raw_fallback() {
+    let (mut app, provider) = app_with_raw();
+    let analysis = request(&mut app, &provider);
+    let candidate = app
+        .apply_auto_setup_proposal(&analysis, proposal())
+        .expect("proposal admitted");
+    settle_candidate(&mut app, &candidate, true);
+    assert_eq!(app.take_ready_forks().len(), 1);
+
+    assert!(app.discard_fork(&candidate, "workspace save failed".into()));
+    assert_eq!(app.active_view_id(), Some("raw"));
+    assert_eq!(app.views().len(), 1);
+    assert!(app.auto_setup_status().is_some_and(|status| {
+        status.stage == AutoSetupStage::Unavailable
+            && status.detail.contains("workspace save failed")
+            && status.detail.contains("raw view kept")
+    }));
+    assert!(matches!(
+        app.take_auto_setup_events().last(),
+        Some(lvu::AutoSetupEvent::Failed { message, .. })
+            if message == "workspace save failed"
+    ));
+}
+
+#[test]
+fn names_are_unique_and_revert_refuses_after_manual_accepted_edit() {
+    let (mut app, provider) = app_with_raw();
+    let first = install_enhanced(&mut app, &provider);
+    assert_eq!(
+        app.views()
+            .iter()
+            .find(|view| view.id == first)
+            .unwrap()
+            .name,
+        "Enhanced"
+    );
+    app.select_view("raw");
+    let second = install_enhanced(&mut app, &provider);
+    assert_eq!(
+        app.views()
+            .iter()
+            .find(|view| view.id == second)
+            .unwrap()
+            .name,
+        "Enhanced 2"
+    );
+
+    let mut edited = app.views.auto_setup_config(&second).unwrap().recipe;
+    edited.pinned_columns.push("manual".into());
+    app.views
+        .apply_recipe(&second, edited, 0)
+        .expect("manual edit queued");
+    let query = app.take_query_requests().remove(0);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: query.view_id,
+        generation: query.generation,
+        revision: query.revision,
+        purpose: query.purpose,
+        result: Ok(()),
+    }));
+    app.handle(Action::RevertAutoSetup, &provider);
+    assert!(
+        app.action_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("edited") && notice.contains("refused"))
+    );
+    assert!(app.take_query_requests().is_empty());
+}
+
+#[test]
+fn exact_revert_is_a_normal_atomic_query_and_removes_its_receipt() {
+    let (mut app, provider) = app_with_raw();
+    let enhanced = install_enhanced(&mut app, &provider);
+    app.handle(Action::RevertAutoSetup, &provider);
+    let query = app.take_query_requests().remove(0);
+    assert_eq!(query.view_id, enhanced);
+    assert_eq!(query.purpose, QueryPurpose::Advanced);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: query.view_id,
+        generation: query.generation,
+        revision: query.revision,
+        purpose: query.purpose,
+        result: Ok(()),
+    }));
+    let restored = app.views.auto_setup_config(&enhanced).unwrap();
+    assert_eq!(restored, lvu::AutoSetupViewConfig::default());
+    assert!(!app.auto_setup_revert_available());
+    assert!(matches!(
+        app.take_auto_setup_events().last(),
+        Some(lvu::AutoSetupEvent::Reverted { .. })
+    ));
+}
+
+#[test]
+fn non_modal_lifecycle_is_visible_in_test_backend() {
+    let (mut app, provider) = app_with_raw();
+    let _ = request(&mut app, &provider);
+    let mut terminal = Terminal::new(TestBackend::new(180, 28)).unwrap();
+    terminal
+        .draw(|frame| lvu::ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(screen.contains("payments / All events · automatic setup: sampling"));
+    assert_eq!(app.active_view_id(), Some("raw"));
+    assert_eq!(
+        app.auto_setup_status().map(|status| status.stage),
+        Some(AutoSetupStage::Sampling)
+    );
+}
+
+#[test]
+fn palette_names_existing_object_before_operation_and_gates_revert() {
+    use lvu::command_palette::{CommandId, Palette, PaletteContext};
+
+    let mut context = PaletteContext::new(lvu::Focus::Logs, true);
+    let mut palette = Palette::new();
+    palette.open(context.clone());
+    let analyze = palette
+        .commands()
+        .iter()
+        .find(|command| command.id == CommandId::AnalyzeAutoSetup)
+        .unwrap();
+    assert_eq!(analyze.name, "Current log › Analyze again");
+    let revert = palette
+        .commands()
+        .iter()
+        .find(|command| command.id == CommandId::RevertAutoSetup)
+        .unwrap();
+    assert!(!revert.is_enabled());
+
+    context.auto_setup_revert_available = true;
+    palette.refresh_context(context);
+    assert!(
+        palette
+            .commands()
+            .iter()
+            .find(|command| command.id == CommandId::RevertAutoSetup)
+            .unwrap()
+            .is_enabled()
+    );
+}

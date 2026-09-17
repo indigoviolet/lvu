@@ -143,6 +143,8 @@ pub enum CommandId {
     Settings,
     SeverityColumnAssistant,
     TimestampColumnAssistant,
+    AnalyzeAutoSetup,
+    RevertAutoSetup,
     AskAi,
     AskAiFilter,
     AskAiEnrichment,
@@ -234,6 +236,8 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::Settings,
     CommandId::SeverityColumnAssistant,
     CommandId::TimestampColumnAssistant,
+    CommandId::AnalyzeAutoSetup,
+    CommandId::RevertAutoSetup,
     CommandId::AskAi,
     CommandId::AskAiFilter,
     CommandId::AskAiEnrichment,
@@ -264,6 +268,7 @@ pub struct PaletteContext {
     /// The active view is its source's All events view: there is no raw
     /// stream to jump to.
     pub in_raw_view: bool,
+    pub auto_setup_revert_available: bool,
     /// Entries the converted components declare for themselves (§4.3). The
     /// palette no longer inspects dialog state to decide availability.
     pub layer_commands: Vec<(LayerId, CommandEntry)>,
@@ -277,6 +282,7 @@ impl PaletteContext {
             has_selected_row: false,
             raw_context_held: false,
             in_raw_view: false,
+            auto_setup_revert_available: false,
             layer_commands: Vec::new(),
         }
     }
@@ -1679,6 +1685,25 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
                 crate::components::ask::AskOpen::Task(crate::app::AskTask::TimestampColumn),
             )),
             view_reason,
+        ),
+        command(
+            CommandId::AnalyzeAutoSetup,
+            "Current log › Analyze again",
+            "Discover enrichments, pins, colour rules and grouping for the current log",
+            "Agent",
+            &["automatic setup", "enhance log", "auto enrich"],
+            Action::AnalyzeAutoSetup,
+            view_reason,
+        ),
+        command(
+            CommandId::RevertAutoSetup,
+            "Current view › Revert automatic setup",
+            "Restore the exact configuration from before this Enhanced view was generated",
+            "Agent",
+            &["undo enhance", "remove automatic enrichment"],
+            Action::RevertAutoSetup,
+            (!context.auto_setup_revert_available)
+                .then_some("select an unedited automatically generated view first"),
         ),
         command(
             CommandId::AskAi,

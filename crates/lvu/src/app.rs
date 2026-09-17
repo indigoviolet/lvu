@@ -10,6 +10,10 @@ use crossterm::event::{
 use lvu_core::{CommandDefinition, CommandProgram, FieldCorrelation, RestartPolicy};
 use ratatui::layout::Rect;
 
+use crate::auto_setup::{
+    AutoSetupEvent, AutoSetupProposal, AutoSetupReceipt, AutoSetupRequest, AutoSetupStage,
+    AutoSetupStatus, AutoSetupViewConfig, config_digest,
+};
 use crate::component::{
     AgentDefaults, Appearance, Clock, Component, Ctx, Event as ComponentEvent, LayerId, NO_ROWS,
     Open, Outcome, RawEvent, Surface, ViewEvent,
@@ -494,6 +498,14 @@ enum ForkEdit {
         config: Box<RecipeConfig>,
         now_nanos: i64,
     },
+    /// Automatic setup is a named recipe-shaped transaction with additional
+    /// presentation fields.  It has no filters, commands, time window or
+    /// source mutation in its proposal type.
+    AutoSetup {
+        config: Box<AutoSetupViewConfig>,
+        before: Box<AutoSetupViewConfig>,
+        now_nanos: i64,
+    },
 }
 
 /// What `Views::install_fork` finished, so the shell can do its half: carry an
@@ -502,6 +514,9 @@ enum ForkEdit {
 pub(crate) struct InstalledFork {
     pub(crate) origin_view_id: String,
     pub(crate) candidate_view_id: String,
+    pub(crate) source_id: String,
+    pub(crate) name: String,
+    auto_before: Option<Box<AutoSetupViewConfig>>,
 }
 
 #[derive(Clone, Debug)]
@@ -510,13 +525,22 @@ pub(crate) struct PendingFork {
     candidate_view_id: String,
     source_id: String,
     name: String,
-    /// The origin's interaction revision when the fork was proposed. A later
-    /// interaction with the origin abandons the candidate rather than
-    /// installing a view the user has moved on from.
-    interaction_revision: u64,
+    fence: ForkFence,
     stage: ForkStage,
     purpose: QueryPurpose,
     edit: ForkEdit,
+}
+
+/// Interactive editor forks follow interaction; automatic setup follows only
+/// semantic definition changes.  Selection, scroll, follow, bookmarks and
+/// fold expansion therefore never stale automatic analysis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ForkFence {
+    Interaction(u64),
+    Automatic {
+        definition_revision: u64,
+        before: Box<AutoSetupViewConfig>,
+    },
 }
 
 /// A bookmark jump waiting for its record to become locatable.
@@ -1042,6 +1066,19 @@ pub(crate) struct PendingRecipe {
     /// The outcome to report once the query lands, attached by the Recipes
     /// layer so an accepted suggestion is only recorded on real acceptance.
     pub(crate) suggestion: Option<RecipeOutcome>,
+    auto: Option<PendingAutoSetup>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingAutoSetup {
+    Apply { applied: Box<AutoSetupViewConfig> },
+    Revert { restored: Box<AutoSetupViewConfig> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AutoSetupQueryOutcome {
+    Reverted { view_id: String },
+    Failed { view_id: String, message: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2047,6 +2084,10 @@ pub enum Action {
         /// accepted chain; anything else leaves roles alone.
         task: Option<AskTask>,
     },
+    /// Existing object first in the palette: current log, then Analyze again.
+    AnalyzeAutoSetup,
+    /// Existing generated view first in the palette, then Revert.
+    RevertAutoSetup,
     Quit,
     CycleFocus,
     NextView,
@@ -2263,6 +2304,13 @@ pub enum RecipeRejected {
     QueueFull,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutoSetupRejected {
+    Stale,
+    Invalid(String),
+    QueueFull,
+}
+
 /// Why the seam would not apply an edit. Either way the caller keeps its draft
 /// and words its own message, rather than the seam guessing how to report it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2320,6 +2368,7 @@ pub struct Views {
     /// live beside it rather than on `App` (§2.3).
     #[doc(hidden)]
     pub(crate) bookmarks: HashMap<String, Vec<Bookmark>>,
+    auto_setup_outcomes: VecDeque<AutoSetupQueryOutcome>,
 }
 
 impl Default for Views {
@@ -2339,6 +2388,7 @@ impl Default for Views {
             fork_discards: VecDeque::new(),
             next_fork_sequence: 1,
             bookmarks: HashMap::new(),
+            auto_setup_outcomes: VecDeque::new(),
         }
     }
 }
@@ -2554,6 +2604,115 @@ impl Views {
         })
     }
 
+    pub fn auto_setup_config(&self, view_id: &str) -> Option<AutoSetupViewConfig> {
+        let state = self.states.get(view_id)?;
+        Some(AutoSetupViewConfig {
+            recipe: self.applied_recipe_config(view_id)?,
+            color_rules: state.color_rules.clone(),
+            severity_column: state.severity_column.clone(),
+            timestamp_column: state.timestamp_column.clone(),
+        })
+    }
+
+    /// Stage a validated automatic setup as a named derived view.  The raw
+    /// canonical view is never mutated and stays immediately usable.
+    pub fn apply_auto_setup(
+        &mut self,
+        request: &AutoSetupRequest,
+        proposal: AutoSetupProposal,
+        now_nanos: i64,
+    ) -> Result<String, AutoSetupRejected> {
+        let Some(item) = self
+            .items
+            .iter()
+            .find(|view| view.id == request.origin_view_id)
+        else {
+            return Err(AutoSetupRejected::Stale);
+        };
+        if item.source_id != request.source_id
+            || self.role(&request.origin_view_id) != ViewRole::Canonical
+            || self.definition_revision(&request.origin_view_id)
+                != Some(request.definition_revision)
+        {
+            return Err(AutoSetupRejected::Stale);
+        }
+        let before = self
+            .auto_setup_config(&request.origin_view_id)
+            .ok_or(AutoSetupRejected::Stale)?;
+        if config_digest(&before) != request.accepted_digest {
+            return Err(AutoSetupRejected::Stale);
+        }
+        validate_auto_setup_proposal(&proposal)?;
+        let mut applied = before.clone();
+        applied.recipe.enrichment = proposal
+            .enrichments
+            .last()
+            .map_or_else(String::new, |stage| stage.source.clone());
+        applied.recipe.enrichments = proposal.enrichments;
+        applied.recipe.pinned_columns = proposal.pinned_columns;
+        applied.recipe.grouping = proposal.grouping;
+        applied.color_rules = proposal.color_rules;
+        applied.severity_column = proposal.severity_column;
+        applied.timestamp_column = proposal.timestamp_column;
+        let edit = ForkEdit::AutoSetup {
+            config: Box::new(applied),
+            before: Box::new(before),
+            now_nanos,
+        };
+        if self
+            .stage_fork(&request.origin_view_id, QueryPurpose::Advanced, edit)
+            .is_none()
+        {
+            return Err(AutoSetupRejected::QueueFull);
+        }
+        self.pending_forks
+            .get(&request.origin_view_id)
+            .map(|fork| fork.candidate_view_id.clone())
+            .ok_or(AutoSetupRejected::QueueFull)
+    }
+
+    fn apply_auto_setup_in_place(
+        &mut self,
+        view_id: &str,
+        config: AutoSetupViewConfig,
+        _before: AutoSetupViewConfig,
+        now_nanos: i64,
+    ) -> Result<u64, RecipeRejected> {
+        let recipe = config.recipe.clone();
+        let applied = config.clone();
+        self.apply_recipe_transaction(
+            view_id,
+            recipe,
+            now_nanos,
+            Some((
+                config,
+                PendingAutoSetup::Apply {
+                    applied: Box::new(applied),
+                },
+            )),
+        )
+    }
+
+    fn revert_auto_setup_in_place(
+        &mut self,
+        view_id: &str,
+        before: AutoSetupViewConfig,
+        now_nanos: i64,
+    ) -> Result<u64, RecipeRejected> {
+        let recipe = before.recipe.clone();
+        self.apply_recipe_transaction(
+            view_id,
+            recipe,
+            now_nanos,
+            Some((
+                before.clone(),
+                PendingAutoSetup::Revert {
+                    restored: Box::new(before),
+                },
+            )),
+        )
+    }
+
     /// The recipe seam. A recipe is a whole definition, so this replaces every
     /// draft and the desired constraints at once and enqueues one query; an
     /// invalid or refused recipe leaves the applied view exactly as it was.
@@ -2597,6 +2756,16 @@ impl Views {
         view_id: &str,
         config: RecipeConfig,
         now_nanos: i64,
+    ) -> Result<u64, RecipeRejected> {
+        self.apply_recipe_transaction(view_id, config, now_nanos, None)
+    }
+
+    fn apply_recipe_transaction(
+        &mut self,
+        view_id: &str,
+        config: RecipeConfig,
+        now_nanos: i64,
+        auto: Option<(AutoSetupViewConfig, PendingAutoSetup)>,
     ) -> Result<u64, RecipeRejected> {
         if !valid_enrichments(&config.enrichments) {
             if let Some(state) = self.states.get_mut(view_id) {
@@ -2647,8 +2816,12 @@ impl Views {
         state.enrichment.error = None;
         state.grouping.error = None;
         state.time_error = None;
-        let pins = config.pinned_columns;
-        let color = config.color_field;
+        let pins = config.pinned_columns.clone();
+        let color = config.color_field.clone();
+        let color_rules = auto.as_ref().map_or_else(
+            || state.color_rules.clone(),
+            |(config, _)| config.color_rules.clone(),
+        );
         let constraints = QueryConstraints {
             text: nonempty_text(&config.search),
             exact_field: state.exact_field.clone(),
@@ -2668,7 +2841,7 @@ impl Views {
             grouping: nonempty(&config.grouping),
             // A recipe describes a definition, not a palette: the view keeps
             // the colour rules the user gave it.
-            color_rules: state.color_rules.clone(),
+            color_rules,
         };
         state.desired_constraints = constraints;
         state.desired_capture_time_policy = policy;
@@ -2700,6 +2873,7 @@ impl Views {
             capture_time_policy: policy,
             time_basis: config.time_basis,
             suggestion: None,
+            auto: auto.map(|(_, pending)| pending),
         });
         Ok(revision)
     }
@@ -3148,6 +3322,7 @@ impl Views {
                     && *basis == base.applied_time_basis
             }
             ForkEdit::Recipe { .. } => false,
+            ForkEdit::AutoSetup { .. } => false,
         };
         if edits_nothing {
             self.cancel_fork_for_origin(origin);
@@ -3164,7 +3339,13 @@ impl Views {
             editor.fork_pending = true;
             editor.error = None;
         }
-        let interaction_revision = base.user_interaction_revision;
+        let fence = match &edit {
+            ForkEdit::AutoSetup { before, .. } => ForkFence::Automatic {
+                definition_revision: base.ai_definition_revision,
+                before: before.clone(),
+            },
+            _ => ForkFence::Interaction(base.user_interaction_revision),
+        };
         let existing = self.pending_forks.get(origin).cloned();
         let candidate_view_id = match &existing {
             Some(fork) => fork.candidate_view_id.clone(),
@@ -3197,7 +3378,7 @@ impl Views {
                 candidate_view_id: candidate_view_id.clone(),
                 source_id: source_id.clone(),
                 name: name.clone(),
-                interaction_revision,
+                fence,
                 stage: match stage {
                     // A superseding edit restarts the candidate's query rather
                     // than racing the one already in flight.
@@ -3248,6 +3429,7 @@ impl Views {
             },
             ForkEdit::Time { .. } => "Time window".to_owned(),
             ForkEdit::Recipe { .. } => "Recipe".to_owned(),
+            ForkEdit::AutoSetup { .. } => "Enhanced".to_owned(),
         };
         let taken = |name: &str, views: &Self| {
             views
@@ -3340,6 +3522,13 @@ impl Views {
             ForkEdit::Recipe { config, now_nanos } => self
                 .apply_recipe_in_place(candidate_view_id, *config, now_nanos)
                 .is_ok(),
+            ForkEdit::AutoSetup {
+                config,
+                before,
+                now_nanos,
+            } => self
+                .apply_auto_setup_in_place(candidate_view_id, *config, *before, now_nanos)
+                .is_ok(),
         }
     }
 
@@ -3397,12 +3586,23 @@ impl Views {
         Some(InstalledFork {
             origin_view_id: fork.origin_view_id,
             candidate_view_id: fork.candidate_view_id,
+            source_id: fork.source_id,
+            name: fork.name,
+            auto_before: match fork.fence {
+                ForkFence::Automatic { before, .. } => Some(before),
+                ForkFence::Interaction(_) => None,
+            },
         })
     }
 
     /// The candidate's name, for the persistent state the shell assembles.
     pub(crate) fn fork_name(&self, candidate_view_id: &str) -> Option<String> {
         Some(self.fork_of_candidate(candidate_view_id)?.name.clone())
+    }
+
+    fn is_automatic_fork(&self, candidate_view_id: &str) -> bool {
+        self.fork_of_candidate(candidate_view_id)
+            .is_some_and(|fork| matches!(fork.fence, ForkFence::Automatic { .. }))
     }
 
     /// Abandons a candidate. Nothing was ever visible, so nothing is removed
@@ -3467,10 +3667,22 @@ impl Views {
         };
         let current = self.pending_forks.get(&fork.origin_view_id);
         let superseded = current.is_none_or(|current| {
-            current.candidate_view_id != fork.candidate_view_id
-                || current.interaction_revision != fork.interaction_revision
+            current.candidate_view_id != fork.candidate_view_id || current.fence != fork.fence
         });
+        let fence_valid =
+            self.states
+                .get(&fork.origin_view_id)
+                .is_some_and(|state| match &fork.fence {
+                    ForkFence::Interaction(revision) => {
+                        state.user_interaction_revision == *revision
+                    }
+                    ForkFence::Automatic {
+                        definition_revision,
+                        ..
+                    } => state.ai_definition_revision == *definition_revision,
+                });
         if superseded
+            || !fence_valid
             || self.role(&fork.origin_view_id) != ViewRole::Canonical
             || self.items.iter().all(|view| view.id != fork.origin_view_id)
         {
@@ -3679,6 +3891,15 @@ pub struct App {
     pub hit_regions: HitRegions,
     pub source_notice: Option<String>,
     pub action_notice: Option<String>,
+    /// One bounded, non-modal automatic-setup lifecycle.  Raw rows and every
+    /// ordinary interaction stay available while this changes.
+    auto_setup_status: Option<AutoSetupStatus>,
+    auto_setup_requests: VecDeque<AutoSetupRequest>,
+    auto_setup_events: VecDeque<AutoSetupEvent>,
+    /// Session mirror of durable receipts.  The executable replaces/populates
+    /// it from the receipt store on integration; keeping it here makes palette
+    /// availability and edit-aware revert deterministic in the meantime.
+    auto_setup_receipts: HashMap<String, AutoSetupReceipt>,
     /// Theme, delight, reduced motion and ASCII fallback. Shell state with one
     /// writer (Settings, through `Ctx.appearance`) and many readers; a separate
     /// `App` field so `shell_ctx` can hand out `&mut` to it disjointly from
@@ -3768,6 +3989,10 @@ impl App {
             hit_regions: HitRegions::default(),
             source_notice: None,
             action_notice: None,
+            auto_setup_status: None,
+            auto_setup_requests: VecDeque::new(),
+            auto_setup_events: VecDeque::new(),
+            auto_setup_receipts: HashMap::new(),
             appearance: Appearance::default(),
             show_startup_title: true,
             view_selection_stamps: HashMap::new(),
@@ -4110,6 +4335,203 @@ impl App {
             .states
             .get(view_id)
             .map(|state| state.ai_definition_revision)
+    }
+
+    pub fn auto_setup_status(&self) -> Option<&AutoSetupStatus> {
+        self.auto_setup_status.as_ref()
+    }
+
+    pub fn auto_setup_revert_available(&self) -> bool {
+        self.active_view_id()
+            .is_some_and(|view_id| self.auto_setup_receipts.contains_key(view_id))
+    }
+
+    pub fn set_auto_setup_status(&mut self, status: AutoSetupStatus) -> bool {
+        let valid = self
+            .views
+            .items
+            .iter()
+            .any(|view| view.id == status.origin_view_id && view.source_id == status.source_id);
+        if valid {
+            self.auto_setup_status = Some(status);
+        }
+        valid
+    }
+
+    pub fn take_auto_setup_requests(&mut self) -> Vec<AutoSetupRequest> {
+        self.auto_setup_requests.drain(..).collect()
+    }
+
+    /// Build the semantic target once a canonical raw view has at least one
+    /// row. The executable owns that readiness check and the durable receipt
+    /// gate; this method owns the accepted-definition fence.
+    pub fn auto_setup_request_for_view(
+        &self,
+        origin_view_id: &str,
+        object_name: String,
+    ) -> Option<AutoSetupRequest> {
+        let item = self
+            .views
+            .items
+            .iter()
+            .find(|view| view.id == origin_view_id)?;
+        (self.view_role(origin_view_id) == ViewRole::Canonical).then_some(())?;
+        let config = self.views.auto_setup_config(origin_view_id)?;
+        Some(AutoSetupRequest {
+            source_id: item.source_id.clone(),
+            origin_view_id: origin_view_id.to_owned(),
+            object_name,
+            definition_revision: self.view_definition_revision(origin_view_id)?,
+            accepted_digest: config_digest(&config),
+        })
+    }
+
+    /// One bounded enqueue used by both source-open automation and Analyze
+    /// again. Callers decide whether they are still waiting for rows or are
+    /// ready to sample; neither state changes the view.
+    pub fn enqueue_auto_setup_request(
+        &mut self,
+        request: AutoSetupRequest,
+        stage: AutoSetupStage,
+    ) -> bool {
+        if !self.auto_setup_requests.is_empty() {
+            return false;
+        }
+        self.auto_setup_status = Some(AutoSetupStatus {
+            source_id: request.source_id.clone(),
+            origin_view_id: request.origin_view_id.clone(),
+            object_name: request.object_name.clone(),
+            stage,
+            detail: "raw view remains usable".into(),
+        });
+        self.auto_setup_requests.push_back(request);
+        true
+    }
+
+    pub fn take_auto_setup_events(&mut self) -> Vec<AutoSetupEvent> {
+        self.auto_setup_events.drain(..).collect()
+    }
+
+    /// Restores a receipt loaded by the executable's durable adapter. Invalid
+    /// or missing generated views are ignored rather than enabling an unsafe
+    /// revert against another object.
+    pub fn restore_auto_setup_receipt(&mut self, receipt: AutoSetupReceipt) -> bool {
+        let exists = self.views.items.iter().any(|view| {
+            view.id == receipt.generated_view_id && view.source_id == receipt.source_id
+        });
+        if exists {
+            self.auto_setup_receipts
+                .insert(receipt.generated_view_id.clone(), receipt);
+        }
+        exists
+    }
+
+    pub fn apply_auto_setup_proposal(
+        &mut self,
+        request: &AutoSetupRequest,
+        proposal: AutoSetupProposal,
+    ) -> Result<String, AutoSetupRejected> {
+        self.auto_setup_status = Some(AutoSetupStatus {
+            source_id: request.source_id.clone(),
+            origin_view_id: request.origin_view_id.clone(),
+            object_name: request.object_name.clone(),
+            stage: AutoSetupStage::Validating,
+            detail: "checking native definitions".into(),
+        });
+        match self
+            .views
+            .apply_auto_setup(request, proposal, self.shell.clock_now_unix_nanos)
+        {
+            Ok(candidate) => {
+                if let Some(status) = &mut self.auto_setup_status {
+                    status.stage = AutoSetupStage::Applying;
+                    status.detail = "building Enhanced without changing All events".into();
+                }
+                Ok(candidate)
+            }
+            Err(error) => {
+                if let Some(status) = &mut self.auto_setup_status {
+                    status.stage = AutoSetupStage::Unavailable;
+                    status.detail = match &error {
+                        AutoSetupRejected::Stale => {
+                            "source or accepted definition changed; analyze again".into()
+                        }
+                        AutoSetupRejected::Invalid(message) => message.clone(),
+                        AutoSetupRejected::QueueFull => "query queue is full; raw view kept".into(),
+                    };
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn request_auto_setup(&mut self) {
+        if !self.auto_setup_requests.is_empty() {
+            self.action_notice = Some("current log · analysis already queued".into());
+            return;
+        }
+        let Some(active) = self.views.active_item().cloned() else {
+            self.action_notice = Some("current log · open a source first".into());
+            return;
+        };
+        let origin_view_id = self
+            .canonical_view_for_source(&active.source_id)
+            .unwrap_or(active.id.as_str())
+            .to_owned();
+        let source_name = self
+            .sources
+            .iter()
+            .find(|source| source.id == active.source_id)
+            .map_or("Current log", |source| source.name.as_str());
+        let object_name = format!("{source_name} / All events");
+        let Some(request) = self.auto_setup_request_for_view(&origin_view_id, object_name) else {
+            self.action_notice = Some("current log · accepted definition unavailable".into());
+            return;
+        };
+        if !self.enqueue_auto_setup_request(request, AutoSetupStage::Sampling) {
+            self.action_notice = Some("current log · analysis already queued".into());
+        }
+    }
+
+    fn revert_auto_setup(&mut self) {
+        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
+            self.action_notice = Some("current view · open an Enhanced view first".into());
+            return;
+        };
+        let Some(receipt) = self.auto_setup_receipts.get(&view_id).cloned() else {
+            self.action_notice = Some("current view · no automatic setup receipt to revert".into());
+            return;
+        };
+        let Some(current) = self.views.auto_setup_config(&view_id) else {
+            self.action_notice = Some("current view · accepted configuration unavailable".into());
+            return;
+        };
+        if current != receipt.applied || config_digest(&current) != receipt.applied_digest {
+            self.action_notice = Some(
+                "current view · automatic setup was edited; revert refused to preserve changes"
+                    .into(),
+            );
+            return;
+        }
+        match self.views.revert_auto_setup_in_place(
+            &view_id,
+            receipt.before,
+            self.shell.clock_now_unix_nanos,
+        ) {
+            Ok(_) => {
+                self.auto_setup_status = Some(AutoSetupStatus {
+                    source_id: receipt.source_id,
+                    origin_view_id: receipt.origin_view_id,
+                    object_name: receipt.generated_view_name,
+                    stage: AutoSetupStage::Applying,
+                    detail: "reverting exact automatic setup".into(),
+                });
+            }
+            Err(_) => {
+                self.action_notice =
+                    Some("current view · revert queue is full; accepted configuration kept".into());
+            }
+        }
     }
 
     pub fn configure_ai(&mut self, provider: String, mode: String, thinking: String) {
@@ -5059,7 +5481,23 @@ impl App {
     /// from the view list; the diagnostic goes back to the view the user is
     /// actually looking at.
     pub fn discard_fork(&mut self, candidate_view_id: &str, reason: String) -> bool {
-        self.views.discard_fork(candidate_view_id, reason)
+        let automatic = self.views.is_automatic_fork(candidate_view_id);
+        let failed_message = (!reason.is_empty()).then(|| reason.clone());
+        let discarded = self.views.discard_fork(candidate_view_id, reason);
+        if discarded
+            && automatic
+            && let Some(message) = failed_message
+        {
+            self.auto_setup_events.push_back(AutoSetupEvent::Failed {
+                view_id: candidate_view_id.to_owned(),
+                message: message.clone(),
+            });
+            if let Some(status) = self.auto_setup_status.as_mut() {
+                status.stage = AutoSetupStage::Unavailable;
+                status.detail = format!("{message}; raw view kept");
+            }
+        }
+        discarded
     }
 
     /// The candidate's definition, for persistence before it is installed.
@@ -5070,22 +5508,27 @@ impl App {
         self.persistent_view_state_named(candidate_view_id, name)
     }
 
-    /// Installs a candidate as a real view and selects it.
+    /// Installs a candidate as a real view. Interactive editor forks select
+    /// it; automatic setup selects it only while the unchanged origin is still
+    /// active, so an asynchronous answer never steals focus.
     ///
     /// The view lifecycle half — inserting the item after its origin, marking
     /// it derived, returning the origin to its applied definition — is the
     /// seam's. What is left here is the shell surface: an open dialog has to
     /// follow the fork, and the user has to end up on the new view.
     pub fn install_fork(&mut self, candidate_view_id: &str) -> bool {
+        let active_before = self.active_view_id().map(str::to_owned);
         let Some(installed) = self.views.install_fork(candidate_view_id) else {
             return false;
         };
+        let automatic = installed.auto_before.is_some();
+        let select = !automatic || active_before.as_deref() == Some(&installed.origin_view_id);
         // An open editor was working on the origin. Its context has to follow
         // the fork, or it would keep describing a view the edit no longer
         // belongs to: a step editor bound to All events shows no accepted
         // outputs, because All events has none.
-        let carried =
-            self.carry_dialogs_to_fork(&installed.origin_view_id, &installed.candidate_view_id);
+        let carried = !automatic
+            && self.carry_dialogs_to_fork(&installed.origin_view_id, &installed.candidate_view_id);
         // Selecting a view normally returns to the log surface, but the user is
         // usually still typing: keep them in the editor they are working in, on
         // the view their edit just created.
@@ -5093,9 +5536,16 @@ impl App {
         // resets focus but never touches the layer stack, so restoring the
         // focus is enough to leave the user in the editor they were typing in.
         let editing = matches!(self.focus, Focus::Layer).then_some(self.focus);
-        self.select_view(&installed.candidate_view_id);
-        if let Some(focus) = editing {
-            self.focus = focus;
+        if select {
+            self.select_view(&installed.candidate_view_id);
+            if let Some(focus) = editing {
+                self.focus = focus;
+            }
+        } else if let Some(active) = active_before {
+            // Inserting immediately after the origin may shift the numeric
+            // sidebar index of the view the user moved to. Restore by stable
+            // identity, not by the stale index.
+            self.select_view(&active);
         }
         if carried {
             // A saved step closes its editor and returns to the step list, the
@@ -5103,10 +5553,52 @@ impl App {
             // leaves the list underneath, which *is* the return (§5.3).
             self.close_layer(LayerId::EnrichmentStep);
         }
-        // Deliberately silent: the view list already shows the new view
-        // selected beside the one it came from, and a status-line notice here
-        // would push the view's own query state off the end of the terminal at
-        // ordinary widths, hiding the answer the user is actually waiting for.
+        if let Some(before) = installed.auto_before {
+            let Some(applied) = self.views.auto_setup_config(&installed.candidate_view_id) else {
+                self.auto_setup_events.push_back(AutoSetupEvent::Failed {
+                    view_id: installed.candidate_view_id,
+                    message: "installed automatic view state is unavailable".into(),
+                });
+                return true;
+            };
+            let receipt = AutoSetupReceipt {
+                source_id: installed.source_id.clone(),
+                origin_view_id: installed.origin_view_id.clone(),
+                generated_view_id: installed.candidate_view_id.clone(),
+                generated_view_name: installed.name.clone(),
+                before: (*before).clone(),
+                before_digest: config_digest(&before),
+                applied: applied.clone(),
+                applied_digest: config_digest(&applied),
+            };
+            self.auto_setup_receipts
+                .insert(installed.candidate_view_id.clone(), receipt.clone());
+            self.auto_setup_events
+                .push_back(AutoSetupEvent::Applied(Box::new(receipt)));
+            let object_name = self
+                .sources
+                .iter()
+                .find(|source| source.id == installed.source_id)
+                .map_or(installed.name.clone(), |source| {
+                    format!("{} / {}", source.name, installed.name)
+                });
+            self.auto_setup_status = Some(AutoSetupStatus {
+                source_id: installed.source_id,
+                origin_view_id: installed.origin_view_id,
+                object_name,
+                stage: AutoSetupStage::Applied,
+                detail: if select {
+                    "Enhanced view selected".into()
+                } else {
+                    "Enhanced view ready; current view kept".into()
+                },
+            });
+            if !select {
+                self.action_notice = Some("Enhanced view ready; current view kept".into());
+            }
+        }
+        // Interactive forks stay deliberately silent: the view list already
+        // shows the selected result and its query state.
         true
     }
 
@@ -6431,6 +6923,7 @@ impl App {
             .err()
             .map(|failure| failure.message.clone());
         let accepted = self.apply_query_completion_inner(completion);
+        self.settle_auto_setup_query_outcomes();
         let Some(candidate) = candidate else {
             return accepted;
         };
@@ -6446,6 +6939,40 @@ impl App {
             }
         }
         accepted
+    }
+
+    fn settle_auto_setup_query_outcomes(&mut self) {
+        let outcomes: Vec<_> = self.views.auto_setup_outcomes.drain(..).collect();
+        for outcome in outcomes {
+            match outcome {
+                AutoSetupQueryOutcome::Reverted { view_id } => {
+                    let restored_digest = self
+                        .views
+                        .auto_setup_config(&view_id)
+                        .map(|config| config_digest(&config))
+                        .unwrap_or_default();
+                    self.auto_setup_receipts.remove(&view_id);
+                    self.auto_setup_events.push_back(AutoSetupEvent::Reverted {
+                        generated_view_id: view_id,
+                        restored_digest,
+                    });
+                    if let Some(status) = &mut self.auto_setup_status {
+                        status.stage = AutoSetupStage::Applied;
+                        status.detail = "automatic setup reverted".into();
+                    }
+                }
+                AutoSetupQueryOutcome::Failed { view_id, message } => {
+                    self.auto_setup_events.push_back(AutoSetupEvent::Failed {
+                        view_id,
+                        message: message.clone(),
+                    });
+                    if let Some(status) = &mut self.auto_setup_status {
+                        status.stage = AutoSetupStage::Unavailable;
+                        status.detail = format!("{message}; accepted view kept");
+                    }
+                }
+            }
+        }
     }
 
     /// Accepts a finished union job for a union view. Union candidates never
@@ -6777,6 +7304,7 @@ impl App {
                     .is_some_and(|pending| pending.revision == completion.revision)
                     && let Some(pending) = state.pending_recipe.take()
                 {
+                    let auto = pending.auto.clone();
                     if let Some(outcome) = pending.suggestion {
                         self.layers.recipes.record_outcome(outcome);
                     }
@@ -6797,9 +7325,30 @@ impl App {
                     state.applied_capture_time_policy = pending.capture_time_policy;
                     state.applied_time_basis = pending.time_basis;
                     state.applied_time_field = None;
-                    if pending.interaction_revision == state.user_interaction_revision {
+                    if pending.interaction_revision == state.user_interaction_revision
+                        || auto.is_some()
+                    {
                         state.pinned_columns = pending.pinned_columns;
                         state.color_field = pending.color_field;
+                    }
+                    if let Some(auto) = auto {
+                        let config = match &auto {
+                            PendingAutoSetup::Apply { applied, .. } => applied,
+                            PendingAutoSetup::Revert { restored } => restored,
+                        };
+                        state.color_rules = config.color_rules.clone();
+                        state.severity_column = config.severity_column.clone();
+                        state.timestamp_column = config.timestamp_column.clone();
+                        match auto {
+                            PendingAutoSetup::Apply { .. } => {}
+                            PendingAutoSetup::Revert { .. } => {
+                                self.views.auto_setup_outcomes.push_back(
+                                    AutoSetupQueryOutcome::Reverted {
+                                        view_id: completion.view_id.clone(),
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
                 clear_accepted_pending(&mut state.search, completion.revision);
@@ -6851,9 +7400,20 @@ impl App {
                     .as_ref()
                     .is_some_and(|pending| pending.revision == completion.revision)
                 {
-                    state.pending_recipe = None;
+                    let pending = state.pending_recipe.take();
                     let failed_purpose = failure.purpose;
                     let failure_message = failure.message;
+                    if pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.auto.is_some())
+                    {
+                        self.views
+                            .auto_setup_outcomes
+                            .push_back(AutoSetupQueryOutcome::Failed {
+                                view_id: completion.view_id.clone(),
+                                message: failure_message.clone(),
+                            });
+                    }
                     clear_accepted_pending(&mut state.search, completion.revision);
                     clear_accepted_pending(&mut state.advanced, completion.revision);
                     clear_accepted_pending(&mut state.enrichment, completion.revision);
@@ -8179,6 +8739,8 @@ impl App {
                     }
                 }
             }
+            Action::AnalyzeAutoSetup => self.request_auto_setup(),
+            Action::RevertAutoSetup => self.revert_auto_setup(),
             Action::StopCapture | Action::RestartCapture => {
                 let source_id = matches!(self.focus, Focus::Logs | Focus::Selector)
                     .then(|| self.views.items.get(self.views.selected))
@@ -9124,6 +9686,60 @@ fn valid_enrichments(stages: &[EnrichmentDefinition]) -> bool {
                 .output_prefix()
                 .is_none_or(|name| valid_command_step_name(name) && names.insert(name.to_owned()))
     })
+}
+
+fn validate_auto_setup_proposal(proposal: &AutoSetupProposal) -> Result<(), AutoSetupRejected> {
+    if !valid_enrichments(&proposal.enrichments)
+        || proposal
+            .enrichments
+            .iter()
+            .any(EnrichmentDefinition::is_command)
+    {
+        return Err(AutoSetupRejected::Invalid(
+            "automatic setup may contain up to 32 native expression stages and no commands".into(),
+        ));
+    }
+    if proposal.pinned_columns.len() > 8
+        || proposal
+            .pinned_columns
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 128)
+        || proposal.pinned_columns.iter().collect::<HashSet<_>>().len()
+            != proposal.pinned_columns.len()
+    {
+        return Err(AutoSetupRejected::Invalid(
+            "automatic setup pins must be unique and limited to 8 named columns".into(),
+        ));
+    }
+    if proposal.color_rules.len() > MAX_COLOR_RULES
+        || proposal
+            .color_rules
+            .iter()
+            .any(|rule| rule.summary().trim().is_empty())
+    {
+        return Err(AutoSetupRejected::Invalid(format!(
+            "automatic setup colour rules must be complete and limited to {MAX_COLOR_RULES}"
+        )));
+    }
+    if proposal.grouping.len() > MAX_EDITOR_BYTES {
+        return Err(AutoSetupRejected::Invalid(
+            "automatic setup grouping is too large".into(),
+        ));
+    }
+    for role in [
+        proposal.severity_column.as_deref(),
+        proposal.timestamp_column.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if role.is_empty() || role.len() > 128 {
+            return Err(AutoSetupRejected::Invalid(
+                "automatic setup display roles must name a bounded enrichment column".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `executable` can be started here: an absolute or directory-qualified

@@ -803,6 +803,7 @@ fn palette_context(app: &App) -> PaletteContext {
     context.in_raw_view = app
         .active_view_id()
         .is_some_and(|view| app.view_role(view) == crate::ViewRole::Canonical);
+    context.auto_setup_revert_available = app.auto_setup_revert_available();
     context.layer_commands = app.layer_commands();
     context
 }

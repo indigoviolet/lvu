@@ -676,6 +676,14 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                 (format!(" | {runtime}"), diagnostic)
             },
         );
+        let automatic_setup = app
+            .auto_setup_status()
+            .filter(|status| {
+                app.views()
+                    .get(app.selected_view())
+                    .is_some_and(|view| view.source_id == status.source_id)
+            })
+            .map_or_else(String::new, |status| format!(" | {}", status.summary()));
         let range = format!(
             " | {}-{}/{}",
             if state.rows_drawn == 0 {
@@ -713,6 +721,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         let optional: Vec<(u8, String)> = vec![
             (RANK_TIME, capture_time.to_owned()),
             (RANK_READINESS, runtime),
+            (RANK_READINESS, automatic_setup),
             (RANK_CONTEXT, diagnostic),
             (RANK_RANGE, range),
             (RANK_FILTERS, search),

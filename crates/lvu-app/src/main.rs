@@ -51,6 +51,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 pub mod agent;
+pub mod auto_setup;
 mod command_controller;
 mod command_execution;
 mod command_rows;
@@ -885,11 +886,13 @@ struct Composition {
     /// rather than the most recently touched source.
     session_sources: Vec<SourceDefinition>,
     command_controller: command_controller::CommandController,
+    auto_setup: auto_setup::AutoSetupCoordinator,
 }
 
 impl Composition {
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
+        changed |= self.auto_setup.sync(app);
         changed |= self.handle_source_management(app);
         changed |= self.handle_source_controls(app, adapter);
         changed |= self.handle_settings(app);
@@ -8915,6 +8918,7 @@ async fn run() -> Result<(), String> {
         capture_root: capture_dir,
         session_sources,
         command_controller,
+        auto_setup: auto_setup::AutoSetupCoordinator::default(),
     };
     composition.record_session(&mut app);
     if let Some(error) = recent_error {
@@ -11064,6 +11068,7 @@ mod tests {
                 directory.path().into(),
                 super::command_rows::CommandPresentation::default(),
             ),
+            auto_setup: super::auto_setup::AutoSetupCoordinator::default(),
         };
         BatchFixture {
             directory,
@@ -12789,6 +12794,7 @@ for line in sys.stdin:
                 directory.path().into(),
                 super::command_rows::CommandPresentation::default(),
             ),
+            auto_setup: super::auto_setup::AutoSetupCoordinator::default(),
         };
         composition.admit_definition(
             &mut app,
@@ -12931,6 +12937,7 @@ for line in sys.stdin:
                 directory.path().into(),
                 super::command_rows::CommandPresentation::default(),
             ),
+            auto_setup: super::auto_setup::AutoSetupCoordinator::default(),
         };
 
         composition.cancel_investigation(21);
