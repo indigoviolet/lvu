@@ -233,6 +233,10 @@ pub struct AutoSetupAnalysis {
 }
 
 impl AutoSetupCoordinator {
+    pub fn is_idle(&self) -> bool {
+        self.active.is_none() && self.pending.is_empty()
+    }
+
     /// Source-open integration hook. The caller invokes it only after the
     /// canonical raw view has at least one row and the durable receipt/settings
     /// policy says this source is eligible.
@@ -317,24 +321,15 @@ impl AutoSetupCoordinator {
         self.active = None;
         let request = &analysis.request;
         if analysis.data_revision != current_data_revision {
-            app.set_auto_setup_status(AutoSetupStatus {
-                source_id: request.source_id.clone(),
-                origin_view_id: request.origin_view_id.clone(),
-                object_name: request.object_name.clone(),
-                stage: AutoSetupStage::Unavailable,
-                detail: "source acquisition changed; analyze again".into(),
-            });
+            app.automatic_setup_unavailable(
+                request,
+                "source acquisition changed; analyze again".into(),
+            );
             return Ok(None);
         }
         match result {
             Err(message) => {
-                app.set_auto_setup_status(AutoSetupStatus {
-                    source_id: request.source_id.clone(),
-                    origin_view_id: request.origin_view_id.clone(),
-                    object_name: request.object_name.clone(),
-                    stage: AutoSetupStage::Unavailable,
-                    detail: format!("{message}; raw view kept"),
-                });
+                app.automatic_setup_unavailable(request, message);
                 Ok(None)
             }
             Ok(proposal) => app

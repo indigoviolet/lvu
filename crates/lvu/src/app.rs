@@ -2637,12 +2637,10 @@ impl Views {
 
     /// Stage a validated automatic setup as a named derived view.  The raw
     /// canonical view is never mutated and stays immediately usable.
-    pub fn apply_auto_setup(
-        &mut self,
+    fn validate_auto_setup_request(
+        &self,
         request: &AutoSetupRequest,
-        proposal: AutoSetupProposal,
-        now_nanos: i64,
-    ) -> Result<String, AutoSetupRejected> {
+    ) -> Result<AutoSetupViewConfig, AutoSetupRejected> {
         let Some(item) = self
             .items
             .iter()
@@ -2663,6 +2661,16 @@ impl Views {
         if before != *request.accepted_config {
             return Err(AutoSetupRejected::Stale);
         }
+        Ok(before)
+    }
+
+    pub fn apply_auto_setup(
+        &mut self,
+        request: &AutoSetupRequest,
+        proposal: AutoSetupProposal,
+        now_nanos: i64,
+    ) -> Result<String, AutoSetupRejected> {
+        let before = self.validate_auto_setup_request(request)?;
         validate_auto_setup_proposal(&proposal)?;
         let mut applied = before.clone();
         applied.recipe.enrichment = proposal
@@ -4347,6 +4355,10 @@ impl App {
             .is_some_and(|view_id| self.auto_setup_receipts.contains_key(view_id))
     }
 
+    pub fn auto_setup_receipt(&self, view_id: &str) -> Option<&AutoSetupReceipt> {
+        self.auto_setup_receipts.get(view_id)
+    }
+
     pub fn set_auto_setup_status(&mut self, status: AutoSetupStatus) -> bool {
         let valid = self
             .views
@@ -4357,6 +4369,22 @@ impl App {
             self.auto_setup_status = Some(status);
         }
         valid
+    }
+
+    pub fn automatic_setup_unavailable(&mut self, request: &AutoSetupRequest, diagnostic: String) {
+        self.auto_setup_status = Some(AutoSetupStatus {
+            source_id: request.source_id.clone(),
+            origin_view_id: request.origin_view_id.clone(),
+            object_name: request.object_name.clone(),
+            stage: AutoSetupStage::Unavailable,
+            detail: format!("{diagnostic}; raw view kept"),
+        });
+        self.auto_setup_events
+            .push_back(AutoSetupEvent::Unavailable {
+                source_id: request.source_id.clone(),
+                origin_view_id: request.origin_view_id.clone(),
+                diagnostic,
+            });
     }
 
     pub fn take_auto_setup_requests(&mut self) -> Vec<AutoSetupRequest> {
@@ -4439,6 +4467,29 @@ impl App {
             stage: AutoSetupStage::Validating,
             detail: "checking native definitions".into(),
         });
+        if proposal == AutoSetupProposal::default() {
+            match self.views.validate_auto_setup_request(request) {
+                Ok(_) => {
+                    self.auto_setup_events.push_back(AutoSetupEvent::NoChanges {
+                        source_id: request.source_id.clone(),
+                        origin_view_id: request.origin_view_id.clone(),
+                    });
+                    if let Some(status) = &mut self.auto_setup_status {
+                        status.stage = AutoSetupStage::Applied;
+                        status.detail = "no useful automatic setup found; raw view kept".into();
+                    }
+                    return Ok(request.origin_view_id.clone());
+                }
+                Err(error) => {
+                    if let Some(status) = &mut self.auto_setup_status {
+                        status.stage = AutoSetupStage::Unavailable;
+                        status.detail =
+                            "source or accepted definition changed; analyze again".into();
+                    }
+                    return Err(error);
+                }
+            }
+        }
         match self
             .views
             .apply_auto_setup(request, proposal, self.shell.clock_now_unix_nanos)

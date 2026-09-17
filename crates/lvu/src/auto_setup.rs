@@ -120,7 +120,19 @@ pub struct AutoSetupReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AutoSetupEvent {
     Applied(Box<AutoSetupReceipt>),
-    Failed { view_id: String, message: String },
+    NoChanges {
+        source_id: String,
+        origin_view_id: String,
+    },
+    Unavailable {
+        source_id: String,
+        origin_view_id: String,
+        diagnostic: String,
+    },
+    Failed {
+        view_id: String,
+        message: String,
+    },
 }
 
 /// Versioned canonical bytes for a durable receipt's SHA-256.

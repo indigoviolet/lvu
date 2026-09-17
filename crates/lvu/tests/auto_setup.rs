@@ -123,6 +123,29 @@ fn raw_first_atomic_success_and_native_editor_state() {
 }
 
 #[test]
+fn empty_proposal_records_no_changes_without_creating_a_view() {
+    let (mut app, provider) = app_with_raw();
+    let analysis = request(&mut app, &provider);
+    assert_eq!(
+        app.apply_auto_setup_proposal(&analysis, AutoSetupProposal::default())
+            .unwrap(),
+        "raw"
+    );
+    assert_eq!(app.views().len(), 1);
+    assert!(app.take_view_fork_requests().is_empty());
+    assert!(matches!(
+        app.take_auto_setup_events().as_slice(),
+        [lvu::AutoSetupEvent::NoChanges {
+            source_id,
+            origin_view_id,
+        }] if source_id == "source" && origin_view_id == "raw"
+    ));
+    assert!(app.auto_setup_status().is_some_and(|status| {
+        status.stage == AutoSetupStage::Applied && status.detail.contains("no useful")
+    }));
+}
+
+#[test]
 fn navigation_does_not_stale_analysis_and_late_success_does_not_steal_focus() {
     let (mut app, provider) = app_with_raw();
     let analysis = request(&mut app, &provider);

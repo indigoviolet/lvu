@@ -47,6 +47,7 @@ use lvu_view::{
     NativeViewAdapter, RowReadiness, SampleTier, ScanState, SnapshotJob, SnapshotLimits,
     SnapshotState, ViewConfig,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -893,11 +894,25 @@ struct Composition {
     session_sources: Vec<SourceDefinition>,
     command_controller: command_controller::CommandController,
     auto_setup: auto_setup::AutoSetupCoordinator,
+    auto_setup_receipt_sequence: u64,
+    auto_setup_receipt_loads: HashMap<u64, SourceId>,
+    auto_setup_ready: VecDeque<SourceId>,
+    auto_setup_restore_pending: HashMap<SourceId, lvu_memory::AutomaticSetupReceipt>,
+    auto_setup_evidence: HashMap<SourceId, AutomaticSetupEvidence>,
+}
+
+#[derive(Clone)]
+struct AutomaticSetupEvidence {
+    proposal_sha256: String,
+    definition_revision: u64,
+    source_generation: u64,
 }
 
 impl Composition {
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
+        changed |= self.handle_auto_setup_events(app);
+        changed |= self.handle_auto_setup_policy(app);
         changed |= self.auto_setup.sync(app);
         changed |= self.handle_source_management(app);
         changed |= self.handle_source_controls(app, adapter);
@@ -1060,6 +1075,9 @@ impl Composition {
                                     "memory error: {error}; raw browsing remains available"
                                 ));
                             }
+                            if let Err(error) = self.request_auto_setup_receipt(source_id) {
+                                memory_notice(app, format!("automatic setup receipt: {error}"));
+                            }
                             self.note_start_succeeded(app, &origin, &view_id);
                         }
                         Err(message) => {
@@ -1190,6 +1208,20 @@ impl Composition {
             let mut job = self.settings_job.take().expect("polled settings job");
             if let Some(worker) = job.worker.take() {
                 let _ = worker.join();
+            }
+            if let Ok(context) = &result {
+                let previous = self.applied_settings.settings.automatic_setup.policy;
+                let policy = stored_automatic_setup_policy(context.saved.automatic_setup);
+                self.applied_settings.settings.automatic_setup.policy = policy;
+                if previous != policy
+                    && policy == settings::AutomaticSetupPolicy::AutomaticOnNewSource
+                {
+                    for source_id in self.sources.keys().copied().collect::<Vec<_>>() {
+                        if let Err(error) = self.request_auto_setup_receipt(source_id) {
+                            memory_notice(app, format!("automatic setup receipt: {error}"));
+                        }
+                    }
+                }
             }
             app.complete_settings_save(job.generation, result);
             changed = true;
@@ -2237,6 +2269,21 @@ impl Composition {
                         } else {
                             auto_setup::decode_auto_setup_proposal(&proposal)
                         };
+                        if result.is_ok()
+                            && let Ok(source_uuid) = Uuid::parse_str(&analysis.request.source_id)
+                            && let Ok(source_generation) = analysis.data_revision.parse::<u64>()
+                        {
+                            let proposal_bytes =
+                                serde_json::to_vec(&proposal.definition).unwrap_or_default();
+                            self.auto_setup_evidence.insert(
+                                SourceId(source_uuid),
+                                AutomaticSetupEvidence {
+                                    proposal_sha256: sha256_hex(&proposal_bytes),
+                                    definition_revision: analysis.request.definition_revision,
+                                    source_generation,
+                                },
+                            );
+                        }
                         if let Err(error) =
                             self.auto_setup
                                 .complete(app, analysis, &current_data_revision, result)
@@ -2413,6 +2460,267 @@ impl Composition {
             }
         }
         true
+    }
+
+    fn automatic_setup_enabled(&self) -> bool {
+        self.applied_settings.settings.automatic_setup.policy
+            == settings::AutomaticSetupPolicy::AutomaticOnNewSource
+    }
+
+    fn next_auto_setup_receipt_request(&mut self) -> u64 {
+        self.auto_setup_receipt_sequence = self.auto_setup_receipt_sequence.saturating_add(1);
+        self.auto_setup_receipt_sequence
+    }
+
+    fn request_auto_setup_receipt(&mut self, source_id: SourceId) -> Result<(), String> {
+        if !self.automatic_setup_enabled()
+            || self
+                .auto_setup_receipt_loads
+                .values()
+                .any(|id| *id == source_id)
+            || self.auto_setup_ready.contains(&source_id)
+        {
+            return Ok(());
+        }
+        let request_id = self.next_auto_setup_receipt_request();
+        self.memory.get_automatic_setup_receipt(
+            request_id,
+            source_id,
+            lvu_memory::AUTOMATIC_SETUP_POLICY_VERSION,
+        )?;
+        self.auto_setup_receipt_loads.insert(request_id, source_id);
+        Ok(())
+    }
+
+    fn handle_auto_setup_policy(&mut self, app: &mut App) -> bool {
+        if !self.automatic_setup_enabled() {
+            let changed = !self.auto_setup_ready.is_empty();
+            self.auto_setup_ready.clear();
+            return changed;
+        }
+        if !self.auto_setup.is_idle() {
+            return false;
+        }
+        if app.auto_setup_status().is_some_and(|status| {
+            matches!(
+                status.stage,
+                lvu::AutoSetupStage::WaitingForRows
+                    | lvu::AutoSetupStage::Sampling
+                    | lvu::AutoSetupStage::Analyzing
+                    | lvu::AutoSetupStage::Validating
+                    | lvu::AutoSetupStage::Applying
+            )
+        }) {
+            return false;
+        }
+        while let Some(source_id) = self.auto_setup_ready.pop_front() {
+            let Some(source_ui_id) = self.sources.get(&source_id).cloned() else {
+                continue;
+            };
+            let Some(definition) = self.definitions.get(&source_id) else {
+                continue;
+            };
+            let origin_view_id = view_id(source_id);
+            let object_name = format!("{} / {}", definition.name, memory::CANONICAL_VIEW_NAME);
+            return self
+                .auto_setup
+                .enqueue_ready(app, &origin_view_id, object_name)
+                && app
+                    .auto_setup_status()
+                    .is_some_and(|status| status.source_id == source_ui_id);
+        }
+        false
+    }
+
+    fn handle_auto_setup_events(&mut self, app: &mut App) -> bool {
+        let events = app.take_auto_setup_events();
+        if events.is_empty() {
+            return false;
+        }
+        for event in events {
+            match event {
+                lvu::AutoSetupEvent::Applied(receipt) => {
+                    let Ok(source_uuid) = Uuid::parse_str(&receipt.source_id) else {
+                        memory_notice(
+                            app,
+                            "automatic setup receipt has an invalid source id".into(),
+                        );
+                        continue;
+                    };
+                    let source_id = SourceId(source_uuid);
+                    let Some(evidence) = self.auto_setup_evidence.remove(&source_id) else {
+                        memory_notice(
+                            app,
+                            "automatic setup receipt lost its proposal evidence".into(),
+                        );
+                        continue;
+                    };
+                    let (Ok(origin_uuid), Ok(generated_uuid)) = (
+                        Uuid::parse_str(&receipt.origin_view_id),
+                        Uuid::parse_str(&receipt.generated_view_id),
+                    ) else {
+                        memory_notice(app, "automatic setup receipt has an invalid view id".into());
+                        continue;
+                    };
+                    let durable = lvu_memory::AutomaticSetupReceipt {
+                        schema_version: lvu_memory::AUTOMATIC_SETUP_RECEIPT_SCHEMA_VERSION,
+                        source_id,
+                        policy_version: lvu_memory::AUTOMATIC_SETUP_POLICY_VERSION,
+                        outcome: lvu_memory::AutomaticSetupOutcome::Applied,
+                        proposal_sha256: Some(evidence.proposal_sha256),
+                        applied_config_sha256: Some(sha256_hex(&lvu::auto_setup_canonical_bytes(
+                            &receipt.applied,
+                        ))),
+                        created_view_id: Some(lvu_core::ViewId(generated_uuid)),
+                        frozen: Some(lvu_memory::AutomaticSetupFrozenRevision {
+                            origin_view_id: lvu_core::ViewId(origin_uuid),
+                            persisted_view_version: 0,
+                            accepted_revision: evidence.definition_revision,
+                            source_generation: evidence.source_generation,
+                            data_revision: evidence.source_generation,
+                        }),
+                        diagnostic: Some("installed Enhanced view".into()),
+                        recorded_at_unix_nanos: unix_now_nanos(),
+                    };
+                    let request_id = self.next_auto_setup_receipt_request();
+                    if let Err(error) = self
+                        .memory
+                        .upsert_automatic_setup_receipt(request_id, durable)
+                    {
+                        memory_notice(app, format!("automatic setup receipt: {error}"));
+                    }
+                }
+                lvu::AutoSetupEvent::NoChanges {
+                    source_id,
+                    origin_view_id: _,
+                } => {
+                    let Ok(source_uuid) = Uuid::parse_str(&source_id) else {
+                        continue;
+                    };
+                    let source_id = SourceId(source_uuid);
+                    let Some(evidence) = self.auto_setup_evidence.remove(&source_id) else {
+                        continue;
+                    };
+                    let durable = lvu_memory::AutomaticSetupReceipt {
+                        schema_version: lvu_memory::AUTOMATIC_SETUP_RECEIPT_SCHEMA_VERSION,
+                        source_id,
+                        policy_version: lvu_memory::AUTOMATIC_SETUP_POLICY_VERSION,
+                        outcome: lvu_memory::AutomaticSetupOutcome::NoChanges,
+                        proposal_sha256: Some(evidence.proposal_sha256),
+                        applied_config_sha256: None,
+                        created_view_id: None,
+                        frozen: None,
+                        diagnostic: Some("no useful automatic setup found".into()),
+                        recorded_at_unix_nanos: unix_now_nanos(),
+                    };
+                    let request_id = self.next_auto_setup_receipt_request();
+                    if let Err(error) = self
+                        .memory
+                        .upsert_automatic_setup_receipt(request_id, durable)
+                    {
+                        memory_notice(app, format!("automatic setup receipt: {error}"));
+                    }
+                }
+                lvu::AutoSetupEvent::Unavailable {
+                    source_id,
+                    origin_view_id: _,
+                    diagnostic,
+                } => {
+                    let Ok(source_uuid) = Uuid::parse_str(&source_id) else {
+                        continue;
+                    };
+                    let source_id = SourceId(source_uuid);
+                    let evidence = self.auto_setup_evidence.remove(&source_id);
+                    let durable = lvu_memory::AutomaticSetupReceipt {
+                        schema_version: lvu_memory::AUTOMATIC_SETUP_RECEIPT_SCHEMA_VERSION,
+                        source_id,
+                        policy_version: lvu_memory::AUTOMATIC_SETUP_POLICY_VERSION,
+                        outcome: lvu_memory::AutomaticSetupOutcome::Unavailable,
+                        proposal_sha256: evidence.map(|value| value.proposal_sha256),
+                        applied_config_sha256: None,
+                        created_view_id: None,
+                        frozen: None,
+                        diagnostic: Some(bounded_receipt_diagnostic(&diagnostic)),
+                        recorded_at_unix_nanos: unix_now_nanos(),
+                    };
+                    let request_id = self.next_auto_setup_receipt_request();
+                    if let Err(error) = self
+                        .memory
+                        .upsert_automatic_setup_receipt(request_id, durable)
+                    {
+                        memory_notice(app, format!("automatic setup receipt: {error}"));
+                    }
+                }
+                lvu::AutoSetupEvent::Failed { message, .. } => {
+                    if let Some(status) = app.auto_setup_status().cloned() {
+                        let origin_view_id = status.origin_view_id.clone();
+                        let request = lvu::AutoSetupRequest {
+                            source_id: status.source_id,
+                            origin_view_id: origin_view_id.clone(),
+                            object_name: status.object_name,
+                            definition_revision: app
+                                .view_definition_revision(&origin_view_id)
+                                .unwrap_or_default(),
+                            accepted_config: Box::new(
+                                app.views
+                                    .auto_setup_config(&origin_view_id)
+                                    .unwrap_or_default(),
+                            ),
+                        };
+                        app.automatic_setup_unavailable(&request, message.clone());
+                    }
+                    memory_notice(app, format!("automatic setup: {message}"));
+                }
+            }
+        }
+        true
+    }
+
+    fn try_restore_auto_setup_receipt(&mut self, app: &mut App, source_id: SourceId) -> bool {
+        let Some(receipt) = self.auto_setup_restore_pending.get(&source_id).cloned() else {
+            return false;
+        };
+        if receipt.outcome != lvu_memory::AutomaticSetupOutcome::Applied {
+            self.auto_setup_restore_pending.remove(&source_id);
+            return true;
+        }
+        let (Some(view_id), Some(expected_hash), Some(frozen)) = (
+            receipt.created_view_id,
+            receipt.applied_config_sha256.as_deref(),
+            receipt.frozen.as_ref(),
+        ) else {
+            self.auto_setup_restore_pending.remove(&source_id);
+            return true;
+        };
+        let generated_view_id = view_id.0.to_string();
+        let origin_view_id = frozen.origin_view_id.0.to_string();
+        let (Some(before), Some(applied)) = (
+            app.views.auto_setup_config(&origin_view_id),
+            app.views.auto_setup_config(&generated_view_id),
+        ) else {
+            return false;
+        };
+        if sha256_hex(&lvu::auto_setup_canonical_bytes(&applied)) != expected_hash {
+            self.auto_setup_restore_pending.remove(&source_id);
+            return true;
+        }
+        let name = app
+            .views()
+            .iter()
+            .find(|view| view.id == generated_view_id)
+            .map_or_else(|| "Enhanced".into(), |view| view.name.clone());
+        let restored = app.restore_auto_setup_receipt(lvu::AutoSetupReceipt {
+            source_id: source_id.0.to_string(),
+            origin_view_id,
+            generated_view_id,
+            generated_view_name: name,
+            before,
+            applied,
+        });
+        if restored {
+            self.auto_setup_restore_pending.remove(&source_id);
+        }
+        restored
     }
 
     /// Acquisition generation is the data-identity fence for automatic
@@ -4942,6 +5250,7 @@ impl Composition {
                     // user on All events.
                     app.restore_source_selection(&source_id.0.to_string());
                     self.memory_ready.insert(source_id);
+                    self.try_restore_auto_setup_receipt(app, source_id);
                 }
             }
             MemoryEvent::DerivedViewCreated(view_id, result) => {
@@ -4993,7 +5302,30 @@ impl Composition {
                 }
             }
             MemoryEvent::ViewDeleted(view_id) => {
+                let automatic = app
+                    .auto_setup_receipt(&view_id.0.to_string())
+                    .cloned()
+                    .and_then(|receipt| {
+                        let source_id = SourceId(Uuid::parse_str(&receipt.source_id).ok()?);
+                        Some((
+                            source_id,
+                            sha256_hex(&lvu::auto_setup_canonical_bytes(&receipt.applied)),
+                        ))
+                    });
                 self.finish_view_delete(app, adapter, view_id);
+                if let Some((source_id, expected_hash)) = automatic {
+                    let request_id = self.next_auto_setup_receipt_request();
+                    if let Err(error) = self.memory.mark_automatic_setup_reverted(
+                        request_id,
+                        source_id,
+                        lvu_memory::AUTOMATIC_SETUP_POLICY_VERSION,
+                        view_id,
+                        expected_hash,
+                        unix_now_nanos(),
+                    ) {
+                        memory_notice(app, format!("automatic setup receipt: {error}"));
+                    }
+                }
             }
             MemoryEvent::ViewDeleteFailed(view_id, error) => {
                 self.pending_view_deletes.remove(&view_id);
@@ -5009,15 +5341,51 @@ impl Composition {
                 self.abort_source_remove(app, source_id, error);
             }
             MemoryEvent::Recent(values) => self.recent_sources = values,
-            MemoryEvent::AutomaticSetupReceiptLoaded { .. }
-            | MemoryEvent::AutomaticSetupReceiptStored { .. }
-            | MemoryEvent::AutomaticSetupReceiptReverted { .. } => {
-                // Receipt transport is available before the automatic-setup
-                // controller owns pending correlations. The upcoming policy
-                // wiring consumes these acknowledgements; there is no honest
-                // user-visible action to fabricate here meanwhile.
+            MemoryEvent::AutomaticSetupReceiptLoaded {
+                request_id,
+                source_id,
+                policy_version,
+                receipt,
+            } => {
+                self.auto_setup_receipt_loads.remove(&request_id);
+                if policy_version == lvu_memory::AUTOMATIC_SETUP_POLICY_VERSION {
+                    if let Some(receipt) = receipt {
+                        self.auto_setup_restore_pending.insert(source_id, *receipt);
+                        self.try_restore_auto_setup_receipt(app, source_id);
+                    } else if self.automatic_setup_enabled()
+                        && !self.auto_setup_ready.contains(&source_id)
+                    {
+                        self.auto_setup_ready.push_back(source_id);
+                    }
+                }
             }
-            MemoryEvent::AutomaticSetupReceiptFailed { reason, .. } => {
+            MemoryEvent::AutomaticSetupReceiptStored {
+                request_id,
+                source_id,
+                policy_version,
+            } => {
+                let _ack = (request_id, source_id, policy_version);
+            }
+            MemoryEvent::AutomaticSetupReceiptReverted {
+                request_id,
+                source_id,
+                policy_version,
+                changed,
+            } => {
+                let _ack = (request_id, source_id, policy_version);
+                if !changed {
+                    app.action_notice =
+                        Some("automatic setup receipt was already reverted or replaced".into());
+                }
+            }
+            MemoryEvent::AutomaticSetupReceiptFailed {
+                request_id,
+                source_id,
+                policy_version,
+                operation,
+                reason,
+            } => {
+                let _failed = (request_id, source_id, policy_version, operation);
                 memory_notice(app, format!("automatic setup receipt: {reason}"));
             }
             MemoryEvent::Recipes(meta, values, candidates) => {
@@ -6593,13 +6961,7 @@ fn remaining(deadline: std::time::Instant) -> Duration {
 
 fn finish_ai_error(app: &mut App, start: &AiStart, message: String) {
     if let Some(analysis) = &start.auto_setup {
-        app.set_auto_setup_status(lvu::AutoSetupStatus {
-            source_id: analysis.request.source_id.clone(),
-            origin_view_id: analysis.request.origin_view_id.clone(),
-            object_name: analysis.request.object_name.clone(),
-            stage: lvu::AutoSetupStage::Unavailable,
-            detail: format!("{message}; raw view kept"),
-        });
+        app.automatic_setup_unavailable(&analysis.request, message);
         return;
     }
     app.finish_ask_ai(
@@ -7290,6 +7652,23 @@ fn unix_now_nanos() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
         .unwrap_or(i64::MAX)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn bounded_receipt_diagnostic(value: &str) -> String {
+    const LIMIT: usize = 512;
+    if value.len() <= LIMIT {
+        return value.to_owned();
+    }
+    let mut end = LIMIT;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn recipe_incompatibility(view: &lvu_memory::NamedViewDefinition) -> Option<String> {
@@ -9075,6 +9454,11 @@ async fn run() -> Result<(), String> {
         session_sources,
         command_controller,
         auto_setup: auto_setup::AutoSetupCoordinator::default(),
+        auto_setup_receipt_sequence: 0,
+        auto_setup_receipt_loads: HashMap::new(),
+        auto_setup_ready: VecDeque::new(),
+        auto_setup_restore_pending: HashMap::new(),
+        auto_setup_evidence: HashMap::new(),
     };
     composition.record_session(&mut app);
     if let Some(error) = recent_error {
@@ -9093,6 +9477,11 @@ async fn run() -> Result<(), String> {
             app.source_notice = Some(format!(
                 "memory error: {error}; raw browsing remains available"
             ));
+        }
+    }
+    for source_id in composition.sources.keys().copied().collect::<Vec<_>>() {
+        if let Err(error) = composition.request_auto_setup_receipt(source_id) {
+            memory_notice(&mut app, format!("automatic setup receipt: {error}"));
         }
     }
     let mut rows = command_rows::CommandRows {
@@ -11244,6 +11633,11 @@ mod tests {
                 super::command_rows::CommandPresentation::default(),
             ),
             auto_setup: super::auto_setup::AutoSetupCoordinator::default(),
+            auto_setup_receipt_sequence: 0,
+            auto_setup_receipt_loads: HashMap::new(),
+            auto_setup_ready: VecDeque::new(),
+            auto_setup_restore_pending: HashMap::new(),
+            auto_setup_evidence: HashMap::new(),
         };
         BatchFixture {
             directory,
@@ -12972,6 +13366,11 @@ for line in sys.stdin:
                 super::command_rows::CommandPresentation::default(),
             ),
             auto_setup: super::auto_setup::AutoSetupCoordinator::default(),
+            auto_setup_receipt_sequence: 0,
+            auto_setup_receipt_loads: HashMap::new(),
+            auto_setup_ready: VecDeque::new(),
+            auto_setup_restore_pending: HashMap::new(),
+            auto_setup_evidence: HashMap::new(),
         };
         composition.admit_definition(
             &mut app,
@@ -13115,6 +13514,11 @@ for line in sys.stdin:
                 super::command_rows::CommandPresentation::default(),
             ),
             auto_setup: super::auto_setup::AutoSetupCoordinator::default(),
+            auto_setup_receipt_sequence: 0,
+            auto_setup_receipt_loads: HashMap::new(),
+            auto_setup_ready: VecDeque::new(),
+            auto_setup_restore_pending: HashMap::new(),
+            auto_setup_evidence: HashMap::new(),
         };
 
         composition.cancel_investigation(21);
