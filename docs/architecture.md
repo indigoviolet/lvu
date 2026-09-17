@@ -1,7 +1,7 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.12` (2026-09-16) is the current public release. In addition to live
+`v0.1.13` (2026-09-16) is the current public release. In addition to live
 unions, shared keys, enrichment-backed colours, automatic shared capture and
 the responsive dialog system, it includes acknowledged view deletion,
 capture-preserving source removal, explicit concurrent discovery outcomes and
@@ -54,7 +54,7 @@ Apple-silicon terminal acceptance remains unverified.
 
 | Component | Responsibility and starting points |
 | --- | --- |
-| `crates/lvu-app` | Executable/composition root. `src/main.rs` wires sources, views, terminal ticks, snapshots and assistance; `memory.rs`, `settings.rs`, `storage.rs`, `agent.rs` own their application workers and lifecycle. The reviewed command path uses `command_controller.rs`, `command_snapshot.rs`, `command_execution.rs` and `command_rows.rs`. |
+| `crates/lvu-app` | Executable/composition root. `src/main.rs` wires sources, views, terminal ticks, snapshots and assistance; `memory.rs`, `settings.rs`, `storage.rs`, `agent.rs` own their application workers and lifecycle. `auto_setup.rs` strictly lowers the bounded automatic-setup wire proposal into native view operations. The reviewed command path uses `command_controller.rs`, `command_snapshot.rs`, `command_execution.rs` and `command_rows.rs`. |
 | `crates/lvu` | Ratatui application state and rendering. `app.rs` is the shell: the layer stack, base-screen actions, view drafts and UI transactions; every dialog is an owned component under `components/` built to `component.rs` and [`component-model.md`](component-model.md), with `dialog_layout.rs` and `dialog_controls.rs` implementing [`dialog-system.md`](dialog-system.md) §3–§10. `terminal.rs` owns input/redraw/terminal restoration and `input.rs` the non-blocking descriptor crossterm reads through; `ui.rs` owns base-screen geometry. `command_palette.rs`, `theme.rs`, `delight.rs`, `text_selection.rs` provide shared presentation behavior. |
 | `crates/lvu-core` | Source/record identities, acquisition, framing and lossless journal format. Start with `model.rs`, `acquisition.rs`, `journal.rs`. |
 | `crates/lvu-ingest` | Durable source lifecycle: manager, journal writer, catalog, resume cursors, admission and shutdown. `SourceManager` returns shared `SourceHandle`s. |
@@ -226,7 +226,7 @@ preempt a running Polars evaluation or kernel filesystem read.
 
 | Storage | Authority and policy |
 | --- | --- |
-| `$XDG_CONFIG_HOME/lvu/settings.toml` | Global model, theme, motion and cache preferences; fallback `~/.config/lvu/settings.toml`. |
+| `$XDG_CONFIG_HOME/lvu/settings.toml` | Global model, disabled-by-default automatic log setup policy, theme, motion and cache preferences; fallback `~/.config/lvu/settings.toml`. |
 | `$XDG_DATA_HOME/lvu` | Default durable capture root; fallback `~/.local/share/lvu`. `--capture-dir` overrides it. Existing legacy `.lvu-captures` can be selected with a notice when the XDG data root does not yet exist; nothing is moved automatically. |
 | `<capture-root>/workspace` | SQLite accepted state, independent drafts, navigation, presentation, sources and recipe metadata; canonical recipes under its `recipes/` directory. |
 | `<capture-root>/workspace/session.json` | The sources of the most recent session in this capture root, in sidebar order, including ones that could not be acquired. The shared worker is the sole writer. It records explicit remote starts/stops and never rewrites while workspace persistence is incompatible; attached apps do not race it. Files resume from durable cursors. Remembered commands and HTTP endpoints stay visible but do not launch/contact automatically. Additive and unversioned against the workspace schema: an older binary ignores unknown fields, and unsafe/unreadable persistence is refused rather than reset. |
@@ -297,6 +297,34 @@ spellings, never display text. This batch flow shipped in v0.1.3.
 Timestamp assistance should inspect actual usable typed fields first, regardless
 of their names, and produce `timestamp_utc`. Raw extraction is a fallback requiring
 evidence. Capture time is not a substitute for a missing event timestamp.
+
+### Automatic log setup
+
+Automatic setup is a raw-first, optional assistance path for a source that
+already exists. The default policy is Disabled; `On new source` queues one
+analysis only after the source's canonical All events view is usable. The
+manual `Current log > Analyze again` palette action uses the same request path.
+It does not add fields to source creation, delay raw rendering or steal focus
+when a background result arrives.
+
+The request reuses short-context construction with the standard 32 KiB inline
+limit and no dataset paths or inspection command. One owned bridge session may
+be active. The proposal schema admits at most eight native enrichment
+expressions, eight unique pins, sixteen exact-value colour rules, optional
+severity/timestamp roles and one Run/Filter grouping. Every presentation field
+must name an output from that same proposal. Commands, filters, sources, time
+windows and hidden record selection are rejected at the bridge, wire-lowering
+and native application boundaries. Definition/data revisions fence stale work.
+
+Native validation applies the complete bundle atomically as an ordinary derived
+Enhanced view; All events and its capture are unchanged. An empty bundle records
+a durable no-change receipt instead of retrying on every launch. An applied
+receipt stores the proposal digest, generated view ID, applied-configuration
+digest and frozen revision evidence in workspace SQLite. Restart reattaches only
+when those views and the applied configuration still agree. Exact revert is
+ordinary durable view deletion and is offered only while the generated
+configuration is unchanged; a later manual edit removes automatic ownership
+rather than being silently undone.
 
 Preview033 manifests include deterministic part-relative row offsets,
 evenly spaced across each source, with at most 128/source and 512 total. Applied

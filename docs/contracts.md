@@ -156,12 +156,46 @@ immutable reference is independent of later command-definition edits.
 Versioned requests carry request_id and method; responses echo request_id and
 either result or structured error; asynchronous events carry session_id and kind.
 Minimum methods: capabilities, start_session, send_prompt, cancel, resume_session,
-request_proposal. Proposals carry kind (source/filter/enrichment/view), definition,
-explanation, and data/definition revision used. Reject stale proposals at apply.
+request_proposal. Proposals carry kind
+(source/filter/enrichment/view/auto_setup), definition, explanation, and
+data/definition revision used. Reject stale proposals at apply.
 The bridge handles Paseo, not Polars execution or bulk log transport. Inspection
 context is a local manifest path plus dataset paths. Provider-neutral API; one
 working provider integration suffices. Preserve native permission interaction if
 the SDK emits it; do not invent a provider login flow.
+
+## Automatic log setup
+
+Automatic setup operates only on an existing source and its canonical All
+events view. Raw rows must be available before it starts and remain usable while
+it runs or fails. The global policy defaults to Disabled. `On new source`
+authorizes one asynchronous attempt after the source is usable; a manual Analyze
+operation uses the same path. Restore never silently re-runs a completed or
+in-flight receipt.
+
+The request uses a maximum 32 KiB inline typed schema/sample and carries no
+dataset paths or inspection command. Its definition/data revisions bind the
+target. Log values, field names and samples are untrusted data, never prompt
+instructions. At most one automatic setup assistance session is active, with
+bounded cancellation and cleanup.
+
+The `auto_setup` proposal is one complete bundle: at most eight unique native
+enrichment expressions, eight unique pins, sixteen exact-value colour rules,
+optional severity/timestamp roles and at most one Run/Filter grouping. Every
+pin, colour column, role and grouping column must name an output created in that
+bundle. External commands, filters, source definitions, time windows, record
+selection and fields outside the closed schema are forbidden. Wire-schema
+validity is not acceptance: native expression lowering, complete-chain semantic
+validation and current revision checks must all pass before publication.
+
+Publication atomically creates an ordinary derived Enhanced view and never
+changes All events, original bytes or stable identities. No useful proposal is
+a durable outcome, not a retry loop. An applied durable receipt binds the
+source, proposal digest, generated view, applied-configuration digest and
+frozen revision evidence. Revert removes only the generated view through the
+acknowledged durable deletion path, and only while its configuration still
+matches the receipt. Any manual edit cancels automatic ownership and must be
+preserved.
 
 ## Dataset/investigation manifest
 

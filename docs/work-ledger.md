@@ -3890,3 +3890,42 @@ No process used the superseded repository-local v0.1.12 install, so it was
 moved to trash and remains recoverable. Human Apple-silicon macOS and arm64
 Linux terminal acceptance, plus the paused volume/cold-query/slow-storage
 investigations, remain explicitly unverified.
+
+## 2026-09-17 — automatic log setup integrated preflight
+
+Primary integrated the delegated automatic-setup slices as one raw-first path.
+The global policy is Disabled by default; `On new source` queues one bounded
+32 KiB short-context request only after All events is usable. Strict bridge and
+native lowering admit at most eight native enrichments, eight pins, sixteen
+exact-value colour rules, optional display roles and one Run/Filter grouping;
+commands, filters, sources and time windows are excluded. A valid bundle creates
+an ordinary Enhanced view atomically without changing focus or capture. Durable
+terminal receipts prevent restart retries, reattach only when the generated
+configuration still agrees, and drive acknowledged view deletion for exact
+revert. Manual edits fail closed instead of being erased. Settings presents the
+existing Automatic log setup object, then Run, then Disabled/On new source.
+
+The semantic flow inventory in `docs/dialog-grammar.md` now applies the product
+rule `existing object -> operation -> parameters -> review -> submit` and
+`new object -> operation/type -> parameters -> review -> submit` to every current
+dialog. It records remaining migrations as Clarify or Split rather than claiming
+they already changed.
+
+Integrated commits are `da601cd`, `bace105`, `031304c`, `d184056`, `c118762`,
+`1e8d7e2`, `dc52896`, `2a05457`, `a94953c`, `387af9c`, `a3c5154`, `64d544f`
+and `b030352`. Locked workspace tests and workspace all-target Clippy passed with
+warnings denied. The first complete actual PTY matrix preserved five failures:
+four Settings traversal assertions had not accounted for the newly inserted
+object-first control, while the fifth lifecycle suite passed immediately in
+isolation. After correcting the four observable traversal expectations, all
+four passed serially and the fresh complete matrix passed **86/86** in 216
+seconds with unchanged product timeouts. Durable logs are
+`primary-sol-scratch/auto-setup-targeted-pty-20260917T024453Z.log` and
+`primary-sol-scratch/auto-setup-full-pty-20260917T024602Z.log` on the build
+volume. The exact clean-source bridge/proof gate and release remain pending.
+
+Disk cleanup removed only rebuildable Cargo outputs and completed agent
+worktrees. It preserved the primary target, compiler cache, captures, proof
+archives and releases; the large build volume had 36 GiB free before the final
+matrix and the root filesystem had 13 GiB free. The foreign `mise.toml` edits
+remain unstaged and byte-untouched.

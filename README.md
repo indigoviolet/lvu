@@ -40,8 +40,10 @@ except that works offline.
   investigation.
 - **Assistance optional, offline core.** Plain-language filter, enrichment,
   and timestamp drafting plus resumable snapshot investigations through
-  your own local agent CLI; everything else works offline (`uv` only for
-  Polars expressions, `node` only for the bridge).
+  your own local agent CLI. If enabled, automatic log setup opens raw data
+  first, then builds a reversible Enhanced view from a bounded sample;
+  everything else works offline (`uv` only for Polars expressions, `node`
+  only for the bridge).
 
 ## Install
 
@@ -126,6 +128,7 @@ In the viewer:
 | `f` | Follow the tail; `g` and `G` jump to the ends; `[` and `]` switch views |
 | `?` | Help |
 | `Ctrl-P` | The command palette: every operation, searchable, with its key |
+| `,` | Settings, including the disabled-by-default Automatic log setup policy |
 
 Escape closes a dialog. `q` quits from the base screen.
 
@@ -174,6 +177,17 @@ provider you already have. It needs:
 Suggestions are proposals: you review and validate them before they touch a
 view. Capture and query execution stay local; text a hosted model reads is
 subject to that provider's terms.
+
+Automatic log setup is disabled by default. Set `Automatic log setup > Run` to
+`On new source` to analyze each newly opened source asynchronously after its raw
+All events view is already usable. A successful bounded proposal creates an
+ordinary Enhanced view containing only native enrichments, pins, exact-value
+colour rules, display roles and Run/Filter grouping. It cannot add a filter,
+command, source or time window. `Current log > Analyze again` runs the same
+operation explicitly; `Current view > Revert automatic setup` removes an
+unchanged generated view while preserving its source and captured bytes. Once
+you edit that setup manually, lvu refuses the automatic revert so it cannot
+erase your work.
 
 Two assistance failures look similar but have different remedies. An owned-route
 busy report names the exact `bridge.lock` under the capture's `assistance`

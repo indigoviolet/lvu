@@ -4,6 +4,29 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## Unreleased
+
+### Features
+
+- Optionally analyze a newly opened log in the background after its raw All
+  events view is already usable, then atomically create a normal Enhanced view
+  with bounded native enrichments, pins, exact-value colours, display roles and
+  grouping. Automatic log setup is disabled by default and can be run manually
+  from the command palette.
+- Revert an unchanged automatically generated Enhanced view through the normal
+  durable view-deletion path. A durable receipt prevents repeat analysis after
+  restart, and lvu refuses automatic revert after a manual edit.
+- Define the semantic dialog grammar for every current flow: existing objects
+  precede operation and parameters; creation starts with operation/type, then
+  parameters and submit.
+
+### Fixes
+
+- Keep the raw view responsive throughout automatic sampling, analysis,
+  validation, failure and application; late results never steal focus.
+- Reap command-enrichment process descendants before reporting terminal state,
+  while preserving the existing sub-second cleanup deadline.
+
 ## v0.1.13 — 2026-09-16
 
 ### Features
