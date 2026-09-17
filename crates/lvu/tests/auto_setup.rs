@@ -1,6 +1,6 @@
 use lvu::{
     Action, App, AutoSetupProposal, AutoSetupStage, ColorRule, EnrichmentDefinition,
-    QueryCompletion, QueryFailure, QueryPurpose, RuleColor, SourceItem, ViewItem, ViewRole,
+    QueryCompletion, QueryFailure, RuleColor, SourceItem, ViewDialogMode, ViewItem, ViewRole,
 };
 use ratatui::{Terminal, backend::TestBackend};
 
@@ -190,6 +190,21 @@ fn failures_and_invalid_proposals_keep_raw_last_good() {
 }
 
 #[test]
+fn full_accepted_config_is_the_staleness_fence() {
+    let (mut app, provider) = app_with_raw();
+    let mut analysis = request(&mut app, &provider);
+    analysis.accepted_config.recipe.search = "different accepted definition".into();
+
+    assert_eq!(
+        app.apply_auto_setup_proposal(&analysis, proposal()),
+        Err(lvu::AutoSetupRejected::Stale)
+    );
+    assert_eq!(app.active_view_id(), Some("raw"));
+    assert_eq!(app.views().len(), 1);
+    assert!(app.take_view_fork_requests().is_empty());
+}
+
+#[test]
 fn bounded_request_queue_refusal_keeps_raw_usable() {
     let (mut app, provider) = app_with_raw();
     app.handle(Action::AnalyzeAutoSetup, &provider);
@@ -278,30 +293,32 @@ fn names_are_unique_and_revert_refuses_after_manual_accepted_edit() {
             .is_some_and(|notice| notice.contains("edited") && notice.contains("refused"))
     );
     assert!(app.take_query_requests().is_empty());
+    assert!(app.layers.view.outbox.take().is_empty());
 }
 
 #[test]
-fn exact_revert_is_a_normal_atomic_query_and_removes_its_receipt() {
+fn exact_revert_uses_normal_durable_view_deletion_and_preserves_raw() {
     let (mut app, provider) = app_with_raw();
     let enhanced = install_enhanced(&mut app, &provider);
     app.handle(Action::RevertAutoSetup, &provider);
-    let query = app.take_query_requests().remove(0);
-    assert_eq!(query.view_id, enhanced);
-    assert_eq!(query.purpose, QueryPurpose::Advanced);
-    assert!(app.apply_query_completion(QueryCompletion {
-        view_id: query.view_id,
-        generation: query.generation,
-        revision: query.revision,
-        purpose: query.purpose,
-        result: Ok(()),
-    }));
-    let restored = app.views.auto_setup_config(&enhanced).unwrap();
-    assert_eq!(restored, lvu::AutoSetupViewConfig::default());
+    assert!(app.take_query_requests().is_empty());
+    let requests = app.layers.view.outbox.take();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].mode, ViewDialogMode::Delete);
+    assert_eq!(requests[0].source_id, "source");
+    assert_eq!(requests[0].view_id, enhanced);
+    assert_eq!(requests[0].name, "Enhanced");
+    assert!(app.auto_setup_revert_available(), "durable ack is pending");
+    assert!(app.views().iter().any(|view| view.id == enhanced));
+
+    assert!(app.remove_view(&enhanced), "durable delete acknowledged");
     assert!(!app.auto_setup_revert_available());
-    assert!(matches!(
-        app.take_auto_setup_events().last(),
-        Some(lvu::AutoSetupEvent::Reverted { .. })
-    ));
+    assert_eq!(app.active_view_id(), Some("raw"));
+    assert_eq!(app.views().len(), 1);
+    assert!(app.auto_setup_status().is_some_and(|status| {
+        status.detail.contains("automatic setup removed")
+            && status.detail.contains("raw capture preserved")
+    }));
 }
 
 #[test]

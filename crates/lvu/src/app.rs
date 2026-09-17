@@ -12,7 +12,7 @@ use ratatui::layout::Rect;
 
 use crate::auto_setup::{
     AutoSetupEvent, AutoSetupProposal, AutoSetupReceipt, AutoSetupRequest, AutoSetupStage,
-    AutoSetupStatus, AutoSetupViewConfig, config_digest,
+    AutoSetupStatus, AutoSetupViewConfig,
 };
 use crate::component::{
     AgentDefaults, Appearance, Clock, Component, Ctx, Event as ComponentEvent, LayerId, NO_ROWS,
@@ -1070,15 +1070,14 @@ pub(crate) struct PendingRecipe {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PendingAutoSetup {
-    Apply { applied: Box<AutoSetupViewConfig> },
-    Revert { restored: Box<AutoSetupViewConfig> },
+struct PendingAutoSetup {
+    applied: Box<AutoSetupViewConfig>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum AutoSetupQueryOutcome {
-    Reverted { view_id: String },
-    Failed { view_id: String, message: String },
+struct AutoSetupQueryOutcome {
+    view_id: String,
+    message: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2639,7 +2638,7 @@ impl Views {
         let before = self
             .auto_setup_config(&request.origin_view_id)
             .ok_or(AutoSetupRejected::Stale)?;
-        if config_digest(&before) != request.accepted_digest {
+        if before != *request.accepted_config {
             return Err(AutoSetupRejected::Stale);
         }
         validate_auto_setup_proposal(&proposal)?;
@@ -2686,28 +2685,8 @@ impl Views {
             now_nanos,
             Some((
                 config,
-                PendingAutoSetup::Apply {
+                PendingAutoSetup {
                     applied: Box::new(applied),
-                },
-            )),
-        )
-    }
-
-    fn revert_auto_setup_in_place(
-        &mut self,
-        view_id: &str,
-        before: AutoSetupViewConfig,
-        now_nanos: i64,
-    ) -> Result<u64, RecipeRejected> {
-        let recipe = before.recipe.clone();
-        self.apply_recipe_transaction(
-            view_id,
-            recipe,
-            now_nanos,
-            Some((
-                before.clone(),
-                PendingAutoSetup::Revert {
-                    restored: Box::new(before),
                 },
             )),
         )
@@ -4382,7 +4361,7 @@ impl App {
             origin_view_id: origin_view_id.to_owned(),
             object_name,
             definition_revision: self.view_definition_revision(origin_view_id)?,
-            accepted_digest: config_digest(&config),
+            accepted_config: Box::new(config),
         })
     }
 
@@ -4506,32 +4485,32 @@ impl App {
             self.action_notice = Some("current view · accepted configuration unavailable".into());
             return;
         };
-        if current != receipt.applied || config_digest(&current) != receipt.applied_digest {
+        if current != receipt.applied {
             self.action_notice = Some(
                 "current view · automatic setup was edited; revert refused to preserve changes"
                     .into(),
             );
             return;
         }
-        match self.views.revert_auto_setup_in_place(
-            &view_id,
-            receipt.before,
-            self.shell.clock_now_unix_nanos,
-        ) {
-            Ok(_) => {
-                self.auto_setup_status = Some(AutoSetupStatus {
-                    source_id: receipt.source_id,
-                    origin_view_id: receipt.origin_view_id,
-                    object_name: receipt.generated_view_name,
-                    stage: AutoSetupStage::Applying,
-                    detail: "reverting exact automatic setup".into(),
-                });
-            }
-            Err(_) => {
-                self.action_notice =
-                    Some("current view · revert queue is full; accepted configuration kept".into());
-            }
+        let request = ViewMutationRequest {
+            source_ids: Vec::new(),
+            mode: ViewDialogMode::Delete,
+            source_id: receipt.source_id.clone(),
+            view_id,
+            name: receipt.generated_view_name.clone(),
+        };
+        if self.layers.view.outbox.push(request).is_err() {
+            self.action_notice =
+                Some("current view · revert queue is full; Enhanced view kept".into());
+            return;
         }
+        self.auto_setup_status = Some(AutoSetupStatus {
+            source_id: receipt.source_id,
+            origin_view_id: receipt.origin_view_id,
+            object_name: receipt.generated_view_name,
+            stage: AutoSetupStage::Applying,
+            detail: "removing Enhanced view; raw capture preserved".into(),
+        });
     }
 
     pub fn configure_ai(&mut self, provider: String, mode: String, thinking: String) {
@@ -5567,9 +5546,7 @@ impl App {
                 generated_view_id: installed.candidate_view_id.clone(),
                 generated_view_name: installed.name.clone(),
                 before: (*before).clone(),
-                before_digest: config_digest(&before),
                 applied: applied.clone(),
-                applied_digest: config_digest(&applied),
             };
             self.auto_setup_receipts
                 .insert(installed.candidate_view_id.clone(), receipt.clone());
@@ -5984,6 +5961,7 @@ impl App {
         self.views.items.retain(|view| view.id != view_id);
         self.views.states.remove(view_id);
         self.views.roles.remove(view_id);
+        let removed_auto_setup = self.auto_setup_receipts.remove(view_id);
         self.shell.cursors.prune_identity(view_id);
         self.shell
             .cursors
@@ -6002,6 +5980,15 @@ impl App {
         self.broadcast_view_event(ViewEvent::ViewDeleted {
             view_id: view_id.to_owned(),
         });
+        if let Some(receipt) = removed_auto_setup {
+            self.auto_setup_status = Some(AutoSetupStatus {
+                source_id: receipt.source_id,
+                origin_view_id: receipt.origin_view_id,
+                object_name: receipt.generated_view_name,
+                stage: AutoSetupStage::Applied,
+                detail: "automatic setup removed; raw capture preserved".into(),
+            });
+        }
         true
     }
 
@@ -6021,6 +6008,7 @@ impl App {
             self.cancel_correlation_for_view(view_id);
             self.views.states.remove(view_id);
             self.views.roles.remove(view_id);
+            self.auto_setup_receipts.remove(view_id);
             self.shell.cursors.prune_identity(view_id);
             self.shell
                 .cursors
@@ -6944,33 +6932,13 @@ impl App {
     fn settle_auto_setup_query_outcomes(&mut self) {
         let outcomes: Vec<_> = self.views.auto_setup_outcomes.drain(..).collect();
         for outcome in outcomes {
-            match outcome {
-                AutoSetupQueryOutcome::Reverted { view_id } => {
-                    let restored_digest = self
-                        .views
-                        .auto_setup_config(&view_id)
-                        .map(|config| config_digest(&config))
-                        .unwrap_or_default();
-                    self.auto_setup_receipts.remove(&view_id);
-                    self.auto_setup_events.push_back(AutoSetupEvent::Reverted {
-                        generated_view_id: view_id,
-                        restored_digest,
-                    });
-                    if let Some(status) = &mut self.auto_setup_status {
-                        status.stage = AutoSetupStage::Applied;
-                        status.detail = "automatic setup reverted".into();
-                    }
-                }
-                AutoSetupQueryOutcome::Failed { view_id, message } => {
-                    self.auto_setup_events.push_back(AutoSetupEvent::Failed {
-                        view_id,
-                        message: message.clone(),
-                    });
-                    if let Some(status) = &mut self.auto_setup_status {
-                        status.stage = AutoSetupStage::Unavailable;
-                        status.detail = format!("{message}; accepted view kept");
-                    }
-                }
+            self.auto_setup_events.push_back(AutoSetupEvent::Failed {
+                view_id: outcome.view_id,
+                message: outcome.message.clone(),
+            });
+            if let Some(status) = &mut self.auto_setup_status {
+                status.stage = AutoSetupStage::Unavailable;
+                status.detail = format!("{}; accepted view kept", outcome.message);
             }
         }
     }
@@ -7332,23 +7300,10 @@ impl App {
                         state.color_field = pending.color_field;
                     }
                     if let Some(auto) = auto {
-                        let config = match &auto {
-                            PendingAutoSetup::Apply { applied, .. } => applied,
-                            PendingAutoSetup::Revert { restored } => restored,
-                        };
+                        let config = auto.applied;
                         state.color_rules = config.color_rules.clone();
                         state.severity_column = config.severity_column.clone();
                         state.timestamp_column = config.timestamp_column.clone();
-                        match auto {
-                            PendingAutoSetup::Apply { .. } => {}
-                            PendingAutoSetup::Revert { .. } => {
-                                self.views.auto_setup_outcomes.push_back(
-                                    AutoSetupQueryOutcome::Reverted {
-                                        view_id: completion.view_id.clone(),
-                                    },
-                                );
-                            }
-                        }
                     }
                 }
                 clear_accepted_pending(&mut state.search, completion.revision);
@@ -7409,7 +7364,7 @@ impl App {
                     {
                         self.views
                             .auto_setup_outcomes
-                            .push_back(AutoSetupQueryOutcome::Failed {
+                            .push_back(AutoSetupQueryOutcome {
                                 view_id: completion.view_id.clone(),
                                 message: failure_message.clone(),
                             });

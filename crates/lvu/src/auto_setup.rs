@@ -6,7 +6,11 @@
 //! pin, colour-rule and grouping editors.  There is no field for a filter,
 //! command, time window or source mutation.
 
-use crate::app::{ColorRule, EnrichmentDefinition, RecipeConfig};
+use lvu_core::{CommandDefinition, CommandProgram, RestartPolicy};
+
+use crate::app::{
+    CaptureTimePolicy, CaptureTimeRange, ColorRule, EnrichmentDefinition, RecipeConfig, TimeBasis,
+};
 
 /// Bounded, non-modal progress shown while the raw view remains usable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,7 +76,9 @@ pub struct AutoSetupRequest {
     /// Semantic view fence.  Navigation and presentation-only interaction do
     /// not advance it.
     pub definition_revision: u64,
-    pub accepted_digest: AutoSetupDigest,
+    /// Complete accepted definition. Proposal application compares this with
+    /// the current native configuration; a hash is never overwrite authority.
+    pub accepted_config: Box<AutoSetupViewConfig>,
 }
 
 /// The only operations the host may accept from an automatic setup proposal.
@@ -99,12 +105,6 @@ pub struct AutoSetupViewConfig {
     pub timestamp_column: Option<String>,
 }
 
-/// Stable bounded fingerprint for receipt lookup and diagnostics.  Revert
-/// also compares the full [`AutoSetupViewConfig`], so hash equality alone is
-/// never authority for overwriting a manual edit.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub struct AutoSetupDigest(pub [u64; 2]);
-
 /// Session form of the durable receipt another module will persist.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoSetupReceipt {
@@ -113,98 +113,93 @@ pub struct AutoSetupReceipt {
     pub generated_view_id: String,
     pub generated_view_name: String,
     pub before: AutoSetupViewConfig,
-    pub before_digest: AutoSetupDigest,
     pub applied: AutoSetupViewConfig,
-    pub applied_digest: AutoSetupDigest,
 }
 
 /// Events the executable can hand to the future durable receipt adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AutoSetupEvent {
     Applied(Box<AutoSetupReceipt>),
-    Reverted {
-        generated_view_id: String,
-        restored_digest: AutoSetupDigest,
-    },
-    Failed {
-        view_id: String,
-        message: String,
-    },
+    Failed { view_id: String, message: String },
 }
 
-/// Deterministic digest over the accepted native representation.
-pub fn config_digest(config: &AutoSetupViewConfig) -> AutoSetupDigest {
-    let mut digest = Digest::new();
-    digest.text(&config.recipe.search);
-    digest.text(&config.recipe.advanced);
-    digest.text(&config.recipe.enrichment);
-    digest.usize(config.recipe.enrichments.len());
+/// Versioned canonical bytes for a durable receipt's SHA-256.
+///
+/// The persistence layer owns the cryptographic digest and stores its
+/// algorithm explicitly. In-memory overwrite safety always compares the full
+/// [`AutoSetupViewConfig`] instead of trusting these bytes or their digest.
+pub fn canonical_config_bytes(config: &AutoSetupViewConfig) -> Vec<u8> {
+    let mut bytes = CanonicalBytes::new();
+    bytes.text(&config.recipe.search);
+    bytes.text(&config.recipe.advanced);
+    bytes.text(&config.recipe.enrichment);
+    bytes.usize(config.recipe.enrichments.len());
     for stage in &config.recipe.enrichments {
-        digest.text(&stage.id.0);
-        digest.text(&stage.source);
+        bytes.text(&stage.id.0);
+        bytes.text(&stage.source);
         match &stage.command {
-            None => digest.byte(0),
+            None => bytes.byte(0),
             Some(command) => {
-                digest.byte(1);
-                // Debug is not used as authority: full config equality is.
-                // It does keep receipts for otherwise-equal command steps
-                // distinct without duplicating lvu-core's wire encoder here.
-                digest.text(&format!("{command:?}"));
+                bytes.byte(1);
+                bytes.command(command);
             }
         }
     }
-    digest.strings(&config.recipe.pinned_columns);
-    digest.optional(config.recipe.color_field.as_deref());
-    digest.text(&format!("{:?}", config.recipe.capture_time));
-    digest.text(&format!("{:?}", config.recipe.capture_time_policy));
-    digest.text(&format!("{:?}", config.recipe.time_basis));
-    digest.text(&config.recipe.grouping);
-    digest.usize(config.color_rules.len());
+    bytes.strings(&config.recipe.pinned_columns);
+    bytes.optional_text(config.recipe.color_field.as_deref());
+    bytes.optional_range(config.recipe.capture_time);
+    bytes.optional_policy(config.recipe.capture_time_policy);
+    bytes.time_basis(config.recipe.time_basis);
+    bytes.text(&config.recipe.grouping);
+    bytes.usize(config.color_rules.len());
     for rule in &config.color_rules {
-        digest.text(&rule.predicate);
-        digest.text(&format!("{:?}", rule.color));
-        digest.optional(rule.column.as_deref());
-        digest.optional(rule.value.as_deref());
+        bytes.text(&rule.predicate);
+        bytes.text(rule.color.label());
+        bytes.optional_text(rule.column.as_deref());
+        bytes.optional_text(rule.value.as_deref());
     }
-    digest.optional(config.severity_column.as_deref());
-    digest.optional(config.timestamp_column.as_deref());
-    AutoSetupDigest([digest.left, digest.right])
+    bytes.optional_text(config.severity_column.as_deref());
+    bytes.optional_text(config.timestamp_column.as_deref());
+    bytes.finish()
 }
 
-struct Digest {
-    left: u64,
-    right: u64,
+struct CanonicalBytes {
+    value: Vec<u8>,
 }
 
-impl Digest {
+impl CanonicalBytes {
     fn new() -> Self {
-        Self {
-            left: 0xcbf29ce484222325,
-            right: 0x84222325cbf29ce4,
-        }
+        let mut value = Vec::with_capacity(256);
+        value.extend_from_slice(b"lvu-auto-setup-config\0v1");
+        Self { value }
     }
 
     fn byte(&mut self, byte: u8) {
-        self.left ^= u64::from(byte);
-        self.left = self.left.wrapping_mul(0x100000001b3);
-        self.right ^= u64::from(byte).rotate_left(1);
-        self.right = self.right.wrapping_mul(0x100000001b3).rotate_left(7);
+        self.value.push(byte);
     }
 
     fn usize(&mut self, value: usize) {
-        for byte in (value as u64).to_le_bytes() {
-            self.byte(byte);
-        }
+        self.value.extend_from_slice(&(value as u64).to_le_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.value.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.value.extend_from_slice(&value.to_le_bytes());
     }
 
     fn text(&mut self, value: &str) {
-        self.usize(value.len());
-        for byte in value.as_bytes() {
-            self.byte(*byte);
-        }
+        self.raw(value.as_bytes());
     }
 
-    fn optional(&mut self, value: Option<&str>) {
+    fn raw(&mut self, value: &[u8]) {
+        self.usize(value.len());
+        self.value.extend_from_slice(value);
+    }
+
+    fn optional_text(&mut self, value: Option<&str>) {
         match value {
             Some(value) => {
                 self.byte(1);
@@ -220,6 +215,79 @@ impl Digest {
             self.text(value);
         }
     }
+
+    fn range(&mut self, range: CaptureTimeRange) {
+        self.i64(range.start_unix_nanos);
+        self.i64(range.end_unix_nanos);
+    }
+
+    fn optional_range(&mut self, range: Option<CaptureTimeRange>) {
+        match range {
+            Some(range) => {
+                self.byte(1);
+                self.range(range);
+            }
+            None => self.byte(0),
+        }
+    }
+
+    fn optional_policy(&mut self, policy: Option<CaptureTimePolicy>) {
+        match policy {
+            None => self.byte(0),
+            Some(CaptureTimePolicy::Absolute(range)) => {
+                self.byte(1);
+                self.range(range);
+            }
+            Some(CaptureTimePolicy::Recent { seconds }) => {
+                self.byte(2);
+                self.u64(seconds);
+            }
+        }
+    }
+
+    fn time_basis(&mut self, basis: TimeBasis) {
+        self.byte(match basis {
+            TimeBasis::Capture => 0,
+            TimeBasis::Event => 1,
+            TimeBasis::Extracted => 2,
+            TimeBasis::Selected => 3,
+        });
+    }
+
+    fn command(&mut self, command: &CommandDefinition) {
+        match &command.program {
+            CommandProgram::Shell { text } => {
+                self.byte(0);
+                self.text(text);
+            }
+            CommandProgram::Exec { executable, args } => {
+                self.byte(1);
+                self.raw(executable.as_os_str().as_encoded_bytes());
+                self.strings(args);
+            }
+        }
+        match &command.cwd {
+            Some(path) => {
+                self.byte(1);
+                self.raw(path.as_os_str().as_encoded_bytes());
+            }
+            None => self.byte(0),
+        }
+        self.usize(command.environment.len());
+        for (name, value) in &command.environment {
+            self.text(name);
+            self.text(value);
+        }
+        self.byte(match command.restart {
+            RestartPolicy::Never => 0,
+            RestartPolicy::OnFailure => 1,
+            RestartPolicy::Always => 2,
+        });
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.value
+    }
 }
 
 #[cfg(test)]
@@ -228,7 +296,7 @@ mod tests {
     use crate::app::RuleColor;
 
     #[test]
-    fn digest_is_order_sensitive_and_full_equality_remains_available() {
+    fn canonical_bytes_are_versioned_and_order_sensitive() {
         let mut first = AutoSetupViewConfig::default();
         first.recipe.enrichments = vec![
             EnrichmentDefinition::expression("one", "one = pl.lit(1)"),
@@ -242,8 +310,27 @@ mod tests {
         });
         let mut second = first.clone();
         second.recipe.enrichments.reverse();
-        assert_ne!(config_digest(&first), config_digest(&second));
+        assert!(canonical_config_bytes(&first).starts_with(b"lvu-auto-setup-config\0v1"));
+        assert_eq!(
+            canonical_config_bytes(&first),
+            canonical_config_bytes(&first.clone())
+        );
+        assert_ne!(
+            canonical_config_bytes(&first),
+            canonical_config_bytes(&second)
+        );
         assert_ne!(first, second);
+
+        let mut left = AutoSetupViewConfig::default();
+        left.recipe.search = "ab".into();
+        left.recipe.advanced = "c".into();
+        let mut right = AutoSetupViewConfig::default();
+        right.recipe.search = "a".into();
+        right.recipe.advanced = "bc".into();
+        assert_ne!(
+            canonical_config_bytes(&left),
+            canonical_config_bytes(&right)
+        );
     }
 
     #[test]

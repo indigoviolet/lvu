@@ -49,6 +49,6 @@ pub use text_edit::TextTarget;
 
 pub use app::Bookmark;
 pub use auto_setup::{
-    AutoSetupDigest, AutoSetupEvent, AutoSetupProposal, AutoSetupReceipt, AutoSetupRequest,
-    AutoSetupStage, AutoSetupStatus, AutoSetupViewConfig, config_digest as auto_setup_digest,
+    AutoSetupEvent, AutoSetupProposal, AutoSetupReceipt, AutoSetupRequest, AutoSetupStage,
+    AutoSetupStatus, AutoSetupViewConfig, canonical_config_bytes as auto_setup_canonical_bytes,
 };
