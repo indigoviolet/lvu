@@ -25,10 +25,11 @@ use std::{
 
 use lvu::theme::ThemeId;
 use lvu::{
-    App, AskAiKind, AskAiRequest, AskAiStage, AskSample, AskSampleTier, DiscoveryItem,
-    DiscoveryUiRequest, InvestigationItem, InvestigationRequest, InvestigationStage,
-    PathCompletionRequest, RowProvider, SettingsContext, SettingsRequest, SettingsValues,
-    SourceAiPreview, SourceAiPreviewItem, SourceAiRequest, SourceAiStage, SourceItem, SourceKind,
+    App, AskAiKind, AskAiRequest, AskAiStage, AskSample, AskSampleTier,
+    AutomaticSetupPolicy as UiAutomaticSetupPolicy, DiscoveryItem, DiscoveryUiRequest,
+    InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
+    RowProvider, SettingsContext, SettingsRequest, SettingsValues, SourceAiPreview,
+    SourceAiPreviewItem, SourceAiRequest, SourceAiStage, SourceItem, SourceKind,
     SourceLaunchRequest, ViewItem, ViewportRequest, terminal::run_with_tick_mut,
 };
 use lvu_core::{
@@ -8433,11 +8434,26 @@ fn lexical_display_hint(_value: &str) -> &'static str {
     "display-text"
 }
 
+fn ui_automatic_setup_policy(policy: settings::AutomaticSetupPolicy) -> UiAutomaticSetupPolicy {
+    match policy {
+        settings::AutomaticSetupPolicy::Disabled => UiAutomaticSetupPolicy::Disabled,
+        settings::AutomaticSetupPolicy::AutomaticOnNewSource => UiAutomaticSetupPolicy::OnNewSource,
+    }
+}
+
+fn stored_automatic_setup_policy(policy: UiAutomaticSetupPolicy) -> settings::AutomaticSetupPolicy {
+    match policy {
+        UiAutomaticSetupPolicy::Disabled => settings::AutomaticSetupPolicy::Disabled,
+        UiAutomaticSetupPolicy::OnNewSource => settings::AutomaticSetupPolicy::AutomaticOnNewSource,
+    }
+}
+
 fn settings_values(value: &settings::Settings) -> SettingsValues {
     SettingsValues {
         provider: value.paseo.provider.clone(),
         mode: value.paseo.mode.clone(),
         thinking: value.paseo.thinking.clone(),
+        automatic_setup: ui_automatic_setup_policy(value.automatic_setup.policy),
         theme: match value.appearance.theme {
             settings::Theme::Terminal => ThemeId::Terminal,
             settings::Theme::LoveDark => ThemeId::LoveDark,
@@ -8531,10 +8547,9 @@ fn save_settings_request(
             mode: value.mode,
             thinking: value.thinking,
         },
-        // The Settings screen does not expose automatic sampling yet. Preserve
-        // the explicit opt-in rather than clearing it when another setting is
-        // saved.
-        automatic_setup: applied.settings.automatic_setup.clone(),
+        automatic_setup: settings::AutomaticSetupSettings {
+            policy: stored_automatic_setup_policy(value.automatic_setup),
+        },
         appearance: settings::AppearanceSettings {
             theme: match value.theme {
                 ThemeId::Terminal => settings::Theme::Terminal,
@@ -10325,6 +10340,25 @@ mod command_name {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn automatic_setup_settings_mapping_is_exact_in_both_directions() {
+        use lvu::AutomaticSetupPolicy as UiPolicy;
+
+        for (stored, ui) in [
+            (
+                crate::settings::AutomaticSetupPolicy::Disabled,
+                UiPolicy::Disabled,
+            ),
+            (
+                crate::settings::AutomaticSetupPolicy::AutomaticOnNewSource,
+                UiPolicy::OnNewSource,
+            ),
+        ] {
+            assert_eq!(super::ui_automatic_setup_policy(stored), ui);
+            assert_eq!(super::stored_automatic_setup_policy(ui), stored);
+        }
+    }
 
     /// The three agent settles occupy independent execution lanes. This checks
     /// their ordering and thread identity directly: the caller-side closure

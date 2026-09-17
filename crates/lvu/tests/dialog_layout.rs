@@ -33,6 +33,7 @@ fn settings_context() -> SettingsContext {
             provider: "fixture/provider".into(),
             mode: "full-access".into(),
             thinking: "medium".into(),
+            automatic_setup: lvu::AutomaticSetupPolicy::Disabled,
             theme: ThemeId::LoveDark,
             display_zone: "Z".into(),
             delight_enabled: true,

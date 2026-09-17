@@ -26,8 +26,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    SettingsContext, SettingsRequest, SettingsValues, time_zone_choices, time_zone_label,
-    validate_display_zone,
+    AutomaticSetupPolicy, SettingsContext, SettingsRequest, SettingsValues, time_zone_choices,
+    time_zone_label, validate_display_zone,
 };
 use crate::component::{
     Appearance, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface, is_typed_char,
@@ -59,13 +59,14 @@ const SETTINGS_FIELD_BYTES: usize = 256;
 /// Logical body rows of the Settings form (§12.14). The form is always shown in
 /// full; the body window follows the focused control, so no field is ever
 /// hidden behind a paging button.
-const SETTINGS_FORM_ROWS: u16 = 17;
+const SETTINGS_FORM_ROWS: u16 = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsField {
     Provider,
     Mode,
     Thinking,
+    AutomaticSetup,
     Theme,
     /// The IANA zone or fixed UTC offset the log viewport shows times in.
     DisplayZone,
@@ -79,10 +80,11 @@ pub enum SettingsField {
 }
 
 impl SettingsField {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Provider,
         Self::Mode,
         Self::Thinking,
+        Self::AutomaticSetup,
         Self::Theme,
         Self::DisplayZone,
         Self::Delight,
@@ -106,7 +108,11 @@ impl SettingsField {
             Self::Membership => 5,
             Self::DiskTotal => 6,
             Self::IndexPerSource => 7,
-            Self::Theme | Self::Delight | Self::ReducedMotion | Self::Ascii => {
+            Self::AutomaticSetup
+            | Self::Theme
+            | Self::Delight
+            | Self::ReducedMotion
+            | Self::Ascii => {
                 return None;
             }
         })
@@ -127,6 +133,10 @@ fn settings_choices(field: SettingsField) -> Vec<String> {
             .iter()
             .map(|(label, _)| (*label).to_owned())
             .chain(std::iter::once("Custom IANA zone…".to_owned()))
+            .collect(),
+        SettingsField::AutomaticSetup => AutomaticSetupPolicy::ALL
+            .iter()
+            .map(|policy| policy.label().to_owned())
             .collect(),
         _ => Vec::new(),
     }
@@ -403,6 +413,14 @@ impl SettingsDialog {
             return;
         };
         match field {
+            SettingsField::AutomaticSetup => {
+                dialog.choice_selected = AutomaticSetupPolicy::ALL
+                    .iter()
+                    .position(|policy| *policy == dialog.draft.automatic_setup)
+                    .unwrap_or(0);
+                dialog.dropdown = Some(SettingsField::AutomaticSetup);
+                return;
+            }
             SettingsField::Theme => {
                 dialog.choice_selected = ThemeId::ALL
                     .iter()
@@ -446,7 +464,8 @@ impl SettingsDialog {
                 self.save()
             }
             Some(SettingsControl::Field(
-                SettingsField::Theme
+                SettingsField::AutomaticSetup
+                | SettingsField::Theme
                 | SettingsField::DisplayZone
                 | SettingsField::Delight
                 | SettingsField::ReducedMotion
@@ -476,6 +495,12 @@ impl SettingsDialog {
             return;
         };
         match field {
+            SettingsField::AutomaticSetup => {
+                let Some(policy) = AutomaticSetupPolicy::ALL.get(index).copied() else {
+                    return;
+                };
+                dialog.draft.automatic_setup = policy;
+            }
             SettingsField::Theme => {
                 let Some(theme) = ThemeId::ALL.get(index).copied() else {
                     return;
@@ -682,7 +707,8 @@ impl SettingsDialog {
                     let activates = matches!(
                         control,
                         SettingsControl::Field(
-                            SettingsField::Theme
+                            SettingsField::AutomaticSetup
+                                | SettingsField::Theme
                                 | SettingsField::Delight
                                 | SettingsField::ReducedMotion
                                 | SettingsField::Ascii
@@ -915,11 +941,11 @@ impl Component for SettingsDialog {
         let roomy_estimate = !crate::dialog_layout::is_compact(area);
         let stacked_estimate = width < 16 + FIELD_GUTTER + 20;
         let form_count: u16 = if stacked_estimate {
-            25
+            28
         } else if roomy_estimate {
             SETTINGS_FORM_ROWS
         } else {
-            SETTINGS_FORM_ROWS - 3
+            SETTINGS_FORM_ROWS - 4
         };
         let natural_body = form_count.saturating_add(u16::try_from(details.len()).unwrap_or(0));
 
@@ -1016,8 +1042,9 @@ impl Component for SettingsDialog {
             } else {
                 roomy_index
                     .saturating_sub(u16::from(roomy_index > 4))
-                    .saturating_sub(u16::from(roomy_index > 9))
-                    .saturating_sub(u16::from(roomy_index > 15))
+                    .saturating_sub(u16::from(roomy_index > 7))
+                    .saturating_sub(u16::from(roomy_index > 12))
+                    .saturating_sub(u16::from(roomy_index > 18))
             }
         };
         let visible = body.height;
@@ -1033,16 +1060,17 @@ impl Component for SettingsDialog {
                 C2::Field(F2::Provider) => 2,
                 C2::Field(F2::Mode) => 4,
                 C2::Field(F2::Thinking) => 6,
-                C2::Field(F2::Theme) => 9,
-                C2::Field(F2::DisplayZone) => 11,
-                C2::Field(F2::Delight) => 12,
-                C2::Field(F2::ReducedMotion) => 13,
-                C2::Field(F2::Ascii) => 14,
-                C2::Field(F2::RowCache) => 17,
-                C2::Field(F2::Membership) => 19,
-                C2::Field(F2::DiskTotal) => 21,
-                C2::Field(F2::IndexPerSource) => 23,
-                C2::More => 24,
+                C2::Field(F2::AutomaticSetup) => 9,
+                C2::Field(F2::Theme) => 12,
+                C2::Field(F2::DisplayZone) => 14,
+                C2::Field(F2::Delight) => 15,
+                C2::Field(F2::ReducedMotion) => 16,
+                C2::Field(F2::Ascii) => 17,
+                C2::Field(F2::RowCache) => 20,
+                C2::Field(F2::Membership) => 22,
+                C2::Field(F2::DiskTotal) => 24,
+                C2::Field(F2::IndexPerSource) => 26,
+                C2::More => 27,
                 C2::Save => 0,
             }
         } else {
@@ -1130,9 +1158,10 @@ impl Component for SettingsDialog {
             };
             // Sections.
             paint_label(frame, 0, &format!("{agent_label} Agent"), false);
-            paint_label(frame, 7, "Appearance", false);
-            paint_label(frame, 15, "Cache limits (MiB)", false);
-            paint_label(frame, 24, "Effective values and paths", false);
+            paint_label(frame, 7, "Automatic log setup", false);
+            paint_label(frame, 10, "Appearance", false);
+            paint_label(frame, 18, "Cache limits (MiB)", false);
+            paint_label(frame, 27, "Effective values and paths", false);
             // Text fields: (label_idx, field_idx, field, label, value).
             for (li, fi, field, label, value) in [
                 (
@@ -1144,24 +1173,24 @@ impl Component for SettingsDialog {
                 ),
                 (3, 4, Field::Mode, "Mode", values.mode.as_str()),
                 (5, 6, Field::Thinking, "Thinking", values.thinking.as_str()),
-                (16, 17, Field::RowCache, "Rows", values.rows_mib.as_str()),
+                (19, 20, Field::RowCache, "Rows", values.rows_mib.as_str()),
                 (
-                    18,
-                    19,
+                    21,
+                    22,
                     Field::Membership,
                     "Membership",
                     values.membership_mib.as_str(),
                 ),
                 (
-                    20,
-                    21,
+                    23,
+                    24,
                     Field::DiskTotal,
                     "Derived total",
                     values.disk_total_mib.as_str(),
                 ),
                 (
-                    22,
-                    23,
+                    25,
+                    26,
                     Field::IndexPerSource,
                     "Per source",
                     values.index_per_source_mib.as_str(),
@@ -1190,55 +1219,47 @@ impl Component for SettingsDialog {
                 }
             }
             // Dropdowns: label above, full-width value + chevron below.
+            // Automatic setup policy is its own object-first section.
+            {
+                let focused = dialog.focus == Control::Field(Field::AutomaticSetup);
+                paint_label(frame, 8, "Run", focused);
+                if let Some(rect) = srect(9) {
+                    caret_cell = render_stacked_dropdown(
+                        frame,
+                        &mut controls_hit,
+                        &mut dropdown_anchors,
+                        rect,
+                        Field::AutomaticSetup,
+                        values.automatic_setup.label(),
+                        focused,
+                        ascii,
+                        theme,
+                    );
+                }
+            }
             // Theme (preset, always dropdown).
             {
                 let focused = dialog.focus == Control::Field(Field::Theme);
-                paint_label(frame, 8, "Theme", focused);
-                if let Some(rect) = srect(9) {
-                    controls_hit.push((rect, Control::Field(Field::Theme)));
-                    InputSurface {
-                        style: if focused {
-                            styles.selection
-                        } else {
-                            styles.input
-                        },
-                    }
-                    .render(rect, frame.buffer_mut());
-                    frame.render_widget(
-                        Paragraph::new(truncated(
-                            values.theme.as_str(),
-                            usize::from(rect.width.saturating_sub(1)),
-                        ))
-                        .style(if focused {
-                            styles.selection
-                        } else {
-                            styles.input
-                        }),
-                        Rect::new(rect.x, rect.y, rect.width.saturating_sub(1).max(1), 1),
+                paint_label(frame, 11, "Theme", focused);
+                if let Some(rect) = srect(12) {
+                    caret_cell = render_stacked_dropdown(
+                        frame,
+                        &mut controls_hit,
+                        &mut dropdown_anchors,
+                        rect,
+                        Field::Theme,
+                        values.theme.as_str(),
+                        focused,
+                        ascii,
+                        theme,
                     );
-                    frame.render_widget(
-                        Paragraph::new(if ascii { "v" } else { "▾" }).style(
-                            Style::default().fg(theme.accent).bg(if focused {
-                                theme.selection_bg
-                            } else {
-                                theme.input_bg
-                            }),
-                        ),
-                        Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1),
-                    );
-                    dropdown_anchors.push((Field::Theme, rect));
-                    if focused {
-                        // Caret for dropdown fields: end of value (dropdown
-                        // opens on Enter/Space; arrows move choices when open).
-                        caret_cell = Some((rect.x.min(rect.right().saturating_sub(1)), rect.y));
-                    }
                 }
             }
             // DisplayZone: preset dropdown or custom text, same stacked rows.
             {
                 let focused = dialog.focus == Control::Field(Field::DisplayZone);
-                paint_label(frame, 10, "Times shown in", focused);
-                if let Some(rect) = srect(11) {
+                paint_label(frame, 13, "Times shown in", focused);
+                if let Some(rect) = srect(14) {
                     if dialog.zone_custom {
                         let caret = focused
                             .then(|| self.caret_of(Field::DisplayZone, &values.display_zone));
@@ -1293,14 +1314,14 @@ impl Component for SettingsDialog {
             }
             // Toggles, one per row when stacked.
             for (idx, field, label, on) in [
-                (12usize, Field::Delight, "Delight", values.delight_enabled),
+                (15usize, Field::Delight, "Delight", values.delight_enabled),
                 (
-                    13,
+                    16,
                     Field::ReducedMotion,
                     "Reduced motion",
                     values.reduced_motion,
                 ),
-                (14, Field::Ascii, "ASCII", values.ascii),
+                (17, Field::Ascii, "ASCII", values.ascii),
             ] {
                 let Some(rect) = srect(idx) else {
                     continue;
@@ -1318,7 +1339,7 @@ impl Component for SettingsDialog {
             }
             // Effective details, indented, via the same shared window.
             for (offset, line) in details.iter().enumerate() {
-                let Some(rect) = srect(25usize.saturating_add(offset)) else {
+                let Some(rect) = srect(28usize.saturating_add(offset)) else {
                     continue;
                 };
                 let indent = crate::dialog_layout::PANE_INDENT.min(rect.width);
@@ -1334,23 +1355,24 @@ impl Component for SettingsDialog {
             }
         } else {
             section(frame, row_rect(0), &format!("{agent_label} Agent"));
-            section(frame, row_rect(5), "Appearance");
-            section(frame, row_rect(10), "Cache limits (MiB)");
+            section(frame, row_rect(5), "Automatic log setup");
+            section(frame, row_rect(8), "Appearance");
+            section(frame, row_rect(13), "Cache limits (MiB)");
 
             for (index, field, label, value) in [
                 (1u16, Field::Provider, "Provider / model", &values.provider),
                 (2, Field::Mode, "Mode", &values.mode),
                 (3, Field::Thinking, "Thinking", &values.thinking),
-                (11, Field::RowCache, "Rows", &values.rows_mib),
-                (12, Field::Membership, "Membership", &values.membership_mib),
+                (14, Field::RowCache, "Rows", &values.rows_mib),
+                (15, Field::Membership, "Membership", &values.membership_mib),
                 (
-                    13,
+                    16,
                     Field::DiskTotal,
                     "Derived total",
                     &values.disk_total_mib,
                 ),
                 (
-                    14,
+                    17,
                     Field::IndexPerSource,
                     "Per source",
                     &values.index_per_source_mib,
@@ -1380,16 +1402,19 @@ impl Component for SettingsDialog {
 
             // §8.3: presets are dropdown fields. A named zone uses the same row as
             // an editable field after the user chooses Custom IANA zone.
-            for (index, field, label, value) in [(
-                6u16,
-                Field::Theme,
-                "Theme",
-                values.theme.as_str().to_owned(),
-            )]
+            for (index, field, label, value) in [
+                (
+                    6u16,
+                    Field::AutomaticSetup,
+                    "Run",
+                    values.automatic_setup.label().to_owned(),
+                ),
+                (9, Field::Theme, "Theme", values.theme.as_str().to_owned()),
+            ]
             .into_iter()
             .chain((!dialog.zone_custom).then(|| {
                 (
-                    7,
+                    10,
                     Field::DisplayZone,
                     "Times shown in",
                     time_zone_label(&values.display_zone),
@@ -1415,7 +1440,7 @@ impl Component for SettingsDialog {
             }
 
             if dialog.zone_custom
-                && let Some(rect) = row_rect(7)
+                && let Some(rect) = row_rect(10)
             {
                 let field = Field::DisplayZone;
                 let control = Control::Field(field);
@@ -1447,7 +1472,7 @@ impl Component for SettingsDialog {
 
             // §8.4: toggles are checkboxes sharing a row, not buttons with state in the
             // label.
-            if let Some(rect) = row_rect(8) {
+            if let Some(rect) = row_rect(11) {
                 let mut x = rect.x;
                 for (field, label, on) in [
                     (Field::Delight, "Delight", values.delight_enabled),
@@ -1668,7 +1693,8 @@ fn setting_field_mut(dialog: &mut SettingsDialogState, field: SettingsField) -> 
         SettingsField::Membership => &mut dialog.draft.membership_mib,
         SettingsField::DiskTotal => &mut dialog.draft.disk_total_mib,
         SettingsField::IndexPerSource => &mut dialog.draft.index_per_source_mib,
-        SettingsField::Theme
+        SettingsField::AutomaticSetup
+        | SettingsField::Theme
         | SettingsField::Delight
         | SettingsField::ReducedMotion
         | SettingsField::Ascii => unreachable!("only editable fields have a text slot"),
@@ -1696,15 +1722,16 @@ fn settings_focus_row(focus: SettingsControl) -> Option<u16> {
         Control::Field(Field::Provider) => 1,
         Control::Field(Field::Mode) => 2,
         Control::Field(Field::Thinking) => 3,
-        Control::Field(Field::Theme) => 6,
-        Control::Field(Field::DisplayZone) => 7,
+        Control::Field(Field::AutomaticSetup) => 6,
+        Control::Field(Field::Theme) => 9,
+        Control::Field(Field::DisplayZone) => 10,
         Control::Field(Field::Delight)
         | Control::Field(Field::ReducedMotion)
-        | Control::Field(Field::Ascii) => 8,
-        Control::Field(Field::RowCache) => 11,
-        Control::Field(Field::Membership) => 12,
-        Control::Field(Field::DiskTotal) => 13,
-        Control::Field(Field::IndexPerSource) => 14,
+        | Control::Field(Field::Ascii) => 11,
+        Control::Field(Field::RowCache) => 14,
+        Control::Field(Field::Membership) => 15,
+        Control::Field(Field::DiskTotal) => 16,
+        Control::Field(Field::IndexPerSource) => 17,
         Control::More => SETTINGS_FORM_ROWS.saturating_sub(1),
         Control::Save => return None,
     })
@@ -1840,6 +1867,54 @@ fn render_dropdown_field(
         Rect::new(field.right().saturating_sub(1), field.y, 1, 1),
     );
     field
+}
+
+/// Compact-floor dropdown painting where the object/field label occupies the
+/// preceding row. The returned anchor is also the exact mouse hitbox.
+#[allow(clippy::too_many_arguments)]
+fn render_stacked_dropdown(
+    frame: &mut Frame<'_>,
+    controls: &mut Vec<(Rect, SettingsControl)>,
+    anchors: &mut Vec<(SettingsField, Rect)>,
+    field: Rect,
+    setting: SettingsField,
+    value: &str,
+    focused: bool,
+    ascii: bool,
+    theme: Theme,
+) -> Option<(u16, u16)> {
+    let styles = DialogStyles::new(theme);
+    controls.push((field, SettingsControl::Field(setting)));
+    InputSurface {
+        style: if focused {
+            styles.selection
+        } else {
+            styles.input
+        },
+    }
+    .render(field, frame.buffer_mut());
+    frame.render_widget(
+        Paragraph::new(truncated(value, usize::from(field.width.saturating_sub(1)))).style(
+            if focused {
+                styles.selection
+            } else {
+                styles.input
+            },
+        ),
+        Rect::new(field.x, field.y, field.width.saturating_sub(1).max(1), 1),
+    );
+    frame.render_widget(
+        Paragraph::new(if ascii { "v" } else { "▾" }).style(Style::default().fg(theme.accent).bg(
+            if focused {
+                theme.selection_bg
+            } else {
+                theme.input_bg
+            },
+        )),
+        Rect::new(field.right().saturating_sub(1), field.y, 1, 1),
+    );
+    anchors.push((setting, field));
+    focused.then(|| (field.x.min(field.right().saturating_sub(1)), field.y))
 }
 
 fn settings_detail_lines(dialog: &SettingsDialogState, agent_label: &str) -> Vec<Line<'static>> {

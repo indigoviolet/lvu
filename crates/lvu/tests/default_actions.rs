@@ -442,6 +442,7 @@ fn settings_context() -> SettingsContext {
             provider: "codex/old".into(),
             mode: "full-access".into(),
             thinking: "medium".into(),
+            automatic_setup: lvu::AutomaticSetupPolicy::Disabled,
             theme: ThemeId::Terminal,
             delight_enabled: true,
             reduced_motion: false,

@@ -2221,6 +2221,7 @@ pub struct SettingsValues {
     pub provider: String,
     pub mode: String,
     pub thinking: String,
+    pub automatic_setup: AutomaticSetupPolicy,
     pub theme: ThemeId,
     /// IANA zone or fixed UTC offset token the log viewport formats times in.
     pub display_zone: String,
@@ -2231,6 +2232,27 @@ pub struct SettingsValues {
     pub membership_mib: String,
     pub disk_total_mib: String,
     pub index_per_source_mib: String,
+}
+
+/// When lvu may analyze a log automatically. This UI-facing type keeps the
+/// component independent from the executable's serialized settings schema;
+/// `lvu-app` performs the explicit conversion at the settings seam.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AutomaticSetupPolicy {
+    #[default]
+    Disabled,
+    OnNewSource,
+}
+
+impl AutomaticSetupPolicy {
+    pub const ALL: [Self; 2] = [Self::Disabled, Self::OnNewSource];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disabled",
+            Self::OnNewSource => "On new source",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

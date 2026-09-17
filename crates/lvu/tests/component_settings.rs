@@ -8,7 +8,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
-    Action, App, RowProvider, SettingsContext, SettingsValues,
+    Action, App, AutomaticSetupPolicy, RowProvider, SettingsContext, SettingsValues,
     component::{Component, LayerId, Open, RawEvent},
     components::settings::{SettingsControl, SettingsField, SettingsStatus},
     fixture::FixtureProvider,
@@ -27,6 +27,7 @@ fn context() -> SettingsContext {
             provider: "codex/old".into(),
             mode: "full-access".into(),
             thinking: "medium".into(),
+            automatic_setup: AutomaticSetupPolicy::Disabled,
             theme: ThemeId::Terminal,
             display_zone: "Z".into(),
             delight_enabled: true,
@@ -266,6 +267,87 @@ fn clicks_outside_the_popup_are_contained_and_the_layer_owns_its_keymap() {
 }
 
 #[test]
+fn automatic_setup_is_object_first_and_saves_from_keyboard_and_mouse() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Settings), &provider);
+    let opened = text(&draw(&provider, &mut app, 140, 40));
+    let object = opened
+        .find("Automatic log setup")
+        .expect("the settings object is named");
+    let value = opened.find("Disabled").expect("the saved policy is shown");
+    assert!(
+        object < value,
+        "object must precede its operation value:\n{opened}"
+    );
+
+    focus(
+        &mut app,
+        &provider,
+        SettingsControl::Field(SettingsField::AutomaticSetup),
+    );
+    key(&mut app, &provider, KeyCode::Enter);
+    let choices = text(&draw(&provider, &mut app, 140, 40));
+    assert!(choices.contains("Disabled"), "{choices}");
+    assert!(choices.contains("On new source"), "{choices}");
+    key(&mut app, &provider, KeyCode::Down);
+    key(&mut app, &provider, KeyCode::Enter);
+    assert_eq!(
+        app.layers.settings.state().unwrap().draft.automatic_setup,
+        AutomaticSetupPolicy::OnNewSource
+    );
+    focus(&mut app, &provider, SettingsControl::Save);
+    key(&mut app, &provider, KeyCode::Enter);
+    let request = app
+        .layers
+        .settings
+        .outbox
+        .take()
+        .pop()
+        .expect("Save sends the automatic setup policy");
+    assert_eq!(
+        request.values.automatic_setup,
+        AutomaticSetupPolicy::OnNewSource
+    );
+
+    let (provider, mut mouse_app) = demo();
+    mouse_app.handle(Action::Open(Open::Settings), &provider);
+    draw(&provider, &mut mouse_app, 100, 30);
+    let field = mouse_app
+        .layers
+        .settings
+        .control_rects()
+        .iter()
+        .find(|(_, control)| *control == SettingsControl::Field(SettingsField::AutomaticSetup))
+        .map(|(rect, _)| *rect)
+        .expect("automatic setup field is painted");
+    click(&mut mouse_app, &provider, (field.x, field.y));
+    draw(&provider, &mut mouse_app, 100, 30);
+    let on_new_source = mouse_app
+        .layers
+        .settings
+        .theme_choice_rects()
+        .iter()
+        .find(|(_, index)| *index == 1)
+        .map(|(rect, _)| *rect)
+        .expect("On new source choice is painted");
+    click(
+        &mut mouse_app,
+        &provider,
+        (on_new_source.x, on_new_source.y),
+    );
+    assert_eq!(
+        mouse_app
+            .layers
+            .settings
+            .state()
+            .unwrap()
+            .draft
+            .automatic_setup,
+        AutomaticSetupPolicy::OnNewSource
+    );
+}
+
+#[test]
 fn settings_without_a_configured_snapshot_do_not_open() {
     let (provider, sources, views) = FixtureProvider::demo();
     let mut app = App::new(sources, views, true);
@@ -492,6 +574,11 @@ fn display_zone_mouse_activation_distinguishes_presets_from_custom_text() {
         "America/Argentina/Buenos_Aires"
     );
     custom.handle(Action::Open(Open::Settings), &provider);
+    focus(
+        &mut custom,
+        &provider,
+        SettingsControl::Field(SettingsField::DisplayZone),
+    );
     draw(&provider, &mut custom, 54, 16);
     let custom_rect = custom
         .layers

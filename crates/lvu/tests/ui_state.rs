@@ -333,6 +333,7 @@ fn settings_context() -> SettingsContext {
             provider: "codex/old".into(),
             mode: "full-access".into(),
             thinking: "medium".into(),
+            automatic_setup: lvu::AutomaticSetupPolicy::Disabled,
             theme: ThemeId::Terminal,
             display_zone: "Z".into(),
             delight_enabled: true,
@@ -418,8 +419,9 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
     let settings_screen = render(&provider, &mut app, 110, 28);
     assert!(settings_screen.contains("Settings"));
 
-    // One press per field: the display zone joined the Appearance section.
-    for _ in 0..11 {
+    // One press per field: display zone and automatic setup are both explicit
+    // controls before the cache section.
+    for _ in 0..12 {
         app.handle(raw_key(KeyCode::Down), &provider);
     }
     let backend = TestBackend::new(54, 12);
