@@ -1,0 +1,42 @@
+{
+  "version": "v0.1.14",
+  "source_tag": "v0.1.14",
+  "source_commit": "5093e24ea849dccf78100c4185a1fab7a283f75c",
+  "tag_object": "22205468cee14cc82afaf998b637f3ac2335012c",
+  "remote_peel": "5093e24ea849dccf78100c4185a1fab7a283f75c",
+  "release_id": 390422897,
+  "release_draft": false,
+  "published_at": "2026-09-17T03:56:22Z",
+  "release_workflow": {
+    "run": 35178801422,
+    "conclusion": "success",
+    "head_sha": "5093e24ea849dccf78100c4185a1fab7a283f75c"
+  },
+  "tap_commit": "cacb6044c88d175b31dae258c85a2262b12ac809",
+  "archive": "lvu-0.1.14-x86_64-unknown-linux-musl.tar.gz",
+  "archive_sha256": "d6da84aa76f57dd078041a703d725ca6a1ab68825c5ad8b26a1256551d12232b",
+  "archive_bytes": 29622778,
+  "tree_manifest_sha256": "a47c43ab3b2eac2a42b17e9fcfd014d39883a1913e05778e7ceec87888da90ea",
+  "tree_manifest_entries": 944,
+  "binary_sha256": "745a1d74967a9f251f011aa5e66272df8464ba27214a012714bc46dcd7867869",
+  "accepted_record": {
+    "path": "/mnt/HC_Volume_106796581/lvu-build/lvu-v014-5093e24-final-acceptance/release-gate-5093e24ea849-30265544d6ec44309d38bcc535793d78/accepted.json",
+    "sha256": "689a2a0444b4d5e1d600b9ce567f12ea4a44d4d55b2c14bbeaf5331c4923b51d",
+    "result": "passed",
+    "pty_passed": "86/86",
+    "proof_count": 10
+  },
+  "previous_latest": "v0.1.13",
+  "acceptance": [
+    "Three CI archives built, executed and matched SHA256SUMS",
+    "Pinned mise install verified checksum, GitHub attestations and SLSA provenance",
+    "Homebrew upgraded to 0.1.14 and its formula test passed",
+    "Official archive helper compiled a real Polars expression and bridge answered live capabilities",
+    "Installed Docker PTY started both Compose-service and individual-container sources"
+  ],
+  "known_limitations": [
+    "The local Docker daemon rejects this user; installed Docker acceptance used a controlled executable fixture",
+    "Apple-silicon macOS and arm64 Linux human interactive acceptance remain unverified",
+    "Volume-backed full soak, cold-query latency and slow-storage autosave investigations remain paused/unaccepted"
+  ]
+}

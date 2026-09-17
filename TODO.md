@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.13**. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.14**. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -27,7 +27,6 @@ holds.
 
 | Status | Work |
 | --- | --- |
-| **Ready** | Automatic log setup opens raw logs immediately, then asynchronously requests one strictly typed, bounded proposal for native enrichments, pins, colour classification, display roles and grouping. A validated bundle publishes atomically as a reversible Enhanced view; durable receipts prevent restart retries and exact revert refuses to erase later manual edits. The global policy is disabled by default. Full Rust, Clippy and 86/86 actual PTY preflight passed; exact release acceptance remains. The semantic dialog grammar and complete current-flow migration inventory are in `docs/dialog-grammar.md`. |
-| **Open** | Prevent build-output accumulation: implement explicit retirement for completed worktree/release targets while preserving named investigation binaries and proof. Cleanup is complete: lvu-build fell from 85.7 to 19.8 GiB, with 69.8 GiB volume free and a running 3 GiB compiler cache. Ordinary janitor omits release/integration names and retires existing worktrees only by `main` containment; current integration uses a separate branch. |
+| **Open** | Prevent build-output accumulation: implement explicit retirement for completed worktree/release targets while preserving named investigation binaries and proof. The pre-release cleanup removed only rebuildable outputs and completed agent worktrees; the accepted v0.1.14 targets and proof archives are deliberately retained. Ordinary janitor omits release/integration names and retires existing worktrees only by `main` containment; current integration uses a separate branch. |
 | **Open** | Optionally retain and display a bookmark's originating view. Bookmarks are deliberately source-scoped today, so the durable record identity and note survive across views but no origin-view metadata is stored; adding it needs a separate compatible schema/product decision. |
-| **Open** | Apple-silicon macOS human terminal acceptance: run the v0.1.13 checklist in Terminal.app and iTerm2. The v0.1.13 archive built and executed on native CI; human acceptance remains outstanding. Linux arm64 also lacks human interactive acceptance. Intel Macs and Windows are unsupported and are not acceptance targets. |
+| **Open** | Apple-silicon macOS human terminal acceptance: run the v0.1.14 checklist in Terminal.app and iTerm2. The v0.1.14 archive built and executed on native CI; human acceptance remains outstanding. Linux arm64 also lacks human interactive acceptance. Intel Macs and Windows are unsupported and are not acceptance targets. |

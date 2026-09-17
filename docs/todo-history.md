@@ -8,6 +8,12 @@ are releases — see [`../CHANGELOG.md`](../CHANGELOG.md).
 Rows completed before preview 047 live in the [work ledger](work-ledger.md)
 under `2026-09-08 — checklist rows shipped before preview 047`.
 
+### v0.1.14 (2026-09-17)
+
+| Status | Request |
+| --- | --- |
+| **Done** | Automatic log setup opens raw logs immediately, then asynchronously requests one strictly typed, bounded proposal for native enrichments, pins, colour classification, display roles and grouping. A validated bundle publishes atomically as a reversible Enhanced view; durable receipts prevent restart retries and exact revert refuses to erase later manual edits. The global policy is disabled by default. The semantic dialog grammar and complete current-flow migration inventory are in `docs/dialog-grammar.md`. Exact release acceptance passed 86/86 actual PTYs and all source-bound proof families. |
+
 ## Shipped since preview 047
 
 Done rows by the preview that first carried them (the publication commit after the row was marked Done). Older Done rows are in the [work ledger](work-ledger.md) under `2026-09-08 — checklist rows shipped before preview 047`.

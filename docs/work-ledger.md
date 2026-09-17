@@ -3942,3 +3942,43 @@ query had settled. The tests now inspect normalized dialog prose and wait for
 the semantic settled message. Failed-candidate evidence remains under
 `lvu-v014-c7d9d13-final-acceptance/release-gate-c7d9d1374ace-a4a51df1a0b648cd86b66d663af30983`
 on the build volume; the corrected commit requires a complete new exact run.
+
+### v0.1.14 accepted, published and installed — 2026-09-17
+
+Exact source `5093e24ea849dccf78100c4185a1fab7a283f75c`, tree
+`e453e2dfd459475127100a2728af01a20efffb4b`, passed locked workspace tests,
+all-target Clippy, 118 bridge tests, **86/86** actual PTYs, two-window shared
+capture, both sequential restart/no-replay proofs and all seven remote-union
+proof families. Accepted app/TUI hashes are `3db13814c421…` and
+`3e2bbd9721dd…`; accepted-record SHA-256 is
+`689a2a0444b4d5e1d600b9ce567f12ea4a44d4d55b2c14bbeaf5331c4923b51d`.
+
+Annotated tag object `22205468cee14cc82afaf998b637f3ac2335012c`
+peels locally and remotely to that source. Release run `35178801422` built,
+executed and uploaded exactly Linux x86_64, Linux arm64 and Apple-silicon
+macOS. Archive SHA-256 values are macOS arm64
+`27ca2d2426940261a70641af2d093ab114e936b3f95d8f7d2d3dce20b233afe7`,
+Linux arm64 `88060f0cbafc1dee2448159c90e4914e5a2641932f3dde9ee05d85dee3f5ea67`
+and Linux x86_64
+`d6da84aa76f57dd078041a703d725ca6a1ab68825c5ad8b26a1256551d12232b`.
+Tap commit
+`cacb6044c88d175b31dae258c85a2262b12ac809` passed style and strict audit and
+was pushed before publication. Release `390422897` became public at 03:56:22
+UTC with only those three archives plus `SHA256SUMS`.
+
+Homebrew upgraded to 0.1.14 and passed the formula test. Pinned mise installed
+0.1.14 after verifying checksum, GitHub artifact attestations and SLSA
+provenance. The official x86_64 archive resolved both resources, compiled a
+real Polars expression without modifying its install tree, and completed a
+live bridge capabilities exchange against ready providers. Its installed
+Docker PTY selected and started both the Compose aggregate and retained
+individual container from an environment-routed controlled Docker executable;
+the host socket still rejects this user, so no live-daemon success is claimed.
+`versions/latest` points to v0.1.14; its binary SHA-256 is
+`745a1d74967a9f251f011aa5e66272df8464ba27214a012714bc46dcd7867869`
+and its 944-file manifest digest is
+`a47c43ab3b2eac2a42b17e9fcfd014d39883a1913e05778e7ceec87888da90ea`.
+No process used the superseded 0.1.13 installs: Homebrew and mise removed them,
+while the repository-local copy was moved to trash and remains recoverable.
+Human Apple-silicon macOS and arm64 Linux terminal acceptance remains
+unverified.
