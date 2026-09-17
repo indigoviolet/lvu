@@ -83,7 +83,8 @@ def configure_named_zone(app):
     """Edit, reject, repair, and persist an IANA display-zone draft."""
     app.send(b",")
     app.wait_for("[ Save ]", timeout=8.0)
-    app.send(b"\t" * 4 + b"\r")
+    # Provider -> Mode -> Thinking -> Automatic log setup -> Theme -> zone.
+    app.send(b"\t" * 5 + b"\r")
     # The anchored zone popup shows at most eight rows, so the custom row is
     # not visible on open. Wait for the popup to be ready, wrap Up to the
     # custom row, and only then wait for it.

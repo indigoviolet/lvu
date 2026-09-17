@@ -439,7 +439,8 @@ def exercise_theme(
             assert "[ More ]" not in settings or "█" in settings, settings
             assert_input_focus(app, expected["input"])
             start = len(app.transcript)
-            app.send(b"\t\t\t ")
+            # Provider -> Mode -> Thinking -> Automatic log setup -> Theme.
+            app.send(b"\t\t\t\t ")
             dropdown = wait_frame(
                 app,
                 lambda text: "love-dark" in text and "love-light" in text,

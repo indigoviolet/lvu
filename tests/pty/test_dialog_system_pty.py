@@ -283,16 +283,16 @@ def run(binary: pathlib.Path) -> None:
             app.wait_until(lambda text: "[ Apply ]" not in text, "view closes")
 
             # --- narrow: every Settings field stays reachable -------------
-            # §12.14: at 54x16 the form used to hide nine of its ten fields
+            # §12.14: at 54x16 the form used to hide fields
             # behind [ More ]. Now the body scrolls to follow focus, so every
             # field can be reached by Tab alone.
             app.send(b",")
             settings_screen = app.wait_for("Provider / model")
-            assert "Theme" in settings_screen, settings_screen
-            # Provider -> Mode -> Thinking -> Theme -> the display zone -> the
-            # three toggles -> the four cache limits: eleven Tabs reaches the
-            # last field.
-            app.send(b"\t" * 11)
+            assert "Automatic log setup" in settings_screen, settings_screen
+            # Provider -> Mode -> Thinking -> Automatic log setup -> Theme ->
+            # the display zone -> the three toggles -> the four cache limits:
+            # twelve Tabs reaches the last field.
+            app.send(b"\t" * 12)
             reached = app.wait_for("Per source")
             assert "Cache limits (MiB)" in reached, reached
             assert "[ More ]" in reached or "Provider / model" in reached, reached

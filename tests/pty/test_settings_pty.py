@@ -161,7 +161,8 @@ def run(binary: pathlib.Path) -> None:
             "pointer-focused Provider caret inside its field row",
         )
         first.send(b"\x7f" * 64 + b"fixture/provider")
-        first.send(b"\t" * 3)
+        # Provider -> Mode -> Thinking -> Automatic log setup -> Theme.
+        first.send(b"\t" * 4)
         first.send(b" ")
         first.wait_for("love-dark")
         first.send(b"\x1b[B\x1b")
@@ -251,7 +252,8 @@ def run(binary: pathlib.Path) -> None:
         keyboard.wait_for("settings-keyboard-record")
         keyboard.send(b",")
         keyboard.wait_for("[ Save ]")
-        keyboard.send(b"\t" * 3 + b" ")
+        # Provider -> Mode -> Thinking -> Automatic log setup -> Theme.
+        keyboard.send(b"\t" * 4 + b" ")
         keyboard.wait_for("love-dark")
         keyboard.send(b"\x1b[B\r")
         keyboard.wait_for("Pending   changes are not saved")
