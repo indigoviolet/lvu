@@ -4,6 +4,25 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## v0.1.16 — 2026-09-18
+
+### Features
+
+- Analyze each newly opened log by default after its raw view is usable,
+  including settings files written before automatic setup existed. The
+  non-modal lifecycle and retained Paseo session remain visible; Settings can
+  explicitly disable it.
+- Replace the arbitrary Settings timezone offsets with System timezone, UTC,
+  and a searchable IANA-zone picker. Fixed offsets remain compatible stored
+  values.
+- Add `lvu --version` (`-V`) and show the same package version on the startup
+  splash.
+
+### Fixes
+
+- Give a base pane focus as soon as its mouse press lands, while preserving
+  drag-to-copy visible text and deferred row activation.
+
 ## v0.1.15 — 2026-09-18
 
 ### Features

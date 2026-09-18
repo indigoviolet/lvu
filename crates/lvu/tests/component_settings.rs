@@ -43,6 +43,7 @@ fn context() -> SettingsContext {
         effective_thinking: "medium".into(),
         effective_theme: ThemeId::Terminal,
         effective_display_zone: "Z".into(),
+        system_display_zone: Some("Europe/Berlin".into()),
         display_zone_source: "default",
         effective_delight_enabled: true,
         effective_reduced_motion: false,
@@ -463,18 +464,17 @@ fn settings_without_a_configured_snapshot_do_not_open() {
 /// immediately, that saving carries it, and that named-zone semantics are
 /// stated without implying that captured instants are reinterpreted.
 #[test]
-fn the_display_zone_previews_immediately_and_states_its_semantics() {
+fn display_zone_starts_with_system_and_utc_then_previews_the_choice() {
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Settings), &provider);
     let opened = text(&draw(&provider, &mut app, 120, 40));
     assert!(opened.contains("Times shown in"), "{opened}");
-    // Help wraps by display width; wider LongContent frames split "Display"
-    // and "only:" across lines, so match the stable tokens, not one wrapping.
     assert!(
         opened.contains("Europe/Berlin")
-            && opened.contains("daylight saving")
-            && opened.contains("Display")
-            && opened.contains("captured/event"),
+            && opened.contains("daylight")
+            && opened.contains("saving")
+            && opened.contains("System timezone")
+            && opened.contains("UTC"),
         "the help line says how named zones affect display:\n{opened}"
     );
 
@@ -484,19 +484,20 @@ fn the_display_zone_previews_immediately_and_states_its_semantics() {
         SettingsControl::Field(SettingsField::DisplayZone),
     );
     key(&mut app, &provider, KeyCode::Enter);
-    // The shared Anchored popup shows at most eight rows; UTC+02:00 (index 8)
-    // scrolls into view via the shared selection reveal.
-    for _ in 0..8 {
-        key(&mut app, &provider, KeyCode::Down);
-    }
     let choices = text(&draw(&provider, &mut app, 120, 40));
-    assert!(choices.contains("UTC+02:00"), "{choices}");
+    assert!(
+        choices.contains("System timezone · Europe/Berlin"),
+        "{choices}"
+    );
+    assert!(choices.contains("UTC"), "{choices}");
+    assert!(choices.contains("Search IANA zones"), "{choices}");
 
-    // Walking to a choice previews it on the log behind the dialog: a time
-    // format has no other honest preview. Selection already rests on +02:00.
+    // Selecting System previews the exact named zone behind Settings. It has
+    // no side effect until Save and Escape still restores the opening value.
     let before = app.appearance.display_zone.clone();
+    key(&mut app, &provider, KeyCode::Up);
     key(&mut app, &provider, KeyCode::Enter);
-    assert_ne!(app.appearance.display_zone, before);
+    assert_eq!(app.appearance.display_zone, "Europe/Berlin");
     let previewed = app.appearance.display_zone.clone();
     assert_eq!(
         app.layers.settings.state().unwrap().draft.display_zone,
@@ -516,7 +517,7 @@ fn the_display_zone_previews_immediately_and_states_its_semantics() {
 }
 
 #[test]
-fn a_named_zone_previews_only_when_valid_and_keeps_the_last_good_view() {
+fn searchable_iana_zone_keeps_an_incomplete_query_out_of_the_applied_draft() {
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Settings), &provider);
     focus(
@@ -525,48 +526,33 @@ fn a_named_zone_previews_only_when_valid_and_keeps_the_last_good_view() {
         SettingsControl::Field(SettingsField::DisplayZone),
     );
     key(&mut app, &provider, KeyCode::Enter);
-    key(&mut app, &provider, KeyCode::Up); // wrap from UTC to Custom IANA zone
+    key(&mut app, &provider, KeyCode::Down);
     key(&mut app, &provider, KeyCode::Enter);
-    assert!(app.layers.settings.state().unwrap().zone_custom);
+    assert!(app.layers.settings.state().unwrap().zone_search_active);
     assert_eq!(app.appearance.display_zone, "Z");
 
-    for character in "Europe/Berlin".chars() {
+    for character in "Europe/Berli".chars() {
         key(&mut app, &provider, KeyCode::Char(character));
     }
+    assert_eq!(app.appearance.display_zone, "Z");
+    assert_eq!(app.layers.settings.state().unwrap().draft.display_zone, "Z");
+    assert_eq!(
+        app.layers.settings.state().unwrap().zone_search,
+        "Europe/Berli"
+    );
+
+    key(&mut app, &provider, KeyCode::Char('n'));
+    key(&mut app, &provider, KeyCode::Enter);
+    assert!(app.layers.settings.outbox.take().is_empty());
     assert_eq!(app.appearance.display_zone, "Europe/Berlin");
     assert_eq!(
         app.layers.settings.state().unwrap().draft.display_zone,
         "Europe/Berlin"
     );
-
-    key(&mut app, &provider, KeyCode::Backspace);
-    let invalid = app.layers.settings.state().unwrap();
-    assert_eq!(invalid.draft.display_zone, "Europe/Berli");
-    assert_eq!(invalid.status_kind, SettingsStatus::Error);
-    assert!(
-        invalid.status.contains("unknown time zone"),
-        "{}",
-        invalid.status
-    );
-    assert_eq!(
-        app.appearance.display_zone, "Europe/Berlin",
-        "an invalid draft cannot replace the last valid preview"
-    );
-
-    key(&mut app, &provider, KeyCode::Enter);
-    assert!(app.layers.settings.outbox.take().is_empty());
-    assert!(
-        app.layers
-            .settings
-            .state()
-            .unwrap()
-            .status
-            .contains("Europe/Berlin")
-    );
 }
 
 #[test]
-fn stale_save_completion_cannot_publish_an_invalid_newer_zone_draft() {
+fn stale_save_completion_cannot_replace_a_newer_searched_zone_preview() {
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Settings), &provider);
     let generation_a = app.layers.settings.state().unwrap().generation;
@@ -592,12 +578,12 @@ fn stale_save_completion_cannot_publish_an_invalid_newer_zone_draft() {
         SettingsControl::Field(SettingsField::DisplayZone),
     );
     key(&mut app, &provider, KeyCode::Enter);
-    key(&mut app, &provider, KeyCode::Up);
+    key(&mut app, &provider, KeyCode::Down);
     key(&mut app, &provider, KeyCode::Enter);
     for character in "Europe/Berlin".chars() {
         key(&mut app, &provider, KeyCode::Char(character));
     }
-    key(&mut app, &provider, KeyCode::Backspace);
+    key(&mut app, &provider, KeyCode::Enter);
     assert_eq!(app.appearance.display_zone, "Europe/Berlin");
 
     assert!(app.complete_settings_save(generation_a, Ok(context())));
@@ -609,13 +595,13 @@ fn stale_save_completion_cannot_publish_an_invalid_newer_zone_draft() {
     );
     assert_eq!(
         app.layers.settings.state().unwrap().draft.display_zone,
-        "Europe/Berli",
-        "the rejected newer draft remains editable"
+        "Europe/Berlin",
+        "the newer selected zone remains editable"
     );
 }
 
 #[test]
-fn display_zone_mouse_activation_distinguishes_presets_from_custom_text() {
+fn display_zone_mouse_activation_enters_search_without_mutating_the_draft() {
     let (provider, mut preset) = demo();
     preset.handle(Action::Open(Open::Settings), &provider);
     draw(&provider, &mut preset, 100, 30);
@@ -633,68 +619,28 @@ fn display_zone_mouse_activation_distinguishes_presets_from_custom_text() {
         Some(SettingsField::DisplayZone),
         "a preset-zone mouse click opens its choices"
     );
-    // The shared Anchored popup pages to eight rows; the Custom row (index
-    // 16) scrolls into view via the shared selection reveal before clicking.
-    for _ in 0..16 {
-        if preset
-            .layers
-            .settings
-            .theme_choice_rects()
-            .iter()
-            .any(|(_, index)| *index == lvu::app::time_zone_choices().len())
-        {
-            break;
-        }
-        key(&mut preset, &provider, KeyCode::Down);
-        draw(&provider, &mut preset, 100, 30);
-    }
     draw(&provider, &mut preset, 100, 30);
-    let custom_choice = preset
+    let search_choice = preset
         .layers
         .settings
         .theme_choice_rects()
         .iter()
-        .find(|(_, index)| *index == lvu::app::time_zone_choices().len())
+        .find(|(_, index)| *index == 2)
         .map(|(rect, _)| *rect)
         .unwrap();
-    click(&mut preset, &provider, (custom_choice.x, custom_choice.y));
-    assert!(preset.layers.settings.state().unwrap().zone_custom);
-    assert_eq!(preset.layers.settings.state().unwrap().dropdown, None);
-
-    let (provider, sources, views) = FixtureProvider::demo();
-    let mut custom = App::new(sources, views, true);
-    let mut named = context();
-    named.saved.display_zone = "America/Argentina/Buenos_Aires".into();
-    named.effective_display_zone = named.saved.display_zone.clone();
-    custom.configure_settings(named);
+    click(&mut preset, &provider, (search_choice.x, search_choice.y));
     assert_eq!(
-        custom.appearance.display_zone,
-        "America/Argentina/Buenos_Aires"
-    );
-    custom.handle(Action::Open(Open::Settings), &provider);
-    focus(
-        &mut custom,
-        &provider,
-        SettingsControl::Field(SettingsField::DisplayZone),
-    );
-    draw(&provider, &mut custom, 54, 16);
-    let custom_rect = custom
-        .layers
-        .settings
-        .control_rects()
-        .iter()
-        .find(|(_, control)| *control == SettingsControl::Field(SettingsField::DisplayZone))
-        .map(|(rect, _)| *rect)
-        .unwrap();
-    click(&mut custom, &provider, (custom_rect.x, custom_rect.y));
-    assert_eq!(
-        custom.layers.settings.state().unwrap().focus,
+        preset.layers.settings.state().unwrap().focus,
         SettingsControl::Field(SettingsField::DisplayZone)
     );
-    assert_eq!(custom.layers.settings.state().unwrap().dropdown, None);
-    draw(&provider, &mut custom, 54, 16);
-    let caret = custom.layers.settings.surface().caret.unwrap();
-    let rendered_field = custom
+    assert!(preset.layers.settings.state().unwrap().zone_search_active);
+    assert_eq!(
+        preset.layers.settings.state().unwrap().draft.display_zone,
+        "Z"
+    );
+    draw(&provider, &mut preset, 54, 16);
+    let caret = preset.layers.settings.surface().caret.unwrap();
+    let rendered_field = preset
         .layers
         .settings
         .control_rects()
@@ -704,7 +650,7 @@ fn display_zone_mouse_activation_distinguishes_presets_from_custom_text() {
         .unwrap();
     assert!(contains(rendered_field, caret));
     assert_eq!(
-        custom
+        preset
             .layers
             .settings
             .hit((rendered_field.x, rendered_field.y)),
@@ -724,7 +670,7 @@ fn a_saved_display_zone_travels_in_the_request() {
         SettingsControl::Field(SettingsField::DisplayZone),
     );
     key(&mut app, &provider, KeyCode::Enter);
-    key(&mut app, &provider, KeyCode::Down);
+    key(&mut app, &provider, KeyCode::Up);
     key(&mut app, &provider, KeyCode::Enter);
     let chosen = app.appearance.display_zone.clone();
     focus(&mut app, &provider, SettingsControl::Save);
@@ -860,12 +806,6 @@ fn dropdowns_are_anchored_to_the_field_with_shared_hitboxes() {
             let (provider, mut app) = demo();
             app.handle(Action::Open(Open::Settings), &provider);
             focus(&mut app, &provider, SettingsControl::Field(field));
-            // Custom-zone text field has no popup; switch to preset first.
-            if field == SettingsField::DisplayZone
-                && app.layers.settings.state().is_some_and(|d| d.zone_custom)
-            {
-                continue;
-            }
             key(&mut app, &provider, KeyCode::Enter);
             draw(&provider, &mut app, width, height);
             let surface = app.layers.settings.surface();

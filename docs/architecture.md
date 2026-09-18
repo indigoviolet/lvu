@@ -237,7 +237,7 @@ preempt a running Polars evaluation or kernel filesystem read.
 
 | Storage | Authority and policy |
 | --- | --- |
-| `$XDG_CONFIG_HOME/lvu/settings.toml` | Global model, disabled-by-default automatic log setup policy, theme, motion and cache preferences; fallback `~/.config/lvu/settings.toml`. |
+| `$XDG_CONFIG_HOME/lvu/settings.toml` | Global model, on-new-source automatic log setup policy by default, theme, motion and cache preferences; fallback `~/.config/lvu/settings.toml`. |
 | `$XDG_DATA_HOME/lvu` | Default durable capture root; fallback `~/.local/share/lvu`. `--capture-dir` overrides it. Existing legacy `.lvu-captures` can be selected with a notice when the XDG data root does not yet exist; nothing is moved automatically. |
 | `<capture-root>/workspace` | SQLite accepted state, independent drafts, navigation, presentation, sources and recipe metadata; canonical recipes under its `recipes/` directory. |
 | `<capture-root>/workspace/session.json` | The sources of the most recent session in this capture root, in sidebar order, including ones that could not be acquired. The shared worker is the sole writer. It records explicit remote starts/stops and never rewrites while workspace persistence is incompatible; attached apps do not race it. Files resume from durable cursors. Remembered commands and HTTP endpoints stay visible but do not launch/contact automatically. Additive and unversioned against the workspace schema: an older binary ignores unknown fields, and unsafe/unreadable persistence is refused rather than reset. |
@@ -311,9 +311,9 @@ evidence. Capture time is not a substitute for a missing event timestamp.
 
 ### Automatic log setup
 
-Automatic setup is a raw-first, optional assistance path for a source that
-already exists. The default policy is Disabled; `On new source` queues one
-analysis only after the source's canonical All events view is usable. The
+Automatic setup is a raw-first assistance path for a source that already
+exists. The default policy is `On new source`; it queues one analysis only
+after the source's canonical All events view is usable. The
 manual `Current log > Analyze again` palette action uses the same request path.
 It does not add fields to source creation, delay raw rendering or steal focus
 when a background result arrives.

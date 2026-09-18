@@ -9,14 +9,14 @@ mode = "full-access"
 thinking = "medium"
 
 # Automatic setup can send a bounded sample from each newly opened log source
-# to the configured provider. Upgrades and new installations leave it disabled
-# until this policy is changed explicitly.
+# to the configured provider. New installations and settings files from before
+# this section use On new source; choose Disabled here to opt out.
 [automatic_setup]
-policy = "disabled" # disabled, automatic-on-new-source
+policy = "automatic-on-new-source" # disabled, automatic-on-new-source
 
 [appearance]
 theme = "terminal" # terminal, love-dark, love-light, dracula, nord, gruvbox-dark
-display_zone = "Z" # zone timestamps are shown in: Z or a fixed offset such as +02:00; no DST
+display_zone = "Z" # Settings offers System timezone, UTC, and IANA search; fixed offsets remain valid
 delight_enabled = true
 reduced_motion = false
 ascii = false

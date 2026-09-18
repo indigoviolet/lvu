@@ -30,6 +30,33 @@ EVENT_TIME = 'event_time = pl.col("ts")'
 FIRST_TS = "2026-01-15T12:00:00.123456Z"
 SECOND_TS = "2026-07-15T12:00:00.123457Z"
 
+SETTINGS = """\
+schema_version = 1
+
+[paseo]
+provider = "fixture/provider"
+mode = "full-access"
+thinking = "medium"
+
+[automatic_setup]
+policy = "disabled"
+
+[appearance]
+theme = "terminal"
+display_zone = "Z"
+delight_enabled = true
+reduced_motion = false
+ascii = false
+
+[cache.memory]
+rows_mib = 4
+membership_mib = 256
+
+[cache.disk]
+total_mib = 5120
+index_per_source_mib = 256
+"""
+
 
 def tooling_environment():
     home = pathlib.Path.home()
@@ -80,27 +107,28 @@ def gutter_starts_with(text, prefix):
 
 
 def configure_named_zone(app):
-    """Edit, reject, repair, and persist an IANA display-zone draft."""
+    """Search for, preview, and persist a named display zone."""
     app.send(b",")
     app.wait_for("[ Save ]", timeout=8.0)
     # Provider -> Mode -> Thinking -> Automatic log setup -> Theme -> zone.
     app.send(b"\t" * 5 + b"\r")
-    # The anchored zone popup shows at most eight rows, so the custom row is
-    # not visible on open. Wait for the popup to be ready, wrap Up to the
-    # custom row, and only then wait for it.
-    app.wait_for("UTC\u221212:00", timeout=8.0)
-    app.send(b"\x1b[A")  # UTC is first; Up wraps to the custom row.
-    app.wait_for("Custom IANA zone", timeout=8.0)
+    app.wait_for("System timezone", timeout=8.0)
+    app.send(b"\x1b[B")
     app.send(b"\r")
+    app.wait_for("Africa/Abidjan", timeout=8.0)
     app.send(b"Europe/Berlin")
     app.wait_for("Europe/Berlin", timeout=8.0)
-
-    # Invalid editor work remains a draft. The already-valid Berlin preview
-    # stays active until the missing final character is restored.
-    app.send(b"\x7f\r")
-    invalid = app.wait_for("unknown time zone", timeout=8.0)
-    assert "Europe/Berli" in invalid, invalid
-    app.send(b"n\r")
+    app.send(b"\r")
+    # A selected zone is the object value. Save is the separate submit action,
+    # not a second activation of the dropdown field. Click the rendered action
+    # rather than coupling this proof to the long-form tab order.
+    for y, line in enumerate(app.text().splitlines()):
+        if "[ Save ]" in line:
+            x = line.index("Save")
+            app.send(f"\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m".encode())
+            break
+    else:
+        raise AssertionError(f"missing Save action\n{app.text()}")
     app.wait_for("saved and applied", timeout=8.0)
     app.send(b"\x1b")
     app.wait_until(lambda text: "[ Save ]" not in text,
@@ -183,6 +211,9 @@ def run(binary):
         )
         environment = {**tooling, "XDG_CONFIG_HOME": str(root / "config"),
                        "XDG_DATA_HOME": str(root / "data"), "XDG_CACHE_HOME": str(root / "cache")}
+        settings_path = root / "config" / "lvu" / "settings.toml"
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(SETTINGS)
         arguments = [str(source), "--capture-dir", str(root / "capture")]
         app = PtyApp(binary, arguments, width=150, height=38, environment=environment)
         try:

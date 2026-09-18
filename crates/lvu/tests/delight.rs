@@ -154,6 +154,24 @@ fn converted_title_keeps_true_black_canvas_red_heart_and_gold_lettering() {
 }
 
 #[test]
+fn startup_renders_the_host_package_version_when_supplied() {
+    let backend = TestBackend::new(100, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            StartupDelight::with_version(Some("9.8.7".into())).render_with_theme(
+                frame,
+                frame.area(),
+                Duration::ZERO,
+                DelightConfig::default(),
+                Theme::LOVE_DARK,
+            );
+        })
+        .unwrap();
+    assert!(text(terminal.backend().buffer()).contains("v9.8.7"));
+}
+
+#[test]
 fn artwork_uses_large_variant_only_when_it_fits_and_recovers_after_resize() {
     let normal = render_startup(80, 24, Duration::ZERO, DelightConfig::default());
     let large = render_startup(120, 40, Duration::ZERO, DelightConfig::default());

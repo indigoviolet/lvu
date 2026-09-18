@@ -2281,8 +2281,8 @@ pub struct SettingsValues {
 /// `lvu-app` performs the explicit conversion at the settings seam.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AutomaticSetupPolicy {
-    #[default]
     Disabled,
+    #[default]
     OnNewSource,
 }
 
@@ -2305,6 +2305,9 @@ pub struct SettingsContext {
     pub effective_thinking: String,
     pub effective_theme: ThemeId,
     pub effective_display_zone: String,
+    /// The named zone currently reported by the operating system. It is a
+    /// picker convenience, not an implicit display-zone override.
+    pub system_display_zone: Option<String>,
     pub display_zone_source: &'static str,
     pub effective_delight_enabled: bool,
     pub effective_reduced_motion: bool,
@@ -3966,6 +3969,9 @@ pub struct App {
     /// Whether an interactive source-less launch should show the startup modal.
     /// This is deliberately independent from the footer delight setting.
     pub show_startup_title: bool,
+    /// Package version shown only by the startup presentation. The executable
+    /// supplies it so the reusable UI crate never guesses its host package.
+    pub startup_version: Option<String>,
     /// When each view was last selected. A restart reopens the view the user
     /// was working in, which is only All events until they choose another.
     view_selection_stamps: HashMap<String, u64>,
@@ -4053,6 +4059,7 @@ impl App {
             auto_setup_receipts: HashMap::new(),
             appearance: Appearance::default(),
             show_startup_title: true,
+            startup_version: None,
             view_selection_stamps: HashMap::new(),
             next_selection_stamp: 1,
             restored_selections: HashSet::new(),
@@ -4091,6 +4098,12 @@ impl App {
 
     pub fn active_view_id(&self) -> Option<&str> {
         self.views.active_id()
+    }
+
+    /// Give the source-less startup presentation the exact package version the
+    /// executable reports through `--version`.
+    pub fn configure_startup_version(&mut self, version: impl Into<String>) {
+        self.startup_version = Some(version.into());
     }
 
     fn dismissal_action(&self) -> Action {
@@ -9252,6 +9265,32 @@ impl App {
             MouseEventKind::ScrollUp if over_sidebar => self.switch_view(-1, provider),
             MouseEventKind::ScrollDown if over_sidebar => self.switch_view(1, provider),
             _ => {}
+        }
+    }
+
+    /// Give a visible base pane keyboard focus on pointer press without also
+    /// activating a row. `terminal` invokes this before it decides whether the
+    /// same press grows into a visible-text selection; row/view activation
+    /// remains the existing release path so dragging never changes data.
+    pub fn focus_base_pane_at(&mut self, point: (u16, u16)) {
+        if self
+            .hit_regions
+            .sidebar
+            .is_some_and(|area| contains(area, point))
+        {
+            self.focus = Focus::Selector;
+        } else if self
+            .hit_regions
+            .details
+            .is_some_and(|area| contains(area, point))
+        {
+            self.focus = Focus::Details;
+        } else if self
+            .hit_regions
+            .log
+            .is_some_and(|area| contains(area, point))
+        {
+            self.focus = Focus::Logs;
         }
     }
 }

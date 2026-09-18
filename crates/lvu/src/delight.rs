@@ -68,11 +68,21 @@ pub enum InputDisposition {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StartupDelight {
     dismissed: bool,
+    version: Option<String>,
 }
 
 impl StartupDelight {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The host package owns release identity. The reusable terminal layer
+    /// renders it when supplied, rather than embedding its own crate version.
+    pub fn with_version(version: Option<String>) -> Self {
+        Self {
+            dismissed: false,
+            version,
+        }
     }
 
     /// A key dismisses the title and is consumed by the host.
@@ -123,7 +133,7 @@ impl StartupDelight {
             return;
         }
         if !config.ascii && area.width >= 80 && area.height >= 22 {
-            render_ansi_title(frame, area, elapsed, config);
+            render_ansi_title(frame, area, elapsed, config, self.version.as_deref());
             return;
         }
         frame.render_widget(Clear, area);
@@ -131,7 +141,7 @@ impl StartupDelight {
             Block::default().style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
             area,
         );
-        let lines = compact_title(area, config, theme);
+        let lines = compact_title(area, config, theme, self.version.as_deref());
         let height = lines.len().min(area.height as usize) as u16;
         let top = area.y + area.height.saturating_sub(height) / 2;
         frame.render_widget(
@@ -285,7 +295,13 @@ fn render_corner_heart(
     }
 }
 
-fn render_ansi_title(frame: &mut Frame<'_>, area: Rect, elapsed: Duration, config: DelightConfig) {
+fn render_ansi_title(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    elapsed: Duration,
+    config: DelightConfig,
+    version: Option<&str>,
+) {
     let black = Color::Rgb(0, 0, 0);
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(Style::default().bg(black)), area);
@@ -302,17 +318,22 @@ fn render_ansi_title(frame: &mut Frame<'_>, area: Rect, elapsed: Duration, confi
             frame.buffer_mut()[(left + x, top + y)] = art[(x, y)].clone();
         }
     }
-    // The artwork's last row is blank. Keep a readable/accessibility label and
-    // Escape hint even when the artwork occupies the entire available height.
+    // The artwork's last row is blank. Keep a readable/accessibility label,
+    // exact package version and Escape hint even when it fills the height.
     frame.render_widget(
-        Paragraph::new("LOVE YOU LOG TIME · PRESS ANY KEY")
+        Paragraph::new(ansi_startup_prompt(version))
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::Rgb(220, 185, 115)).bg(black)),
         Rect::new(area.x, area.bottom() - 1, area.width, 1),
     );
 }
 
-fn compact_title(area: Rect, config: DelightConfig, theme: Theme) -> Vec<Line<'static>> {
+fn compact_title(
+    area: Rect,
+    config: DelightConfig,
+    theme: Theme,
+    version: Option<&str>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if area.height >= 3 {
         lines.push(Line::styled(
@@ -330,11 +351,29 @@ fn compact_title(area: Rect, config: DelightConfig, theme: Theme) -> Vec<Line<'s
     ));
     if area.height >= 2 {
         lines.push(Line::styled(
-            truncate_width("PRESS ANY KEY", area.width as usize),
+            truncate_width(
+                &compact_startup_prompt(version, config.ascii),
+                area.width as usize,
+            ),
             Style::default().fg(theme.muted),
         ));
     }
     lines
+}
+
+fn ansi_startup_prompt(version: Option<&str>) -> String {
+    match version.filter(|value| !value.is_empty()) {
+        Some(version) => format!("LOVE YOU LOG TIME · v{version} · PRESS ANY KEY"),
+        None => "LOVE YOU LOG TIME · PRESS ANY KEY".into(),
+    }
+}
+
+fn compact_startup_prompt(version: Option<&str>, ascii: bool) -> String {
+    match version.filter(|value| !value.is_empty()) {
+        Some(version) if ascii => format!("v{version} - PRESS ANY KEY"),
+        Some(version) => format!("v{version} · PRESS ANY KEY"),
+        None => "PRESS ANY KEY".into(),
+    }
 }
 
 fn footer_badge(

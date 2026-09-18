@@ -81,9 +81,9 @@ pub struct Settings {
     pub schema_version: u32,
     pub paseo: PaseoSettings,
     /// Policy for agent-assisted setup of newly opened log sources. Missing in
-    /// older settings files means disabled: automatic analysis may send a
-    /// bounded log sample to the configured provider, so upgrades never opt a
-    /// user in silently.
+    /// older settings files uses the current default: automatic analysis sends
+    /// only a bounded log sample to the configured provider, creates a
+    /// reviewable Enhanced view, and retains its Paseo conversation.
     #[serde(default)]
     pub automatic_setup: AutomaticSetupSettings,
     pub appearance: AppearanceSettings,
@@ -113,8 +113,8 @@ pub struct AutomaticSetupSettings {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AutomaticSetupPolicy {
-    #[default]
     Disabled,
+    #[default]
     AutomaticOnNewSource,
 }
 
@@ -148,6 +148,15 @@ pub struct AppearanceSettings {
 
 fn default_display_zone() -> String {
     lvu::app::DEFAULT_DISPLAY_ZONE.to_owned()
+}
+
+/// The operating system's current named zone, when it can identify one that
+/// lvu's formatter can actually resolve. Failure is represented in Settings as
+/// an unavailable System choice; it never changes timestamp authority.
+pub fn system_display_zone() -> Option<String> {
+    let zone = iana_time_zone::get_timezone().ok()?;
+    lvu::app::validate_display_zone(&zone).ok()?;
+    Some(zone)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -848,11 +857,11 @@ index_per_source_mib = 256
 "#;
 
     #[test]
-    fn older_settings_default_automatic_setup_to_disabled() {
+    fn older_settings_enable_automatic_setup_by_default() {
         let settings: Settings = toml::from_str(LEGACY_SETTINGS).unwrap();
         assert_eq!(
             settings.automatic_setup.policy,
-            AutomaticSetupPolicy::Disabled
+            AutomaticSetupPolicy::AutomaticOnNewSource
         );
         let validated = settings.validate().unwrap();
         let loaded = LoadedSettings {
@@ -863,7 +872,7 @@ index_per_source_mib = 256
         assert_eq!(
             effective.automatic_setup_policy,
             EffectiveValue {
-                value: AutomaticSetupPolicy::Disabled,
+                value: AutomaticSetupPolicy::AutomaticOnNewSource,
                 source: ValueSource::GlobalFile,
             }
         );

@@ -93,9 +93,6 @@ provider = "fixture/provider"
 mode = "full-access"
 thinking = "medium"
 
-[automatic_setup]
-policy = "automatic-on-new-source"
-
 [appearance]
 theme = "terminal"
 display_zone = "Z"
@@ -171,6 +168,7 @@ def run(binary: pathlib.Path) -> None:
             "LVU_AGENT_BRIDGE_CWD": str(root),
             "FAKE_BRIDGE_ARCHIVE": str(archive),
             "FAKE_BRIDGE_STARTED": str(started),
+            "LVU_PTY_ALLOW_DEFAULT_AUTOMATIC_SETUP": "1",
             "LVU_NO_DELIGHT": "1",
         }
 

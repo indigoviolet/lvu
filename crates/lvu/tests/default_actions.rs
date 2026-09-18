@@ -461,6 +461,7 @@ fn settings_context() -> SettingsContext {
         effective_reduced_motion: false,
         effective_ascii: false,
         effective_display_zone: "Z".into(),
+        system_display_zone: Some("Europe/Berlin".into()),
         display_zone_source: "default",
         provider_source: "environment LVU_AI_PROVIDER".into(),
         mode_source: "settings.toml".into(),

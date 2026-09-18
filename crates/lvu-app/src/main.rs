@@ -277,6 +277,9 @@ struct Options {
     /// sharing on ordinary launches; session consumption waits for the
     /// remote handle seam.
     shared: bool,
+    /// Exit after printing the package version. This remains an Options value
+    /// rather than a pre-parse side path so it has one tested CLI grammar.
+    version: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -9094,6 +9097,7 @@ fn settings_context(
             settings::Theme::GruvboxDark => ThemeId::GruvboxDark,
         },
         effective_display_zone: effective.display_zone.value.clone(),
+        system_display_zone: settings::system_display_zone(),
         display_zone_source: match effective.display_zone.source {
             settings::ValueSource::Default => "default",
             _ => "settings.toml",
@@ -9241,6 +9245,10 @@ async fn run() -> Result<(), String> {
         print_help();
         return Ok(());
     };
+    if options.version {
+        print_version();
+        return Ok(());
+    }
     ensure_controlling_terminal()?;
     let cwd = env::current_dir().map_err(|error| format!("current directory: {error}"))?;
     let paths = settings::resolve_paths().map_err(|error| error.to_string())?;
@@ -9357,6 +9365,7 @@ async fn run() -> Result<(), String> {
     };
     let mut app = App::new(Vec::new(), Vec::new(), false);
     app.title = "lvu live sources".into();
+    app.configure_startup_version(VERSION);
     app.configure_ai(
         effective_settings.provider.value.clone(),
         effective_settings.mode.value.clone(),
@@ -10693,6 +10702,7 @@ fn parse_args(
     let mut fresh = false;
     let mut resume = false;
     let mut shared = false;
+    let mut version = false;
     let mut explicit_stdin = false;
     let mut options_ended = false;
     let mut index = 0;
@@ -10712,6 +10722,7 @@ fn parse_args(
         match option {
             Some("--") => options_ended = true,
             Some("--help" | "-h") => return Ok(None),
+            Some("--version" | "-V") => version = true,
             // Resuming is the default. `--resume` exists so a script can say so
             // and keep saying so if the default ever moves; `--fresh` is the
             // only spelling that changes what happens.
@@ -10780,6 +10791,7 @@ fn parse_args(
         sources,
         fresh,
         shared,
+        version,
     }))
 }
 
@@ -10859,6 +10871,7 @@ fn path_identity_bytes(path: &Path) -> Vec<u8> {
 /// mise both put this binary on PATH as `lvu`. Every message a user can see
 /// spells it that way.
 pub const COMMAND: &str = "lvu";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The `--help` text, as a value so it can be asserted rather than only
 /// eyeballed. `print_help` is the only caller that writes it out.
@@ -10882,6 +10895,7 @@ fn help_text() -> String {
          \x20                   .lvu-captures root records that choice for this directory\n\
          --                  Treat remaining arguments as file paths\n\
          --help              Show this help\n\
+         --version, -V       Show the installed lvu version\n\
          --keys              Print the bytes your terminal sends for each key you press,\n\
          \x20                   and how they decode. Answers 'why did that chord do\n\
          \x20                   nothing'. Ctrl-C exits.\n\
@@ -10897,9 +10911,17 @@ fn print_help() {
     println!("{}", help_text());
 }
 
+fn version_text() -> String {
+    format!("{COMMAND} {VERSION}")
+}
+
+fn print_version() {
+    println!("{}", version_text());
+}
+
 #[cfg(test)]
 mod command_name {
-    use super::{COMMAND, help_text};
+    use super::{COMMAND, VERSION, help_text, parse_args, version_text};
 
     /// Nothing a user can run is called `lvu-app`. That is the crate binary's
     /// name; Homebrew and mise both install it as `lvu`, and the workspace's
@@ -10937,6 +10959,16 @@ mod command_name {
             !rendered.contains("lvu-app"),
             "a fatal error must not name the crate binary, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn version_is_a_cli_exit_with_the_packaged_value() {
+        let version = parse_args(vec!["--version".into()], true)
+            .expect("version parses")
+            .expect("version is not help");
+        assert!(version.version);
+        assert_eq!(version_text(), format!("lvu {VERSION}"));
+        assert!(help_text().contains("--version, -V"));
     }
 }
 

@@ -26,8 +26,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    AutomaticSetupPolicy, SettingsContext, SettingsRequest, SettingsValues, time_zone_choices,
-    time_zone_label, validate_display_zone,
+    AutomaticSetupPolicy, SettingsContext, SettingsRequest, SettingsValues, time_zone_label,
+    validate_display_zone,
 };
 use crate::component::{
     Appearance, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface, is_typed_char,
@@ -119,8 +119,14 @@ impl SettingsField {
     }
 }
 
-/// The rows a field's dropdown offers, in the order it draws them.
-fn settings_choices(field: SettingsField) -> Vec<String> {
+const SYSTEM_ZONE_CHOICE: usize = 0;
+const UTC_ZONE_CHOICE: usize = 1;
+const SEARCH_ZONE_CHOICE: usize = 2;
+
+/// The rows a field's dropdown offers, in the order it draws them. Display
+/// zones deliberately start with a small, comprehensible operation menu; the
+/// full IANA database appears only after Search is chosen.
+fn settings_choices(field: SettingsField, dialog: &SettingsDialogState) -> Vec<String> {
     match field {
         // The token, not the pretty label: it is what the settings file
         // stores, and showing the two spellings apart would invite a bug
@@ -129,11 +135,22 @@ fn settings_choices(field: SettingsField) -> Vec<String> {
             .iter()
             .map(|theme| theme.as_str().to_owned())
             .collect(),
-        SettingsField::DisplayZone => time_zone_choices()
-            .iter()
-            .map(|(label, _)| (*label).to_owned())
-            .chain(std::iter::once("Custom IANA zone…".to_owned()))
-            .collect(),
+        SettingsField::DisplayZone if dialog.zone_search_active => {
+            let matches = zone_search_choices(&dialog.zone_search);
+            if matches.is_empty() {
+                vec!["No matching IANA zones".into()]
+            } else {
+                matches
+            }
+        }
+        SettingsField::DisplayZone => vec![
+            dialog.context.system_display_zone.as_ref().map_or_else(
+                || "System timezone · unavailable".into(),
+                |zone| format!("System timezone · {zone}"),
+            ),
+            "UTC".into(),
+            "Search IANA zones…".into(),
+        ],
         SettingsField::AutomaticSetup => AutomaticSetupPolicy::ALL
             .iter()
             .map(|policy| policy.label().to_owned())
@@ -142,14 +159,26 @@ fn settings_choices(field: SettingsField) -> Vec<String> {
     }
 }
 
-/// Where a stored zone token sits in the offered list. Valid names use the
-/// custom editor row; invalid persisted values are rejected before this layer
-/// is configured.
-fn zone_index(token: &str) -> usize {
-    time_zone_choices()
+/// Where a stored zone token sits in the small operation menu. A selected IANA
+/// zone opens Search so the reader can refine or replace it.
+fn zone_index(dialog: &SettingsDialogState) -> usize {
+    if dialog.context.system_display_zone.as_deref() == Some(&dialog.draft.display_zone) {
+        SYSTEM_ZONE_CHOICE
+    } else if matches!(dialog.draft.display_zone.as_str(), "Z" | "UTC") {
+        UTC_ZONE_CHOICE
+    } else {
+        SEARCH_ZONE_CHOICE
+    }
+}
+
+fn zone_search_choices(query: &str) -> Vec<String> {
+    let needle = query.trim().to_ascii_lowercase();
+    chrono_tz::TZ_VARIANTS
         .iter()
-        .position(|(_, value)| *value == token)
-        .unwrap_or(time_zone_choices().len())
+        .map(|zone| zone.name())
+        .filter(|zone| needle.is_empty() || zone.to_ascii_lowercase().contains(&needle))
+        .map(str::to_owned)
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,9 +211,10 @@ pub struct SettingsDialogState {
     /// a third would cost nothing.
     pub dropdown: Option<SettingsField>,
     pub choice_selected: usize,
-    /// Named zones are edited as text after choosing the custom row. Presets
-    /// remain the compact dropdown behavior existing settings users know.
-    pub zone_custom: bool,
+    /// Search is a separate candidate from the persisted display-zone draft:
+    /// incomplete text never replaces a valid time display behind Settings.
+    pub zone_search_active: bool,
+    pub zone_search: String,
     /// Preview authority kept apart from the editable token. A stale save
     /// acknowledgement may rebuild the other preview fields from a newer
     /// draft, but an invalid zone draft must never reach `Appearance`.
@@ -430,7 +460,9 @@ impl SettingsDialog {
                 return;
             }
             SettingsField::DisplayZone => {
-                dialog.choice_selected = zone_index(&dialog.draft.display_zone);
+                dialog.zone_search_active = false;
+                dialog.zone_search.clear();
+                dialog.choice_selected = zone_index(dialog);
                 dialog.dropdown = Some(SettingsField::DisplayZone);
                 return;
             }
@@ -458,11 +490,6 @@ impl SettingsDialog {
     /// default, `Save`.
     fn activate(&mut self, ctx: &mut Ctx<'_>) {
         match self.state.as_ref().map(|dialog| dialog.focus) {
-            Some(SettingsControl::Field(SettingsField::DisplayZone))
-                if self.state.as_ref().is_some_and(|dialog| dialog.zone_custom) =>
-            {
-                self.save()
-            }
             Some(SettingsControl::Field(
                 SettingsField::AutomaticSetup
                 | SettingsField::Theme
@@ -483,7 +510,7 @@ impl SettingsDialog {
         let Some(field) = dialog.dropdown else {
             return;
         };
-        let count = settings_choices(field).len().max(1) as i32;
+        let count = settings_choices(field, dialog).len().max(1) as i32;
         dialog.choice_selected = (dialog.choice_selected as i32 + delta).rem_euclid(count) as usize;
     }
 
@@ -509,27 +536,46 @@ impl SettingsDialog {
                 ctx.appearance.theme_id = theme;
             }
             SettingsField::DisplayZone => {
-                if let Some((_, token)) = time_zone_choices().get(index) {
-                    dialog.zone_custom = false;
-                    dialog.draft.display_zone = (*token).to_owned();
-                    // Previewed immediately, like the theme: the log behind the
-                    // dialog is the only honest preview of a time format.
-                    ctx.appearance.display_zone = (*token).to_owned();
-                    dialog.last_valid_display_zone = (*token).to_owned();
-                } else if index == time_zone_choices().len() {
-                    dialog.zone_custom = true;
-                    if time_zone_choices()
-                        .iter()
-                        .any(|(_, token)| *token == dialog.draft.display_zone)
-                    {
-                        dialog.draft.display_zone.clear();
-                    }
-                    self.cursors[SettingsField::DisplayZone.text_slot().unwrap()] =
-                        Some(TextCursor {
-                            char_index: dialog.draft.display_zone.chars().count(),
-                        });
+                if dialog.zone_search_active {
+                    let matches = zone_search_choices(&dialog.zone_search);
+                    let Some(token) = matches.get(index) else {
+                        return;
+                    };
+                    dialog.draft.display_zone = token.clone();
+                    ctx.appearance.display_zone = token.clone();
+                    dialog.last_valid_display_zone = token.clone();
+                    dialog.zone_search_active = false;
+                    dialog.zone_search.clear();
                 } else {
-                    return;
+                    match index {
+                        SYSTEM_ZONE_CHOICE => {
+                            let Some(token) = dialog.context.system_display_zone.clone() else {
+                                dialog.status_kind = SettingsStatus::Error;
+                                dialog.status =
+                                    "system timezone is unavailable; search for an IANA zone"
+                                        .into();
+                                dialog.details_scroll = 0;
+                                return;
+                            };
+                            dialog.draft.display_zone = token.clone();
+                            ctx.appearance.display_zone = token.clone();
+                            dialog.last_valid_display_zone = token;
+                        }
+                        UTC_ZONE_CHOICE => {
+                            dialog.draft.display_zone = "Z".into();
+                            ctx.appearance.display_zone = "Z".into();
+                            dialog.last_valid_display_zone = "Z".into();
+                        }
+                        SEARCH_ZONE_CHOICE => {
+                            dialog.zone_search_active = true;
+                            dialog.zone_search.clear();
+                            dialog.choice_selected = 0;
+                            self.cursors[SettingsField::DisplayZone.text_slot().unwrap()] =
+                                Some(TextCursor { char_index: 0 });
+                            return;
+                        }
+                        _ => return,
+                    }
                 }
             }
             _ => return,
@@ -580,7 +626,7 @@ impl SettingsDialog {
     /// Line editing against the focused text field, using the dialog's own
     /// caret. Non-text controls have no field, so a character aimed at one is
     /// dropped — exactly as `edit_setting` dropped it.
-    fn edit_field(&mut self, command: EditCommand<'_>, ctx: &mut Ctx<'_>) {
+    fn edit_field(&mut self, command: EditCommand<'_>, _ctx: &mut Ctx<'_>) {
         let Some(dialog) = &mut self.state else {
             return;
         };
@@ -590,6 +636,29 @@ impl SettingsDialog {
         let Some(slot) = field.text_slot() else {
             return;
         };
+        if field == SettingsField::DisplayZone {
+            if !(dialog.dropdown == Some(SettingsField::DisplayZone) && dialog.zone_search_active) {
+                return;
+            }
+            let mut cursor = self.cursors[slot].unwrap_or(TextCursor {
+                char_index: dialog.zone_search.chars().count(),
+            });
+            cursor.char_index = cursor.char_index.min(dialog.zone_search.chars().count());
+            let outcome = edit(
+                &mut dialog.zone_search,
+                &mut cursor,
+                command,
+                EditPolicy {
+                    max_bytes: SETTINGS_FIELD_BYTES,
+                    multiline: false,
+                },
+            );
+            self.cursors[slot] = Some(cursor);
+            if outcome.changed {
+                dialog.choice_selected = 0;
+            }
+            return;
+        }
         let value = setting_field_mut(dialog, field);
         let mut cursor = self.cursors[slot].unwrap_or(TextCursor {
             char_index: value.chars().count(),
@@ -606,24 +675,7 @@ impl SettingsDialog {
         );
         self.cursors[slot] = Some(cursor);
         if outcome.changed {
-            if field == SettingsField::DisplayZone {
-                match validate_display_zone(&dialog.draft.display_zone) {
-                    Ok(()) => {
-                        ctx.appearance.display_zone = dialog.draft.display_zone.clone();
-                        dialog.last_valid_display_zone = dialog.draft.display_zone.clone();
-                        mark_settings_pending(dialog);
-                    }
-                    Err(error) => {
-                        // An invalid draft is editable, but it cannot replace
-                        // the last valid preview behind the dialog.
-                        dialog.status_kind = SettingsStatus::Error;
-                        dialog.status = error;
-                        dialog.details_scroll = 0;
-                    }
-                }
-            } else {
-                mark_settings_pending(dialog);
-            }
+            mark_settings_pending(dialog);
         }
     }
 
@@ -633,18 +685,29 @@ impl SettingsDialog {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Outcome::Ignored;
         }
-        // The dropdown owns every key while it is open.
-        if self
+        // The dropdown owns every key while it is open. IANA Search gives its
+        // typed query to the same field/cursor that paints it, while arrows
+        // remain list navigation.
+        if let Some(dialog) = self
             .state
             .as_ref()
-            .is_some_and(|dialog| dialog.dropdown.is_some())
+            .filter(|dialog| dialog.dropdown.is_some())
         {
+            let zone_search =
+                dialog.dropdown == Some(SettingsField::DisplayZone) && dialog.zone_search_active;
             match key.code {
                 KeyCode::Up => self.move_choice(-1),
                 KeyCode::Down => self.move_choice(1),
                 KeyCode::Enter => {
                     let selected = self.state.as_ref().map_or(0, |d| d.choice_selected);
                     self.choose(selected, ctx);
+                }
+                KeyCode::Left if zone_search => self.edit_field(EditCommand::MoveLeft, ctx),
+                KeyCode::Right if zone_search => self.edit_field(EditCommand::MoveRight, ctx),
+                KeyCode::Backspace if zone_search => self.edit_field(EditCommand::Backspace, ctx),
+                KeyCode::Char(character) if zone_search && is_typed_char(&key) => {
+                    let mut buffer = [0u8; 4];
+                    self.edit_field(EditCommand::Insert(character.encode_utf8(&mut buffer)), ctx);
                 }
                 _ => {}
             }
@@ -713,12 +776,8 @@ impl SettingsDialog {
                                 | SettingsField::ReducedMotion
                                 | SettingsField::Ascii
                         ) | SettingsControl::Save
-                    ) || (control
-                        == SettingsControl::Field(SettingsField::DisplayZone)
-                        && self
-                            .state
-                            .as_ref()
-                            .is_some_and(|dialog| !dialog.zone_custom));
+                    ) || control
+                        == SettingsControl::Field(SettingsField::DisplayZone);
                     if activates {
                         self.activate(ctx);
                     }
@@ -798,9 +857,6 @@ impl Component for SettingsDialog {
         };
         let generation = self.next_generation;
         self.next_generation = generation.saturating_add(1);
-        let zone_custom = time_zone_choices()
-            .iter()
-            .all(|(_, token)| *token != context.saved.display_zone);
         let last_valid_display_zone = context.effective_display_zone.clone();
         self.state = Some(SettingsDialogState {
             generation,
@@ -813,7 +869,8 @@ impl Component for SettingsDialog {
             status: "Saved settings loaded; cache-limit changes apply after restart".into(),
             dropdown: None,
             choice_selected: 0,
-            zone_custom,
+            zone_search_active: false,
+            zone_search: String::new(),
             last_valid_display_zone,
             details_scroll: 0,
             details_scroll_limit: 0,
@@ -834,10 +891,18 @@ impl Component for SettingsDialog {
             // §5.3: the innermost thing closes first, so an open dropdown
             // absorbs the dismissal rather than the whole dialog.
             Event::Dismiss => {
-                if let Some(dialog) = &mut self.state
-                    && dialog.dropdown.take().is_some()
-                {
-                    return Outcome::Consumed;
+                if let Some(dialog) = &mut self.state {
+                    if dialog.dropdown == Some(SettingsField::DisplayZone)
+                        && dialog.zone_search_active
+                    {
+                        dialog.zone_search_active = false;
+                        dialog.zone_search.clear();
+                        dialog.choice_selected = zone_index(dialog);
+                        return Outcome::Consumed;
+                    }
+                    if dialog.dropdown.take().is_some() {
+                        return Outcome::Consumed;
+                    }
                 }
                 // An unsaved preview is rolled back to the effective values the
                 // layer opened with.
@@ -952,7 +1017,7 @@ impl Component for SettingsDialog {
         let save_label = if dialog.saving { "Saving…" } else { "Save" };
         // §3: the anatomy has a help row, and this is the one thing about
         // Settings a user cannot discover from the form itself.
-        let help = "Use an IANA zone such as Europe/Berlin for per-instant daylight saving, or a fixed UTC offset. Display only: captured/event instants never change. Times always show their offset.";
+        let help = "Choose the detected System timezone, UTC, or search IANA zones such as Europe/Berlin for daylight saving. Display only: captured/event instants never change.";
         // Two-pass for stable More: estimate overflow with max labels, then
         // resolve with actual labels. Frame is policy-only so both share it.
         let natural_usize = usize::from(natural_body);
@@ -1255,24 +1320,25 @@ impl Component for SettingsDialog {
                     );
                 }
             }
-            // DisplayZone: preset dropdown or custom text, same stacked rows.
+            // DisplayZone: a compact operation menu or the IANA Search input.
             {
                 let focused = dialog.focus == Control::Field(Field::DisplayZone);
                 paint_label(frame, 13, "Times shown in", focused);
                 if let Some(rect) = srect(14) {
-                    if dialog.zone_custom {
-                        let caret = focused
-                            .then(|| self.caret_of(Field::DisplayZone, &values.display_zone));
+                    if dialog.zone_search_active {
+                        let caret =
+                            focused.then(|| self.caret_of(Field::DisplayZone, &dialog.zone_search));
                         let placed = place_input_cursor_at(
                             frame,
                             rect,
                             0,
                             0,
-                            &values.display_zone,
-                            caret.unwrap_or_else(|| values.display_zone.chars().count()),
+                            &dialog.zone_search,
+                            caret.unwrap_or_else(|| dialog.zone_search.chars().count()),
                             theme,
                         );
                         controls_hit.push((rect, Control::Field(Field::DisplayZone)));
+                        dropdown_anchors.push((Field::DisplayZone, rect));
                         if focused {
                             caret_cell = placed;
                         }
@@ -1400,8 +1466,9 @@ impl Component for SettingsDialog {
                 }
             }
 
-            // §8.3: presets are dropdown fields. A named zone uses the same row as
-            // an editable field after the user chooses Custom IANA zone.
+            // §8.3: Settings first offers System, UTC and IANA Search. A
+            // search query uses the same row without becoming a persisted
+            // invalid draft.
             for (index, field, label, value) in [
                 (
                     6u16,
@@ -1412,7 +1479,7 @@ impl Component for SettingsDialog {
                 (9, Field::Theme, "Theme", values.theme.as_str().to_owned()),
             ]
             .into_iter()
-            .chain((!dialog.zone_custom).then(|| {
+            .chain((!dialog.zone_search_active).then(|| {
                 (
                     10,
                     Field::DisplayZone,
@@ -1439,20 +1506,20 @@ impl Component for SettingsDialog {
                 dropdown_anchors.push((field, anchor));
             }
 
-            if dialog.zone_custom
+            if dialog.zone_search_active
                 && let Some(rect) = row_rect(10)
             {
                 let field = Field::DisplayZone;
                 let control = Control::Field(field);
                 let focused = dialog.focus == control;
-                let caret = focused.then(|| self.caret_of(field, &values.display_zone));
+                let caret = focused.then(|| self.caret_of(field, &dialog.zone_search));
                 let placed = render_labelled_field(
                     frame,
                     &mut controls_hit,
                     rect,
                     label_width,
-                    "Times shown in",
-                    &values.display_zone,
+                    "Search IANA zones",
+                    &dialog.zone_search,
                     control,
                     focused,
                     caret,
@@ -1585,7 +1652,7 @@ impl Component for SettingsDialog {
                 .map(|(_, rect)| *rect)
             && anchor.width > 0
         {
-            let choices = settings_choices(field);
+            let choices = settings_choices(field, &dialog);
             let longest = choices
                 .iter()
                 .map(|value| UnicodeWidthStr::width(value.as_str()))

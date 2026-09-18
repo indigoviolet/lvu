@@ -11,6 +11,33 @@ from test_lvu_pty import PtyApp
 LOVE_DARK_FOCUS = b"\x1b[1m\x1b[38;2;35;20;25;48;2;255;167;151m"
 FRAME_END = b"\x1b[?2026l"
 
+SETTINGS_WITH_AUTOMATIC_SETUP_DISABLED = """\
+schema_version = 1
+
+[paseo]
+provider = "codex/gpt-5.6-luna"
+mode = "full-access"
+thinking = "medium"
+
+[automatic_setup]
+policy = "disabled"
+
+[appearance]
+theme = "terminal"
+display_zone = "Z"
+delight_enabled = true
+reduced_motion = false
+ascii = false
+
+[cache.memory]
+rows_mib = 4
+membership_mib = 256
+
+[cache.disk]
+total_mib = 5120
+index_per_source_mib = 256
+"""
+
 
 def dialog_text(screen: str, title: str) -> str:
     """Visible text inside one dialog, excluding borders and background panes."""
@@ -131,6 +158,12 @@ def settings_environment(root: pathlib.Path) -> dict[str, str]:
     }
 
 
+def write_disabled_automatic_setup(root: pathlib.Path) -> None:
+    path = root / "config" / "lvu" / "settings.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(SETTINGS_WITH_AUTOMATIC_SETUP_DISABLED)
+
+
 def run(binary: pathlib.Path) -> None:
     evidence = pathlib.Path(tempfile.mkdtemp(prefix="lvu-settings-proof-"))
     print(f"Settings PTY evidence: {evidence}", flush=True)
@@ -138,6 +171,9 @@ def run(binary: pathlib.Path) -> None:
     root = pathlib.Path(temporary.name)
     source = root / "events.log"
     source.write_text("settings-visible-record\n")
+    # This suite owns Settings/persistence, not automatic analysis. The
+    # legacy-settings auto-setup PTY exercises default-on behavior separately.
+    write_disabled_automatic_setup(root)
     environment = settings_environment(root)
     arguments = ["--fresh", "--file", str(source)]
 
@@ -249,7 +285,10 @@ def run(binary: pathlib.Path) -> None:
     keyboard_root = pathlib.Path(keyboard_temporary.name)
     keyboard_source = keyboard_root / "events.log"
     keyboard_source.write_text("settings-keyboard-record\n")
-    keyboard_environment = settings_environment(keyboard_root)
+    keyboard_environment = {
+        **settings_environment(keyboard_root),
+        "LVU_PTY_PRESERVE_UNCONFIGURED_SETTINGS": "1",
+    }
     keyboard_arguments = ["--fresh", "--file", str(keyboard_source)]
     keyboard = PtyApp(
         binary, keyboard_arguments, width=112, height=28, environment=keyboard_environment

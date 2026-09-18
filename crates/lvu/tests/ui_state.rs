@@ -349,6 +349,7 @@ fn settings_context() -> SettingsContext {
         effective_thinking: "medium".into(),
         effective_theme: ThemeId::Terminal,
         effective_display_zone: "Z".into(),
+        system_display_zone: Some("Europe/Berlin".into()),
         display_zone_source: "default",
         effective_delight_enabled: false,
         effective_reduced_motion: true,
@@ -5933,6 +5934,25 @@ fn panes_support_spatial_focus_hover_wheel_and_narrow_fallback() {
     render(&provider, &mut app, 40, 8);
     assert_eq!(app.focus, Focus::Logs);
     assert!(app.hit_regions.details.is_none());
+}
+
+#[test]
+fn base_pane_focus_is_available_on_mouse_press_before_row_activation() {
+    let (provider, mut app) = demo();
+    render(&provider, &mut app, 88, 24);
+    app.handle(Action::ToggleDetails, &provider);
+    render(&provider, &mut app, 88, 24);
+    let sidebar = app.hit_regions.sidebar.expect("sidebar");
+    let log = app.hit_regions.log.expect("log");
+    let details = app.hit_regions.details.expect("details");
+
+    app.focus = Focus::Logs;
+    app.focus_base_pane_at((sidebar.x + 1, sidebar.y + 1));
+    assert_eq!(app.focus, Focus::Selector);
+    app.focus_base_pane_at((details.x + 1, details.y + 1));
+    assert_eq!(app.focus, Focus::Details);
+    app.focus_base_pane_at((log.x + 1, log.y + 1));
+    assert_eq!(app.focus, Focus::Logs);
 }
 
 #[test]

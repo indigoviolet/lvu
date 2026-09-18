@@ -1646,9 +1646,10 @@ dependencies = [
 
 [[package]]
 name = "lvu-app"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "fs2",
+ "iana-time-zone",
  "libc",
  "lvu",
  "lvu-command-enrich",

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pathlib
+import subprocess
 import sys
 import tempfile
 
@@ -18,6 +19,8 @@ def close(app: PtyApp) -> None:
 
 
 def run(binary: pathlib.Path) -> None:
+    version = subprocess.check_output([str(binary), "--version"], text=True).strip()
+    assert version.startswith("lvu "), version
     with tempfile.TemporaryDirectory(prefix="lvu-title-pty-") as directory:
         root = pathlib.Path(directory)
         environment = {
@@ -31,6 +34,7 @@ def run(binary: pathlib.Path) -> None:
         app = PtyApp(binary, [], width=124, height=42, cwd=root, environment=environment)
         try:
             app.wait_for("LOVE YOU LOG TIME")
+            app.wait_for(f"v{version.split()[1]}")
             app.assert_remains("PRESS ANY KEY", "Add source", duration=1.0)
             app.send(b"\x1b[200~hidden-paste\x1b[201~")
             app.assert_remains("PRESS ANY KEY", "hidden-paste", duration=0.2)

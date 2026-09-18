@@ -372,7 +372,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         crate::delight::MAX_STARTUP_DURATION,
     );
     let started = Instant::now();
-    let mut startup = StartupDelight::new();
+    let mut startup = StartupDelight::with_version(app.startup_version.clone());
     let mut startup_visible =
         app.show_startup_title && startup.is_visible(started.elapsed(), delight_config);
     let mut animation_tick = 0;
@@ -590,6 +590,27 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         match &event {
             Event::Mouse(mouse) if !startup_visible => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
+                    // Click-to-focus belongs to the press, not the release.
+                    // The selection layer deliberately delays row activation
+                    // until it knows whether this becomes a drag, but waiting
+                    // for that release made a pane look inert (and loses focus
+                    // entirely in terminals that omit the release report).
+                    // Keep selection's deferred activation below; this only
+                    // changes the base-pane focus ring and keyboard owner.
+                    if !palette.is_open() && app.hit_regions.selection_modal.is_none() {
+                        app.focus_base_pane_at((mouse.column, mouse.row));
+                        // The selection begins in the focus the press just
+                        // established. Record that scope now; otherwise the
+                        // next frame sees the old focus, clears this fresh
+                        // selection, and the following drag can never extend
+                        // it. Row/view activation still waits for release.
+                        selection_scope = Some((
+                            app.focus,
+                            app.active_view_id().map(str::to_owned),
+                            palette.is_open(),
+                            startup_visible,
+                        ));
+                    }
                     if let Some(buffer) = &visible_buffer {
                         let position = (mouse.column, mouse.row).into();
                         let bounds = if palette.is_open() {

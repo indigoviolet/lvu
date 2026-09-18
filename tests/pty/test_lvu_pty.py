@@ -65,6 +65,34 @@ ERASE_DISPLAY = b"\x1b[2J"
 SYNC_SETTLE_SECONDS = 0.5
 
 SCRATCH_PREFIX = "lvu-pty-scratch-"
+_PRESERVE_UNCONFIGURED_SETTINGS = "LVU_PTY_PRESERVE_UNCONFIGURED_SETTINGS"
+_ALLOW_DEFAULT_AUTOMATIC_SETUP = "LVU_PTY_ALLOW_DEFAULT_AUTOMATIC_SETUP"
+_NON_AGENT_SETTINGS = """\
+schema_version = 1
+
+[paseo]
+provider = "fixture/provider"
+mode = "full-access"
+thinking = "medium"
+
+[automatic_setup]
+policy = "disabled"
+
+[appearance]
+theme = "terminal"
+display_zone = "Z"
+delight_enabled = true
+reduced_motion = false
+ascii = false
+
+[cache.memory]
+rows_mib = 4
+membership_mib = 256
+
+[cache.disk]
+total_mib = 5120
+index_per_source_mib = 256
+"""
 # Only names this harness generates are ever swept: the prefix plus the exact
 # mkdtemp suffix shape. Proof archives, previews, capture directories and cargo
 # target directories do not match and are never inspected.
@@ -302,10 +330,32 @@ def isolated_launch(
     if "--demo" in arguments:
         return arguments, chosen
     defaults = default_xdg_environment()
-    return arguments, {
+    resolved = {
         **{key: value for key, value in defaults.items() if key not in chosen},
         **chosen,
     }
+    preserve_missing_settings = _PRESERVE_UNCONFIGURED_SETTINGS in resolved
+    allow_default_automatic_setup = _ALLOW_DEFAULT_AUTOMATIC_SETUP in resolved
+    resolved.pop(_PRESERVE_UNCONFIGURED_SETTINGS, None)
+    resolved.pop(_ALLOW_DEFAULT_AUTOMATIC_SETUP, None)
+    if not preserve_missing_settings:
+        settings = pathlib.Path(resolved["XDG_CONFIG_HOME"]) / "lvu" / "settings.toml"
+        if not settings.exists():
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            settings.write_text(_NON_AGENT_SETTINGS)
+        elif not allow_default_automatic_setup:
+            # Most older PTY fixtures configure a fake provider for an
+            # unrelated workflow. Add the explicit opt-out only in their
+            # private XDG file; otherwise a product-default automatic request
+            # reaches that intentionally nonexistent provider and masks the
+            # behavior the fixture was written to assert. The automatic-setup
+            # suite opts out of this harness rule to exercise real migration.
+            text = settings.read_text()
+            if "[automatic_setup]" not in text:
+                settings.write_text(
+                    f"{text.rstrip()}\n\n[automatic_setup]\npolicy = \"disabled\"\n"
+                )
+    return arguments, resolved
 
 
 # The Filter dialog's two tab markers (dialog-system.md §12.1). `/` opens it on

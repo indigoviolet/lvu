@@ -200,6 +200,10 @@ def run(binary: pathlib.Path) -> None:
             # Freeze a visible selected-record witness in Details, then send a
             # wheel and full click lifecycle over the log outside Help. If
             # either leaks, the selected record/focus behind the modal moves.
+            # Rendering the tail does not itself promise selection publication;
+            # make the test's intended last-record witness explicit first.
+            app.send(b"G")
+            app.wait_for("event 39 ready")
             app.send(b"d")
             app.wait_for("Selected event details")
             assert "event 39 ready" in details_panel(app), app.text()

@@ -49,6 +49,7 @@ fn settings_context() -> SettingsContext {
         effective_thinking: "medium".into(),
         effective_theme: ThemeId::LoveDark,
         effective_display_zone: "Z".into(),
+        system_display_zone: Some("Europe/Berlin".into()),
         display_zone_source: "default",
         effective_delight_enabled: true,
         effective_reduced_motion: false,

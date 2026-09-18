@@ -1,12 +1,13 @@
 [package]
 name = "lvu-app"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 fs2 = "=0.4.3"
+iana-time-zone = "=0.1.65"
 toml = "=1.1.5"
 thiserror = "=2.0.20"
 lvu = { path = "../lvu" }

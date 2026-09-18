@@ -168,10 +168,10 @@ the SDK emits it; do not invent a provider login flow.
 
 Automatic setup operates only on an existing source and its canonical All
 events view. Raw rows must be available before it starts and remain usable while
-it runs or fails. The global policy defaults to Disabled. `On new source`
-authorizes one asynchronous attempt after the source is usable; a manual Analyze
-operation uses the same path. Restore never silently re-runs a completed or
-in-flight receipt.
+it runs or fails. The global policy defaults to `On new source`, authorizing one
+asynchronous attempt after the source is usable; `Disabled` opts out and a
+manual Analyze operation uses the same path. Restore never silently re-runs a
+completed or in-flight receipt.
 
 The request uses a maximum 32 KiB inline typed schema/sample and carries no
 dataset paths or inspection command. Its definition/data revisions bind the
