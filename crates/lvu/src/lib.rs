@@ -7,6 +7,7 @@ pub mod components;
 pub mod delight;
 pub mod details;
 pub mod dialog_controls;
+pub mod dialog_flow;
 pub mod dialog_layout;
 pub mod field_stats;
 pub mod fixture;

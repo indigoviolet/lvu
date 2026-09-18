@@ -298,6 +298,55 @@ impl Open {
             Open::Union(_) => true,
         }
     }
+
+    /// Exhaustive semantic-grammar inventory for every current component
+    /// entry point. A slice has more than one entry only when the component
+    /// contains distinct phases still called out for splitting in
+    /// `docs/dialog-grammar.md`; the component's eventual `flow_spec()` names
+    /// the one phase that is active.
+    pub fn flow_grammars(&self) -> &'static [crate::dialog_flow::FlowGrammar] {
+        use crate::dialog_flow::FlowGrammar::{
+            AsyncResult, Existing, Informational, Inspector, Manager, New,
+        };
+
+        match self {
+            Open::Storage => &[Inspector],
+            Open::Time | Open::Settings | Open::Folding => &[Existing],
+            Open::Help => &[Informational],
+            Open::Fields | Open::FieldColumn { .. } | Open::ViewSummary => &[Inspector],
+            // The View layer can switch between Blank/Clone creation and
+            // Rename/Sources/Delete for the established active view.
+            Open::View => &[New, Existing],
+            Open::ViewMembership | Open::ViewDelete => &[Existing],
+            // Agent source creation advances from a new-object request to an
+            // asynchronous proposal result; Manual and Discover remain New.
+            Open::Source => &[New, AsyncResult],
+            Open::Sources => &[Manager],
+            Open::Recipes { mode } => match mode {
+                RecipeDialogMode::Browse | RecipeDialogMode::History => &[Manager],
+                RecipeDialogMode::Save | RecipeDialogMode::Import => &[New],
+                RecipeDialogMode::Export | RecipeDialogMode::Update => &[Existing],
+            },
+            Open::RecipeHistory { .. } => &[Manager],
+            Open::Search | Open::Advanced | Open::Grouping => &[Existing],
+            // These are manager surfaces whose Add/Edit operations eventually
+            // become child flows; the prose inventory marks the fused cases.
+            Open::ColorRules => &[Manager, New, Existing],
+            Open::Enrichment => &[Manager],
+            Open::EnrichmentStep { editing: None, .. }
+            | Open::ExternalCommand { stage: None, .. } => &[New],
+            Open::EnrichmentStep {
+                editing: Some(_), ..
+            }
+            | Open::ExternalCommand { stage: Some(_), .. } => &[Existing],
+            Open::Bookmarks => &[Manager],
+            Open::Ask(_) => &[New, AsyncResult],
+            // One current layer contains New, Saved-manager and existing
+            // conversation phases; its Split rows remain explicit in docs.
+            Open::Investigation => &[New, Manager, Existing],
+            Open::Correlation(_) | Open::Union(_) => &[New],
+        }
+    }
 }
 
 /// Terminal input before the shell has decided what it means. `terminal.rs`
@@ -637,6 +686,17 @@ pub trait Component {
     /// Called by the shell when the layer is pushed.
     fn open(&mut self, params: Self::Open, ctx: &mut Ctx<'_>);
 
+    /// The dialog's executable semantic grammar, when this component has been
+    /// migrated to `docs/dialog-grammar.md`.
+    ///
+    /// This is intentionally an opt-in seam: existing components keep their
+    /// current behaviour while migrations can expose one validated source of
+    /// subject, operation and phase metadata. Geometry remains owned by
+    /// `DialogSpec` and `Surface`.
+    fn flow_spec(&self) -> Option<&crate::dialog_flow::DialogFlowSpec> {
+        None
+    }
+
     /// Input for this layer. Returns what the shell must do next.
     fn handle(&mut self, event: Event<Self::Hit>, ctx: &mut Ctx<'_>) -> Outcome;
 
@@ -770,5 +830,47 @@ impl<Req> Outbox<Req> {
         }
         self.queue = kept;
         taken
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialog_flow::FlowGrammar;
+
+    #[test]
+    fn component_entry_inventory_names_single_and_multi_phase_grammars() {
+        assert_eq!(Open::Help.flow_grammars(), &[FlowGrammar::Informational]);
+        assert_eq!(Open::Sources.flow_grammars(), &[FlowGrammar::Manager]);
+        assert_eq!(
+            Open::Source.flow_grammars(),
+            &[FlowGrammar::New, FlowGrammar::AsyncResult]
+        );
+        assert_eq!(
+            Open::View.flow_grammars(),
+            &[FlowGrammar::New, FlowGrammar::Existing]
+        );
+        assert_eq!(
+            Open::Recipes {
+                mode: RecipeDialogMode::Import,
+            }
+            .flow_grammars(),
+            &[FlowGrammar::New]
+        );
+        assert_eq!(
+            Open::Recipes {
+                mode: RecipeDialogMode::Browse,
+            }
+            .flow_grammars(),
+            &[FlowGrammar::Manager]
+        );
+        assert_eq!(
+            Open::EnrichmentStep {
+                editing: Some(EnrichmentStageId("stage-7".into())),
+                prefill: None,
+            }
+            .flow_grammars(),
+            &[FlowGrammar::Existing]
+        );
     }
 }

@@ -34,6 +34,15 @@ This model complements `DialogSpec`; it does not replace the existing component
 stack, layout system or geometry authority.
 
 ```rust
+enum FlowGrammar {
+    Existing,
+    New,
+    Manager,
+    Inspector,
+    Informational,
+    AsyncResult,
+}
+
 enum Subject {
     Existing(ObjectSummary),
     New {
@@ -48,6 +57,8 @@ enum FlowPhase {
     ChooseOperation,
     EditParameters,
     Review,
+    InspectDetails,
+    Read,
     Pending,
     Result,
 }
@@ -55,12 +66,14 @@ enum FlowPhase {
 struct OperationSpec {
     id: OperationId,
     label: Cow<'static, str>,
-    parameters: ParameterGroup,
+    parameters: Option<ParameterGroup>,
     submit_label: Cow<'static, str>,
     destructive: bool,
 }
 
 struct DialogFlowSpec {
+    grammar: FlowGrammar,
+    object_kind: Cow<'static, str>,
     subject: Subject,
     operations: Vec<OperationSpec>,
     selected_operation: Option<OperationId>,
@@ -68,9 +81,24 @@ struct DialogFlowSpec {
 }
 ```
 
-This metadata should eventually drive semantic-order tests, initial focus and
-mode transitions. Rendering, cursor placement, scroll extents and mouse hitboxes
-continue to come from the same `DialogGeometry` and component surface.
+This metadata drives semantic-order and initial-unresolved-phase tests now; each
+dialog migration can make it the authority for focus and mode transitions.
+Rendering, cursor placement, scroll extents and mouse hitboxes continue to come
+from the same `DialogGeometry` and component surface.
+
+The production model lives in `crates/lvu/src/dialog_flow.rs`. Its constructors
+establish the first unresolved phase and its checked transitions reject invalid
+ordering without changing the last valid state. `Component::flow_spec` is the
+incremental adoption seam; `Open::flow_grammars` exhaustively maps every current
+component entry point, including multi-phase components. Existing components do
+not claim adoption until they return a validated flow spec.
+
+The inventory below remains authoritative for migration status. In particular,
+every row marked **Split** is still nonconforming: Source Agent proposal,
+shared-key union, Recipes Save, Filter, Grouping, Time, Edit enrichment step,
+Existing external command, Colour rules, Folding, Ask Proposal, Investigation
+Saved and Investigation Conversation. Rows marked **Clarify** preserve sound
+behaviour but still lack explicit subject or phase presentation.
 
 ## Current flow inventory
 
