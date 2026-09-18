@@ -95,7 +95,8 @@ def add_ordered_rules(app: PtyApp) -> tuple[str, str]:
     # the legacy raw-predicate editor. Both rules deliberately overlap.
     app.send(b"\x1ba")
     classifier = app.wait_until(
-        lambda text: "Column" in text
+        lambda text: "New colour rule" in text
+        and "Column" in text
         and "Value" in text
         and "‹ severity ›" in text,
         "new union rule binds the accepted severity output",
@@ -103,14 +104,19 @@ def add_ordered_rules(app: PtyApp) -> tuple[str, str]:
     )
     assert "Predicate" not in classifier, classifier
     app.send(b"critical")
-    app.wait_for("severity = critical")
+    app.wait_for("critical")
+    app.send(b"\x1bs")
+    app.wait_until(
+        lambda text: "New colour rule" not in text and "severity = critical" in text,
+        "first classifier saved to manager",
+    )
 
     # Alt-A is the dialog's actual Add control mnemonic. New rules advance to
     # the next palette colour, so the second overlapping classifier is
     # observably lower precedence.
     app.send(b"\x1ba")
     second_classifier = app.wait_until(
-        lambda text: "2 of 2" in text
+        lambda text: "New colour rule" in text
         and "Column" in text
         and "Value" in text
         and "‹ severity ›" in text,
@@ -119,6 +125,7 @@ def add_ordered_rules(app: PtyApp) -> tuple[str, str]:
     )
     assert "Predicate" not in second_classifier, second_classifier
     app.send(b"critical")
+    app.send(b"\x1bs")
     summary = "severity = critical"
     app.wait_until(
         lambda text: text.count(summary) == 2,
@@ -129,8 +136,8 @@ def add_ordered_rules(app: PtyApp) -> tuple[str, str]:
     second = swatch_foreground(app, summary, 1)
     assert first != second, (first, second, app.text())
 
-    # Enter in Value applies the complete ordered draft.
-    app.send(b"\r")
+    # Apply is an explicit manager operation after both child saves.
+    app.send(b"\x1bp")
     app.wait_until(
         lambda text: "2 rules painting this view" in text,
         "ordered union colour rules accepted",
@@ -147,9 +154,8 @@ def assert_persisted_rule_order(app: PtyApp, first: str, second: str) -> None:
     rules = app.wait_until(
         lambda text: "2 rules painting this view" in text
         and text.count(summary) == 2
-        and "Column" in text
-        and "Value" in text
-        and "‹ severity ›" in text,
+        and "Column" not in text
+        and "Value" not in text,
         "accepted ordered rules restored",
         timeout=15,
     )

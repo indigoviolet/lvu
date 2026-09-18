@@ -74,6 +74,9 @@ pub enum LayerId {
     Grouping,
     /// Predicate colour rules for the active view.
     ColorRules,
+    /// Parameters for one new or existing colour rule. A true child of the
+    /// Colour rules manager: closing it restores the same selected rule.
+    ColorRuleEditor,
     /// The enrichment step list.
     Enrichment,
     /// The step editor. A true child of `Enrichment` (§5.3): saving or
@@ -147,6 +150,11 @@ pub enum Open {
     Advanced,
     Grouping,
     ColorRules,
+    /// Add when `editing` is `None`; otherwise edit the rule at the stable
+    /// position the manager selected before opening this child.
+    ColorRuleEditor {
+        editing: Option<usize>,
+    },
     Enrichment,
     /// A new step when `editing` is `None`, otherwise the existing stage. The
     /// list decides which before it opens the child, so the child never has to
@@ -193,7 +201,7 @@ impl LayerId {
             LayerId::Recipes | LayerId::RecipeHistory => CommandId::Recipes,
             LayerId::Filter => CommandId::LiteralFilter,
             LayerId::Grouping => CommandId::Grouping,
-            LayerId::ColorRules => CommandId::ColorRules,
+            LayerId::ColorRules | LayerId::ColorRuleEditor => CommandId::ColorRules,
             LayerId::Enrichment | LayerId::EnrichmentStep => CommandId::Enrichment,
             LayerId::ExternalCommand => CommandId::CommandEnrichment,
             LayerId::Bookmarks => CommandId::Bookmarks,
@@ -224,6 +232,7 @@ impl Open {
             Open::Search | Open::Advanced => LayerId::Filter,
             Open::Grouping => LayerId::Grouping,
             Open::ColorRules => LayerId::ColorRules,
+            Open::ColorRuleEditor { .. } => LayerId::ColorRuleEditor,
             Open::Enrichment => LayerId::Enrichment,
             Open::EnrichmentStep { .. } => LayerId::EnrichmentStep,
             Open::ExternalCommand { .. } => LayerId::ExternalCommand,
@@ -256,6 +265,7 @@ impl Open {
             // A rule paints the active view's rows; there is nothing to paint
             // without one.
             | Open::ColorRules
+            | Open::ColorRuleEditor { .. }
             | Open::Enrichment
             | Open::EnrichmentStep { .. }
             | Open::ExternalCommand { .. } => true,

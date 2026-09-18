@@ -27,7 +27,7 @@ use crate::app::QueryPurpose;
 use crate::component::LayerId;
 use ask::AskDialog;
 use bookmarks::BookmarksDialog;
-use color_rules::ColorRulesDialog;
+use color_rules::{ColorRuleEditorDialog, ColorRulesDialog};
 use correlation::CorrelationDialog;
 use editors::EditorDialog;
 use enrichment::EnrichmentDialog;
@@ -77,6 +77,9 @@ pub struct Layers {
     pub filter: EditorDialog,
     pub grouping: EditorDialog,
     pub color_rules: ColorRulesDialog,
+    /// Parameter editor opened as a child of the rule manager. The parent
+    /// remains rendered underneath and retains its rule selection.
+    pub color_rule_editor: ColorRuleEditorDialog,
     pub enrichment: EnrichmentDialog,
     /// The only true child in the model (§5.3): it is opened by `Enrichment`
     /// with `OpenChild`, draws over the list it came from, and `Close` returns
@@ -114,6 +117,7 @@ impl Default for Layers {
             filter: EditorDialog::filter(),
             grouping: EditorDialog::new(QueryPurpose::Grouping),
             color_rules: ColorRulesDialog::default(),
+            color_rule_editor: ColorRuleEditorDialog::default(),
             enrichment: EnrichmentDialog::default(),
             enrichment_step: EnrichmentStepLayer::default(),
             external_command: ExternalCommandDialog::default(),

@@ -298,6 +298,9 @@ fn render_layers<P: RowProvider>(
             crate::component::LayerId::Filter => layers.filter.render(frame, area, &ctx),
             crate::component::LayerId::Grouping => layers.grouping.render(frame, area, &ctx),
             crate::component::LayerId::ColorRules => layers.color_rules.render(frame, area, &ctx),
+            crate::component::LayerId::ColorRuleEditor => {
+                layers.color_rule_editor.render(frame, area, &ctx)
+            }
             crate::component::LayerId::Enrichment => layers.enrichment.render(frame, area, &ctx),
             crate::component::LayerId::EnrichmentStep => {
                 layers.enrichment_step.render(frame, area, &ctx)

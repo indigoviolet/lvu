@@ -97,10 +97,13 @@ def underlined_runs(app: PtyApp, row: int) -> list[str]:
 def open_rules_and_add(app: PtyApp, predicate: str) -> None:
     app.send(b"c")
     app.wait_for("Colour rules")
-    app.send(b"\x1ba")  # Alt-A adds a rule and puts the caret in its predicate.
+    app.send(b"\x1ba")  # Alt-A opens the new-rule parameter child.
+    app.wait_for("New colour rule")
     app.wait_for("Predicate")
     app.send(predicate.encode())
     app.wait_for(predicate)
+    app.send(b"\x1bs")  # Save returns to the manager; Apply remains separate.
+    app.wait_until(lambda text: "New colour rule" not in text, "rule saved to manager")
 
 
 def open_enrichment_and_save_step(app: PtyApp, expression: str, marker: str) -> None:
@@ -131,10 +134,13 @@ def open_rules_and_add_column_value(app: PtyApp, value: str) -> None:
     app.send(b"c")
     app.wait_for("Colour rules")
     app.send(b"\x1ba")
+    app.wait_for("New colour rule")
     app.wait_for("Value", timeout=4.0)
     app.wait_for("Column", timeout=4.0)
     app.send(value.encode())
     app.wait_for(value)
+    app.send(b"\x1bs")
+    app.wait_until(lambda text: "New colour rule" not in text, "classifier saved to manager")
 
 
 def story(binary: pathlib.Path, width: int, height: int) -> None:
@@ -180,7 +186,7 @@ def story(binary: pathlib.Path, width: int, height: int) -> None:
 
             # --- a rule paints the rows it matched, and nothing else --------
             open_rules_and_add(app, "ready")
-            app.send(b"\r")  # Apply
+            app.send(b"\x1bp")  # Apply from the manager.
             app.wait_until(
                 lambda text: "Colour rules" not in text or "rule painting" in text,
                 "the rules were applied",
@@ -287,7 +293,7 @@ def column_story(app: PtyApp) -> None:
     painted_ready = row_foreground(app, "ready eve", 1)
     plain_error = row_foreground(app, "ERROR eve", 1)
     open_rules_and_add_column_value(app, "ERROR")
-    app.send(b"\r")  # Apply
+    app.send(b"\x1bp")  # Apply from the manager.
     app.wait_until(
         lambda text: "Applied" in text and "2 rules painting this view" in text,
         "the column rule was applied",

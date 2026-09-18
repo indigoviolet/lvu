@@ -7801,6 +7801,10 @@ impl App {
             Open::Advanced => layers.filter.open(Some(QueryPurpose::Advanced), &mut ctx),
             Open::Grouping => layers.grouping.open(None, &mut ctx),
             Open::ColorRules => layers.color_rules.open((), &mut ctx),
+            Open::ColorRuleEditor { editing } => layers.color_rule_editor.open(
+                crate::components::color_rules::ColorRuleEditorOpen { editing },
+                &mut ctx,
+            ),
             Open::Enrichment => layers.enrichment.open((), &mut ctx),
             Open::EnrichmentStep { editing, prefill } => layers.enrichment_step.open(
                 crate::components::enrichment_step::StepOpen { editing, prefill },
@@ -7921,6 +7925,9 @@ impl App {
             LayerId::Filter => dispatch_raw(&mut layers.filter, event, &mut ctx),
             LayerId::Grouping => dispatch_raw(&mut layers.grouping, event, &mut ctx),
             LayerId::ColorRules => dispatch_raw(&mut layers.color_rules, event, &mut ctx),
+            LayerId::ColorRuleEditor => {
+                dispatch_raw(&mut layers.color_rule_editor, event, &mut ctx)
+            }
             LayerId::Enrichment => dispatch_raw(&mut layers.enrichment, event, &mut ctx),
             LayerId::EnrichmentStep => dispatch_raw(&mut layers.enrichment_step, event, &mut ctx),
             LayerId::ExternalCommand => dispatch_raw(&mut layers.external_command, event, &mut ctx),
@@ -7970,6 +7977,7 @@ impl App {
             LayerId::Source => layers.source.action_labels(&ctx),
             LayerId::Folding => layers.folding.action_labels(&ctx),
             LayerId::ColorRules => layers.color_rules.action_labels(&ctx),
+            LayerId::ColorRuleEditor => layers.color_rule_editor.action_labels(&ctx),
             LayerId::Recipes | LayerId::RecipeHistory => layers.recipes.action_labels(&ctx),
             LayerId::Filter => layers.filter.action_labels(&ctx),
             LayerId::Grouping => layers.grouping.action_labels(&ctx),
@@ -8003,6 +8011,7 @@ impl App {
             LayerId::Source => layers.source.text_focus(),
             LayerId::Folding => layers.folding.text_focus(),
             LayerId::ColorRules => layers.color_rules.text_focus(),
+            LayerId::ColorRuleEditor => layers.color_rule_editor.text_focus(),
             LayerId::Recipes | LayerId::RecipeHistory => layers.recipes.text_focus(),
             LayerId::Filter => layers.filter.text_focus(),
             LayerId::Grouping => layers.grouping.text_focus(),
@@ -8066,6 +8075,9 @@ impl App {
                 .handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::ColorRules => layers
                 .color_rules
+                .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::ColorRuleEditor => layers
+                .color_rule_editor
                 .handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Enrichment => layers
                 .enrichment
@@ -8164,6 +8176,9 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::ColorRules => layers
                     .color_rules
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::ColorRuleEditor => layers
+                    .color_rule_editor
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Enrichment => layers
                     .enrichment
@@ -8277,6 +8292,13 @@ impl App {
                 .commands(&self.views)
                 .into_iter()
                 .map(|entry| (LayerId::ColorRules, entry)),
+        );
+        entries.extend(
+            self.layers
+                .color_rule_editor
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::ColorRuleEditor, entry)),
         );
         entries.extend(
             self.layers

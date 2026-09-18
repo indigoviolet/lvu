@@ -922,12 +922,12 @@ fn folding_fills_its_one_verb_and_leaves_enter_to_the_controls_that_consume_it()
 }
 
 // ---------------------------------------------------------------------------
-// Colour rules — the fill is Apply, and moves to Add when there is nothing to
-// apply yet.
+// Colour rules — the manager defaults to Add when empty and Edit when an
+// object exists; Apply stays an explicit operation after the child saves.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn color_rules_fills_add_on_an_empty_list_and_apply_once_a_rule_exists() {
+fn color_rules_fills_add_on_an_empty_list_and_edit_once_a_rule_exists() {
     let theme = Theme::LOVE_DARK;
     for (width, height) in [(80, 24), (54, 16)] {
         let (provider, mut app) = demo();
@@ -943,15 +943,15 @@ fn color_rules_fills_add_on_an_empty_list_and_apply_once_a_rule_exists() {
         // Enter on the list has no row to edit, so it runs the default.
         key(&mut app, &provider, KeyCode::Enter);
         assert_eq!(
-            app.layers.color_rules.control(),
-            ColorRulesControl::Predicate,
-            "Enter on an empty list adds a rule and edits it"
+            app.layers.stack.last(),
+            Some(&lvu::component::LayerId::ColorRuleEditor)
         );
         paste(&mut app, &provider, "timeout");
+        key(&mut app, &provider, KeyCode::Enter);
         let buffer = draw(&provider, &mut app, width, height, theme);
         assert_eq!(
             filled_buttons(&buffer, &color_rules_buttons(&app, &buffer), theme),
-            vec!["Apply".to_owned()],
+            vec!["Edit".to_owned()],
             "with a rule at {width}x{height}\n{}",
             screen(&buffer)
         );
@@ -966,7 +966,10 @@ fn color_rules_buttons(app: &App, buffer: &Buffer) -> Vec<(Rect, String)> {
         .filter(|(_, control)| {
             matches!(
                 control,
-                ColorRulesControl::Add | ColorRulesControl::Remove | ColorRulesControl::Apply
+                ColorRulesControl::Add
+                    | ColorRulesControl::Edit
+                    | ColorRulesControl::Remove
+                    | ColorRulesControl::Apply
             )
         })
         .map(|(rect, _)| (*rect, labelled(buffer, *rect)))

@@ -59,15 +59,15 @@ pub enum ColorRulesControl {
     /// The rule list.
     #[default]
     List,
-    /// The enrichment column a column rule classifies. Reached by Tab only
-    /// when the selected rule is a column rule.
+    /// Compatibility-only name retained for callers compiled against the
+    /// former fused editor; the manager never focuses parameter controls.
     Column,
-    /// The text field for the rule being added or edited: the exact value
-    /// for a column rule, the predicate for a legacy rule.
+    /// Compatibility-only former predicate/value field.
     Predicate,
-    /// The colour chooser for that rule.
+    /// Compatibility-only former colour chooser.
     Color,
     Add,
+    Edit,
     Remove,
     Apply,
 }
@@ -78,7 +78,7 @@ pub enum ColorRulesHit {
     Row(usize),
     Swatch(usize),
     /// The `More ▾` button (`None`) or a row of its open overflow menu, by
-    /// ORIGINAL action index (0 Add, 1 Remove, 2 Apply) for `press_action`.
+    /// ORIGINAL action index (0 Add, 1 Edit, 2 Remove, 3 Apply) for `press_action`.
     More(Option<usize>),
     Control(ColorRulesControl),
     Body,
@@ -108,14 +108,6 @@ pub struct ColorRulesDialog {
     open: bool,
     selected: usize,
     control: ColorRulesControl,
-    /// The predicate being typed, and its caret. Dialog-owned rather than
-    /// view-owned: it is one row of the draft list being edited in place, and
-    /// it is committed into that list on every keystroke, so nothing is lost.
-    cursor: TextCursor,
-    /// Set while a newly added rule has never been committed, so leaving the
-    /// field empty removes it again instead of leaving a rule that matches
-    /// nothing.
-    adding: bool,
     top: usize,
     /// The action-overflow (`More ▾`) menu: open flag, selection as a position
     /// within the overflow list, and retained scroll offset. Activation routes
@@ -130,9 +122,9 @@ pub struct ColorRulesDialog {
 /// The action row, in drawn order, with its §8.10 mnemonics. `Add` takes the
 /// `A`, so `Apply` underlines its `p`; the shell resolves both from these
 /// labels, which is why the dialog keeps no Alt keymap of its own.
-const COLOR_RULES_BUTTONS: [&str; 3] = ["&Add", "&Remove", "A&pply"];
+const COLOR_RULES_BUTTONS: [&str; 4] = ["&Add", "&Edit", "&Remove", "A&pply"];
 
-/// Stable responsive budgets for the Colour rules inspector.
+/// Stable responsive budgets for the Colour rules manager.
 ///
 /// `Contextual::Inspector` against the frozen opening-row anchor: the frame
 /// avoids the referent row when possible (above/below with a one-row gap,
@@ -140,9 +132,8 @@ const COLOR_RULES_BUTTONS: [&str; 3] = ["&Add", "&Remove", "A&pply"];
 /// chases live selection. Outer size comes from the presentation policy plus
 /// these stable maxima alone — never from the rule count or the message
 /// length — so empty/populated/pending/error frames share one `frame` and
-/// sticky tail origins. `body_content_rows` sizes only the shared scroll
-/// extent; the list, every editor row and the caret stay reachable through
-/// shared body projection and focus reveal.
+/// sticky tail origins. `body_content_rows` sizes only the list's shared
+/// scroll extent; rule parameters are owned by the child editor.
 ///
 /// Action/message/help budgets are area-aware (see `responsive_chrome`): one
 /// action row at roomy widths, two where the verbs wrap, with message/help
@@ -256,74 +247,12 @@ impl ColorRulesDialog {
         columns
     }
 
-    /// Whether the selected draft rule classifies a column. The text field
-    /// edits its exact value; otherwise it edits a legacy predicate.
-    fn selected_is_column(ctx: &Ctx<'_>, selected: usize) -> bool {
-        Self::draft(ctx)
-            .get(selected)
-            .is_some_and(ColorRule::is_column)
-    }
-
-    /// The text the field edits for the selected rule: exact value or
-    /// legacy predicate.
-    fn selected_text(ctx: &Ctx<'_>, selected: usize) -> String {
-        Self::draft(ctx)
-            .get(selected)
-            .map(|rule| {
-                if rule.is_column() {
-                    rule.value.clone().unwrap_or_default()
-                } else {
-                    rule.predicate.clone()
-                }
-            })
-            .unwrap_or_default()
-    }
-
-    /// Point a column rule at another accepted output, keeping its value:
-    /// re classification never rewrites what it classifies against.
-    fn cycle_column(&mut self, delta: i32, ctx: &mut Ctx<'_>) {
-        let options = Self::classifiable_columns(ctx);
-        if options.is_empty() {
-            return;
-        }
-        let selected = self.selected;
-        Self::with_draft(ctx, |rules| {
-            let Some(rule) = rules.get_mut(selected) else {
-                return;
-            };
-            if !rule.is_column() {
-                return;
-            }
-            let current = rule.column.clone().unwrap_or_default();
-            let at = options
-                .iter()
-                .position(|name| *name == current)
-                .unwrap_or(if delta >= 0 { options.len() - 1 } else { 0 });
-            let next =
-                options[(at as i32 + delta).rem_euclid(options.len() as i32) as usize].clone();
-            rule.column = Some(next);
-        });
-        self.reset_cursor(ctx);
-    }
-
-    /// Whether the predicate field currently has the keys, which is what makes
-    /// `q` a character rather than a dismissal (§1).
-    fn editing(&self) -> bool {
-        self.control == ColorRulesControl::Predicate
-    }
-
     fn controls(&self, ctx: &Ctx<'_>) -> Vec<ColorRulesControl> {
         let rules = Self::draft(ctx).len();
         let mut controls = vec![ColorRulesControl::List];
-        if rules > 0 {
-            if Self::selected_is_column(ctx, self.selected) {
-                controls.push(ColorRulesControl::Column);
-            }
-            controls.push(ColorRulesControl::Predicate);
-            controls.push(ColorRulesControl::Color);
-        }
         controls.push(ColorRulesControl::Add);
         if rules > 0 {
+            controls.push(ColorRulesControl::Edit);
             controls.push(ColorRulesControl::Remove);
         }
         controls.push(ColorRulesControl::Apply);
@@ -344,9 +273,6 @@ impl ColorRulesDialog {
         // focus ring then and Enter opens the menu (see `activate`). Hidden
         // actions stay directly reachable through their mnemonics too.
         self.control = controls[(at as i32 + delta).rem_euclid(controls.len() as i32) as usize];
-        if self.editing() {
-            self.reset_cursor(ctx);
-        }
     }
 
     /// The overflow menu drives while it is active: selection wraps over the
@@ -395,14 +321,11 @@ impl ColorRulesDialog {
     fn action_index(control: ColorRulesControl) -> Option<usize> {
         match control {
             ColorRulesControl::Add => Some(0),
-            ColorRulesControl::Remove => Some(1),
-            ColorRulesControl::Apply => Some(2),
+            ColorRulesControl::Edit => Some(1),
+            ColorRulesControl::Remove => Some(2),
+            ColorRulesControl::Apply => Some(3),
             _ => None,
         }
-    }
-
-    fn reset_cursor(&mut self, ctx: &Ctx<'_>) {
-        reset_cursor_to_end(&Self::selected_text(ctx, self.selected), &mut self.cursor);
     }
 
     fn move_selection(&mut self, delta: i32, ctx: &mut Ctx<'_>) {
@@ -410,71 +333,28 @@ impl ColorRulesDialog {
         if rules == 0 {
             return;
         }
-        self.commit_empty_addition(ctx);
-        let rules = Self::draft(ctx).len();
-        if rules == 0 {
-            self.selected = 0;
-            return;
-        }
         self.selected = (self.selected as i32 + delta).rem_euclid(rules as i32) as usize;
-        self.reset_cursor(ctx);
     }
 
-    /// A rule added and then abandoned without its match text is removed
-    /// rather than left in the list matching nothing: the exact value for a
-    /// column rule, the predicate for a legacy one.
-    fn commit_empty_addition(&mut self, ctx: &mut Ctx<'_>) {
-        if !self.adding {
-            return;
-        }
-        self.adding = false;
-        let selected = self.selected;
-        let empty = Self::draft(ctx).get(selected).is_some_and(|rule| {
-            if rule.is_column() {
-                rule.value.as_deref().is_none_or(|value| value.is_empty())
-            } else {
-                rule.predicate.trim().is_empty()
-            }
-        });
-        if empty {
-            Self::with_draft(ctx, |rules| {
-                if selected < rules.len() {
-                    rules.remove(selected);
-                }
-            });
-            self.selected = selected.saturating_sub(1);
-        }
-    }
-
-    fn add(&mut self, ctx: &mut Ctx<'_>) {
-        self.commit_empty_addition(ctx);
+    fn add(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         if Self::draft(ctx).len() >= MAX_COLOR_RULES {
             Self::error(
                 ctx,
                 &format!("at most {MAX_COLOR_RULES} colour rules in one view"),
             );
-            return;
+            return Outcome::Consumed;
         }
-        // A new rule takes the next colour in the palette, so a list built by
-        // pressing Add repeatedly is legible without choosing anything.
-        let color = RuleColor::ALL[Self::draft(ctx).len() % RuleColor::ALL.len()];
-        // Normal entry classifies an enrichment column: patterns and keys
-        // belong in ordinary enrichment definitions, so a new rule never
-        // starts life as an independent raw pattern classifier. With no
-        // accepted outputs yet there is nothing to classify and the rule
-        // starts as the explicit raw-text exception instead.
-        let column = Self::classifiable_columns(ctx).into_iter().next();
-        Self::with_draft(ctx, |rules| {
-            if let Some(column) = column {
-                rules.push(ColorRule::column_rule(column, String::new(), color));
-            } else {
-                rules.push(ColorRule::predicate_rule(String::new(), color));
-            }
-        });
-        self.selected = Self::draft(ctx).len().saturating_sub(1);
-        self.control = ColorRulesControl::Predicate;
-        self.adding = true;
-        self.reset_cursor(ctx);
+        Outcome::OpenChild(crate::component::Open::ColorRuleEditor { editing: None })
+    }
+
+    fn edit(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
+        if Self::draft(ctx).get(self.selected).is_none() {
+            ctx.notice("no colour rule is selected; use Add to create one");
+            return Outcome::Consumed;
+        }
+        Outcome::OpenChild(crate::component::Open::ColorRuleEditor {
+            editing: Some(self.selected),
+        })
     }
 
     fn remove(&mut self, ctx: &mut Ctx<'_>) {
@@ -482,71 +362,12 @@ impl ColorRulesDialog {
         if selected >= Self::draft(ctx).len() {
             return;
         }
-        self.adding = false;
         Self::with_draft(ctx, |rules| {
             rules.remove(selected);
         });
         self.selected = selected.min(Self::draft(ctx).len().saturating_sub(1));
         if Self::draft(ctx).is_empty() {
             self.control = ColorRulesControl::List;
-        }
-        self.reset_cursor(ctx);
-    }
-
-    fn cycle_color(&mut self, delta: i32, ctx: &mut Ctx<'_>) {
-        let selected = self.selected;
-        Self::with_draft(ctx, |rules| {
-            if let Some(rule) = rules.get_mut(selected) {
-                let at = RuleColor::ALL
-                    .iter()
-                    .position(|color| *color == rule.color)
-                    .unwrap_or(0);
-                rule.color = RuleColor::ALL
-                    [(at as i32 + delta).rem_euclid(RuleColor::ALL.len() as i32) as usize];
-            }
-        });
-    }
-
-    fn text(&mut self, command: EditCommand<'_>, ctx: &mut Ctx<'_>) -> Outcome {
-        if !self.editing() {
-            return Outcome::Ignored;
-        }
-        let selected = self.selected;
-        if Self::draft(ctx).get(selected).is_none() {
-            return Outcome::Ignored;
-        }
-        let column = Self::selected_is_column(ctx, selected);
-        let mut value = Self::selected_text(ctx, selected);
-        let mut cursor = self.cursor;
-        let outcome = edit(
-            &mut value,
-            &mut cursor,
-            command,
-            EditPolicy {
-                max_bytes: MAX_PREDICATE_BYTES,
-                multiline: false,
-            },
-        );
-        self.cursor = cursor;
-        if outcome.changed {
-            // Authored text settles the new rule: clearing it afterwards
-            // reads as an (empty, valid) edit rather than an abandoned
-            // addition, which removes itself instead.
-            self.adding = false;
-            Self::with_draft(ctx, |rules| {
-                if let Some(rule) = rules.get_mut(selected) {
-                    if column {
-                        rule.value = Some(value);
-                    } else {
-                        rule.predicate = value;
-                    }
-                }
-            });
-        }
-        if outcome.changed || outcome.moved {
-            Outcome::Consumed
-        } else {
-            Outcome::Ignored
         }
     }
 
@@ -598,7 +419,6 @@ impl ColorRulesDialog {
     }
 
     fn apply(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
-        self.commit_empty_addition(ctx);
         let Some(view_id) = ctx.views.active_id().map(str::to_owned) else {
             return Outcome::Consumed;
         };
@@ -639,49 +459,32 @@ impl ColorRulesDialog {
             }
         }
         match self.control {
-            // Enter on the column chooser applies, like Enter on the colour
-            // chooser: choosing is done with Left/Right.
-            ColorRulesControl::Column => self.apply(ctx),
-            ColorRulesControl::Add => {
-                self.add(ctx);
-                Outcome::Consumed
-            }
+            ColorRulesControl::Add => self.add(ctx),
+            ColorRulesControl::Edit => self.edit(ctx),
             ColorRulesControl::Remove => {
                 self.remove(ctx);
                 Outcome::Consumed
             }
-            ColorRulesControl::Color => {
-                self.cycle_color(1, ctx);
-                Outcome::Consumed
-            }
             ColorRulesControl::List => {
-                // Enter on the list edits the rule under the cursor, which is
-                // the only thing there is to do with it. On an empty list there
-                // is no row to edit, so it runs the default, which is `Add`
-                // (§8.9, the same shape as Enrichment's empty chain).
                 if Self::draft(ctx).is_empty() {
-                    self.add(ctx);
+                    self.add(ctx)
                 } else {
-                    self.control = ColorRulesControl::Predicate;
-                    self.reset_cursor(ctx);
+                    self.edit(ctx)
                 }
-                Outcome::Consumed
             }
-            ColorRulesControl::Predicate | ColorRulesControl::Apply => self.apply(ctx),
+            ColorRulesControl::Apply => self.apply(ctx),
+            // Parameter controls belong exclusively to ColorRuleEditor. These
+            // retained public variants keep downstream API compatibility but
+            // are never traversed by the manager.
+            ColorRulesControl::Column | ColorRulesControl::Predicate | ColorRulesControl::Color => {
+                Outcome::Ignored
+            }
         }
     }
 
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Outcome {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Outcome::Ignored;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Char('a') => self.text(EditCommand::StartOfLine, ctx),
-                KeyCode::Char('e') => self.text(EditCommand::EndOfLine, ctx),
-                KeyCode::Char('k') => self.text(EditCommand::KillToEndOfLine, ctx),
-                _ => Outcome::Ignored,
-            };
         }
         // The overflow menu is transient: while it is active its own arrows
         // and Enter drive it, and any other key dismisses it first and then
@@ -720,27 +523,6 @@ impl ColorRulesDialog {
                 self.move_control(1, ctx);
                 Outcome::Consumed
             }
-            // Left/Right choose the colour while the chooser has focus, the
-            // column while its chooser does, and move the caret while the
-            // field does.
-            KeyCode::Left if self.control == ColorRulesControl::Color => {
-                self.cycle_color(-1, ctx);
-                Outcome::Consumed
-            }
-            KeyCode::Right if self.control == ColorRulesControl::Color => {
-                self.cycle_color(1, ctx);
-                Outcome::Consumed
-            }
-            KeyCode::Left if self.control == ColorRulesControl::Column => {
-                self.cycle_column(-1, ctx);
-                Outcome::Consumed
-            }
-            KeyCode::Right if self.control == ColorRulesControl::Column => {
-                self.cycle_column(1, ctx);
-                Outcome::Consumed
-            }
-            KeyCode::Left if self.editing() => self.text(EditCommand::MoveLeft, ctx),
-            KeyCode::Right if self.editing() => self.text(EditCommand::MoveRight, ctx),
             KeyCode::Up => {
                 self.move_selection(-1, ctx);
                 Outcome::Consumed
@@ -750,11 +532,6 @@ impl ColorRulesDialog {
                 Outcome::Consumed
             }
             KeyCode::Enter => self.activate(ctx),
-            KeyCode::Backspace => self.text(EditCommand::Backspace, ctx),
-            KeyCode::Char(character) => {
-                let mut buffer = [0u8; 4];
-                self.text(EditCommand::Insert(character.encode_utf8(&mut buffer)), ctx)
-            }
             _ => Outcome::Ignored,
         }
     }
@@ -796,30 +573,19 @@ impl ColorRulesDialog {
         match (pressed, hit) {
             (true, Some(ColorRulesHit::Swatch(index))) => {
                 self.selected = index;
-                self.control = ColorRulesControl::Color;
-                self.cycle_color(1, ctx);
+                self.control = ColorRulesControl::List;
                 return Outcome::Consumed;
             }
             (true, Some(ColorRulesHit::Row(index))) => {
-                self.commit_empty_addition(ctx);
                 self.selected = index.min(Self::draft(ctx).len().saturating_sub(1));
                 self.control = ColorRulesControl::List;
-                self.reset_cursor(ctx);
                 return Outcome::Consumed;
             }
             (true, Some(ColorRulesHit::Control(control))) => {
                 if self.controls(ctx).contains(&control) {
                     self.control = control;
-                    if self.editing() {
-                        self.reset_cursor(ctx);
-                    }
                 }
-                if !matches!(
-                    control,
-                    ColorRulesControl::List
-                        | ColorRulesControl::Column
-                        | ColorRulesControl::Predicate
-                ) {
+                if control != ColorRulesControl::List {
                     return self.activate(ctx);
                 }
                 return Outcome::Consumed;
@@ -857,7 +623,6 @@ impl Component for ColorRulesDialog {
         self.open = true;
         self.selected = 0;
         self.top = 0;
-        self.adding = false;
         self.control = ColorRulesControl::List;
         self.more_open = false;
         self.more_selected = 0;
@@ -872,13 +637,12 @@ impl Component for ColorRulesDialog {
         {
             state.color_rules_draft = state.color_rules.clone();
         }
-        self.reset_cursor(ctx);
     }
 
     fn handle(&mut self, event: Event<ColorRulesHit>, ctx: &mut Ctx<'_>) -> Outcome {
         match event {
             Event::Key(key) => self.key(key, ctx),
-            Event::Paste(text) => self.text(EditCommand::Insert(&text), ctx),
+            Event::Paste(_) => Outcome::Ignored,
             Event::Mouse { kind, hit, .. } => self.mouse(kind, hit, ctx),
             Event::Dismiss => {
                 // §10 frontmost-first: the overflow menu closes before the
@@ -887,7 +651,6 @@ impl Component for ColorRulesDialog {
                     self.more_open = false;
                     return Outcome::Consumed;
                 }
-                self.commit_empty_addition(ctx);
                 self.open = false;
                 Outcome::Close
             }
@@ -918,12 +681,13 @@ impl Component for ColorRulesDialog {
     fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
         // Any press dismisses the transient overflow menu first — including
         // the menu's own items, which arrive here with original indices (0
-        // Add, 1 Remove, 2 Apply) and run exactly what their buttons would.
+        // Add, 1 Edit, 2 Remove, 3 Apply) and run exactly what their buttons would.
         self.more_open = false;
         match index {
-            0 => self.add(ctx),
-            1 => self.remove(ctx),
-            2 => return self.apply(ctx),
+            0 => return self.add(ctx),
+            1 => return self.edit(ctx),
+            2 => self.remove(ctx),
+            3 => return self.apply(ctx),
             _ => return Outcome::Ignored,
         }
         Outcome::Consumed
@@ -931,7 +695,7 @@ impl Component for ColorRulesDialog {
 
     fn surface(&self) -> Surface {
         Surface {
-            text_focus: self.editing(),
+            text_focus: false,
             ..self.surface
         }
     }
@@ -994,7 +758,6 @@ impl Component for ColorRulesDialog {
         );
         let mut rows: Vec<(Rect, usize)> = Vec::new();
         let mut swatches: Vec<(Rect, usize)> = Vec::new();
-        let mut caret: Option<(u16, u16)> = None;
 
         let dirty = rules != accepted;
         let (state, sentence) = match error.as_deref() {
@@ -1018,33 +781,18 @@ impl Component for ColorRulesDialog {
         };
         let help = "The first matching rule wins. A rule classifies an enrichment column's exact value; raw text is the explicit exception, and earlier predicates keep working.";
         let labels = COLOR_RULES_BUTTONS;
-        let has_column_editor = rules
-            .get(self.selected)
-            .is_some_and(|rule| rule.is_column());
-        // Natural body rows for the scroll extent alone (never the frame):
-        // the list heading, one row per rule (or the single empty-state
-        // line), then — when rules exist — a gap row plus the editor rows
-        // (Column/Value/Colour for a column rule, Predicate/Colour otherwise).
+        // The manager is only an object list. Parameter rows belong to the
+        // child editor, so selecting a rule cannot silently expose or mutate
+        // its column, value, predicate, or colour.
         let rule_rows = rules.len().max(1);
-        let editor_rows = if rules.is_empty() {
-            0
-        } else if has_column_editor {
-            3
-        } else {
-            2
-        };
-        let content_rows = 1usize
-            .saturating_add(rule_rows)
-            .saturating_add(if rules.is_empty() { 0 } else { 1 + editor_rows });
-        // First editor row in logical coordinates (the gap row sits before it).
-        let editor_base = 1usize.saturating_add(rule_rows).saturating_add(1);
+        let content_rows = 1usize.saturating_add(rule_rows);
         let spec = color_spec(area);
         let Ok(geometry) = crate::dialog_layout::resolve_dialog(
             area,
             &spec,
             content_rows,
             &labels,
-            Some(if rules.is_empty() { 0 } else { 2 }),
+            Some(if rules.is_empty() { 0 } else { 1 }),
             ctx.context_anchor,
         ) else {
             // Below the 20x6 floor the tiny fallback owns the frame; stay open
@@ -1053,7 +801,11 @@ impl Component for ColorRulesDialog {
             self.surface = Surface::default();
             return self.surface;
         };
-        render_responsive_frame(frame, &geometry, "Colour rules", true, theme);
+        let title = ctx.views.active_item().map_or_else(
+            || "Colour rules".to_owned(),
+            |view| format!("View · {} › Colour rules", view.name),
+        );
+        render_responsive_frame(frame, &geometry, &title, true, theme);
         // One authoritative geometry for frame/anatomy/body/actions. The same
         // projected rects drive paint, caret, scrollbar, selection and mouse;
         // no independent outer calculation.
@@ -1062,34 +814,19 @@ impl Component for ColorRulesDialog {
             interior: geometry.interior,
             caret: None,
             scrollable: geometry.body.overflow() > 0,
-            text_focus: self.editing(),
+            text_focus: false,
         };
         self.geometry.body = geometry.body.viewport;
 
-        // Shared body projection with focus reveal: the editor row being
-        // edited while an editor control has focus, otherwise the selected
-        // rule — the list always keeps its selection visible, as before, and
-        // the sticky action band needs no reveal.
+        // Shared body projection keeps the selected object visible. There is
+        // no parameter focus in this layer.
         let mut body = ScrollViewport::new(geometry.body.viewport, content_rows, 0);
         if !rules.is_empty() {
             let selected_row = 1usize.saturating_add(self.selected.min(rules.len() - 1));
-            let reveal_row = match self.control {
-                ColorRulesControl::Column => editor_base,
-                ColorRulesControl::Predicate => {
-                    editor_base.saturating_add(usize::from(has_column_editor))
-                }
-                ColorRulesControl::Color => {
-                    editor_base.saturating_add(editor_rows.saturating_sub(1))
-                }
-                ColorRulesControl::List
-                | ColorRulesControl::Add
-                | ColorRulesControl::Remove
-                | ColorRulesControl::Apply => selected_row,
-            };
             body = ScrollViewport::new(
                 geometry.body.viewport,
                 content_rows,
-                body.reveal(reveal_row),
+                body.reveal(selected_row),
             );
         }
         self.top = body.first_row.saturating_sub(1).min(rules.len());
@@ -1179,125 +916,6 @@ impl Component for ColorRulesDialog {
             rows.push((row, index));
         }
 
-        // The editor for the selected rule: column chooser plus value field
-        // plus colour chooser for a column rule; predicate field plus colour
-        // chooser for a legacy one. Every row is projected through the same
-        // shared viewport, so caret, selection and mouse agree; rows scrolled
-        // out paint nothing and claim no hitbox.
-        let label_width = u16::try_from(UnicodeWidthStr::width("Predicate")).unwrap_or(9);
-        // The column chooser's hitbox, registered with the action controls
-        // below when a column rule is selected.
-        let mut column_rect: Option<Rect> = None;
-        if !rules.is_empty() {
-            let field_x = body
-                .viewport
-                .x
-                .saturating_add(label_width)
-                .saturating_add(FIELD_GUTTER);
-            let mut editor_row = editor_base;
-            if has_column_editor {
-                if let Some(label) = body.project_row(editor_row) {
-                    let column = rules
-                        .get(self.selected)
-                        .and_then(|rule| rule.column.clone())
-                        .unwrap_or_default();
-                    frame.render_widget(
-                        Paragraph::new("Column").style(
-                            if self.control == ColorRulesControl::Column {
-                                styles.shortcut.add_modifier(Modifier::BOLD)
-                            } else {
-                                styles.label
-                            },
-                        ),
-                        Rect::new(label.x, label.y, label_width.min(label.width), 1),
-                    );
-                    if field_x < label.right() {
-                        let chooser = Rect::new(field_x, label.y, label.right() - field_x, 1);
-                        frame.render_widget(
-                            Paragraph::new(truncated(
-                                &format!("‹ {column} ›"),
-                                usize::from(label.right() - field_x),
-                            ))
-                            .style(styles.description),
-                            chooser,
-                        );
-                        column_rect = Some(chooser);
-                    }
-                }
-                editor_row = editor_row.saturating_add(1);
-            }
-            let field_label = if has_column_editor {
-                "Value"
-            } else {
-                "Predicate"
-            };
-            if let Some(label) = body.project_row(editor_row) {
-                frame.render_widget(
-                    Paragraph::new(field_label).style(if self.editing() {
-                        styles.shortcut.add_modifier(Modifier::BOLD)
-                    } else {
-                        styles.label
-                    }),
-                    Rect::new(label.x, label.y, label_width.min(label.width), 1),
-                );
-                if field_x < label.right() {
-                    let field = Rect::new(field_x, label.y, label.right() - field_x, 1);
-                    let predicate = rules
-                        .get(self.selected)
-                        .map(|rule| {
-                            if rule.is_column() {
-                                rule.value.clone().unwrap_or_default()
-                            } else {
-                                rule.predicate.clone()
-                            }
-                        })
-                        .unwrap_or_default();
-                    if self.editing() {
-                        caret = place_input_cursor_at(
-                            frame,
-                            field,
-                            0,
-                            0,
-                            &predicate,
-                            self.cursor.char_index,
-                            theme,
-                        );
-                    } else {
-                        frame.render_widget(
-                            Paragraph::new(truncated(&predicate, usize::from(field.width)))
-                                .style(styles.description),
-                            field,
-                        );
-                    }
-                }
-            }
-            editor_row = editor_row.saturating_add(1);
-            if let Some(label) = body.project_row(editor_row) {
-                frame.render_widget(
-                    Paragraph::new("Colour").style(if self.control == ColorRulesControl::Color {
-                        styles.shortcut.add_modifier(Modifier::BOLD)
-                    } else {
-                        styles.label
-                    }),
-                    Rect::new(label.x, label.y, label_width.min(label.width), 1),
-                );
-                if field_x < label.right() {
-                    let color = rules
-                        .get(self.selected)
-                        .map(|rule| rule.color)
-                        .unwrap_or_default();
-                    frame.render_widget(
-                        Paragraph::new(truncated(
-                            &format!("‹ {} ›", color.label()),
-                            usize::from(label.right() - field_x),
-                        ))
-                        .style(styles.description.fg(theme.rule_color(color))),
-                        Rect::new(field_x, label.y, label.right() - field_x, 1),
-                    );
-                }
-            }
-        }
-
         render_message(frame, geometry.message, state, &sentence, theme, ascii);
         render_help_text(frame, geometry.help, help, theme);
         // §8.9: the verb is the default, and a destructive action never is.
@@ -1305,11 +923,12 @@ impl Component for ColorRulesDialog {
         // that does anything on an empty list. Roles are presentation only;
         // the rects come from the one shared action geometry, so click and
         // paint cannot disagree.
-        let default_idx = if rules.is_empty() { 0 } else { 2 };
+        let default_idx = if rules.is_empty() { 0 } else { 1 };
         let focused_idx = match self.control {
             ColorRulesControl::Add => Some(0),
-            ColorRulesControl::Remove => Some(1),
-            ColorRulesControl::Apply => Some(2),
+            ColorRulesControl::Edit => Some(1),
+            ColorRulesControl::Remove => Some(2),
+            ColorRulesControl::Apply => Some(3),
             _ => None,
         };
         // The live overflow list and More button rect flow into the stored
@@ -1323,11 +942,12 @@ impl Component for ColorRulesDialog {
         for (index, rect) in &geometry.actions.buttons {
             let control = match index {
                 0 => ColorRulesControl::Add,
-                1 => ColorRulesControl::Remove,
+                1 => ColorRulesControl::Edit,
+                2 => ColorRulesControl::Remove,
                 _ => ColorRulesControl::Apply,
             };
             if let Some(label) = labels.get(*index) {
-                let role = if *index == 1 {
+                let role = if *index == 2 {
                     ButtonRole::Destructive
                 } else if *index == default_idx {
                     ButtonRole::Default
@@ -1371,12 +991,13 @@ impl Component for ColorRulesDialog {
                     } else {
                         ButtonRole::Normal
                     },
-                    ButtonRole::Destructive,
                     if rules.is_empty() {
                         ButtonRole::Normal
                     } else {
                         ButtonRole::Default
                     },
+                    ButtonRole::Destructive,
+                    ButtonRole::Normal,
                 ];
                 let (popup, rows, first, overflows) = draw_action_menu(
                     frame,
@@ -1409,11 +1030,7 @@ impl Component for ColorRulesDialog {
             // Overflow gone (regrew wider) means the menu has nothing to show.
             self.more_open = false;
         }
-        // The column chooser answers clicks exactly like the colour chooser.
-        if let Some(rect) = column_rect {
-            controls.push((rect, ColorRulesControl::Column));
-        }
-        surface.caret = caret;
+        surface.caret = None;
         surface.scrollable = body.overflow() > 0 || menu_overflows;
         self.geometry = ColorRulesGeometry {
             body: geometry.body.viewport,
@@ -1424,6 +1041,566 @@ impl Component for ColorRulesDialog {
             more_overflow: live_overflow,
             more_rows,
             action_band: geometry.actions.band,
+        };
+        self.surface = surface;
+        surface
+    }
+}
+
+/// Parameters for the rule-parameter child. `None` creates a new rule;
+/// `Some(index)` edits exactly the manager row that opened it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ColorRuleEditorOpen {
+    pub editing: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ColorRuleEditorControl {
+    Column,
+    #[default]
+    Value,
+    Color,
+    Save,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColorRuleEditorHit {
+    Control(ColorRuleEditorControl),
+    Body,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ColorRuleEditorGeometry {
+    body: Rect,
+    controls: Vec<(Rect, ColorRuleEditorControl)>,
+}
+
+/// A true child editor. Its rule is local until Save, so Escape cannot leak a
+/// half-entered parameter into the manager's per-view draft.
+#[derive(Debug, Default)]
+pub struct ColorRuleEditorDialog {
+    open: bool,
+    view_id: String,
+    editing: Option<usize>,
+    rule: ColorRule,
+    columns: Vec<String>,
+    control: ColorRuleEditorControl,
+    cursor: TextCursor,
+    error: Option<String>,
+    geometry: ColorRuleEditorGeometry,
+    surface: Surface,
+}
+
+const COLOR_RULE_EDITOR_BUTTONS: [&str; 2] = ["&Save", "&Cancel"];
+
+impl ColorRuleEditorDialog {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub fn editing(&self) -> Option<usize> {
+        self.editing
+    }
+
+    pub fn control(&self) -> ColorRuleEditorControl {
+        self.control
+    }
+
+    pub fn rule(&self) -> &ColorRule {
+        &self.rule
+    }
+
+    pub fn control_rects(&self) -> &[(Rect, ColorRuleEditorControl)] {
+        &self.geometry.controls
+    }
+
+    fn text(&self) -> &str {
+        if self.rule.is_column() {
+            self.rule.value.as_deref().unwrap_or_default()
+        } else {
+            &self.rule.predicate
+        }
+    }
+
+    fn text_editing(&self) -> bool {
+        self.control == ColorRuleEditorControl::Value
+    }
+
+    fn reset_cursor(&mut self) {
+        let text = self.text().to_owned();
+        reset_cursor_to_end(&text, &mut self.cursor);
+    }
+
+    fn controls(&self) -> Vec<ColorRuleEditorControl> {
+        let mut controls = Vec::new();
+        if self.rule.is_column() {
+            controls.push(ColorRuleEditorControl::Column);
+        }
+        controls.extend([
+            ColorRuleEditorControl::Value,
+            ColorRuleEditorControl::Color,
+            ColorRuleEditorControl::Save,
+            ColorRuleEditorControl::Cancel,
+        ]);
+        controls
+    }
+
+    fn move_control(&mut self, delta: i32) -> Outcome {
+        let controls = self.controls();
+        let at = controls
+            .iter()
+            .position(|control| *control == self.control)
+            .unwrap_or(0);
+        self.control = controls[(at as i32 + delta).rem_euclid(controls.len() as i32) as usize];
+        if self.text_editing() {
+            self.reset_cursor();
+        }
+        Outcome::Consumed
+    }
+
+    fn cycle_column(&mut self, delta: i32) -> Outcome {
+        if self.columns.is_empty() || !self.rule.is_column() {
+            return Outcome::Consumed;
+        }
+        let current = self.rule.column.as_deref().unwrap_or_default();
+        let at = self
+            .columns
+            .iter()
+            .position(|name| name == current)
+            .unwrap_or(if delta >= 0 {
+                self.columns.len() - 1
+            } else {
+                0
+            });
+        let next = (at as i32 + delta).rem_euclid(self.columns.len() as i32) as usize;
+        self.rule.column = Some(self.columns[next].clone());
+        self.error = None;
+        Outcome::Consumed
+    }
+
+    fn cycle_color(&mut self, delta: i32) -> Outcome {
+        let at = RuleColor::ALL
+            .iter()
+            .position(|color| *color == self.rule.color)
+            .unwrap_or(0);
+        let next = (at as i32 + delta).rem_euclid(RuleColor::ALL.len() as i32) as usize;
+        self.rule.color = RuleColor::ALL[next];
+        self.error = None;
+        Outcome::Consumed
+    }
+
+    fn edit_text(&mut self, command: EditCommand<'_>) -> Outcome {
+        if !self.text_editing() {
+            return Outcome::Ignored;
+        }
+        let column = self.rule.is_column();
+        let mut value = self.text().to_owned();
+        let mut cursor = self.cursor;
+        let changed = edit(
+            &mut value,
+            &mut cursor,
+            command,
+            EditPolicy {
+                max_bytes: MAX_PREDICATE_BYTES,
+                multiline: false,
+            },
+        );
+        self.cursor = cursor;
+        if changed.changed {
+            if column {
+                self.rule.value = Some(value);
+            } else {
+                self.rule.predicate = value;
+            }
+            self.error = None;
+        }
+        if changed.changed || changed.moved {
+            Outcome::Consumed
+        } else {
+            Outcome::Ignored
+        }
+    }
+
+    fn save(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
+        if let Err(error) = ColorRulesDialog::validate(std::slice::from_ref(&self.rule)) {
+            self.error = Some(error);
+            return Outcome::Consumed;
+        }
+        let Some(state) = ctx.views.state_mut(&self.view_id) else {
+            self.error = Some("the view is no longer available".to_owned());
+            return Outcome::Consumed;
+        };
+        match self.editing {
+            Some(index) => {
+                let Some(slot) = state.color_rules_draft.get_mut(index) else {
+                    self.error = Some("the selected rule is no longer available".to_owned());
+                    return Outcome::Consumed;
+                };
+                *slot = self.rule.clone();
+            }
+            None if state.color_rules_draft.len() < MAX_COLOR_RULES => {
+                state.color_rules_draft.push(self.rule.clone());
+            }
+            None => {
+                self.error = Some(format!(
+                    "at most {MAX_COLOR_RULES} colour rules in one view"
+                ));
+                return Outcome::Consumed;
+            }
+        }
+        state.color_rules_error = None;
+        ctx.views.touch(&self.view_id);
+        self.open = false;
+        Outcome::Close
+    }
+
+    fn cancel(&mut self) -> Outcome {
+        self.open = false;
+        Outcome::Close
+    }
+
+    fn activate(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
+        match self.control {
+            ColorRuleEditorControl::Column | ColorRuleEditorControl::Color => {
+                if self.control == ColorRuleEditorControl::Column {
+                    self.cycle_column(1)
+                } else {
+                    self.cycle_color(1)
+                }
+            }
+            ColorRuleEditorControl::Value | ColorRuleEditorControl::Save => self.save(ctx),
+            ColorRuleEditorControl::Cancel => self.cancel(),
+        }
+    }
+
+    fn key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Outcome {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return Outcome::Ignored;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('a') => self.edit_text(EditCommand::StartOfLine),
+                KeyCode::Char('e') => self.edit_text(EditCommand::EndOfLine),
+                KeyCode::Char('k') => self.edit_text(EditCommand::KillToEndOfLine),
+                _ => Outcome::Ignored,
+            };
+        }
+        match key.code {
+            KeyCode::BackTab => self.move_control(-1),
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => self.move_control(-1),
+            KeyCode::Tab => self.move_control(1),
+            KeyCode::Left if self.control == ColorRuleEditorControl::Column => {
+                self.cycle_column(-1)
+            }
+            KeyCode::Right if self.control == ColorRuleEditorControl::Column => {
+                self.cycle_column(1)
+            }
+            KeyCode::Left if self.control == ColorRuleEditorControl::Color => self.cycle_color(-1),
+            KeyCode::Right if self.control == ColorRuleEditorControl::Color => self.cycle_color(1),
+            KeyCode::Left => self.edit_text(EditCommand::MoveLeft),
+            KeyCode::Right => self.edit_text(EditCommand::MoveRight),
+            KeyCode::Backspace => self.edit_text(EditCommand::Backspace),
+            KeyCode::Enter => self.activate(ctx),
+            KeyCode::Char(character) => {
+                let mut buffer = [0u8; 4];
+                self.edit_text(EditCommand::Insert(character.encode_utf8(&mut buffer)))
+            }
+            _ => Outcome::Ignored,
+        }
+    }
+
+    fn mouse(
+        &mut self,
+        kind: MouseEventKind,
+        hit: Option<ColorRuleEditorHit>,
+        ctx: &mut Ctx<'_>,
+    ) -> Outcome {
+        if !matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Outcome::Ignored;
+        }
+        let Some(ColorRuleEditorHit::Control(control)) = hit else {
+            return Outcome::Consumed;
+        };
+        if !self.controls().contains(&control) {
+            return Outcome::Consumed;
+        }
+        self.control = control;
+        if self.text_editing() {
+            self.reset_cursor();
+        }
+        match control {
+            ColorRuleEditorControl::Column
+            | ColorRuleEditorControl::Color
+            | ColorRuleEditorControl::Save
+            | ColorRuleEditorControl::Cancel => self.activate(ctx),
+            ColorRuleEditorControl::Value => Outcome::Consumed,
+        }
+    }
+}
+
+impl Component for ColorRuleEditorDialog {
+    type Hit = ColorRuleEditorHit;
+    type Open = ColorRuleEditorOpen;
+
+    fn open(&mut self, params: ColorRuleEditorOpen, ctx: &mut Ctx<'_>) {
+        self.open = true;
+        self.view_id = ctx.views.active_id().unwrap_or_default().to_owned();
+        self.editing = params.editing;
+        self.columns = ColorRulesDialog::classifiable_columns(ctx);
+        self.error = None;
+        self.geometry = ColorRuleEditorGeometry::default();
+        self.surface = Surface::default();
+        self.rule = params
+            .editing
+            .and_then(|index| {
+                ctx.views
+                    .state(&self.view_id)
+                    .and_then(|state| state.color_rules_draft.get(index))
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                let count = ctx
+                    .views
+                    .state(&self.view_id)
+                    .map_or(0, |state| state.color_rules_draft.len());
+                let color = RuleColor::ALL[count % RuleColor::ALL.len()];
+                self.columns.first().cloned().map_or_else(
+                    || ColorRule::predicate_rule(String::new(), color),
+                    |column| ColorRule::column_rule(column, String::new(), color),
+                )
+            });
+        self.control = ColorRuleEditorControl::Value;
+        self.reset_cursor();
+    }
+
+    fn handle(&mut self, event: Event<Self::Hit>, ctx: &mut Ctx<'_>) -> Outcome {
+        match event {
+            Event::Key(key) => self.key(key, ctx),
+            Event::Paste(text) => self.edit_text(EditCommand::Insert(&text)),
+            Event::Mouse { kind, hit, .. } => self.mouse(kind, hit, ctx),
+            Event::Dismiss => self.cancel(),
+            Event::Command(_) | Event::View(_) | Event::Resize => Outcome::Ignored,
+        }
+    }
+
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        COLOR_RULE_EDITOR_BUTTONS.to_vec()
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        match index {
+            0 => self.save(ctx),
+            1 => self.cancel(),
+            _ => Outcome::Ignored,
+        }
+    }
+
+    fn hit(&self, point: (u16, u16)) -> Option<Self::Hit> {
+        self.geometry
+            .controls
+            .iter()
+            .find_map(|(rect, control)| {
+                contains(*rect, point).then_some(ColorRuleEditorHit::Control(*control))
+            })
+            .or_else(|| contains(self.geometry.body, point).then_some(ColorRuleEditorHit::Body))
+    }
+
+    fn surface(&self) -> Surface {
+        Surface {
+            text_focus: self.text_editing(),
+            ..self.surface
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface {
+        let theme = ctx.theme;
+        let styles = DialogStyles::new(theme);
+        let child_area = if crate::dialog_layout::is_compact(area) {
+            area
+        } else {
+            Rect::new(
+                area.x.saturating_add(6),
+                area.y.saturating_add(1),
+                area.width.saturating_sub(12),
+                area.height.saturating_sub(2),
+            )
+        };
+        let body_rows = if self.rule.is_column() { 3 } else { 2 };
+        let (policy_width, _) =
+            crate::dialog_layout::policy_size(child_area, PresentationKind::SelfContainedForm);
+        let action_rows = crate::dialog_controls::stable_action_rows(
+            policy_width.saturating_sub(4).max(1),
+            &COLOR_RULE_EDITOR_BUTTONS,
+        );
+        let spec = DialogSpec::new(PresentationKind::SelfContainedForm, 0, 1, 2, 1, action_rows);
+        let Ok(geometry) = crate::dialog_layout::resolve_dialog(
+            child_area,
+            &spec,
+            body_rows,
+            &COLOR_RULE_EDITOR_BUTTONS,
+            Some(0),
+            None,
+        ) else {
+            self.geometry = ColorRuleEditorGeometry::default();
+            self.surface = Surface::default();
+            return self.surface;
+        };
+        let title = self.editing.map_or_else(
+            || "New colour rule".to_owned(),
+            |index| format!("Rule · {} › Edit", index + 1),
+        );
+        render_responsive_frame(frame, &geometry, &title, true, theme);
+
+        let label_width = 9u16.min(geometry.body.viewport.width);
+        let field_x = geometry
+            .body
+            .viewport
+            .x
+            .saturating_add(label_width)
+            .saturating_add(FIELD_GUTTER);
+        let mut controls = Vec::new();
+        let mut row = 0usize;
+        if self.rule.is_column() {
+            if let Some(rect) =
+                ScrollViewport::new(geometry.body.viewport, body_rows, 0).project_row(row)
+            {
+                frame.render_widget(
+                    Paragraph::new("Column").style(
+                        if self.control == ColorRuleEditorControl::Column {
+                            styles.shortcut.add_modifier(Modifier::BOLD)
+                        } else {
+                            styles.label
+                        },
+                    ),
+                    Rect::new(rect.x, rect.y, label_width.min(rect.width), 1),
+                );
+                if field_x < rect.right() {
+                    let field = Rect::new(field_x, rect.y, rect.right() - field_x, 1);
+                    let column = self.rule.column.as_deref().unwrap_or_default();
+                    frame.render_widget(
+                        Paragraph::new(truncated(
+                            &format!("‹ {column} ›"),
+                            usize::from(field.width),
+                        ))
+                        .style(styles.description),
+                        field,
+                    );
+                    controls.push((rect, ColorRuleEditorControl::Column));
+                }
+            }
+            row += 1;
+        }
+        let viewport = ScrollViewport::new(geometry.body.viewport, body_rows, 0);
+        let mut caret = None;
+        if let Some(rect) = viewport.project_row(row) {
+            let label = if self.rule.is_column() {
+                "Value"
+            } else {
+                "Predicate"
+            };
+            frame.render_widget(
+                Paragraph::new(label).style(if self.text_editing() {
+                    styles.shortcut.add_modifier(Modifier::BOLD)
+                } else {
+                    styles.label
+                }),
+                Rect::new(rect.x, rect.y, label_width.min(rect.width), 1),
+            );
+            if field_x < rect.right() {
+                let field = Rect::new(field_x, rect.y, rect.right() - field_x, 1);
+                if self.text_editing() {
+                    caret = place_input_cursor_at(
+                        frame,
+                        field,
+                        0,
+                        0,
+                        self.text(),
+                        self.cursor.char_index,
+                        theme,
+                    );
+                } else {
+                    frame.render_widget(
+                        Paragraph::new(truncated(self.text(), usize::from(field.width)))
+                            .style(styles.description),
+                        field,
+                    );
+                }
+                controls.push((rect, ColorRuleEditorControl::Value));
+            }
+        }
+        row += 1;
+        if let Some(rect) = viewport.project_row(row) {
+            frame.render_widget(
+                Paragraph::new("Colour").style(if self.control == ColorRuleEditorControl::Color {
+                    styles.shortcut.add_modifier(Modifier::BOLD)
+                } else {
+                    styles.label
+                }),
+                Rect::new(rect.x, rect.y, label_width.min(rect.width), 1),
+            );
+            if field_x < rect.right() {
+                let field = Rect::new(field_x, rect.y, rect.right() - field_x, 1);
+                frame.render_widget(
+                    Paragraph::new(truncated(
+                        &format!("‹ {} ›", self.rule.color.label()),
+                        usize::from(field.width),
+                    ))
+                    .style(styles.description.fg(theme.rule_color(self.rule.color))),
+                    field,
+                );
+                controls.push((rect, ColorRuleEditorControl::Color));
+            }
+        }
+
+        let (state, sentence) = self.error.as_ref().map_or(
+            (
+                MessageState::Ready,
+                if self.editing.is_some() {
+                    "Save replaces this rule in the editable list".to_owned()
+                } else {
+                    "Save adds this rule to the editable list".to_owned()
+                },
+            ),
+            |error| (MessageState::Error, error.clone()),
+        );
+        render_message(frame, geometry.message, state, &sentence, theme, ctx.ascii);
+        render_help_text(
+            frame,
+            geometry.help,
+            "Choose parameters here; Apply remains an operation in the rule manager.",
+            theme,
+        );
+        for (index, rect) in &geometry.actions.buttons {
+            let control = if *index == 0 {
+                ColorRuleEditorControl::Save
+            } else {
+                ColorRuleEditorControl::Cancel
+            };
+            render_role_button(
+                frame,
+                *rect,
+                COLOR_RULE_EDITOR_BUTTONS[*index],
+                if *index == 0 {
+                    ButtonRole::Default
+                } else {
+                    ButtonRole::Normal
+                },
+                self.control == control,
+                theme,
+            );
+            controls.push((*rect, control));
+        }
+        let surface = Surface {
+            popup: geometry.frame,
+            interior: geometry.interior,
+            caret,
+            scrollable: false,
+            text_focus: self.text_editing(),
+        };
+        self.geometry = ColorRuleEditorGeometry {
+            body: geometry.body.viewport,
+            controls,
         };
         self.surface = surface;
         surface
