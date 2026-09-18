@@ -376,6 +376,10 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ),
                 ("[ / ]", "Previous / next view".into()),
                 ("Tab", "Cycle focus: sources, log, details".into()),
+                (
+                    "Ctrl + arrows",
+                    "Move focus spatially between visible panes".into(),
+                ),
                 ("f", "Toggle follow / history".into()),
                 ("d", "Toggle the details pane".into()),
                 ("b", "Toggle a bookmark on the selected record".into()),

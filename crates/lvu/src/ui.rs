@@ -169,6 +169,16 @@ pub fn render_with_theme<P: RowProvider>(
         app.shell.context_anchor = None;
     }
     app.shell.size = (geometry.area.width, geometry.area.height);
+    // Pane focus must always have a visible focus ring. Responsive geometry
+    // can remove the sidebar or the docked Details pane; when that happens,
+    // return keyboard ownership to the log instead of retaining invisible
+    // focus. Layers remain authoritative and are never rewritten here.
+    if !modal
+        && ((app.focus == Focus::Selector && geometry.sidebar.is_none())
+            || (app.focus == Focus::Details && geometry.details.is_none()))
+    {
+        app.focus = Focus::Logs;
+    }
     if geometry.tiny {
         app.hit_regions = Default::default();
         render_tiny(frame, app, geometry.area, theme);

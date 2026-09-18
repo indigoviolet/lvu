@@ -910,12 +910,16 @@ fn sources_dialog_exposes_full_failure_and_manages_source_by_stable_id() {
 }
 
 fn render<P: RowProvider>(provider: &P, app: &mut App, width: u16, height: u16) -> String {
+    screen(&render_buffer(provider, app, width, height))
+}
+
+fn render_buffer<P: RowProvider>(provider: &P, app: &mut App, width: u16, height: u16) -> Buffer {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     terminal
         .draw(|frame| ui::render(frame, app, provider))
         .expect("render");
-    screen(terminal.backend().buffer())
+    terminal.backend().buffer().clone()
 }
 
 fn take_path_completions(app: &mut App) -> Vec<lvu::PathCompletionRequest> {
@@ -5815,6 +5819,117 @@ fn focus_and_hit_regions_route_sidebar_log_and_modal_mouse() {
 }
 
 #[test]
+fn panes_support_spatial_focus_hover_wheel_and_narrow_fallback() {
+    let (provider, mut app) = demo();
+    render(&provider, &mut app, 88, 24);
+    app.handle(Action::ToggleDetails, &provider);
+    render(&provider, &mut app, 88, 24);
+    assert_eq!(app.focus, Focus::Details);
+    let geometry = ui::layout(ratatui::layout::Rect::new(0, 0, 88, 24), true);
+    let details = geometry.details.expect("details geometry");
+    let buffer = render_buffer(&provider, &mut app, 88, 24);
+    assert_eq!(
+        buffer[(details.x, details.y)].fg,
+        Theme::TERMINAL.focused_input_border,
+        "Details paints the visible focus border"
+    );
+
+    let control = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+    app.handle(app.key_to_action(control(KeyCode::Up)), &provider);
+    assert_eq!(app.focus, Focus::Logs);
+    let buffer = render_buffer(&provider, &mut app, 88, 24);
+    assert_eq!(
+        buffer[(geometry.log.x, geometry.log.y)].fg,
+        Theme::TERMINAL.active_border,
+        "Logs paints the visible focus border"
+    );
+    assert_eq!(
+        buffer[(details.x, details.y)].fg,
+        Theme::TERMINAL.border,
+        "the previous pane loses its focus border"
+    );
+    app.handle(app.key_to_action(control(KeyCode::Left)), &provider);
+    assert_eq!(app.focus, Focus::Selector);
+    app.handle(app.key_to_action(control(KeyCode::Right)), &provider);
+    assert_eq!(app.focus, Focus::Logs);
+    app.handle(app.key_to_action(control(KeyCode::Down)), &provider);
+    assert_eq!(app.focus, Focus::Details);
+    app.handle(app.key_to_action(control(KeyCode::Left)), &provider);
+    assert_eq!(app.focus, Focus::Selector);
+
+    // The wheel acts on the pane under the pointer without borrowing its
+    // keyboard focus. Exercise every base pane from a different focus.
+    let log = app.hit_regions.log.expect("log hitbox");
+    let sidebar = app.hit_regions.sidebar.expect("sidebar hitbox");
+    let details = app.hit_regions.details.expect("details hitbox");
+    let selected = app.view_state().unwrap().selected.clone();
+    app.handle(
+        Action::Mouse(mouse(MouseEventKind::ScrollUp, log.x + 1, log.y + 2)),
+        &provider,
+    );
+    assert_eq!(app.focus, Focus::Selector);
+    assert_ne!(app.view_state().unwrap().selected, selected);
+
+    app.focus = Focus::Logs;
+    let view = app.active_view_id().map(str::to_owned);
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            sidebar.x + 1,
+            sidebar.y + 1,
+        )),
+        &provider,
+    );
+    assert_eq!(app.focus, Focus::Logs);
+    assert_ne!(app.active_view_id().map(str::to_owned), view);
+
+    app.focus = Focus::Logs;
+    let scroll = app.view_state().unwrap().details_scroll;
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            details.x + 1,
+            details.y + 1,
+        )),
+        &provider,
+    );
+    assert_eq!(app.focus, Focus::Logs);
+    assert!(app.view_state().unwrap().details_scroll >= scroll);
+
+    // A layer keeps both modified keys and mouse input. Neither may retarget
+    // the workspace behind it.
+    app.handle(Action::Open(Open::Help), &provider);
+    assert_eq!(app.focus, Focus::Layer);
+    app.handle(raw_ctrl(KeyCode::Left), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            sidebar.x + 1,
+            sidebar.y + 1,
+        ))),
+        &provider,
+    );
+    assert_eq!(app.focus, Focus::Layer);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert_eq!(app.focus, Focus::Logs);
+
+    // Compact width removes the sidebar. Rendering repairs stale selector
+    // focus, and Ctrl+Left is then an explicit no-op. Compact height can also
+    // remove Details and must repair it by the same rule.
+    app.focus = Focus::Selector;
+    render(&provider, &mut app, 40, 14);
+    assert_eq!(app.focus, Focus::Logs);
+    assert!(app.hit_regions.sidebar.is_none());
+    app.handle(app.key_to_action(control(KeyCode::Left)), &provider);
+    assert_eq!(app.focus, Focus::Logs);
+
+    app.focus = Focus::Details;
+    render(&provider, &mut app, 40, 8);
+    assert_eq!(app.focus, Focus::Logs);
+    assert!(app.hit_regions.details.is_none());
+}
+
+#[test]
 fn grouping_editor_is_per_view_transactional_and_groups_expand_by_key_and_mouse() {
     let (fixture, mut app) = demo();
     app.handle(Action::Open(Open::Grouping), &fixture);
@@ -6500,6 +6615,27 @@ fn release_keys_are_ignored_and_selector_arrows_do_not_move_logs() {
             Focus::Selector
         ),
         Action::SelectSidebar(1)
+    );
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            Focus::Selector
+        ),
+        Action::FocusPane(Focus::Logs)
+    );
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+            Focus::Logs
+        ),
+        Action::FocusPane(Focus::Details)
+    );
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+            Focus::Details
+        ),
+        Action::FocusPane(Focus::Logs)
     );
 }
 

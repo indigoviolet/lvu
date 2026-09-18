@@ -2089,6 +2089,10 @@ pub enum Action {
     RevertAutoSetup,
     Quit,
     CycleFocus,
+    /// Move keyboard focus directly to a spatially adjacent base pane. The
+    /// rendered hit regions decide whether the target exists, so a narrow
+    /// layout cannot leave focus on an invisible sidebar or Details pane.
+    FocusPane(Focus),
     NextView,
     PreviousView,
     SelectSidebar(i32),
@@ -8405,6 +8409,17 @@ impl App {
                     Focus::Logs | Focus::Details | Focus::Layer => Focus::Logs,
                 }
             }
+            Action::FocusPane(target) => {
+                let visible = match target {
+                    Focus::Selector => self.hit_regions.sidebar.is_some(),
+                    Focus::Logs => self.hit_regions.log.is_some(),
+                    Focus::Details => self.hit_regions.details.is_some(),
+                    Focus::Layer => false,
+                };
+                if self.focus != Focus::Layer && visible {
+                    self.focus = target;
+                }
+            }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
             Action::PreviousView | Action::SelectSidebar(-1) => self.switch_view(-1, provider),
             Action::SelectSidebar(_) => {}
@@ -10203,6 +10218,22 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
+    }
+    // Plain arrows belong to the focused pane: sidebar selection, log
+    // navigation/panning and the Details tree. Ctrl+Arrow is the separate,
+    // collision-free spatial focus path supported by terminal key protocols.
+    // Visibility is checked when the action runs against the last rendered
+    // geometry, so these targets safely become no-ops in compact layouts.
+    if key.modifiers == KeyModifiers::CONTROL {
+        match (focus, key.code) {
+            (Focus::Selector, KeyCode::Right) => return Action::FocusPane(Focus::Logs),
+            (Focus::Logs, KeyCode::Left) | (Focus::Details, KeyCode::Left) => {
+                return Action::FocusPane(Focus::Selector);
+            }
+            (Focus::Logs, KeyCode::Down) => return Action::FocusPane(Focus::Details),
+            (Focus::Details, KeyCode::Up) => return Action::FocusPane(Focus::Logs),
+            _ => {}
+        }
     }
     // §8.10: the base screen takes no text, so every letter there is a key and
     // no base operation is bound to Alt alone. These two were, and on an xterm

@@ -464,6 +464,7 @@ fn help_indexes_the_base_screen_and_never_a_dialogs_own_buttons() {
         "Ctrl-P",
         "g / G",
         "{ / }",
+        "Move focus spatially between visible panes",
         // The two source keys, asserted by their rows rather than by the
         // bare letters, which would match anywhere on the screen.
         "Stop the selected source",
