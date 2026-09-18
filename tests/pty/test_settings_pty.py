@@ -195,10 +195,16 @@ def run(binary: pathlib.Path) -> None:
             lambda text: "[ More ]" not in text and "[ Save ]" in text,
             "resize removes inactive overflow control",
         )
+        # A resize is asynchronous at the PTY boundary. Require the final
+        # large geometry to remain authoritative before deriving its mouse
+        # target; otherwise a concurrent matrix can observe the first complete
+        # frame and send the click while a queued resize redraw replaces it.
+        first.assert_remains("[ Save ]", "[ More ]")
+        resized = first.text()
         save_row = next(
             row for row, line in enumerate(resized.splitlines()) if "[ Save ]" in line
         )
-        save_column = resized.splitlines()[save_row].index("[ Save ]") + 2
+        save_column = resized.splitlines()[save_row].index("Save") + 1
         first.send(
             (
                 f"\x1b[<0;{save_column};{save_row + 1}M"

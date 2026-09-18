@@ -4018,3 +4018,19 @@ application crate and lockfile now agree on version 0.1.15. Clean immutable
 candidate acceptance, bridge checks, two-window capture, both sequential
 restart/no-replay probes and the seven remote-union proof families remain
 pending; no tag or release has been created.
+
+The first clean 0.1.15 candidate, source `0ebc6a923a132291497d6673addeae03b505432b`
+and tree `fe78abc7139b0982e244ef64052751a431c06801`, passed formatting, locked
+workspace tests, all-target Clippy and bridge checks. Its pinned app/TUI
+SHA-256 values were `cf36eabd8ff20e2b49f9426f1f964ea1aaee175b887ea4dabea6b175fbe82f41`
+and `6c4dc92bb7c51e380ce3e20013377e9e36e8873db9762a73ffbda7c6bd5c617d`.
+The exact PTY matrix stopped at **86/88**, so no acceptance record or tag was
+created. Settings derived a mouse target from the first post-resize frame
+without first requiring that final geometry to remain stable; text selection
+compared the independently asynchronous Ready/Updating sentence as selection
+geometry. Both suites passed sequentially against the unchanged pinned binary.
+The tests now stabilize the resized frame and exclude only that separately
+covered async sentence from the cross-dialog cell comparison. Failed evidence
+is retained under
+`lvu-v015-0ebc6a9-final-acceptance/release-gate-0ebc6a923a13-917b61ecb5c543efbf4e4e35479e8d84`;
+a corrected commit requires a complete new exact run.
