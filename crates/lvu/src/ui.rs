@@ -137,6 +137,10 @@ pub fn render_with_theme<P: RowProvider>(
         crate::delight::ActivityState<'_>,
     )>,
 ) {
+    // Geometry is authoritative only after this frame has completed painting.
+    // Clear the previous frame up front; tiny/base frames intentionally leave
+    // no modal surface behind.
+    app.shell.rendered_surface = None;
     let modal = dialog_is_open(app);
     let geometry = layout_with_backdrop(
         frame.area(),
@@ -263,75 +267,91 @@ fn render_layers<P: RowProvider>(
         hit_regions,
         ..
     } = app;
-    let mut ctx = crate::component::RenderCtx {
-        views,
-        cursors: &shell.cursors,
-        sources,
-        provider,
-        whole_view_stats: app_whole_view_stats.as_ref(),
-        field_stats_pending: app_stats_pending,
-        active: true,
-        theme,
-        ascii: appearance.ascii,
-        display_zone: &appearance.display_zone,
-        size: shell.size,
-        clock: shell.clock(),
-        // Phase B: the frozen opening-row anchor for later Contextual
-        // Inspector/Prompt `resolve_dialog` calls. Legacy layers render
-        // through their `DialogClass` adapters unchanged and ignore it.
-        context_anchor: shell.context_anchor,
-    };
-    let stack = layers.stack.clone();
-    let compact = crate::dialog_layout::is_compact(area);
-    let mut top_surface = None;
-    for (index, id) in stack.iter().copied().enumerate() {
-        let is_top = index + 1 == stack.len();
-        if compact && !is_top {
-            continue;
-        }
-        if index > 0 {
-            crate::dialog_layout::scrim(frame.buffer_mut(), area, theme);
-        }
-        ctx.active = is_top;
-        let surface = match id {
-            crate::component::LayerId::Storage => layers.storage.render(frame, area, &ctx),
-            crate::component::LayerId::Time => layers.time.render(frame, area, &ctx),
-            crate::component::LayerId::Help => layers.help.render(frame, area, &ctx),
-            crate::component::LayerId::Settings => layers.settings.render(frame, area, &ctx),
-            crate::component::LayerId::Fields => layers.fields.render(frame, area, &ctx),
-            crate::component::LayerId::View => layers.view.render(frame, area, &ctx),
-            crate::component::LayerId::Source => layers.source.render(frame, area, &ctx),
-            crate::component::LayerId::Folding => layers.folding.render(frame, area, &ctx),
-            crate::component::LayerId::Recipes | crate::component::LayerId::RecipeHistory => {
-                layers.recipes.render(frame, area, &ctx)
-            }
-            crate::component::LayerId::Filter => layers.filter.render(frame, area, &ctx),
-            crate::component::LayerId::Grouping => layers.grouping.render(frame, area, &ctx),
-            crate::component::LayerId::ColorRules => layers.color_rules.render(frame, area, &ctx),
-            crate::component::LayerId::ColorRuleEditor => {
-                layers.color_rule_editor.render(frame, area, &ctx)
-            }
-            crate::component::LayerId::Enrichment => layers.enrichment.render(frame, area, &ctx),
-            crate::component::LayerId::EnrichmentStep => {
-                layers.enrichment_step.render(frame, area, &ctx)
-            }
-            crate::component::LayerId::ExternalCommand => {
-                layers.external_command.render(frame, area, &ctx)
-            }
-            crate::component::LayerId::Bookmarks => layers.bookmarks.render(frame, area, &ctx),
-            crate::component::LayerId::Ask => layers.ask.render(frame, area, &ctx),
-            crate::component::LayerId::Investigation => {
-                layers.investigation.render(frame, area, &ctx)
-            }
-            crate::component::LayerId::Correlation => layers.correlation.render(frame, area, &ctx),
-            crate::component::LayerId::Union => layers.union.render(frame, area, &ctx),
-            crate::component::LayerId::ViewSummary => layers.view_summary.render(frame, area, &ctx),
+    let top_surface = {
+        let mut ctx = crate::component::RenderCtx {
+            views,
+            cursors: &shell.cursors,
+            sources,
+            provider,
+            whole_view_stats: app_whole_view_stats.as_ref(),
+            field_stats_pending: app_stats_pending,
+            active: true,
+            theme,
+            ascii: appearance.ascii,
+            display_zone: &appearance.display_zone,
+            size: shell.size,
+            clock: shell.clock(),
+            // Phase B: the frozen opening-row anchor for later Contextual
+            // Inspector/Prompt `resolve_dialog` calls. Legacy layers render
+            // through their `DialogClass` adapters unchanged and ignore it.
+            context_anchor: shell.context_anchor,
         };
-        if is_top {
-            top_surface = Some(surface);
+        let stack = layers.stack.clone();
+        let compact = crate::dialog_layout::is_compact(area);
+        let mut top_surface = None;
+        for (index, id) in stack.iter().copied().enumerate() {
+            let is_top = index + 1 == stack.len();
+            if compact && !is_top {
+                continue;
+            }
+            if index > 0 {
+                crate::dialog_layout::scrim(frame.buffer_mut(), area, theme);
+            }
+            ctx.active = is_top;
+            let surface = match id {
+                crate::component::LayerId::Storage => layers.storage.render(frame, area, &ctx),
+                crate::component::LayerId::Time => layers.time.render(frame, area, &ctx),
+                crate::component::LayerId::Help => layers.help.render(frame, area, &ctx),
+                crate::component::LayerId::Settings => layers.settings.render(frame, area, &ctx),
+                crate::component::LayerId::Fields => layers.fields.render(frame, area, &ctx),
+                crate::component::LayerId::View => layers.view.render(frame, area, &ctx),
+                crate::component::LayerId::Source => layers.source.render(frame, area, &ctx),
+                crate::component::LayerId::Folding => layers.folding.render(frame, area, &ctx),
+                crate::component::LayerId::Recipes | crate::component::LayerId::RecipeHistory => {
+                    layers.recipes.render(frame, area, &ctx)
+                }
+                crate::component::LayerId::Filter => layers.filter.render(frame, area, &ctx),
+                crate::component::LayerId::Grouping => layers.grouping.render(frame, area, &ctx),
+                crate::component::LayerId::ColorRules => {
+                    layers.color_rules.render(frame, area, &ctx)
+                }
+                crate::component::LayerId::ColorRuleEditor => {
+                    layers.color_rule_editor.render(frame, area, &ctx)
+                }
+                crate::component::LayerId::Enrichment => {
+                    layers.enrichment.render(frame, area, &ctx)
+                }
+                crate::component::LayerId::EnrichmentStep => {
+                    layers.enrichment_step.render(frame, area, &ctx)
+                }
+                crate::component::LayerId::ExternalCommand => {
+                    layers.external_command.render(frame, area, &ctx)
+                }
+                crate::component::LayerId::Bookmarks => layers.bookmarks.render(frame, area, &ctx),
+                crate::component::LayerId::Ask => layers.ask.render(frame, area, &ctx),
+                crate::component::LayerId::Investigation => {
+                    layers.investigation.render(frame, area, &ctx)
+                }
+                crate::component::LayerId::Correlation => {
+                    layers.correlation.render(frame, area, &ctx)
+                }
+                crate::component::LayerId::Union => layers.union.render(frame, area, &ctx),
+                crate::component::LayerId::ViewSummary => {
+                    layers.view_summary.render(frame, area, &ctx)
+                }
+            };
+            if is_top {
+                top_surface = Some((id, surface));
+            }
         }
-    }
-    hit_regions.selection_modal = top_surface.map(|surface| surface.interior);
+        top_surface
+    };
+    // RenderCtx's immutable shell borrow has ended. Publish precisely the
+    // surface that selection and caret placement just used, never a
+    // component's older cached copy.
+    shell.rendered_surface =
+        top_surface.map(|(layer, surface)| crate::component::RenderedSurface { layer, surface });
+    hit_regions.selection_modal = top_surface.map(|(_, surface)| surface.interior);
 }
 
 fn sidebar_view_regions(app: &App, area: Option<Rect>) -> Vec<(Rect, usize)> {

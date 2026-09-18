@@ -145,6 +145,15 @@ fn every_recorded_control_was_painted_and_answers_the_hit_test() {
         key(&mut app, &provider, KeyCode::Enter);
         draw(&provider, &mut app, width, height);
         let surface = app.layers.settings.surface();
+        let rendered = app
+            .shell
+            .rendered_surface
+            .expect("the renderer publishes the top surface");
+        assert_eq!(rendered.layer, LayerId::Settings);
+        assert_eq!(
+            rendered.surface, surface,
+            "shell authority must be the exact Surface returned by render"
+        );
         for (rect, control) in app.layers.settings.control_rects() {
             let point = (rect.x, rect.y);
             assert!(
@@ -264,6 +273,95 @@ fn clicks_outside_the_popup_are_contained_and_the_layer_owns_its_keymap() {
         ),
         Action::None
     );
+}
+
+/// Mouse ownership belongs to the top rendered surface, including kinds that
+/// do not normally activate a control.  None may fall through to the log or
+/// sidebar behind a modal.
+#[test]
+fn every_outside_mouse_kind_is_captured_without_background_focus_or_scroll() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Settings), &provider);
+    draw(&provider, &mut app, 100, 30);
+    let selected = app.view_state().and_then(|state| state.selected.clone());
+    let top = app.view_state().map(|state| state.top);
+    let popup = app.layers.settings.surface().popup;
+    assert!(!contains(popup, (0, 0)));
+    let settings_focus = app.layers.settings.state().unwrap().focus;
+
+    for kind in [
+        MouseEventKind::Moved,
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::ScrollUp,
+        MouseEventKind::ScrollDown,
+        MouseEventKind::ScrollLeft,
+        MouseEventKind::ScrollRight,
+    ] {
+        app.handle(
+            Action::Raw(RawEvent::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })),
+            &provider,
+        );
+    }
+
+    assert_eq!(app.focus, lvu::Focus::Layer);
+    assert_eq!(app.layers.top(), Some(LayerId::Settings));
+    assert_eq!(app.layers.settings.state().unwrap().focus, settings_focus);
+    assert_eq!(
+        app.view_state().and_then(|state| state.selected.clone()),
+        selected
+    );
+    assert_eq!(app.view_state().map(|state| state.top), top);
+}
+
+/// A resize and a fresh open both revoke the previous frame before a new
+/// surface is painted.  A click at an old button coordinate must be dropped,
+/// while that same button works again after the next TestBackend frame.
+#[test]
+fn resize_and_reopen_revoke_stale_hitboxes_until_the_next_render() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Settings), &provider);
+    draw(&provider, &mut app, 100, 30);
+    let old_save = app
+        .layers
+        .settings
+        .control_rects()
+        .iter()
+        .find_map(|(rect, control)| (*control == SettingsControl::Save).then_some(*rect))
+        .expect("painted Save");
+    assert!(app.shell.rendered_surface.is_some());
+
+    // Same-size resize is intentional: a terminal may have reflowed even when
+    // its reported dimensions return to the same values.
+    app.handle(Action::Resize(100, 30), &provider);
+    assert!(app.shell.rendered_surface.is_none());
+    click(&mut app, &provider, (old_save.x, old_save.y));
+    assert!(app.layers.settings.outbox.take().is_empty());
+
+    draw(&provider, &mut app, 100, 30);
+    let save = app
+        .layers
+        .settings
+        .control_rects()
+        .iter()
+        .find_map(|(rect, control)| (*control == SettingsControl::Save).then_some(*rect))
+        .expect("fresh Save");
+    click(&mut app, &provider, (save.x, save.y));
+    assert_eq!(app.layers.settings.outbox.take().len(), 1);
+
+    // Close and reopen the same component. Its internal cache still contains
+    // the old rect, but the stack transition has revoked shell authority.
+    key(&mut app, &provider, KeyCode::Esc);
+    app.handle(Action::Open(Open::Settings), &provider);
+    assert!(app.shell.rendered_surface.is_none());
+    click(&mut app, &provider, (save.x, save.y));
+    assert!(app.layers.settings.outbox.take().is_empty());
 }
 
 #[test]

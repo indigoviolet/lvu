@@ -431,6 +431,22 @@ pub struct Surface {
     pub text_focus: bool,
 }
 
+/// The exact top-layer surface published by the most recently completed
+/// render.
+///
+/// Components retain their own [`Surface`] so their `hit()` implementation can
+/// resolve the rects it painted.  The shell must not infer that the retained
+/// value belongs to the layer and viewport currently on screen, though: a
+/// layer can be reopened after keeping its old component state, and a resize
+/// makes every recorded coordinate stale before the next frame.  Mouse
+/// dispatch therefore uses only this renderer-owned record and requires its
+/// layer identity to match the current stack top.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderedSurface {
+    pub layer: LayerId,
+    pub surface: Surface,
+}
+
 /// The agent provider, mode and thinking level `lvu-app` resolved from
 /// settings. Pure shell configuration, like `appearance`: `App::configure_ai`
 /// and a settings save are its only writers, and Source, Ask and Investigation
@@ -629,8 +645,11 @@ pub trait Component {
     /// scrolling and text selection (AGENTS.md).
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx<'_>) -> Surface;
 
-    /// The `Surface` the last `render` produced. The shell uses it for modal
-    /// containment (§5.2) and selection bounds (§3) between frames.
+    /// The `Surface` the last `render` produced, retained beside this
+    /// component's hit geometry.  The renderer separately records the return
+    /// value with the current top-layer identity for shell containment and
+    /// selection; input dispatch never assumes this component cache belongs
+    /// to the current opening or viewport.
     fn surface(&self) -> Surface;
 
     /// Whether a text field has focus *right now*. The shell asks this to

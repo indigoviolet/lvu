@@ -50,6 +50,21 @@ def assert_backdrop_is_scrimmed(app: PtyApp, bounds: tuple[int, int, int, int]) 
     assert not coloured, f"backdrop keeps active colour at {coloured[:6]}\n{app.text()}"
 
 
+def wheel(app: PtyApp, column: int, row: int, down: bool = True) -> None:
+    """Send one SGR wheel event at zero-based screen coordinates."""
+    button = 65 if down else 64
+    app.send(f"\x1b[<{button};{column + 1};{row + 1}M".encode())
+
+
+def details_panel(app: PtyApp) -> str:
+    lines = app.text().splitlines()
+    heading = next(
+        row for row, line in enumerate(lines)
+        if "Selected event details" in line and "┌" in line
+    )
+    return "\n".join(lines[heading:])
+
+
 def source_dialog_rect(app: PtyApp) -> tuple[int, int, int, int] | None:
     """(x, y, width, height) of the Add source popup, or None while it is gone.
 
@@ -181,6 +196,33 @@ def run(binary: pathlib.Path) -> None:
             app.wait_for("event 39 ready")
             app.wait_for("raw view", timeout=10.0)
 
+            # --- modal owns every mouse event, including outside it --------
+            # Freeze a visible selected-record witness in Details, then send a
+            # wheel and full click lifecycle over the log outside Help. If
+            # either leaks, the selected record/focus behind the modal moves.
+            app.send(b"d")
+            app.wait_for("Selected event details")
+            assert "event 39 ready" in details_panel(app), app.text()
+            app.send(b"?")
+            app.wait_for("Help")
+            help_bounds = dialog_bounds(app, "Help")
+            outside = (139, 3)
+            assert not (
+                help_bounds[0] <= outside[0] <= help_bounds[2]
+                and help_bounds[1] <= outside[1] <= help_bounds[3]
+            ), help_bounds
+            wheel(app, *outside, down=False)
+            click(app, *outside)
+            app.assert_remains("Help", "modal-mouse-leak-impossible-marker")
+            app.send(b"\x1b")
+            app.wait_for("Selected event details")
+            assert "event 39 ready" in details_panel(app), app.text()
+            app.send(b"d")
+            app.wait_until(
+                lambda text: "Selected event details" not in text,
+                "Details closes",
+            )
+
             # --- wide: a one-field prompt stays a prompt -----------------
             app.send(b"/")
             app.wait_for("Filter")
@@ -289,6 +331,61 @@ def run(binary: pathlib.Path) -> None:
             app.send(b",")
             settings_screen = app.wait_for("Provider / model")
             assert "Automatic log setup" in settings_screen, settings_screen
+            # Provider -> Mode -> Thinking -> Automatic log setup -> Theme.
+            # The choice list is an anchored top surface and can extend past
+            # the dialog frame; clicking its painted row must still land.
+            app.send(b"\t" * 4 + b"\r")
+            dropdown = app.wait_for("love-light")
+            light_column, light_row = find_text(app, "love-light")
+            assert 0 <= light_column < 54 and 0 <= light_row < 16, dropdown
+            click(app, light_column + 1, light_row)
+            app.wait_until(
+                lambda text: "love-light" in text and "rose-pine" not in text,
+                "anchored Theme choice lands through the top surface",
+            )
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "┌" in text and "Provider / model" not in text,
+                "settings closes after dropdown proof",
+                timeout=8.0,
+            )
+
+            # A large repaint must revoke the old compact Save hitbox. Its old
+            # coordinate is valid terminal space but outside the new dialog;
+            # clicking it cannot save/close or focus the workspace behind.
+            app.send(b",")
+            app.wait_for("Provider / model")
+            old_save_column, old_save_row = find_text(app, "[ Save ]")
+            app.resize(140, 40)
+            app.wait_until(
+                lambda text: "Provider / model" in text
+                and dialog_bounds(app, "Settings")[2]
+                - dialog_bounds(app, "Settings")[0]
+                + 1
+                > 52,
+                "wide Settings repaint",
+            )
+            wide_bounds = dialog_bounds(app, "Settings")
+            assert not (
+                wide_bounds[0] <= old_save_column <= wide_bounds[2]
+                and wide_bounds[1] <= old_save_row <= wide_bounds[3]
+            ), (old_save_column, old_save_row, wide_bounds)
+            click(app, old_save_column, old_save_row)
+            app.assert_remains("Provider / model", "Saving settings")
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "┌" in text and "Provider / model" not in text,
+                "wide settings closes after stale-hitbox proof",
+                timeout=8.0,
+            )
+
+            app.resize(54, 16)
+            app.wait_until(
+                lambda text: "event" in text and "┌" in text,
+                "workspace repaints at 54x16 again",
+            )
+            app.send(b",")
+            settings_screen = app.wait_for("Provider / model")
             # Provider -> Mode -> Thinking -> Automatic log setup -> Theme ->
             # the display zone -> the three toggles -> the four cache limits:
             # twelve Tabs reaches the last field.
@@ -318,7 +415,8 @@ def run(binary: pathlib.Path) -> None:
         assert_source_geometry_is_stable(binary, width, height)
     print(
         "Dialog system PTY passed: scrim, input tone, class rects, hitboxes, "
-        "stable live-region geometry"
+        "stable live-region geometry, modal mouse capture, dropdown bounds, "
+        "resize-stale hitboxes"
     )
 
 

@@ -16,7 +16,7 @@ use crate::auto_setup::{
 };
 use crate::component::{
     AgentDefaults, Appearance, Clock, Component, Ctx, Event as ComponentEvent, LayerId, NO_ROWS,
-    Open, Outcome, RawEvent, Surface, ViewEvent,
+    Open, Outcome, RawEvent, RenderedSurface, Surface, ViewEvent,
 };
 use crate::components::Layers;
 use crate::provider::{DisplayRow, GapDirection, RowId, RowProvider, ViewportRequest};
@@ -3869,6 +3869,13 @@ pub struct Shell {
     /// later Contextual Inspector/Prompt `resolve_dialog` calls; no new
     /// independently computed row rectangle and no widened global hit regions.
     pub context_anchor: Option<crate::dialog_layout::ContextAnchor>,
+    /// Exact top-layer geometry returned by the last completed render.
+    ///
+    /// `None` means mouse geometry is not authoritative yet (initial open,
+    /// layer transition, resize, or tiny fallback).  In that state the top
+    /// modal still owns mouse input, but drops it without consulting a
+    /// component's retained pre-transition hitboxes.
+    pub rendered_surface: Option<RenderedSurface>,
 }
 
 impl Shell {
@@ -6297,6 +6304,7 @@ impl App {
         }
         self.layers.stack.retain(|id| *id != LayerId::Source);
         self.layers.stack.push(LayerId::Source);
+        self.shell.rendered_surface = None;
         self.focus = Focus::Layer;
     }
 
@@ -7738,6 +7746,10 @@ impl App {
         // layer leaves exactly the same state behind as it used to.
         self.dialog_scroll = 0;
         self.dialog_scroll_focused = false;
+        // The component may retain geometry from an earlier opening.  It is
+        // not authoritative for this stack position until render publishes a
+        // fresh surface for this exact layer.
+        self.shell.rendered_surface = None;
         // Phase B: freeze the opening-row anchor when the first layer opens
         // from the base screen. Child pushes and `Replace` retain the held
         // value (see `apply_outcome`); live row movement never updates it.
@@ -7841,6 +7853,7 @@ impl App {
 
     fn pop_layer(&mut self) {
         self.layers.stack.pop();
+        self.shell.rendered_surface = None;
         if self.layers.stack.is_empty() {
             self.focus = self.layer_return_focus;
             // Phase B: the stack returned to base, so the frozen opening-row
@@ -7864,6 +7877,7 @@ impl App {
                 // unconditionally instead.
                 let held = self.shell.context_anchor;
                 self.layers.stack.pop();
+                self.shell.rendered_surface = None;
                 if self.layers.stack.is_empty() {
                     self.focus = self.layer_return_focus;
                 }
@@ -7895,6 +7909,14 @@ impl App {
         let Some(top) = self.layers.top() else {
             return;
         };
+        // Only the surface returned while painting this exact top layer may
+        // authorize mouse coordinates.  A cached component surface can belong
+        // to a prior opening or pre-resize viewport.
+        let rendered_surface = self
+            .shell
+            .rendered_surface
+            .filter(|rendered| rendered.layer == top)
+            .map(|rendered| rendered.surface);
         let App {
             shell,
             layers,
@@ -7915,32 +7937,65 @@ impl App {
             provider,
         );
         let outcome = match top {
-            LayerId::Storage => dispatch_raw(&mut layers.storage, event, &mut ctx),
-            LayerId::Time => dispatch_raw(&mut layers.time, event, &mut ctx),
-            LayerId::Help => dispatch_raw(&mut layers.help, event, &mut ctx),
-            LayerId::Settings => dispatch_raw(&mut layers.settings, event, &mut ctx),
-            LayerId::Fields => dispatch_raw(&mut layers.fields, event, &mut ctx),
-            LayerId::View => dispatch_raw(&mut layers.view, event, &mut ctx),
-            LayerId::Source => dispatch_raw(&mut layers.source, event, &mut ctx),
-            LayerId::Folding => dispatch_raw(&mut layers.folding, event, &mut ctx),
+            LayerId::Storage => {
+                dispatch_raw(&mut layers.storage, event, rendered_surface, &mut ctx)
+            }
+            LayerId::Time => dispatch_raw(&mut layers.time, event, rendered_surface, &mut ctx),
+            LayerId::Help => dispatch_raw(&mut layers.help, event, rendered_surface, &mut ctx),
+            LayerId::Settings => {
+                dispatch_raw(&mut layers.settings, event, rendered_surface, &mut ctx)
+            }
+            LayerId::Fields => dispatch_raw(&mut layers.fields, event, rendered_surface, &mut ctx),
+            LayerId::View => dispatch_raw(&mut layers.view, event, rendered_surface, &mut ctx),
+            LayerId::Source => dispatch_raw(&mut layers.source, event, rendered_surface, &mut ctx),
+            LayerId::Folding => {
+                dispatch_raw(&mut layers.folding, event, rendered_surface, &mut ctx)
+            }
             LayerId::Recipes | LayerId::RecipeHistory => {
-                dispatch_raw(&mut layers.recipes, event, &mut ctx)
+                dispatch_raw(&mut layers.recipes, event, rendered_surface, &mut ctx)
             }
-            LayerId::Filter => dispatch_raw(&mut layers.filter, event, &mut ctx),
-            LayerId::Grouping => dispatch_raw(&mut layers.grouping, event, &mut ctx),
-            LayerId::ColorRules => dispatch_raw(&mut layers.color_rules, event, &mut ctx),
-            LayerId::ColorRuleEditor => {
-                dispatch_raw(&mut layers.color_rule_editor, event, &mut ctx)
+            LayerId::Filter => dispatch_raw(&mut layers.filter, event, rendered_surface, &mut ctx),
+            LayerId::Grouping => {
+                dispatch_raw(&mut layers.grouping, event, rendered_surface, &mut ctx)
             }
-            LayerId::Enrichment => dispatch_raw(&mut layers.enrichment, event, &mut ctx),
-            LayerId::EnrichmentStep => dispatch_raw(&mut layers.enrichment_step, event, &mut ctx),
-            LayerId::ExternalCommand => dispatch_raw(&mut layers.external_command, event, &mut ctx),
-            LayerId::Bookmarks => dispatch_raw(&mut layers.bookmarks, event, &mut ctx),
-            LayerId::Ask => dispatch_raw(&mut layers.ask, event, &mut ctx),
-            LayerId::Investigation => dispatch_raw(&mut layers.investigation, event, &mut ctx),
-            LayerId::Correlation => dispatch_raw(&mut layers.correlation, event, &mut ctx),
-            LayerId::Union => dispatch_raw(&mut layers.union, event, &mut ctx),
-            LayerId::ViewSummary => dispatch_raw(&mut layers.view_summary, event, &mut ctx),
+            LayerId::ColorRules => {
+                dispatch_raw(&mut layers.color_rules, event, rendered_surface, &mut ctx)
+            }
+            LayerId::ColorRuleEditor => dispatch_raw(
+                &mut layers.color_rule_editor,
+                event,
+                rendered_surface,
+                &mut ctx,
+            ),
+            LayerId::Enrichment => {
+                dispatch_raw(&mut layers.enrichment, event, rendered_surface, &mut ctx)
+            }
+            LayerId::EnrichmentStep => dispatch_raw(
+                &mut layers.enrichment_step,
+                event,
+                rendered_surface,
+                &mut ctx,
+            ),
+            LayerId::ExternalCommand => dispatch_raw(
+                &mut layers.external_command,
+                event,
+                rendered_surface,
+                &mut ctx,
+            ),
+            LayerId::Bookmarks => {
+                dispatch_raw(&mut layers.bookmarks, event, rendered_surface, &mut ctx)
+            }
+            LayerId::Ask => dispatch_raw(&mut layers.ask, event, rendered_surface, &mut ctx),
+            LayerId::Investigation => {
+                dispatch_raw(&mut layers.investigation, event, rendered_surface, &mut ctx)
+            }
+            LayerId::Correlation => {
+                dispatch_raw(&mut layers.correlation, event, rendered_surface, &mut ctx)
+            }
+            LayerId::Union => dispatch_raw(&mut layers.union, event, rendered_surface, &mut ctx),
+            LayerId::ViewSummary => {
+                dispatch_raw(&mut layers.view_summary, event, rendered_surface, &mut ctx)
+            }
         };
         self.apply_outcome(outcome, provider);
     }
@@ -8220,6 +8275,7 @@ impl App {
     /// that are not on top. `pop_layer` is the top-of-stack case.
     fn close_layer(&mut self, id: LayerId) {
         self.layers.stack.retain(|open| *open != id);
+        self.shell.rendered_surface = None;
         if self.layers.stack.is_empty() {
             // Phase B: the stack returned to base, so the frozen opening-row
             // anchor no longer names anything on screen. Clear regardless of
@@ -8885,6 +8941,10 @@ impl App {
             }
             Action::OpenSource => self.handle(Action::Open(Open::Source), provider),
             Action::Resize(width, height) => {
+                // Even a same-size Resize means the terminal may have
+                // reflowed.  No pre-event hitbox remains authoritative until
+                // the renderer publishes the next complete top surface.
+                self.shell.rendered_surface = None;
                 // Phase B: a resize invalidates the frozen anchor's coordinates.
                 // The next render recaptures nothing while the stack is up; the
                 // inspector falls back to centered/top-biased placement instead
@@ -9200,8 +9260,12 @@ fn shell_ctx<'a, P: RowProvider>(
 /// `Ignored` key from a layer rather than passing it down to the base screen
 /// (§7.5, and `key_to_action`'s `Focus::Layer` arm), so the letter reached
 /// nothing at all.
-fn dispatch_raw<C: Component>(component: &mut C, event: RawEvent, ctx: &mut Ctx<'_>) -> Outcome {
-    let surface: Surface = component.surface();
+fn dispatch_raw<C: Component>(
+    component: &mut C,
+    event: RawEvent,
+    rendered_surface: Option<Surface>,
+    ctx: &mut Ctx<'_>,
+) -> Outcome {
     let event = match event {
         RawEvent::Key(key) => {
             if is_dismissal(key, !component.text_focus()) {
@@ -9219,9 +9283,19 @@ fn dispatch_raw<C: Component>(component: &mut C, event: RawEvent, ctx: &mut Ctx<
         RawEvent::Paste(text) => ComponentEvent::Paste(text),
         RawEvent::Resize => ComponentEvent::Resize,
         RawEvent::Mouse(mouse) => {
+            let Some(surface) = rendered_surface else {
+                // The modal remains the input owner while its new frame is
+                // pending.  Dropping here prevents a retained pre-open or
+                // pre-resize hitbox from firing and never falls through to the
+                // workspace.
+                return Outcome::Consumed;
+            };
             let point = (mouse.column, mouse.row);
             if !contains(surface.popup, point) {
-                return Outcome::Ignored;
+                // Outside clicks, movement and wheel input are still consumed
+                // by the top modal.  They cannot change background hover,
+                // scroll, selection or focus.
+                return Outcome::Consumed;
             }
             let hit = component.hit(point);
             ComponentEvent::Mouse {

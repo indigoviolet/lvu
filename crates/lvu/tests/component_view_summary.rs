@@ -281,6 +281,10 @@ fn enter_on_each_row_replaces_the_summary_with_the_owning_layer_and_its_item() {
             vec![*layer],
             "{row:?}: Enter replaces the summary with its owner"
         );
+        assert!(
+            app.shell.rendered_surface.is_none(),
+            "{row:?}: Replace must revoke the summary's painted surface until the owner renders"
+        );
         assert!(!app.layers.view_summary.is_open());
         match row {
             SummaryRow::Role => assert_eq!(app.layers.view.mode(), ViewDialogMode::Clone),
