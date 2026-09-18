@@ -8,6 +8,12 @@ are releases — see [`../CHANGELOG.md`](../CHANGELOG.md).
 Rows completed before preview 047 live in the [work ledger](work-ledger.md)
 under `2026-09-08 — checklist rows shipped before preview 047`.
 
+### v0.1.15 (2026-09-18)
+
+| Status | Request |
+| --- | --- |
+| **Done** | Discover groups source kinds, orders established activity newest-first, collapses old unavailable rows, and names Compose services once while preserving individual containers. Automatic setup retains an inspectable Paseo session and explicit Analyze again action. Base panes support spatial keyboard/mouse focus, Color Rules separates object management from parameter editing, and executable dialog metadata enforces object-first/create-first flow order. Exact release acceptance passed 88/88 actual PTYs and all source-bound proof families. |
+
 ### v0.1.14 (2026-09-17)
 
 | Status | Request |

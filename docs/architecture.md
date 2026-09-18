@@ -1,10 +1,12 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.14` (2026-09-17) is the current public release. In addition to live
+`v0.1.15` (2026-09-18) is the current public release. In addition to live
 unions, shared keys, enrichment-backed colours, automatic shared capture and
 the responsive dialog system, it includes optional raw-first automatic log
-setup, acknowledged view deletion,
+setup with an inspectable retained agent conversation, source-type-grouped
+discovery, spatial keyboard/mouse pane focus, object-first colour-rule
+management, acknowledged view deletion,
 capture-preserving source removal, explicit concurrent discovery outcomes and
 distinct assistance route/daemon diagnostics. The unified Sources dialog keeps
 stopped/error sources selectable, shows full health, and restarts or durably

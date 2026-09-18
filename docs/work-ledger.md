@@ -4034,3 +4034,42 @@ covered async sentence from the cross-dialog cell comparison. Failed evidence
 is retained under
 `lvu-v015-0ebc6a9-final-acceptance/release-gate-0ebc6a923a13-917b61ecb5c543efbf4e4e35479e8d84`;
 a corrected commit requires a complete new exact run.
+
+### v0.1.15 accepted, published and installed — 2026-09-18
+
+Exact source `2489b8722641fa15a21333e079951c72e6ed74cb`, tree
+`75f9d500b33763fc031d3744bfac5eba473c57b7`, passed locked workspace tests,
+all-target Clippy, 120 bridge tests, **88/88** actual PTYs, two-window shared
+capture, both sequential restart/no-replay proofs and all seven remote-union
+proof families. Accepted app/TUI hashes are `c9833e9b5d31…` and
+`6c4dc92bb7c5…`; accepted-record SHA-256 is
+`30d7c43ce02fae2b1b77c46de20d4fccfb57bebe8377cbe1c9644e24c439e234`.
+
+Annotated tag object `64936c9b3c87235b05ac10e78f267c4eae55ea08` peels locally and
+remotely to that source. Release run `35308773347` built, executed and uploaded
+exactly Linux x86_64, Linux arm64 and Apple-silicon macOS. Archive SHA-256
+values are macOS arm64
+`43fbefc7990644a37a533a4f4fa08a82c42498261da8ca4c902a5a79bcbfb03d`,
+Linux arm64 `33986ac28b6f93ef416e2996b4cc2e707ff27c5236e4e314ee087467e4d7c089`
+and Linux x86_64
+`27b32a9ffc51147a9a9752bdcbdb2285232230db9530c71f8a336c3d2e25dc0c`.
+Tap commit `9f1fdbc3d4584ca4b382d0d90f40c5af917c1077` passed style and strict
+audit and was pushed before publication. Release `391229338` became public at
+05:08:20 UTC with only those three archives plus `SHA256SUMS`.
+
+Homebrew upgraded to 0.1.15 and passed the formula test. Pinned mise installed
+0.1.15 after verifying checksum, GitHub artifact attestations and SLSA
+provenance. The official x86_64 archive resolved both resources, compiled a
+real Polars expression without modifying its install tree, and completed a
+live bridge capabilities exchange. Its installed Docker PTY selected and
+started both the Compose aggregate and retained individual container from an
+environment-routed controlled Docker executable; the host socket remains
+unavailable to this user, so no live-daemon success is claimed.
+`versions/latest` points to v0.1.15; its binary SHA-256 is
+`28b30b073697ba2ba425d9b640a5c020f2d3a5a862cdf6a7c48c9cef94561ed5`
+and its 944-file manifest digest is
+`f35433abc9cb9c5788b15551133de2feb5cd703208cba781f7975047b0e7de7c`.
+No process used the superseded 0.1.14 installs: Homebrew and mise removed them,
+while the repository-local copy was moved to trash and remains recoverable.
+Human Apple-silicon macOS and arm64 Linux terminal acceptance remains
+unverified.

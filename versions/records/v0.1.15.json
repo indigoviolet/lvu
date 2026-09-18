@@ -1,0 +1,42 @@
+{
+  "version": "v0.1.15",
+  "source_tag": "v0.1.15",
+  "source_commit": "2489b8722641fa15a21333e079951c72e6ed74cb",
+  "tag_object": "64936c9b3c87235b05ac10e78f267c4eae55ea08",
+  "remote_peel": "2489b8722641fa15a21333e079951c72e6ed74cb",
+  "release_id": 391229338,
+  "release_draft": false,
+  "published_at": "2026-09-18T05:08:20Z",
+  "release_workflow": {
+    "run": 35308773347,
+    "conclusion": "success",
+    "head_sha": "2489b8722641fa15a21333e079951c72e6ed74cb"
+  },
+  "tap_commit": "9f1fdbc3d4584ca4b382d0d90f40c5af917c1077",
+  "archive": "lvu-0.1.15-x86_64-unknown-linux-musl.tar.gz",
+  "archive_sha256": "27b32a9ffc51147a9a9752bdcbdb2285232230db9530c71f8a336c3d2e25dc0c",
+  "archive_bytes": 29628048,
+  "tree_manifest_sha256": "f35433abc9cb9c5788b15551133de2feb5cd703208cba781f7975047b0e7de7c",
+  "tree_manifest_entries": 944,
+  "binary_sha256": "28b30b073697ba2ba425d9b640a5c020f2d3a5a862cdf6a7c48c9cef94561ed5",
+  "accepted_record": {
+    "path": "/mnt/HC_Volume_106796581/lvu-build/lvu-v015-2489b87-final-acceptance/release-gate-2489b8722641-974300d56ee34fe2862fda870fc76d9b/accepted.json",
+    "sha256": "30d7c43ce02fae2b1b77c46de20d4fccfb57bebe8377cbe1c9644e24c439e234",
+    "result": "passed",
+    "pty_passed": "88/88",
+    "proof_count": 10
+  },
+  "previous_latest": "v0.1.14",
+  "acceptance": [
+    "Three CI archives built, executed and matched SHA256SUMS",
+    "Pinned mise install verified checksum, GitHub attestations and SLSA provenance",
+    "Homebrew upgraded to 0.1.15 and its formula test passed",
+    "Official archive helper compiled a real Polars expression and bridge answered live capabilities",
+    "Installed Docker PTY started both Compose-service and individual-container sources"
+  ],
+  "known_limitations": [
+    "The local Docker daemon is unavailable to this user; installed Docker acceptance used a controlled executable fixture",
+    "Apple-silicon macOS and arm64 Linux human interactive acceptance remain unverified",
+    "Volume-backed full soak, cold-query latency and slow-storage autosave investigations remain paused/unaccepted"
+  ]
+}

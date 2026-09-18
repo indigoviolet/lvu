@@ -1,6 +1,6 @@
 # lvu work plan
 
-Current published version: **v0.1.14**. See [CHANGELOG.md](CHANGELOG.md) for what
+Current published version: **v0.1.15**. See [CHANGELOG.md](CHANGELOG.md) for what
 each version shipped, and the [work ledger](docs/work-ledger.md) for validation
 evidence. Completed checklist history is archived in
 [docs/todo-history.md](docs/todo-history.md).
@@ -27,7 +27,7 @@ holds.
 
 | Status | Work |
 | --- | --- |
-| **Open** | Prevent build-output accumulation: implement explicit retirement for completed worktree/release targets while preserving named investigation binaries and proof. The pre-release cleanup removed only rebuildable outputs and completed agent worktrees; the accepted v0.1.14 targets and proof archives are deliberately retained. Ordinary janitor omits release/integration names and retires existing worktrees only by `main` containment; current integration uses a separate branch. |
+| **Open** | Prevent build-output accumulation: implement explicit retirement for completed worktree/release targets while preserving named investigation binaries and proof. The pre-release cleanup removed only rebuildable outputs and completed agent worktrees; the accepted v0.1.15 target and proof archive are deliberately retained. Ordinary janitor omits release/integration names and retires existing worktrees only by `main` containment; current integration uses a separate branch. |
 | **Open** | Optionally retain and display a bookmark's originating view. Bookmarks are deliberately source-scoped today, so the durable record identity and note survive across views but no origin-view metadata is stored; adding it needs a separate compatible schema/product decision. |
 | **Open** | Replace the hand-curated display-zone presets with UTC, the detected local IANA zone, recent choices and searchable IANA/custom input. UTC remains the default; the current custom field already accepts named IANA zones and fixed offsets. |
-| **Open** | Apple-silicon macOS human terminal acceptance: run the v0.1.14 checklist in Terminal.app and iTerm2. The v0.1.14 archive built and executed on native CI; human acceptance remains outstanding. Linux arm64 also lacks human interactive acceptance. Intel Macs and Windows are unsupported and are not acceptance targets. |
+| **Open** | Apple-silicon macOS human terminal acceptance: run the v0.1.15 checklist in Terminal.app and iTerm2. The v0.1.15 archive built and executed on native CI; human acceptance remains outstanding. Linux arm64 also lacks human interactive acceptance. Intel Macs and Windows are unsupported and are not acceptance targets. |
