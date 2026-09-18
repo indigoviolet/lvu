@@ -5217,6 +5217,7 @@ fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
             label: "stale.log".into(),
             detail: "old scan".into(),
             status: "available".into(),
+            ..DiscoveryItem::default()
         }],
         "stale complete".into(),
     ));
@@ -5227,20 +5228,24 @@ fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
                 key: "docker".into(),
                 label: "api service".into(),
                 detail: "compose service api".into(),
-                status: "Docker High Available".into(),
+                status: "Running".into(),
+                section: lvu::DiscoverySection::DockerServices,
+                ..DiscoveryItem::default()
             },
             DiscoveryItem {
                 key: "file".into(),
                 label: "events.log".into(),
                 detail: "/tmp/events.log — writable tee target".into(),
-                status: "Procfs High Available".into(),
+                status: "Updated just now".into(),
+                section: lvu::DiscoverySection::ProcessFiles,
+                ..DiscoveryItem::default()
             },
         ],
         "2 candidates, complete".into(),
     ));
     let discovered = render(&provider, &mut app, 100, 24);
     assert!(discovered.contains("api service"), "{discovered}");
-    assert!(discovered.contains("Docker High Available"), "{discovered}");
+    assert!(discovered.contains("Running"), "{discovered}");
     assert!(discovered.contains("compose service api"));
     assert!(discovered.contains("2 candidates, complete"));
     assert!(discovered.contains("Manual"));
@@ -5480,6 +5485,7 @@ fn discovery_fixed_rows_keep_last_candidate_visible_highlighted_and_clickable() 
             ),
             detail: format!("/tmp/very long directory/候補 {index:02}/events.log — evidence"),
             status: "available with long provider evidence".into(),
+            ..DiscoveryItem::default()
         })
         .collect();
     assert!(app.apply_discovery_result(

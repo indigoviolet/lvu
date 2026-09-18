@@ -177,7 +177,11 @@ The request uses a maximum 32 KiB inline typed schema/sample and carries no
 dataset paths or inspection command. Its definition/data revisions bind the
 target. Log values, field names and samples are untrusted data, never prompt
 instructions. At most one automatic setup assistance session is active, with
-bounded cancellation and cleanup.
+bounded cancellation and cleanup. It uses the distinct `auto_setup` session
+purpose and title `lvu automatic log setup`. A settled proposal releases lvu's
+bounded active slot but leaves the resumable Paseo conversation and its owned
+ledger record intact for inspection. The terminal status exposes its session
+ID.
 
 The `auto_setup` proposal is one complete bundle: at most eight unique native
 enrichment expressions, eight unique pins, sixteen exact-value colour rules,

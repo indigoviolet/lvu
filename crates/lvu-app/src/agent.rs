@@ -83,6 +83,7 @@ pub const MAX_SOURCES_PER_PROPOSAL: usize = 8;
 #[serde(rename_all = "snake_case")]
 pub enum SessionPurpose {
     Ask,
+    AutoSetup,
     SourceAssistance,
     Investigation,
 }
@@ -2265,6 +2266,7 @@ done
             "result='{\"session_id\":\"session-1\"}'",
             r#"case "$line" in
                 *'"purpose":"ask"'*) result='{"session_id":"ask"}' ;;
+                *'"purpose":"auto_setup"'*) result='{"session_id":"auto_setup"}' ;;
                 *'"purpose":"source_assistance"'*) result='{"session_id":"source_assistance"}' ;;
                 *'"purpose":"investigation"'*) result='{"session_id":"investigation"}' ;;
                 *'"purpose"'*) result='{"session_id":"invalid"}' ;;
@@ -2274,6 +2276,7 @@ done
         let (_temp, host) = fake(&body, Duration::from_secs(1));
         for (purpose, expected) in [
             (Some(SessionPurpose::Ask), "ask"),
+            (Some(SessionPurpose::AutoSetup), "auto_setup"),
             (Some(SessionPurpose::SourceAssistance), "source_assistance"),
             (Some(SessionPurpose::Investigation), "investigation"),
             (None, "legacy"),

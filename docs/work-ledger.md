@@ -3982,3 +3982,32 @@ No process used the superseded 0.1.13 installs: Homebrew and mise removed them,
 while the repository-local copy was moved to trash and remains recoverable.
 Human Apple-silicon macOS and arm64 Linux terminal acceptance remains
 unverified.
+
+## 2026-09-18 — v0.1.15 discovery presentation and inspectable automatic setup
+
+Primary integrated the responsive dialog, pane-interaction, Color Rules and
+dialog-grammar slices, then self-reviewed the combined behavior. Discover now
+uses separate source-type sections, newest-established activity ordering,
+plain availability language and a keyboard/mouse Show row for known unavailable
+sources older than fourteen days. Matching filters reveal collapsed rows.
+Compose service rows show the project/service name once; container rows remain
+independently selectable.
+
+Automatic setup now creates a distinctly titled, resumable `auto_setup` Paseo
+conversation rather than an ephemeral Ask session. After a proposal settles,
+the bridge detaches its observer and frees bounded live-session capacity without
+archiving the Paseo conversation or owned ledger entry. The non-modal footer
+shows `Paseo: <session>` through application, no-change and diagnosable failure
+paths; `Current log > Analyze again` remains the explicit retry/trigger.
+
+Targeted evidence is green: combined Rust check; all 236 `lvu-app` unit tests
+plus its settings, shared-key, storage and union suites; the Source component
+suite after resolving two test assumptions exposed by section headings; bridge
+typecheck/build and 119/119 tests; and actual PTYs for Docker service/container
+discovery and raw-first automatic setup/restart/revert. The first combined Rust
+check preserved test-import failures, the first Source component run preserved
+two geometry/visibility assertion failures, and the first two automatic-setup
+PTY runs proved the session status was being dropped as an overlong optional
+footer segment; each cause was corrected before the recorded green rerun. Full
+workspace, Clippy and complete PTY/restart/remote-union acceptance remain
+pending; no release version or tag has been created.

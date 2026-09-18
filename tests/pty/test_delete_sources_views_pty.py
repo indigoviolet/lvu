@@ -184,7 +184,7 @@ def run(binary):
             app.send(b" ")
             app.wait_for("Add source")
             app.send(b"\x04")
-            app.wait_for("Candidates")
+            app.wait_for("Details")
             # The report lands when the bounded scan completes; the scanning
             # message losing its "scanning" tail is visible without scrolling
             # and proves completion.
@@ -204,7 +204,7 @@ def run(binary):
                 "Processes / open files",
                 "Project files",
                 "Docker services / containers",
-                "Remembered sources",
+                "Previously opened",
             )
             while _time.monotonic() < deadline:
                 app.drain()
@@ -232,11 +232,11 @@ def run(binary):
                 )
             joined = "\n".join(seen)
             for category in ("Processes / open files", "Project files",
-                             "Docker services / containers", "Remembered sources"):
+                             "Docker services / containers", "Previously opened"):
                 assert category in joined, f"discovery names {category}:\n{joined}"
             assert "Procfs" not in joined, "product labels, not Debug names"
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Candidates" not in text, "discovery closed")
+            app.wait_until(lambda text: "Details" not in text, "discovery closed")
             stop(app)
         finally:
             if app.process.poll() is None:

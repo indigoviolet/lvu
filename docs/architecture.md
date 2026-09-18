@@ -125,7 +125,7 @@ Discovery checks every enabled category concurrently against the one global
 deadline (processes/open files, project files, Docker services/containers), so
 a slow scan cannot starve Docker, and reports each with product labels, match
 counts and checked/partial/unavailable/unsupported/cancelled/time-limit outcomes
-plus bounded detail; remembered sources report alongside. Docker keeps each
+plus bounded detail; previously opened sources report alongside. Docker keeps each
 container candidate and adds one Compose project/service aggregate when the
 recorded configuration is locally addressable. Its commands are exact argv:
 implicit routing preserves `DOCKER_HOST`/`DOCKER_CONTEXT`, while only an
@@ -134,6 +134,14 @@ from independently JSON-escaped label fields because Docker's flattened Labels
 text cannot preserve a comma-separated config-file list. Aggregates with stale
 remote-host paths are omitted while their container candidates remain. An empty
 completed scan gives the report the unused candidate space.
+
+The Discover surface groups candidates into Docker Compose services, Docker
+containers, processes/open files, project files, previously opened and other
+sections. Within a section it orders by newest activity the provider can
+establish, then label and stable key. Unknown age is not guessed. A known
+unavailable source older than fourteen days is hidden by default behind a
+keyboard- and mouse-operable Show row; a non-empty filter includes matching old
+rows regardless of that collapse state.
 
 The journal owns exact bytes, delimiters, invalid UTF-8, capture timestamps and
 physical identities. Display strings and parsed/derived fields are projections.
@@ -326,6 +334,13 @@ when those views and the applied configuration still agree. Exact revert is
 ordinary durable view deletion and is offered only while the generated
 configuration is unchanged; a later manual edit removes automatic ownership
 rather than being silently undone.
+
+Automatic setup starts a managed bridge session with purpose `auto_setup` and
+the user-visible title `lvu automatic log setup`. Unlike short-lived Ask work,
+the Paseo conversation is resumable and remains in the owned workspace after
+the proposal settles. The bridge detaches its local observer to free bounded
+session capacity, while lvu keeps the session ID in the non-modal status so the
+conversation can be inspected in Paseo.
 
 Preview033 manifests include deterministic part-relative row offsets,
 evenly spaced across each source, with at most 128/source and 512 total. Applied

@@ -451,7 +451,7 @@ fn empty_discovery_expands_the_report_with_every_category_named() {
         "Processes / open files: no matches · checked — examined 12 entries",
         "Project files: no matches · checked — examined 4 entries",
         "Docker containers: no matches · checked — docker discovery complete",
-        "Remembered sources: no matches · checked",
+        "Previously opened: no matches · checked",
     ]
     .join("\n");
     assert!(app.apply_discovery_result(generation, Vec::new(), report));
@@ -466,7 +466,7 @@ fn empty_discovery_expands_the_report_with_every_category_named() {
         "Processes / open files",
         "Project files",
         "Docker containers",
-        "Remembered sources",
+        "Previously opened",
     ] {
         assert!(
             rendered.contains(category),
@@ -480,7 +480,7 @@ fn empty_discovery_expands_the_report_with_every_category_named() {
         "Processes / open files: no matches · checked",
         "Project files: no matches · checked",
         "Docker containers: no matches · unavailable — docker ps failed: permission denied; check Docker daemon/socket access for this user (OS permission; lvu cannot change it)",
-        "Remembered sources: no matches · checked",
+        "Previously opened: no matches · checked",
     ]
     .join("\n");
     assert!(app.apply_discovery_result(generation, Vec::new(), failure));

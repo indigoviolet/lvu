@@ -61,6 +61,9 @@ impl AutoSetupStatus {
             value.push_str(" · ");
             value.push_str(&self.detail);
         }
+        if self.stage == AutoSetupStage::Unavailable {
+            value.push_str(" · retry: Ctrl-P → Current log › Analyze again");
+        }
         value
     }
 }
@@ -357,6 +360,26 @@ mod tests {
         assert_eq!(
             status.summary(),
             "payments / All events · automatic setup: analyzing · bounded sample"
+        );
+    }
+
+    #[test]
+    fn unavailable_status_names_the_manual_retry_path() {
+        let status = AutoSetupStatus {
+            source_id: "source".into(),
+            origin_view_id: "view".into(),
+            object_name: "payments / All events".into(),
+            stage: AutoSetupStage::Unavailable,
+            detail: "agent service unavailable".into(),
+        };
+        let summary = status.summary();
+        assert!(
+            summary.contains("automatic setup: unavailable"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Ctrl-P → Current log › Analyze again"),
+            "{summary}"
         );
     }
 }

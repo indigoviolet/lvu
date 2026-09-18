@@ -12,7 +12,7 @@
 //! only handed over once `SOURCE_PATH_COMPLETION_DEBOUNCE` has passed, which is
 //! what keeps automatic completion from asking on every keystroke.
 
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -26,9 +26,9 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    DiscoveryItem, DiscoveryUiRequest, MAX_AI_PROMPT_BYTES, MAX_EDITOR_BYTES,
-    PathCompletionRequest, SourceAiPreview, SourceAiRequest, SourceAiStage, SourceKind,
-    SourceLaunchRequest,
+    DiscoveryAvailability, DiscoveryItem, DiscoverySection, DiscoveryUiRequest,
+    MAX_AI_PROMPT_BYTES, MAX_EDITOR_BYTES, PathCompletionRequest, SourceAiPreview, SourceAiRequest,
+    SourceAiStage, SourceKind, SourceLaunchRequest,
 };
 use crate::command_palette::CommandId;
 use crate::component::{
@@ -53,6 +53,7 @@ const SOURCE_PATH_COMPLETION_DEBOUNCE: std::time::Duration = std::time::Duration
 const MAX_SOURCE_REQUESTS: usize = 8;
 const MAX_DISCOVERY_REQUESTS: usize = 4;
 const MAX_SOURCE_AI_REQUESTS: usize = 8;
+const OLDER_UNAVAILABLE_SECONDS: i64 = 14 * 24 * 60 * 60;
 
 /// One queue for four kinds of work; the cap only has to stop an unbounded
 /// queue if `lvu-app` stops draining (AGENTS.md). Each kind's own refusal
@@ -152,6 +153,7 @@ pub struct DiscoveryDialogState {
     pub status: String,
     pub status_scroll: usize,
     pub status_scroll_limit: usize,
+    pub show_older_unavailable: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -236,6 +238,7 @@ pub enum SourceHit {
     Control(SourceControl),
     PathCompletion(usize),
     Discovery(usize),
+    OlderUnavailable,
     Existing(usize),
     /// The scrollable status or proposal pane.
     Scroll,
@@ -248,6 +251,7 @@ struct SourceGeometry {
     controls: Vec<(Rect, SourceControl)>,
     path_completion_rows: Vec<(Rect, usize)>,
     discovery_rows: Vec<(Rect, usize)>,
+    older_unavailable: Option<Rect>,
     existing_rows: Vec<(Rect, usize)>,
     scroll: Option<Rect>,
 }
@@ -430,6 +434,7 @@ impl SourceDialog {
         self.state.discovery.scanning = false;
         self.state.discovery.status = status;
         self.state.discovery.status_scroll = 0;
+        self.state.discovery.show_older_unavailable = false;
         self.state.error = None;
         true
     }
@@ -672,18 +677,92 @@ pub(crate) fn clear_path_completion(dialog: &mut SourceDialogState) {
 /// Discovery rows the query keeps, by index into `items`. Moved from `App`.
 pub fn filtered_discovery_indices(state: &DiscoveryDialogState) -> Vec<usize> {
     let query = state.query.to_lowercase();
-    state
+    let now = discovery_now();
+    let mut indices = state
         .items
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            query.is_empty()
+            let matches = query.is_empty()
                 || item.label.to_lowercase().contains(&query)
                 || item.detail.to_lowercase().contains(&query)
-                || item.status.to_lowercase().contains(&query)
+                || item.status.to_lowercase().contains(&query);
+            let older_unavailable = is_older_unavailable(item, now);
+            matches && (!query.is_empty() || state.show_older_unavailable || !older_unavailable)
         })
         .map(|(index, _)| index)
-        .collect()
+        .collect::<Vec<_>>();
+    indices.sort_by(|left, right| {
+        let left = &state.items[*left];
+        let right = &state.items[*right];
+        left.section
+            .cmp(&right.section)
+            .then_with(|| right.recent_activity.cmp(&left.recent_activity))
+            .then_with(|| left.label.to_lowercase().cmp(&right.label.to_lowercase()))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    indices
+}
+
+fn discovery_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+fn is_older_unavailable(item: &DiscoveryItem, now: i64) -> bool {
+    item.availability == DiscoveryAvailability::NotAvailable
+        && item
+            .recent_activity
+            .is_some_and(|activity| now.saturating_sub(activity) > OLDER_UNAVAILABLE_SECONDS)
+}
+
+fn hidden_older_unavailable(state: &DiscoveryDialogState) -> usize {
+    if state.show_older_unavailable || !state.query.is_empty() {
+        return 0;
+    }
+    let now = discovery_now();
+    state
+        .items
+        .iter()
+        .filter(|item| is_older_unavailable(item, now))
+        .count()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiscoveryDisplayRow {
+    Heading(DiscoverySection),
+    Candidate { item: usize, selection: usize },
+    OlderUnavailable(usize),
+}
+
+fn discovery_display_rows(state: &DiscoveryDialogState) -> Vec<DiscoveryDisplayRow> {
+    let indices = filtered_discovery_indices(state);
+    let mut rows = Vec::with_capacity(indices.len().saturating_mul(2).saturating_add(1));
+    let hidden = hidden_older_unavailable(state);
+    if hidden > 0 {
+        rows.push(DiscoveryDisplayRow::OlderUnavailable(hidden));
+    } else if state.show_older_unavailable
+        && state.query.is_empty()
+        && state
+            .items
+            .iter()
+            .any(|item| is_older_unavailable(item, discovery_now()))
+    {
+        rows.push(DiscoveryDisplayRow::OlderUnavailable(0));
+    }
+    let mut last_section = None;
+    for (selection, item) in indices.into_iter().enumerate() {
+        let section = state.items[item].section;
+        if last_section != Some(section) {
+            rows.push(DiscoveryDisplayRow::Heading(section));
+            last_section = Some(section);
+        }
+        rows.push(DiscoveryDisplayRow::Candidate { item, selection });
+    }
+    rows
 }
 
 impl SourceDialog {
@@ -804,6 +883,7 @@ impl SourceDialog {
         discovery.scanning = true;
         discovery.items.clear();
         discovery.selected = 0;
+        discovery.show_older_unavailable = false;
         discovery.status = "scanning bounded local providers…".into();
         let generation = discovery.generation;
         if let Some(generation) = cancel {
@@ -837,6 +917,13 @@ impl SourceDialog {
             .selected
             .saturating_add_signed(delta as isize)
             .min(count - 1);
+    }
+
+    fn toggle_older_unavailable(&mut self) {
+        let discovery = &mut self.state.discovery;
+        discovery.show_older_unavailable = !discovery.show_older_unavailable;
+        let count = filtered_discovery_indices(discovery).len();
+        discovery.selected = discovery.selected.min(count.saturating_sub(1));
     }
 
     fn move_path_completion(&mut self, delta: i32) {
@@ -1357,6 +1444,9 @@ impl SourceDialog {
         match key.code {
             KeyCode::Char('d') if control => self.toggle_discovery(),
             KeyCode::Char('r') if control => self.start_discovery_scan(),
+            KeyCode::Char('o') if alt && self.state.mode == SourceDialogMode::Discovery => {
+                self.toggle_older_unavailable()
+            }
             KeyCode::Char('f') if alt => self.select_kind(SourceKind::File),
             KeyCode::Char('c') if alt => self.select_kind(SourceKind::Command),
             KeyCode::Delete if self.state.mode == SourceDialogMode::Existing => {
@@ -1451,6 +1541,10 @@ impl SourceDialog {
             return Outcome::Consumed;
         }
         if self.state.mode != SourceDialogMode::Discovery {
+            return Outcome::Consumed;
+        }
+        if pressed && hit == Some(SourceHit::OlderUnavailable) {
+            self.toggle_older_unavailable();
             return Outcome::Consumed;
         }
         if pressed && let Some(SourceHit::Discovery(index)) = hit {
@@ -1670,6 +1764,12 @@ impl Component for SourceDialog {
                 geometry.discovery_rows.iter().find_map(|(rect, index)| {
                     contains(*rect, point).then_some(SourceHit::Discovery(*index))
                 })
+            })
+            .or_else(|| {
+                geometry
+                    .older_unavailable
+                    .filter(|rect| contains(*rect, point))
+                    .map(|_| SourceHit::OlderUnavailable)
             })
     }
 
@@ -2306,37 +2406,45 @@ fn render_source(
                 }
             }
             if !empty_report && list_area.height > 0 {
-                let total = discovery_indices.len();
+                let display_rows = discovery_display_rows(&dialog.discovery);
+                let total = display_rows.len();
                 let selected = dialog
                     .discovery
                     .selected
                     .min(discovery_indices.len().saturating_sub(1));
+                let selected_row = display_rows.iter().position(|entry| {
+                    matches!(entry, DiscoveryDisplayRow::Candidate { selection, .. } if *selection == selected)
+                });
                 // One authoritative list plan: heading/count/viewport/
                 // scrollbar plus the selected window and painted row rects.
                 // The same rects drive paint, selection, scrollbar and mouse.
                 // The heading counts what is shown against the total (§8.7).
-                let plan_probe = plan_list(
-                    list_area,
-                    0,
-                    total.max(1),
-                    (!discovery_indices.is_empty()).then_some(selected),
-                    0,
-                );
-                let shown = plan_probe.row_rects.len().min(total);
-                let count = if total == 0 {
+                let plan_probe = plan_list(list_area, 0, total.max(1), selected_row, 0);
+                let shown = plan_probe
+                    .row_rects
+                    .iter()
+                    .enumerate()
+                    .filter(|(offset, _)| {
+                        matches!(
+                            display_rows.get(plan_probe.first_row.saturating_add(*offset)),
+                            Some(DiscoveryDisplayRow::Candidate { .. })
+                        )
+                    })
+                    .count();
+                let count = if discovery_indices.is_empty() {
                     "none".to_owned()
                 } else {
-                    format!("{shown} of {total}")
+                    format!("{shown} of {}", discovery_indices.len())
                 };
                 let rects = plan_list(
                     list_area,
                     u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
                     total.max(1),
-                    (!discovery_indices.is_empty()).then_some(selected),
+                    selected_row,
                     0,
                 );
                 frame.render_widget(
-                    Paragraph::new("Candidates").style(styles.label.add_modifier(Modifier::BOLD)),
+                    Paragraph::new("Sources").style(styles.label.add_modifier(Modifier::BOLD)),
                     rects.heading,
                 );
                 if rects.count.width > 0 {
@@ -2348,7 +2456,7 @@ fn render_source(
                     );
                 }
                 let top = rects.first_row;
-                if discovery_indices.is_empty() {
+                if display_rows.is_empty() {
                     frame.render_widget(
                         Paragraph::new("No matching candidates").style(styles.unavailable),
                         rects.viewport,
@@ -2356,29 +2464,53 @@ fn render_source(
                 }
                 for (offset, row) in rects.row_rects.iter().copied().enumerate() {
                     let position = top.saturating_add(offset);
-                    let Some(index) = discovery_indices.get(position).copied() else {
+                    let Some(entry) = display_rows.get(position).copied() else {
                         continue;
                     };
-                    let item = &dialog.discovery.items[index];
-                    let chosen = position == selected;
-                    let marker = if chosen {
-                        if ascii { "> " } else { "› " }
-                    } else {
-                        "  "
-                    };
-                    frame.render_widget(
-                        Paragraph::new(truncated(
-                            &format!("{marker}{}  {}", item.label, item.status),
-                            usize::from(row.width),
-                        ))
-                        .style(if chosen {
-                            styles.selection
-                        } else {
-                            styles.description
-                        }),
-                        row,
-                    );
-                    geometry.discovery_rows.push((row, position));
+                    match entry {
+                        DiscoveryDisplayRow::Heading(section) => frame.render_widget(
+                            Paragraph::new(truncated(section.label(), usize::from(row.width)))
+                                .style(styles.shortcut),
+                            row,
+                        ),
+                        DiscoveryDisplayRow::Candidate { item, selection } => {
+                            let item = &dialog.discovery.items[item];
+                            let chosen = selection == selected;
+                            let marker = if chosen {
+                                if ascii { "> " } else { "› " }
+                            } else {
+                                "  "
+                            };
+                            frame.render_widget(
+                                Paragraph::new(truncated(
+                                    &format!("{marker}{}  {}", item.label, item.status),
+                                    usize::from(row.width),
+                                ))
+                                .style(if chosen {
+                                    styles.selection
+                                } else if item.availability == DiscoveryAvailability::NotAvailable {
+                                    styles.unavailable
+                                } else {
+                                    styles.description
+                                }),
+                                row,
+                            );
+                            geometry.discovery_rows.push((row, selection));
+                        }
+                        DiscoveryDisplayRow::OlderUnavailable(hidden) => {
+                            let label = if hidden == 0 {
+                                "Hide older unavailable sources · Alt-O".to_owned()
+                            } else {
+                                format!("Show {hidden} older unavailable sources · Alt-O")
+                            };
+                            frame.render_widget(
+                                Paragraph::new(truncated(&label, usize::from(row.width)))
+                                    .style(styles.shortcut),
+                                row,
+                            );
+                            geometry.older_unavailable = Some(row);
+                        }
+                    }
                 }
                 if let Some(bar) = rects.scrollbar {
                     render_scrollbar(

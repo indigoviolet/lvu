@@ -101,14 +101,17 @@ for an explicit launch; select one to read its complete status, restart it or
 remove it from the workspace. Its Add source action opens the separate creation
 dialog. `n` goes straight to that Add source dialog, whose Manual tab opens
 files or commands, while Discover checks processes/open files, project files,
-Docker services/containers and remembered sources, naming every category
-checked and which produced no results. Docker discovery keeps every individual
-container source and also offers one Compose-service source that follows all
-replicas when its Compose configuration is available locally; it uses the same
-implicit Docker environment routing as the CLI unless a context was explicitly
-configured. Agent proposes reviewed sources. With no source and nothing to
-resume, Add source opens automatically. Nothing starts capturing until you
-choose it.
+Docker services/containers and previously opened sources, naming every category
+checked and which produced no results. Results are separated by source type and
+sorted by newest established activity within each section. Sources known to be
+unavailable for more than two weeks are collapsed behind an explicit Show row;
+filtering still finds them, and `Alt-O` expands or collapses them. Docker
+discovery keeps every individual container source and also offers one
+Compose-service source that follows all replicas when its Compose configuration
+is available locally; it uses the same implicit Docker environment routing as
+the CLI unless a context was explicitly configured. Agent proposes reviewed
+sources. With no source and nothing to resume, Add source opens automatically.
+Nothing starts capturing until you choose it.
 
 In the viewer:
 
@@ -187,7 +190,10 @@ command, source or time window. `Current log > Analyze again` runs the same
 operation explicitly; `Current view > Revert automatic setup` removes an
 unchanged generated view while preserving its source and captured bytes. Once
 you edit that setup manually, lvu refuses the automatic revert so it cannot
-erase your work.
+erase your work. While analysis runs, the footer names its current stage without
+blocking raw browsing. Its `Paseo: <session>` result identifies a retained
+`lvu automatic log setup` conversation in Paseo; these conversations are not
+archived when the one-shot proposal completes.
 
 Two assistance failures look similar but have different remedies. An owned-route
 busy report names the exact `bridge.lock` under the capture's `assistance`

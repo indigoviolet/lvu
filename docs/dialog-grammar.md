@@ -96,7 +96,7 @@ not claim adoption until they return a validated flow spec.
 The inventory below remains authoritative for migration status. In particular,
 every row marked **Split** is still nonconforming: Source Agent proposal,
 shared-key union, Recipes Save, Filter, Grouping, Time, Edit enrichment step,
-Existing external command, Colour rules, Folding, Ask Proposal, Investigation
+Existing external command, Folding, Ask Proposal, Investigation
 Saved and Investigation Conversation. Rows marked **Clarify** preserve sound
 behaviour but still lack explicit subject or phase presentation.
 
@@ -137,7 +137,7 @@ object changes.
 | Edit enrichment step | Existing stage | expression/output | stage summary -> Edit -> parameters/preview -> Save | Split: current editor begins with generic Edit |
 | New external command | New stage | program/args/cwd/env | Add command -> parameters -> Save | Keep |
 | Existing external command | Existing stage | Edit, Review and run, Remove | stage summary -> operation -> operation controls | Split: definition fields are always visible |
-| Colour rules | Existing view/rules and new rules | Add, Edit, Remove, Apply; column/value/colour | manager: view -> rules -> operation; child: Add/Edit -> parameters -> Save | Split: manager and implicit editor are fused |
+| Colour rules | Existing view/rules and new rules | Add, Edit, Remove, Apply; column/value/colour | manager: view -> rules -> operation; child: Add/Edit -> parameters -> Save | Keep: manager and parameter editor are separate layers |
 | Folding | Existing view | Configure, Collapse all; key/minimum/scope | view -> operation -> Configure parameters only | Split: unrelated operation shares the form |
 | Fields | Existing record and field/value | Pin, Filter, Exclude, Colour, Fold, Correlate | frozen record -> field/value -> operation | Clarify with a sticky subject summary |
 | Correlation | Existing field/value; new result | per-source field mapping | frozen origin -> Correlate -> mappings -> Create | Clarify |
@@ -167,6 +167,8 @@ It never adds fields to Add source and never delays raw display.
 5. A successful locally validated proposal atomically creates an ordinary
    derived `Enhanced` view. `All events` remains raw.
 6. The generated setup receipt becomes an existing child object of that view.
+7. The applied state names the retained Paseo session; inspecting that
+   conversation is outside the mutation flow and changes no view state.
 
 Manual operations follow the same grammar:
 

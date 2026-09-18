@@ -90,7 +90,7 @@ def run(binary: pathlib.Path) -> None:
         app.send(b"\x04")  # Ctrl-D: discovery.
         # §12.7 folds discovery into `Add source` as a mode, so it is identified
         # by its own body and actions rather than by a separate dialog title.
-        discovery = app.wait_for("Candidates")
+        discovery = app.wait_for("Details")
         assert "never starts capture" in discovery, discovery
         assert "[ Rescan ]" in discovery and "Manual" in discovery
         assert "Details" in discovery, discovery
@@ -98,7 +98,7 @@ def run(binary: pathlib.Path) -> None:
             assert hint not in discovery, f"shortcut hint {hint!r} leaked into discovery"
 
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Candidates" not in text, "discovery closed")
+        app.wait_until(lambda text: "Details" not in text, "discovery closed")
         app.send(b"q")
         assert app.wait_exit(timeout=5) == 0
         app.assert_restored()

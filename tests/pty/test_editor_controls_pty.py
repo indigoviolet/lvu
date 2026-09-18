@@ -97,7 +97,7 @@ def run(binary, arguments=None, environment=None):
         app.send(b"\t")
         app.assert_remains("Manual", "THIS STRING CANNOT APPEAR")
         app.send(b"\x1b[C")
-        app.wait_for("Candidates")
+        app.wait_for("Details")
         app.send(b"\x1b")
         app.wait_until(lambda text: "Add source" not in text, "source dialog closes")
 

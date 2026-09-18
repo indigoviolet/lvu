@@ -17,7 +17,7 @@ def discover(app: PtyApp, query: bytes, expected: str) -> None:
     app.send(b"n")
     app.wait_for("Add source")
     app.send(b"\x04")
-    app.wait_for("Candidates")
+    app.wait_for("Sources")
     app.wait_until(lambda text: "scanning" not in text, "Docker discovery settled", timeout=15)
     app.send(query)
     app.wait_for(expected)
@@ -51,12 +51,22 @@ def run(binary: pathlib.Path) -> None:
             },
             separators=(",", ":"),
         )
+        old_row = json.dumps(
+            {
+                "ID": "retired-job-id",
+                "Names": "retired-job",
+                "Image": "example",
+                "State": "exited",
+                "Status": "Exited (0) 3 weeks ago",
+            },
+            separators=(",", ":"),
+        )
         docker.write_text(
             "#!/bin/sh\n"
             "if [ \"$1\" = context ] && [ \"$2\" = show ]; then\n"
             "  printf 'default\\n'\n"
             "elif [ \"$1\" = ps ] && [ \"$2\" = --all ]; then\n"
-            f"  printf '%s\\n' '{row}'\n"
+            f"  printf '%s\\n%s\\n' '{row}' '{old_row}'\n"
             "elif [ \"$1\" = compose ]; then\n"
             f"  printf 'compose:%s\\n' \"$*\" >> '{invocations}'\n"
             "  printf 'service-aggregate-row\\n'\n"
@@ -88,11 +98,29 @@ def run(binary: pathlib.Path) -> None:
             app.send(b" ")
             app.wait_for("Add source")
             app.send(b"\x1b")
-            discover(app, b"Docker service", "pty/api (Docker service)")
+            app.send(b"n")
+            app.wait_for("Add source")
+            app.send(b"\x04")
+            app.wait_for("Sources")
+            app.wait_until(
+                lambda text: "scanning" not in text,
+                "Docker discovery settled",
+                timeout=15,
+            )
+            app.wait_for("Show 1 older unavailable source")
+            assert "retired-job" not in app.text()
+            app.send(b"\x1bo")
+            app.wait_for("retired-job")
+            assert "Docker Compose services" in app.text()
+            assert "Docker containers" in app.text()
+            app.send(b"pty/api")
+            app.wait_for("pty/api")
+            assert "pty/api (Docker service)" not in app.text()
+            app.send(b"\r")
             app.wait_for("service-aggregate-row", timeout=20)
 
             # Rescan and open the retained per-container candidate too.
-            discover(app, b"#1", "pty/api #1 (Docker)")
+            discover(app, b"pty-api-1", "pty-api-1")
             app.wait_for("individual-container-row", timeout=20)
             recorded = invocations.read_text().splitlines()
             assert any(

@@ -364,18 +364,21 @@ fn discovery_items() -> Vec<DiscoveryItem> {
             label: "api.log".into(),
             detail: "/tmp/api.log".into(),
             status: "available".into(),
+            ..DiscoveryItem::default()
         },
         DiscoveryItem {
             key: "worker-a".into(),
             label: "worker-a.log".into(),
             detail: "/tmp/worker-a.log".into(),
             status: "available".into(),
+            ..DiscoveryItem::default()
         },
         DiscoveryItem {
             key: "worker-b".into(),
             label: "worker-b.log".into(),
             detail: "/tmp/worker-b.log".into(),
             status: "available".into(),
+            ..DiscoveryItem::default()
         },
     ]
 }
@@ -408,24 +411,33 @@ fn docker_service_and_container_candidates_remain_distinct_and_selectable() {
         vec![
             DiscoveryItem {
                 key: "container-key".into(),
-                label: "shop/api #1 (Docker)".into(),
+                label: "shop-api-1".into(),
                 detail: "Docker container shop-api-1 — Docker container log source".into(),
-                status: "Docker container · High · Available".into(),
+                status: "Running".into(),
+                section: lvu::DiscoverySection::DockerContainers,
+                availability: lvu::DiscoveryAvailability::Ready,
+                ..DiscoveryItem::default()
             },
             DiscoveryItem {
                 key: "service-key".into(),
-                label: "shop/api (Docker service)".into(),
+                label: "shop/api".into(),
                 detail: "Compose service shop/api — Docker Compose service log source".into(),
-                status: "Docker service · High · Available".into(),
+                status: "Running".into(),
+                section: lvu::DiscoverySection::DockerServices,
+                availability: lvu::DiscoveryAvailability::Ready,
+                ..DiscoveryItem::default()
             },
         ],
         "Docker services / containers: 2 matches · checked".into(),
     ));
     let rendered = screen(&draw(&mut app, 80, 24));
-    assert!(rendered.contains("shop/api #1 (Docker)"), "{rendered}");
-    assert!(rendered.contains("shop/api (Docker service)"), "{rendered}");
+    assert!(rendered.contains("Docker Compose services"), "{rendered}");
+    assert!(rendered.contains("Docker containers"), "{rendered}");
+    assert!(rendered.contains("shop-api-1"), "{rendered}");
+    assert!(rendered.contains("shop/api"), "{rendered}");
+    assert!(!rendered.contains("High"), "{rendered}");
 
-    paste(&mut app, "Docker service");
+    paste(&mut app, "shop/api");
     draw(&mut app, 80, 24);
     key(&mut app, KeyCode::Enter);
     assert_eq!(
@@ -434,6 +446,82 @@ fn docker_service_and_container_candidates_remain_distinct_and_selectable() {
             generation,
             key: "service-key".into(),
         }]
+    );
+}
+
+#[test]
+fn discovery_groups_types_sorts_recent_activity_and_expands_old_unavailable() {
+    let mut app = empty();
+    key_with(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    let generation = match app.take_discovery_requests().pop().unwrap() {
+        lvu::DiscoveryUiRequest::Scan { generation } => generation,
+        other => panic!("unexpected request: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(app.apply_discovery_result(
+        generation,
+        vec![
+            DiscoveryItem {
+                key: "older-project".into(),
+                label: "older.log".into(),
+                status: "Updated 2m ago".into(),
+                section: lvu::DiscoverySection::ProjectFiles,
+                recent_activity: Some(now - 120),
+                availability: lvu::DiscoveryAvailability::Ready,
+                ..DiscoveryItem::default()
+            },
+            DiscoveryItem {
+                key: "newer-project".into(),
+                label: "newer.log".into(),
+                status: "Updated just now".into(),
+                section: lvu::DiscoverySection::ProjectFiles,
+                recent_activity: Some(now),
+                availability: lvu::DiscoveryAvailability::Ready,
+                ..DiscoveryItem::default()
+            },
+            DiscoveryItem {
+                key: "service".into(),
+                label: "shop/api".into(),
+                status: "Running".into(),
+                section: lvu::DiscoverySection::DockerServices,
+                recent_activity: Some(now - 500),
+                availability: lvu::DiscoveryAvailability::Ready,
+                ..DiscoveryItem::default()
+            },
+            DiscoveryItem {
+                key: "old-stopped".into(),
+                label: "retired-worker".into(),
+                status: "Stopped · active 3w ago".into(),
+                section: lvu::DiscoverySection::DockerContainers,
+                recent_activity: Some(now - 21 * 24 * 60 * 60),
+                availability: lvu::DiscoveryAvailability::NotAvailable,
+                ..DiscoveryItem::default()
+            },
+        ],
+        "complete".into(),
+    ));
+
+    let collapsed = screen(&draw(&mut app, 90, 32));
+    assert!(!collapsed.contains("retired-worker"), "{collapsed}");
+    assert!(
+        collapsed.contains("Show 1 older unavailable sources"),
+        "{collapsed}"
+    );
+    let service = collapsed.find("Docker Compose services").unwrap();
+    let projects = collapsed.find("Project log files").unwrap();
+    let newer = collapsed.find("newer.log").unwrap();
+    let older = collapsed.find("older.log").unwrap();
+    assert!(service < projects && projects < newer && newer < older);
+
+    key_with(&mut app, KeyCode::Char('o'), KeyModifiers::ALT);
+    let expanded = screen(&draw(&mut app, 90, 32));
+    assert!(expanded.contains("retired-worker"), "{expanded}");
+    assert!(
+        expanded.contains("Hide older unavailable sources"),
+        "{expanded}"
     );
 }
 
@@ -579,14 +667,14 @@ fn compact_discovery_and_review_stay_reachable_by_keyboard_and_mouse() {
             "candidate paint/hit disagree"
         );
     }
-    let (_, third) = rows[2];
+    let (_, visible) = rows[rows.len() - 1];
     let (row, _) = rows
         .iter()
-        .find(|(_, index)| *index == third)
+        .find(|(_, index)| *index == visible)
         .copied()
         .unwrap();
     click(&mut app, (row.x, row.y));
-    assert_eq!(app.layers.source.state().discovery.selected, third);
+    assert_eq!(app.layers.source.state().discovery.selected, visible);
     let pane = app.layers.source.scroll_rect().expect("details surface");
     click(&mut app, (pane.x, pane.y));
     draw(&mut app, 54, 16);
@@ -652,12 +740,14 @@ fn long_unicode_clips_with_exact_hitboxes() {
                     label: "café-日本語-👩‍💻-漢字-mix-".repeat(3),
                     detail: "combining éé wide 漢字 detail".into(),
                     status: "available".into(),
+                    ..DiscoveryItem::default()
                 },
                 DiscoveryItem {
                     key: "plain".into(),
                     label: "worker.log".into(),
                     detail: "/tmp/worker.log".into(),
                     status: "available".into(),
+                    ..DiscoveryItem::default()
                 },
             ],
             "complete".into(),

@@ -38,7 +38,8 @@ for line in sys.stdin:
     method = request["method"]
     request_id = request["request_id"]
     if method == "start_session":
-        assert request.get("purpose") == "ask"
+        assert request.get("purpose") == "auto_setup"
+        assert request.get("title") == "lvu automatic log setup"
         result = {"session_id": "automatic-setup-session"}
     elif method == "request_proposal":
         assert request["kind"] == "auto_setup"
@@ -77,7 +78,7 @@ for line in sys.stdin:
         result = {"accepted": True}
     print(json.dumps({"schema_version": 1, "request_id": request_id,
                       "ok": True, "result": result}), flush=True)
-    if method in ("request_proposal", "cancel"):
+    if method == "cancel":
         print(json.dumps({"schema_version": 1,
                           "session_id": "automatic-setup-session",
                           "kind": "session_archived"}), flush=True)
@@ -183,8 +184,11 @@ def run(binary: pathlib.Path) -> None:
         assert "Enhanced" not in raw, raw
 
         enhanced = app.wait_until(
-            lambda text: "Enhanced" in text and "automatic setup: applied" in text,
-            "strict proposal installed as an Enhanced view",
+            lambda text: "Enhanced" in text
+            and "automatic setup: applied" in text
+            and "Paseo:" in text
+            and "automatic-setup-session" in text,
+            "strict proposal installed with its inspectable Paseo session",
             timeout=25.0,
         )
         assert "All events" in enhanced and "database failed" in enhanced, enhanced
@@ -225,6 +229,9 @@ def run(binary: pathlib.Path) -> None:
         reopened = None
 
         requests = [json.loads(line) for line in archive.read_text().splitlines()]
+        started_session = next(item for item in requests if item.get("method") == "start_session")
+        assert started_session["purpose"] == "auto_setup"
+        assert started_session["title"] == "lvu automatic log setup"
         proposal = next(item for item in requests if item.get("method") == "request_proposal")
         assert proposal["kind"] == "auto_setup"
         assert proposal["context"]["dataset_paths"] == []

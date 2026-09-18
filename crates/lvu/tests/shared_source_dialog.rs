@@ -218,18 +218,21 @@ fn discovery_input_arrows_select_and_enter_admits_without_open_focus() {
                 label: "api.log".into(),
                 detail: "/tmp/api.log".into(),
                 status: "available".into(),
+                ..DiscoveryItem::default()
             },
             DiscoveryItem {
                 key: "worker-a".into(),
                 label: "worker-a.log".into(),
                 detail: "/tmp/worker-a.log".into(),
                 status: "available".into(),
+                ..DiscoveryItem::default()
             },
             DiscoveryItem {
                 key: "worker-b".into(),
                 label: "worker-b.log".into(),
                 detail: "/tmp/worker-b.log".into(),
                 status: "available".into(),
+                ..DiscoveryItem::default()
             },
         ],
         "complete".into(),
@@ -329,6 +332,7 @@ fn last_discovery_candidate_stays_visible_and_has_its_exact_row_hitbox() {
             label: format!("candidate-{index:02}.log"),
             detail: format!("/tmp/candidate-{index:02}.log"),
             status: "available".into(),
+            ..DiscoveryItem::default()
         })
         .collect();
     assert!(app.apply_discovery_result(generation, items, "complete".into()));

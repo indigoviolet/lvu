@@ -67,7 +67,7 @@ def run(binary):
                 "readable unfocused diagnostics",
                 timeout=10.0,
             )
-            # Candidates stream in, and each one moves the heading down a row.
+            # Sources stream in, and each one moves the heading down a row.
             # Measuring and then clicking a row that has since scrolled reads as
             # "focus does nothing", so take the coordinates only once the pane
             # has stopped moving.

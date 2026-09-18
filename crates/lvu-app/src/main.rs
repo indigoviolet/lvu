@@ -20,17 +20,18 @@ use std::{
         mpsc as std_mpsc,
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use lvu::theme::ThemeId;
 use lvu::{
     App, AskAiKind, AskAiRequest, AskAiStage, AskSample, AskSampleTier,
-    AutomaticSetupPolicy as UiAutomaticSetupPolicy, DiscoveryItem, DiscoveryUiRequest,
-    InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
-    RowProvider, SettingsContext, SettingsRequest, SettingsValues, SourceAiPreview,
-    SourceAiPreviewItem, SourceAiRequest, SourceAiStage, SourceItem, SourceKind,
-    SourceLaunchRequest, ViewItem, ViewportRequest, terminal::run_with_tick_mut,
+    AutomaticSetupPolicy as UiAutomaticSetupPolicy, DiscoveryAvailability, DiscoveryItem,
+    DiscoverySection, DiscoveryUiRequest, InvestigationItem, InvestigationRequest,
+    InvestigationStage, PathCompletionRequest, RowProvider, SettingsContext, SettingsRequest,
+    SettingsValues, SourceAiPreview, SourceAiPreviewItem, SourceAiRequest, SourceAiStage,
+    SourceItem, SourceKind, SourceLaunchRequest, ViewItem, ViewportRequest,
+    terminal::run_with_tick_mut,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -906,6 +907,7 @@ struct AutomaticSetupEvidence {
     proposal_sha256: String,
     definition_revision: u64,
     source_generation: u64,
+    session_id: String,
 }
 
 impl Composition {
@@ -996,6 +998,7 @@ impl Composition {
                     .map(recent_discovery_item)
                     .collect();
                 items.extend(scan.result.candidates.iter().map(discovery_item));
+                sort_discovery_items(&mut items);
                 if app.apply_discovery_result(
                     scan.generation,
                     items,
@@ -2212,6 +2215,12 @@ impl Composition {
                     if cancelled {
                         let _ = self.begin_cancel(session_id, None, start.generation);
                     } else {
+                        if start.auto_setup.is_some()
+                            && let Some(mut status) = app.auto_setup_status().cloned()
+                        {
+                            status.detail = format!("Paseo: {session_id}");
+                            app.set_auto_setup_status(status);
+                        }
                         self.begin_proposal(
                             app,
                             start,
@@ -2260,6 +2269,7 @@ impl Composition {
                 }
                 Some(Ok(proposal)) => {
                     if let Some(analysis) = &start.auto_setup {
+                        let paseo_session_id = session_id.clone();
                         let current_data_revision = self
                             .auto_setup_data_revision(&analysis.request.source_id)
                             .unwrap_or_else(|| "source-unavailable".into());
@@ -2281,6 +2291,7 @@ impl Composition {
                                     proposal_sha256: sha256_hex(&proposal_bytes),
                                     definition_revision: analysis.request.definition_revision,
                                     source_generation,
+                                    session_id: session_id.clone(),
                                 },
                             );
                         }
@@ -2289,6 +2300,23 @@ impl Composition {
                                 .complete(app, analysis, &current_data_revision, result)
                         {
                             finish_ai_error(app, &start, error);
+                        }
+                        if let Some(mut status) = app.auto_setup_status().cloned()
+                            && status.stage == lvu::AutoSetupStage::Unavailable
+                        {
+                            status.detail =
+                                format!("{} · Paseo: {paseo_session_id}", status.detail);
+                            app.set_auto_setup_status(status);
+                        }
+                        // The bridge detaches this completed one-shot operation
+                        // without archiving its resumable Paseo conversation.
+                        // Release only lvu's active slot so another source can
+                        // be analyzed while this session remains inspectable.
+                        if self.owned_ai_session.as_deref() == Some(&paseo_session_id) {
+                            self.owned_ai_session = None;
+                            self.owned_ai_session_config = None;
+                            self.ai_session_busy = false;
+                            self.retire_ai_session = false;
                         }
                         return true;
                     }
@@ -2346,10 +2374,13 @@ impl Composition {
                     });
                 }
                 Some(Ok(result)) => {
+                    let retained_auto_setup = failure
+                        .as_ref()
+                        .is_some_and(|(start, _)| start.auto_setup.is_some());
                     match validate_remote_cancellation(&result) {
                         Ok(()) => {
                             self.ai_session_busy = false;
-                            if self.retire_ai_session
+                            if (self.retire_ai_session || retained_auto_setup)
                                 && self.owned_ai_session.as_deref() == Some(&session_id)
                             {
                                 self.owned_ai_session = None;
@@ -2358,6 +2389,13 @@ impl Composition {
                             self.retire_ai_session = false;
                             if let Some((start, message)) = failure {
                                 finish_ai_error(app, &start, message);
+                                if retained_auto_setup
+                                    && let Some(mut status) = app.auto_setup_status().cloned()
+                                {
+                                    status.detail =
+                                        format!("{} · Paseo: {session_id}", status.detail);
+                                    app.set_auto_setup_status(status);
+                                }
                             }
                         }
                         Err(error) => {
@@ -2555,6 +2593,7 @@ impl Composition {
                         );
                         continue;
                     };
+                    let paseo_session_id = evidence.session_id.clone();
                     let (Ok(origin_uuid), Ok(generated_uuid)) = (
                         Uuid::parse_str(&receipt.origin_view_id),
                         Uuid::parse_str(&receipt.generated_view_id),
@@ -2589,6 +2628,10 @@ impl Composition {
                     {
                         memory_notice(app, format!("automatic setup receipt: {error}"));
                     }
+                    if let Some(mut status) = app.auto_setup_status().cloned() {
+                        status.detail = format!("Paseo: {paseo_session_id}");
+                        app.set_auto_setup_status(status);
+                    }
                 }
                 lvu::AutoSetupEvent::NoChanges {
                     source_id,
@@ -2601,6 +2644,7 @@ impl Composition {
                     let Some(evidence) = self.auto_setup_evidence.remove(&source_id) else {
                         continue;
                     };
+                    let paseo_session_id = evidence.session_id.clone();
                     let durable = lvu_memory::AutomaticSetupReceipt {
                         schema_version: lvu_memory::AUTOMATIC_SETUP_RECEIPT_SCHEMA_VERSION,
                         source_id,
@@ -2620,6 +2664,10 @@ impl Composition {
                     {
                         memory_notice(app, format!("automatic setup receipt: {error}"));
                     }
+                    if let Some(mut status) = app.auto_setup_status().cloned() {
+                        status.detail = format!("no useful setup · Paseo: {paseo_session_id}");
+                        app.set_auto_setup_status(status);
+                    }
                 }
                 lvu::AutoSetupEvent::Unavailable {
                     source_id,
@@ -2631,6 +2679,7 @@ impl Composition {
                     };
                     let source_id = SourceId(source_uuid);
                     let evidence = self.auto_setup_evidence.remove(&source_id);
+                    let paseo_session_id = evidence.as_ref().map(|value| value.session_id.clone());
                     let durable = lvu_memory::AutomaticSetupReceipt {
                         schema_version: lvu_memory::AUTOMATIC_SETUP_RECEIPT_SCHEMA_VERSION,
                         source_id,
@@ -2649,6 +2698,12 @@ impl Composition {
                         .upsert_automatic_setup_receipt(request_id, durable)
                     {
                         memory_notice(app, format!("automatic setup receipt: {error}"));
+                    }
+                    if let Some(paseo_session_id) = paseo_session_id
+                        && let Some(mut status) = app.auto_setup_status().cloned()
+                    {
+                        status.detail = format!("{} · Paseo: {paseo_session_id}", status.detail);
+                        app.set_auto_setup_status(status);
                     }
                 }
                 lvu::AutoSetupEvent::Failed { message, .. } => {
@@ -3580,13 +3635,18 @@ impl Composition {
             finish_ai_error(app, &start, "local agent service unavailable".into());
             return;
         };
+        let (title, purpose) = if start.auto_setup.is_some() {
+            ("lvu automatic log setup", SessionPurpose::AutoSetup)
+        } else {
+            ("lvu Ask agent", SessionPurpose::Ask)
+        };
         match host.start_session_with_purpose(
             &start.provider,
             &output_dir,
             Some(&start.mode),
             Some(&start.thinking),
-            Some("lvu Ask agent"),
-            Some(SessionPurpose::Ask),
+            Some(title),
+            Some(purpose),
         ) {
             Ok(request) => {
                 app.update_ask_ai_progress(
@@ -8610,33 +8670,164 @@ fn discovery_item(candidate: &DiscoveryCandidate) -> DiscoveryItem {
         })
         .collect::<Vec<_>>()
         .join("; ");
+    let section = match (
+        &candidate.provider,
+        candidate
+            .identity_hints
+            .get("docker_log_scope")
+            .map(String::as_str),
+    ) {
+        (_, Some("compose_service")) => DiscoverySection::DockerServices,
+        (_, Some("container")) => DiscoverySection::DockerContainers,
+        (Provider::Procfs, _) => DiscoverySection::ProcessFiles,
+        (Provider::Project, _) => DiscoverySection::ProjectFiles,
+        (Provider::Recent, _) => DiscoverySection::Remembered,
+        _ => DiscoverySection::Other,
+    };
+    let recent_activity = candidate_activity(candidate);
+    let availability = match candidate.availability {
+        lvu_discovery::Availability::Available => DiscoveryAvailability::Ready,
+        lvu_discovery::Availability::Unavailable => DiscoveryAvailability::NotAvailable,
+        lvu_discovery::Availability::Unknown => DiscoveryAvailability::CheckOnOpen,
+    };
+    let label = match section {
+        DiscoverySection::DockerServices => format!(
+            "{}/{}",
+            candidate
+                .identity_hints
+                .get("compose_project")
+                .map(String::as_str)
+                .unwrap_or("?"),
+            candidate
+                .identity_hints
+                .get("compose_service")
+                .map(String::as_str)
+                .unwrap_or("?")
+        ),
+        DiscoverySection::DockerContainers => candidate
+            .identity_hints
+            .get("docker_container_name")
+            .cloned()
+            .unwrap_or_else(|| candidate.display_label.clone()),
+        _ => candidate.display_label.clone(),
+    };
     DiscoveryItem {
         key: candidate.fingerprint.clone(),
-        label: candidate.display_label.clone(),
+        label,
         detail: if evidence.is_empty() {
             acquisition
         } else {
             format!("{acquisition} — {evidence}")
         },
-        status: match candidate
-            .identity_hints
-            .get("docker_log_scope")
-            .map(String::as_str)
-        {
-            Some("compose_service") => format!(
-                "Docker service {:?} {:?}",
-                candidate.confidence, candidate.availability
-            ),
-            Some("container") => format!(
-                "Docker container {:?} {:?}",
-                candidate.confidence, candidate.availability
-            ),
-            _ => format!(
-                "{:?} {:?} {:?}",
-                candidate.provider, candidate.confidence, candidate.availability
-            ),
-        },
+        status: discovery_item_status(section, availability, recent_activity),
+        section,
+        recent_activity,
+        availability,
     }
+}
+
+fn unix_seconds(time: SystemTime) -> Option<i64> {
+    i64::try_from(time.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs()).ok()
+}
+
+fn candidate_activity(candidate: &DiscoveryCandidate) -> Option<i64> {
+    if candidate.availability == lvu_discovery::Availability::Available
+        && matches!(candidate.provider, Provider::Docker | Provider::Procfs)
+    {
+        return unix_seconds(SystemTime::now());
+    }
+    if let Acquisition::File { path, .. } = &candidate.source.acquisition
+        && let Ok(modified) = std::fs::metadata(path).and_then(|metadata| metadata.modified())
+    {
+        return unix_seconds(modified);
+    }
+    candidate
+        .evidence
+        .iter()
+        .filter_map(|evidence| evidence.attributes.get("status"))
+        .filter_map(|status| relative_status_activity(status, SystemTime::now()))
+        .max()
+}
+
+fn relative_status_activity(status: &str, now: SystemTime) -> Option<i64> {
+    let words = status.split_whitespace().collect::<Vec<_>>();
+    let ago = words.iter().position(|word| *word == "ago")?;
+    let amount = words.get(ago.checked_sub(2)?)?.parse::<u64>().ok()?;
+    let unit = words.get(ago.checked_sub(1)?)?.trim_end_matches('s');
+    let seconds = match unit {
+        "second" => amount,
+        "minute" => amount.checked_mul(60)?,
+        "hour" => amount.checked_mul(60 * 60)?,
+        "day" => amount.checked_mul(24 * 60 * 60)?,
+        "week" => amount.checked_mul(7 * 24 * 60 * 60)?,
+        "month" => amount.checked_mul(30 * 24 * 60 * 60)?,
+        "year" => amount.checked_mul(365 * 24 * 60 * 60)?,
+        _ => return None,
+    };
+    unix_seconds(now.checked_sub(Duration::from_secs(seconds))?)
+}
+
+fn activity_age(activity: i64) -> String {
+    let now = unix_seconds(SystemTime::now()).unwrap_or(activity);
+    let seconds = now.saturating_sub(activity) as u64;
+    match seconds {
+        0..=59 => "just now".into(),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+        86_400..=604_799 => format!("{}d ago", seconds / 86_400),
+        _ => format!("{}w ago", seconds / 604_800),
+    }
+}
+
+fn discovery_item_status(
+    section: DiscoverySection,
+    availability: DiscoveryAvailability,
+    activity: Option<i64>,
+) -> String {
+    let age = activity.map(activity_age);
+    match (section, availability, age) {
+        (
+            DiscoverySection::DockerServices | DiscoverySection::DockerContainers,
+            DiscoveryAvailability::Ready,
+            _,
+        ) => "Running".into(),
+        (
+            DiscoverySection::DockerServices | DiscoverySection::DockerContainers,
+            DiscoveryAvailability::NotAvailable,
+            Some(age),
+        ) => format!("Stopped · active {age}"),
+        (
+            DiscoverySection::DockerServices | DiscoverySection::DockerContainers,
+            DiscoveryAvailability::NotAvailable,
+            None,
+        ) => "Stopped".into(),
+        (DiscoverySection::Remembered, DiscoveryAvailability::Ready, Some(age)) => {
+            format!("Last opened {age}")
+        }
+        (DiscoverySection::Remembered, DiscoveryAvailability::NotAvailable, Some(age)) => {
+            format!("Not currently available · last opened {age}")
+        }
+        (DiscoverySection::Remembered, DiscoveryAvailability::NotAvailable, None) => {
+            "Not currently available".into()
+        }
+        (_, DiscoveryAvailability::Ready, Some(age)) => format!("Updated {age}"),
+        (_, DiscoveryAvailability::Ready, None) => "Ready".into(),
+        (_, DiscoveryAvailability::NotAvailable, Some(age)) => {
+            format!("Not currently available · active {age}")
+        }
+        (_, DiscoveryAvailability::NotAvailable, None) => "Not currently available".into(),
+        (_, DiscoveryAvailability::CheckOnOpen, _) => "Availability checked when opened".into(),
+    }
+}
+
+fn sort_discovery_items(items: &mut [DiscoveryItem]) {
+    items.sort_by(|left, right| {
+        left.section
+            .cmp(&right.section)
+            .then_with(|| right.recent_activity.cmp(&left.recent_activity))
+            .then_with(|| left.label.to_lowercase().cmp(&right.label.to_lowercase()))
+            .then_with(|| left.key.cmp(&right.key))
+    });
 }
 
 fn recent_key(id: SourceId) -> String {
@@ -8650,15 +8841,20 @@ fn recent_discovery_item(source: &lvu_memory::SourceMetadata) -> DiscoveryItem {
         Acquisition::Http { url, .. } => url.clone(),
         Acquisition::Stdin => "one-shot standard input".into(),
     };
+    let recent_activity = Some(source.last_seen);
+    let availability = if source.missing {
+        DiscoveryAvailability::NotAvailable
+    } else {
+        DiscoveryAvailability::CheckOnOpen
+    };
     DiscoveryItem {
         key: recent_key(source.definition.id),
         label: source.definition.name.clone(),
         detail: format!("{detail} — remembered source"),
-        status: if source.missing {
-            "Remembered Missing".into()
-        } else {
-            "Remembered Unknown".into()
-        },
+        status: discovery_item_status(DiscoverySection::Remembered, availability, recent_activity),
+        section: DiscoverySection::Remembered,
+        recent_activity,
+        availability,
     }
 }
 
@@ -8766,7 +8962,7 @@ fn discovery_status(result: &DiscoveryResult, remembered: usize) -> String {
         category("Project files", Provider::Project),
         category("Docker services / containers", Provider::Docker),
         format!(
-            "Remembered sources: {} · checked",
+            "Previously opened: {} · checked",
             matches_word(remembered_matches)
         ),
     ]
@@ -10862,13 +11058,14 @@ mod tests {
         complete_path, definition, discovery_item, discovery_status, expand_tilde_path,
         lexical_display_hint, owned_session_start_admission, parse_args, prepare_ai_context,
         prepend_notice, proposal_expression, recipe_incompatibility, reconcile_pending_state,
-        record_agent_session, record_capture_root, resources, resume_notice, select_capture_root,
-        shared_key_controller, validate_recipe_proposal_source, validate_remote_cancellation,
+        record_agent_session, record_capture_root, relative_status_activity, resources,
+        resume_notice, select_capture_root, shared_key_controller, sort_discovery_items,
+        unix_seconds, validate_recipe_proposal_source, validate_remote_cancellation,
         view_admission_error,
     };
     use lvu::{
-        App, PathCompletionRequest, PersistentViewState, SourceItem, SourceKind,
-        SourceLaunchRequest, ViewItem,
+        App, DiscoveryItem, DiscoverySection, PathCompletionRequest, PersistentViewState,
+        SourceItem, SourceKind, SourceLaunchRequest, ViewItem,
     };
     use lvu_core::{Acquisition, CommandProgram, SourceId, ViewId};
     use serde_json::json;
@@ -10876,7 +11073,7 @@ mod tests {
         collections::{HashMap, HashSet, VecDeque},
         path::PathBuf,
         sync::Arc,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime},
     };
 
     fn pending_memory_save(
@@ -14093,7 +14290,7 @@ root = \"/tmp/elsewhere\"\n",
         assert!(report.contains("Processes / open files"), "{report}");
         assert!(report.contains("Project files"), "{report}");
         assert!(report.contains("Docker services / containers"), "{report}");
-        assert!(report.contains("Remembered sources"), "{report}");
+        assert!(report.contains("Previously opened"), "{report}");
         assert!(!report.contains("Procfs"), "{report}");
         assert!(report.contains("no matches · checked"), "{report}");
         assert!(report.contains("unavailable"), "{report}");
@@ -14161,17 +14358,72 @@ root = \"/tmp/elsewhere\"\n",
             .expect("service candidate");
         let authoritative_id = candidate.source.id;
         let item = discovery_item(candidate);
-        assert!(item.label.contains("shop/api (Docker service)"));
+        assert_eq!(item.label, "shop/api");
         assert!(item.detail.contains("Compose service shop/api"));
         assert!(item.detail.contains("Docker Compose service"));
-        assert!(item.status.contains("Docker service"));
+        assert_eq!(item.status, "Running");
+        assert_eq!(item.section, DiscoverySection::DockerServices);
+        assert!(!item.status.contains("High"));
+        assert!(!item.status.contains("Unknown"));
+        assert!(!item.label.contains("Docker service"));
         assert_eq!(candidate.source.id, authoritative_id);
         let report = discovery_status(&result, 0);
         assert!(report.contains("2 candidates"), "{report}");
         assert!(report.contains("Docker services / containers"), "{report}");
         assert!(report.contains("2 matches"), "{report}");
         assert!(report.contains("checked"), "{report}");
-        assert!(report.contains("Remembered sources"), "{report}");
+        assert!(report.contains("Previously opened"), "{report}");
+    }
+
+    #[test]
+    fn discovery_rows_group_types_then_sort_newest_activity() {
+        let mut items = vec![
+            DiscoveryItem {
+                key: "old-container".into(),
+                label: "old container".into(),
+                section: DiscoverySection::DockerContainers,
+                recent_activity: Some(10),
+                ..DiscoveryItem::default()
+            },
+            DiscoveryItem {
+                key: "project".into(),
+                label: "project.log".into(),
+                section: DiscoverySection::ProjectFiles,
+                recent_activity: Some(50),
+                ..DiscoveryItem::default()
+            },
+            DiscoveryItem {
+                key: "new-container".into(),
+                label: "new container".into(),
+                section: DiscoverySection::DockerContainers,
+                recent_activity: Some(90),
+                ..DiscoveryItem::default()
+            },
+            DiscoveryItem {
+                key: "service".into(),
+                label: "shop/api".into(),
+                section: DiscoverySection::DockerServices,
+                recent_activity: Some(5),
+                ..DiscoveryItem::default()
+            },
+        ];
+        sort_discovery_items(&mut items);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect::<Vec<_>>(),
+            ["service", "new-container", "old-container", "project"]
+        );
+    }
+
+    #[test]
+    fn docker_relative_status_produces_a_bounded_activity_time() {
+        let now = SystemTime::now();
+        let activity = relative_status_activity("Exited (0) 3 days ago", now).expect("age");
+        let now = unix_seconds(now).expect("now");
+        assert!(now.saturating_sub(activity).abs_diff(3 * 24 * 60 * 60) <= 1);
+        assert!(relative_status_activity("Exited (0)", SystemTime::now()).is_none());
     }
 
     /// `record_session` refuses loudly when the existing manifest is

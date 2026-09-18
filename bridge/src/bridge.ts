@@ -369,6 +369,10 @@ export class Bridge {
     if (hadRemoteTurn && !remoteCancelled && session.owned?.lifecycle === "ephemeral") session.terminalCleanupOnUpdate = true;
     this.#event(request.session_id, "observation_cancelled", { remote_cancelled: remoteCancelled, remote_agent_may_still_be_running: hadRemoteTurn && !remoteCancelled });
     this.#ok(request.request_id, { cancelled: hadRemoteTurn, remote_cancelled: remoteCancelled, remote_agent_may_still_be_running: hadRemoteTurn && !remoteCancelled, ...(cancelError === null ? {} : { cancel_error: cancelError.slice(0, 4096) }) });
+    if (session.owned?.purpose === "auto_setup" && !session.remoteBusy && !session.cancelPending) {
+      this.#dispose(session);
+      this.#sessions.delete(request.session_id);
+    }
   }
 
   async #resume(request: Extract<BridgeRequest, { method: "resume_session" }>): Promise<void> {
@@ -428,6 +432,14 @@ export class Bridge {
     catch (error) { throw coded("INVALID_PROPOSAL", errorMessage(error)); }
     this.#ok(request.request_id, { proposal });
     this.#event(request.session_id, "proposal_completed", { request_id: request.request_id, proposal_kind: request.kind });
+    // Automatic setup is a one-shot lvu operation, but its Paseo conversation
+    // is durable user-visible evidence. Detach the local bridge observer once
+    // the proposal has settled so the bounded live-session capacity is free;
+    // the resumable Paseo agent and owned-session ledger entry remain intact.
+    if (session.owned?.purpose === "auto_setup" && session.owned.lifecycle === "resumable") {
+      this.#dispose(session);
+      this.#sessions.delete(request.session_id);
+    }
   }
 
   #attach(agent: AgentHandle, owned: OwnedSessionRecord | null = null): Session {

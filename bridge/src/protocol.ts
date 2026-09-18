@@ -118,10 +118,10 @@ const base = z.object({ schema_version: z.literal(1), request_id: boundedText(12
 const sessionConfig = { provider: boundedText(256), cwd: path, mode_id: boundedText(128).optional(), thinking_option_id: boundedText(128).optional(), title: z.string().max(256).optional() };
 export const requestSchema = z.discriminatedUnion("method", [
   base.extend({ method: z.literal("capabilities") }).strict(),
-  base.extend({ method: z.literal("start_session"), ...sessionConfig, purpose: z.enum(["ask", "source_assistance", "investigation"]).optional(), prompt: z.string().max(131_072).optional(), timeout_ms: z.number().int().min(1).max(600_000).optional() }).strict(),
+  base.extend({ method: z.literal("start_session"), ...sessionConfig, purpose: z.enum(["ask", "auto_setup", "source_assistance", "investigation"]).optional(), prompt: z.string().max(131_072).optional(), timeout_ms: z.number().int().min(1).max(600_000).optional() }).strict(),
   base.extend({ method: z.literal("send_prompt"), session_id: boundedText(256), prompt: boundedText(131_072), timeout_ms: z.number().int().min(1).max(600_000).optional() }).strict(),
   base.extend({ method: z.literal("cancel"), session_id: boundedText(256) }).strict(),
-  base.extend({ method: z.literal("resume_session"), session_id: boundedText(256), purpose: z.enum(["ask", "source_assistance", "investigation"]).optional() }).strict(),
+  base.extend({ method: z.literal("resume_session"), session_id: boundedText(256), purpose: z.enum(["ask", "auto_setup", "source_assistance", "investigation"]).optional() }).strict(),
   base.extend({ method: z.literal("request_proposal"), session_id: boundedText(256), kind: z.enum(proposalKinds), instruction: boundedText(131_072), originating_revision: revisionSchema, context: contextSchema, timeout_ms: z.number().int().min(1).max(600_000).optional() }).strict(),
 ]);
 export type BridgeRequest = z.infer<typeof requestSchema>;

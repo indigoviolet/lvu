@@ -2030,12 +2030,50 @@ pub struct PathCompletionRequest {
     pub draft: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryItem {
     pub key: String,
     pub label: String,
     pub detail: String,
     pub status: String,
+    pub section: DiscoverySection,
+    /// Unix seconds for the newest activity the provider can establish.
+    /// `None` is deliberately distinct from old: unknown-age rows remain
+    /// visible instead of being hidden on a guess.
+    pub recent_activity: Option<i64>,
+    pub availability: DiscoveryAvailability,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DiscoverySection {
+    DockerServices,
+    DockerContainers,
+    ProcessFiles,
+    ProjectFiles,
+    Remembered,
+    #[default]
+    Other,
+}
+
+impl DiscoverySection {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DockerServices => "Docker Compose services",
+            Self::DockerContainers => "Docker containers",
+            Self::ProcessFiles => "Processes / open files",
+            Self::ProjectFiles => "Project log files",
+            Self::Remembered => "Previously opened",
+            Self::Other => "Other sources",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DiscoveryAvailability {
+    Ready,
+    NotAvailable,
+    #[default]
+    CheckOnOpen,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

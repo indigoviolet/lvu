@@ -123,10 +123,10 @@ def run(binary):
             app.send(b"Add source\r")
             app.wait_for("Add source", timeout=8)
             app.send(b"\x04")
-            app.wait_for("Candidates", timeout=10)
+            app.wait_for("Details", timeout=10)
             app.send(b"shell")
             app.wait_until(
-                lambda text: "shell command" in text and "Remembered" in text,
+                lambda text: "shell command" in text and "Previously opened" in text,
                 "the remembered command is a discovery candidate",
                 timeout=10,
             )

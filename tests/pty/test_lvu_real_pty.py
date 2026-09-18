@@ -137,7 +137,12 @@ def wait_reaped(pid: int, timeout: float = 18.0) -> None:
         stat = pathlib.Path(f"/proc/{pid}/stat")
         if not stat.exists():
             return
-        fields = stat.read_text(errors="replace").split()
+        try:
+            fields = stat.read_text(errors="replace").split()
+        except (FileNotFoundError, ProcessLookupError):
+            # `/proc/<pid>` can disappear between the existence check and
+            # open; that is precisely the successful reaping condition.
+            return
         if len(fields) > 2 and fields[2] == "Z":
             return
         time.sleep(0.01)
@@ -500,6 +505,8 @@ def run_memory_restore_story(binary: pathlib.Path) -> None:
         try:
             enter_source_dialog(recent)
             recent.send(b"\x04")
+            recent.wait_for("Details", timeout=8.0)
+            recent.send(b"remembered.log")
             recent.wait_for("remembered.log", timeout=8.0)
             recent.send(b"\r")
             recent.wait_until(lambda text: 'search:"beta"' in text and "beta late" in text, "explicit recent-source reopen", timeout=12.0)
@@ -548,7 +555,8 @@ def run_discovery_story(binary: pathlib.Path) -> None:
             discovered = app.wait_until(
                 lambda text: name in text
                 and "1 of 1" in text
-                and ("Project Medium Available" in text or "Procfs High Available" in text),
+                and ("Project log files" in text or "Processes / open files" in text)
+                and ("Updated" in text or "Ready" in text),
                 "controlled tee/file discovery candidate",
                 timeout=6.0,
             )

@@ -158,7 +158,7 @@ describe("proposal validation", () => {
 it("accepts only the bounded assistance lifecycle purposes", () => {
   const start = { schema_version: 1, request_id: "start", method: "start_session", provider: "fake", cwd: "/tmp" };
   expect(requestSchema.safeParse(start).success).toBe(true);
-  for (const purpose of ["ask", "source_assistance", "investigation"]) expect(requestSchema.safeParse({ ...start, purpose }).success).toBe(true);
+  for (const purpose of ["ask", "auto_setup", "source_assistance", "investigation"]) expect(requestSchema.safeParse({ ...start, purpose }).success).toBe(true);
   expect(requestSchema.safeParse({ ...start, purpose: "cleanup" }).success).toBe(false);
   expect(requestSchema.safeParse({ schema_version: 1, request_id: "resume", method: "resume_session", session_id: "agent", purpose: "investigation" }).success).toBe(true);
 });

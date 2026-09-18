@@ -18,6 +18,7 @@ function harness(customLimits = limits) { const backend = new FakeBackend(); con
 async function startOne(h: ReturnType<typeof harness>, extras: Record<string, unknown> = {}) { await h.bridge.start(); await h.bridge.handle(requestSchema.parse({ ...base, request_id: "start", method: "start_session", provider: "fake/model", cwd: "/tmp/investigation", ...extras })); }
 function proposalRequest(id = "proposal") { return requestSchema.parse({ ...base, request_id: id, method: "request_proposal", session_id: "agent-1", kind: "filter", instruction: "errors only", originating_revision: revision, context: { manifest_path: "/tmp/i/manifest.json", dataset_paths: ["/tmp/i/sample.parquet"] } }); }
 function validFilter() { return JSON.stringify({ kind: "filter", definition: { schema_version: 1, expression: "pl.col('level') == 'error'" }, explanation: "Select errors", originating_revision: revision }); }
+function validAutoSetup() { return JSON.stringify({ kind: "auto_setup", definition: { schema_version: 1, enrichments: [], pinned_columns: [], color_rules: [], grouping: null }, explanation: "No useful enrichment found", originating_revision: revision }); }
 
 describe("Bridge lifecycle", () => {
   it("cannot reopen when connect resolves after close", async () => {
@@ -386,6 +387,45 @@ describe("managed assistance lifecycle", () => {
       const record = await ledger.readByAgent("agent-1");
       expect(record).toMatchObject({ purpose: "ask", lifecycle: "ephemeral", state: "archived", workspaceId: "workspace-1" });
       expect((await readFile(ledger.activityPath(record!), "utf8"))).toContain("run_settled");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("retains automatic setup as a clearly labelled Paseo conversation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const backend = new FakeBackend(); const output: Array<Record<string, unknown>> = [];
+      const ledger = new OwnedSessionLedger(root); const bridge = new Bridge(backend, (message) => output.push(message), { ...limits, maxSessions: 1 }, ledger);
+      await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "auto", method: "start_session", provider: "fake/model", cwd: "/ignored", purpose: "auto_setup", title: "lvu automatic log setup" }));
+      expect(backend.createCalls[0]).toMatchObject({ title: "lvu automatic log setup", labels: { "lvu.lifecycle": "resumable", "lvu.purpose": "auto_setup" } });
+      const proposal = bridge.handle(requestSchema.parse({ ...base, request_id: "auto-proposal", method: "request_proposal", session_id: "agent-1", kind: "auto_setup", instruction: "set up this log", originating_revision: revision, context: { manifest_path: "/tmp/i/manifest.json", dataset_paths: ["/tmp/i/sample.parquet"] } }));
+      await tick();
+      backend.agents.get("agent-1")!.runs[0]!.resolve({ status: "idle", error: null, lastMessage: validAutoSetup(), agentStatus: "idle" });
+      await proposal;
+      expect(response(output, "auto-proposal")).toMatchObject({ ok: true });
+      expect(backend.agents.get("agent-1")!.streamListeners.size).toBe(0);
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "next-auto", method: "start_session", provider: "fake/model", cwd: "/ignored", purpose: "auto_setup", title: "lvu automatic log setup" }));
+      expect(response(output, "next-auto")).toMatchObject({ ok: true });
+      await bridge.close();
+      expect(backend.cleanupCalls).toEqual([]);
+      const record = await ledger.readByAgent("agent-1");
+      expect(record).toMatchObject({ purpose: "auto_setup", lifecycle: "resumable", state: "active", workspaceId: "workspace-1" });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("detaches a settled automatic setup cancellation without archiving it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const backend = new FakeBackend(); const output: Array<Record<string, unknown>> = [];
+      const ledger = new OwnedSessionLedger(root); const bridge = new Bridge(backend, (message) => output.push(message), { ...limits, maxSessions: 1 }, ledger);
+      await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "auto", method: "start_session", provider: "fake/model", cwd: "/ignored", purpose: "auto_setup", title: "lvu automatic log setup" }));
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "cancel-auto", method: "cancel", session_id: "agent-1" }));
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "replacement", method: "start_session", provider: "fake/model", cwd: "/ignored", purpose: "auto_setup", title: "lvu automatic log setup" }));
+      expect(response(output, "replacement")).toMatchObject({ ok: true });
+      expect(backend.cleanupCalls).toEqual([]);
+      expect(await ledger.readByAgent("agent-1")).toMatchObject({ purpose: "auto_setup", lifecycle: "resumable", state: "active" });
+      await bridge.close();
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

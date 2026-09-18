@@ -329,9 +329,9 @@ impl Open {
             },
             Open::RecipeHistory { .. } => &[Manager],
             Open::Search | Open::Advanced | Open::Grouping => &[Existing],
-            // These are manager surfaces whose Add/Edit operations eventually
-            // become child flows; the prose inventory marks the fused cases.
-            Open::ColorRules => &[Manager, New, Existing],
+            Open::ColorRules => &[Manager],
+            Open::ColorRuleEditor { editing: None } => &[New],
+            Open::ColorRuleEditor { editing: Some(_) } => &[Existing],
             Open::Enrichment => &[Manager],
             Open::EnrichmentStep { editing: None, .. }
             | Open::ExternalCommand { stage: None, .. } => &[New],

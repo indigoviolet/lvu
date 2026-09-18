@@ -3,7 +3,7 @@ import { mkdir, open, opendir, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
 
-export type SessionPurpose = "ask" | "source_assistance" | "investigation";
+export type SessionPurpose = "ask" | "auto_setup" | "source_assistance" | "investigation";
 export type SessionLifecycle = "ephemeral" | "resumable";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,256}$/);
@@ -12,7 +12,7 @@ const workspaceSchema = z.object({ version: z.literal(1), workspaceId: id, proje
 const leaseSchema = z.object({ pid: z.number().int().positive(), nonce: id }).strict();
 const sessionSchema = z.object({
   version: z.literal(1), ownershipId: id, requestId: id, protocolRequestId: z.string().min(1).max(128),
-  purpose: z.enum(["ask", "source_assistance", "investigation"]), lifecycle: z.enum(["ephemeral", "resumable"]),
+  purpose: z.enum(["ask", "auto_setup", "source_assistance", "investigation"]), lifecycle: z.enum(["ephemeral", "resumable"]),
   state: z.enum(["pending_create", "active", "pending_cleanup", "archived", "archive_failed", "create_failed"]),
   workspaceId: id.optional(), agentId: id.optional(), createdAt: timestamp, updatedAt: timestamp,
   lastUserMessageAt: timestamp.nullable().optional(), archivedAt: timestamp.nullable().optional(),
