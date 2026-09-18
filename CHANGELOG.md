@@ -4,6 +4,30 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## v0.1.15 — 2026-09-18
+
+### Features
+
+- Navigate the base panes spatially with the keyboard and mouse while keeping
+  pane focus, scrolling, selection and click targets aligned.
+- Manage colour rules as existing objects in a dedicated list, with Add and
+  Edit opening separate parameter dialogs and Remove requiring confirmation.
+- Keep automatic log-setup conversations inspectable in Paseo after they
+  settle. lvu shows the session identifier without retaining a bounded active
+  bridge slot, and `Analyze again` remains the explicit retry action.
+
+### Fixes
+
+- Group discovered sources by type, sort each section by recent established
+  activity and hide known unavailable sources older than fourteen days behind
+  an explicit keyboard/mouse Show row. User-facing availability language now
+  replaces internal ranking terms.
+- Show Compose project/service names once while retaining separately selectable
+  aggregate-service and individual-container sources.
+- Make rendered dialog geometry authoritative for focus, cursors, scrolling and
+  hitboxes, and validate the object-first/create-first dialog flow grammar in
+  executable metadata.
+
 ## v0.1.14 — 2026-09-17
 
 ### Features

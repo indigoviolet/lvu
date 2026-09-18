@@ -4008,6 +4008,13 @@ discovery and raw-first automatic setup/restart/revert. The first combined Rust
 check preserved test-import failures, the first Source component run preserved
 two geometry/visibility assertion failures, and the first two automatic-setup
 PTY runs proved the session status was being dropped as an overlong optional
-footer segment; each cause was corrected before the recorded green rerun. Full
-workspace, Clippy and complete PTY/restart/remote-union acceptance remain
-pending; no release version or tag has been created.
+footer segment; each cause was corrected before the recorded green rerun. The
+subsequent integrated preflight passed formatting, every locked workspace
+test and doc-test, workspace all-target Clippy with warnings denied, and the
+complete **88/88** actual PTY matrix against freshly rebuilt app and TUI
+binaries. Durable matrix evidence is
+`primary-v015-acceptance/pty-matrix-preversion.log` on the build volume. The
+application crate and lockfile now agree on version 0.1.15. Clean immutable
+candidate acceptance, bridge checks, two-window capture, both sequential
+restart/no-replay probes and the seven remote-union proof families remain
+pending; no tag or release has been created.
