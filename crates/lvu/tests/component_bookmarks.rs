@@ -457,3 +457,18 @@ fn note_child_shows_parent_behind_and_escapes_back() {
     key(&mut app, &provider, KeyCode::Esc);
     assert!(!app.layers.bookmarks.is_open());
 }
+
+#[test]
+fn note_save_button_has_a_live_alt_shortcut_while_the_note_is_text_focused() {
+    let (provider, mut app) = opened();
+    let view = app.active_view_id().unwrap().to_owned();
+    draw(&provider, &mut app, 100, 30);
+    alt(&mut app, &provider, KeyCode::Char('e'));
+    draw(&provider, &mut app, 100, 30);
+    assert_eq!(app.top_layer_action_labels(&provider), ["&Save note"]);
+    key(&mut app, &provider, KeyCode::Char('o'));
+    key(&mut app, &provider, KeyCode::Char('k'));
+    alt(&mut app, &provider, KeyCode::Char('s'));
+    assert_eq!(app.bookmarks_for_view(&view)[0].note, "ok");
+    assert!(app.layers.bookmarks.state().editing.is_none());
+}

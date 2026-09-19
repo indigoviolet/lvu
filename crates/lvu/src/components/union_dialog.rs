@@ -71,7 +71,7 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
 
 /// Action row, in drawn order. Cancel carries no mnemonic: Escape closes the
 /// layer, and `c` unambiguously creates.
-const UNION_ACTIONS: [&str; 2] = ["&Create union", "Cancel"];
+const UNION_ACTIONS: [&str; 2] = ["&Create union", "&Cancel"];
 
 const UNION_HELP: &str = "Up/Down move · Space toggles a view · Enter creates · Esc closes. \
      Ties break by list order; equal times keep input order.";

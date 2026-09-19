@@ -1,6 +1,8 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use lvu::{
-    Action, App, AutoSetupProposal, AutoSetupStage, ColorRule, EnrichmentDefinition,
-    QueryCompletion, QueryFailure, RuleColor, SourceItem, ViewDialogMode, ViewItem, ViewRole,
+    Action, App, AutoSetupProposal, AutoSetupStage, AutoSetupStatus, ColorRule,
+    EnrichmentDefinition, QueryCompletion, QueryFailure, RuleColor, SourceItem, ViewDialogMode,
+    ViewItem, ViewRole,
 };
 use ratatui::{Terminal, backend::TestBackend};
 
@@ -359,12 +361,94 @@ fn non_modal_lifecycle_is_visible_in_test_backend() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(screen.contains("payments / All events · automatic setup: sampling"));
+    assert!(
+        screen.contains("setup: sampling") && screen.contains("raw view remains usable"),
+        "manual analysis must visibly acknowledge queueing:\n{screen}"
+    );
     assert_eq!(app.active_view_id(), Some("raw"));
     assert_eq!(
         app.auto_setup_status().map(|status| status.stage),
         Some(AutoSetupStage::Sampling)
     );
+}
+
+#[test]
+fn setup_inspector_names_the_log_session_and_live_manual_retry() {
+    let (mut app, provider) = app_with_raw();
+    assert!(app.set_auto_setup_status(AutoSetupStatus {
+        source_id: "source".into(),
+        origin_view_id: "raw".into(),
+        object_name: "payments / All events".into(),
+        stage: AutoSetupStage::Analyzing,
+        session_id: Some("paseo-auto-session".into()),
+        detail: "bounded sample sent for typed setup".into(),
+    }));
+    app.handle(Action::OpenAutoSetupStatus, &provider);
+    assert_eq!(
+        app.top_layer_action_labels(&provider),
+        ["&Analyze again", "&Close"]
+    );
+    let mut terminal = Terminal::new(TestBackend::new(180, 32)).unwrap();
+    terminal
+        .draw(|frame| lvu::ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(screen.contains("Automatic setup status"), "{screen}");
+    assert!(screen.contains("Log: payments / All events"), "{screen}");
+    assert!(screen.contains("automatic setup: analyzing"), "{screen}");
+    assert!(screen.contains("paseo-auto-session"), "{screen}");
+    assert!(
+        screen.contains("Analyze again") && screen.contains("Close"),
+        "{screen}"
+    );
+
+    // The bridge may acquire a session or move stages while this inspector is
+    // open. It must redraw that one authoritative lifecycle object rather
+    // than leaving a stale modal over the live status line.
+    assert!(app.set_auto_setup_status(AutoSetupStatus {
+        source_id: "source".into(),
+        origin_view_id: "raw".into(),
+        object_name: "payments / All events".into(),
+        stage: AutoSetupStage::Applying,
+        session_id: Some("paseo-auto-session".into()),
+        detail: "building Enhanced without changing All events".into(),
+    }));
+    terminal
+        .draw(|frame| lvu::ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let updated = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(updated.contains("automatic setup: applying"), "{updated}");
+    assert!(updated.contains("building Enhanced"), "{updated}");
+
+    // The visible A mnemonic is a real retry: it closes the inspector, queues
+    // one bounded analysis and immediately publishes its sampling state.
+    app.handle(
+        Action::Raw(lvu::component::RawEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        ))),
+        &provider,
+    );
+    assert_eq!(app.take_auto_setup_requests().len(), 1);
+    assert_eq!(
+        app.auto_setup_status().map(|status| status.stage),
+        Some(AutoSetupStage::Sampling)
+    );
+    assert!(app.action_notice.as_deref().is_some_and(|notice| {
+        notice.contains("setup: sampling") && notice.contains("raw view remains usable")
+    }));
 }
 
 #[test]

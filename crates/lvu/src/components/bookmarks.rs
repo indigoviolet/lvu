@@ -645,7 +645,7 @@ impl BookmarksDialog {
 /// Enter runs it.
 fn bookmark_actions() -> [(&'static str, BookmarkDialogControl); 4] {
     [
-        ("Open in All events", BookmarkDialogControl::Goto),
+        ("&Open in All events", BookmarkDialogControl::Goto),
         ("&Edit note", BookmarkDialogControl::Edit),
         ("Inspect c&ontext", BookmarkDialogControl::Context),
         ("&Remove", BookmarkDialogControl::Delete),
@@ -658,7 +658,7 @@ fn bookmark_actions() -> [(&'static str, BookmarkDialogControl); 4] {
 /// one frame and sticky tail.
 fn bookmarks_spec_for(area: Rect) -> DialogSpec {
     let labels = [
-        "Open in All events",
+        "&Open in All events",
         "&Edit note",
         "Inspect c&ontext",
         "&Remove",
@@ -757,17 +757,23 @@ impl Component for BookmarksDialog {
     }
 
     fn action_labels(&self, ctx: &Ctx<'_>) -> Vec<&'static str> {
-        // The Note child's own row is `[ Save note ]`, which marks no letter,
-        // so while it is up this layer offers no mnemonic (§10).
-        if self.state.editing.is_some()
-            || ctx.views.bookmarks_for_view(&self.state.view_id).is_empty()
-        {
+        if self.state.editing.is_some() {
+            return vec!["&Save note"];
+        }
+        if ctx.views.bookmarks_for_view(&self.state.view_id).is_empty() {
             return Vec::new();
         }
         bookmark_actions().iter().map(|(label, _)| *label).collect()
     }
 
     fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        if self.state.editing.is_some() {
+            return if index == 0 {
+                self.submit(ctx)
+            } else {
+                Outcome::Ignored
+            };
+        }
         match bookmark_actions().get(index).map(|(_, control)| *control) {
             Some(control) => self.run(control, ctx),
             None => Outcome::Ignored,
@@ -873,7 +879,7 @@ impl Component for BookmarksDialog {
                 crate::dialog_layout::scrim(frame.buffer_mut(), area, theme);
             }
             let child_spec = note_spec_for(area);
-            let child_labels = ["Save note"];
+            let child_labels = ["&Save note"];
             let Ok(mut child_geometry) = crate::dialog_layout::resolve_dialog(
                 area,
                 &child_spec,

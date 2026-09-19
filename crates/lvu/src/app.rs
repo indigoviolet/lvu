@@ -2122,6 +2122,8 @@ pub enum Action {
         task: Option<AskTask>,
     },
     /// Existing object first in the palette: current log, then Analyze again.
+    OpenAutoSetupStatus,
+    /// Existing object first in the palette: current log, then Analyze again.
     AnalyzeAutoSetup,
     /// Existing generated view first in the palette, then Revert.
     RevertAutoSetup,
@@ -4428,25 +4430,60 @@ impl App {
             .iter()
             .any(|view| view.id == status.origin_view_id && view.source_id == status.source_id);
         if valid {
-            self.auto_setup_status = Some(status);
+            self.action_notice = Some(status.notice());
+            self.replace_auto_setup_status(status);
         }
         valid
     }
 
+    /// Keep the base acknowledgement and an already-open lifecycle inspector
+    /// on one status object rather than allowing direct writers to drift.
+    fn replace_auto_setup_status(&mut self, status: AutoSetupStatus) {
+        self.layers.auto_setup_status.update(status.clone());
+        self.auto_setup_status = Some(status);
+    }
+
+    fn refresh_auto_setup_inspector(&mut self) {
+        if let Some(status) = self.auto_setup_status.clone() {
+            self.layers.auto_setup_status.update(status);
+        }
+    }
+
     pub fn automatic_setup_unavailable(&mut self, request: &AutoSetupRequest, diagnostic: String) {
-        self.auto_setup_status = Some(AutoSetupStatus {
+        self.replace_auto_setup_status(AutoSetupStatus {
             source_id: request.source_id.clone(),
             origin_view_id: request.origin_view_id.clone(),
             object_name: request.object_name.clone(),
             stage: AutoSetupStage::Unavailable,
+            session_id: self.auto_setup_session_for(request),
             detail: format!("{diagnostic}; raw view kept"),
         });
+        if let Some(status) = &self.auto_setup_status {
+            self.action_notice = Some(status.notice());
+        }
         self.auto_setup_events
             .push_back(AutoSetupEvent::Unavailable {
                 source_id: request.source_id.clone(),
                 origin_view_id: request.origin_view_id.clone(),
                 diagnostic,
             });
+    }
+
+    fn auto_setup_session_for(&self, request: &AutoSetupRequest) -> Option<String> {
+        self.auto_setup_session_for_identity(&request.source_id, &request.origin_view_id)
+    }
+
+    fn auto_setup_session_for_identity(
+        &self,
+        source_id: &str,
+        origin_view_id: &str,
+    ) -> Option<String> {
+        self.auto_setup_status
+            .as_ref()
+            .filter(|status| {
+                status.source_id == source_id && status.origin_view_id == origin_view_id
+            })
+            .and_then(|status| status.session_id.clone())
     }
 
     pub fn take_auto_setup_requests(&mut self) -> Vec<AutoSetupRequest> {
@@ -4488,13 +4525,17 @@ impl App {
         if !self.auto_setup_requests.is_empty() {
             return false;
         }
-        self.auto_setup_status = Some(AutoSetupStatus {
+        self.replace_auto_setup_status(AutoSetupStatus {
             source_id: request.source_id.clone(),
             origin_view_id: request.origin_view_id.clone(),
             object_name: request.object_name.clone(),
             stage,
+            session_id: None,
             detail: "raw view remains usable".into(),
         });
+        if let Some(status) = &self.auto_setup_status {
+            self.action_notice = Some(status.notice());
+        }
         self.auto_setup_requests.push_back(request);
         true
     }
@@ -4522,11 +4563,12 @@ impl App {
         request: &AutoSetupRequest,
         proposal: AutoSetupProposal,
     ) -> Result<String, AutoSetupRejected> {
-        self.auto_setup_status = Some(AutoSetupStatus {
+        self.replace_auto_setup_status(AutoSetupStatus {
             source_id: request.source_id.clone(),
             origin_view_id: request.origin_view_id.clone(),
             object_name: request.object_name.clone(),
             stage: AutoSetupStage::Validating,
+            session_id: self.auto_setup_session_for(request),
             detail: "checking native definitions".into(),
         });
         if proposal == AutoSetupProposal::default() {
@@ -4540,6 +4582,7 @@ impl App {
                         status.stage = AutoSetupStage::Applied;
                         status.detail = "no useful automatic setup found; raw view kept".into();
                     }
+                    self.refresh_auto_setup_inspector();
                     return Ok(request.origin_view_id.clone());
                 }
                 Err(error) => {
@@ -4548,35 +4591,41 @@ impl App {
                         status.detail =
                             "source or accepted definition changed; analyze again".into();
                     }
+                    self.refresh_auto_setup_inspector();
                     return Err(error);
                 }
             }
         }
-        match self
-            .views
-            .apply_auto_setup(request, proposal, self.shell.clock_now_unix_nanos)
-        {
-            Ok(candidate) => {
-                if let Some(status) = &mut self.auto_setup_status {
-                    status.stage = AutoSetupStage::Applying;
-                    status.detail = "building Enhanced without changing All events".into();
+        let result =
+            match self
+                .views
+                .apply_auto_setup(request, proposal, self.shell.clock_now_unix_nanos)
+            {
+                Ok(candidate) => {
+                    if let Some(status) = &mut self.auto_setup_status {
+                        status.stage = AutoSetupStage::Applying;
+                        status.detail = "building Enhanced without changing All events".into();
+                    }
+                    Ok(candidate)
                 }
-                Ok(candidate)
-            }
-            Err(error) => {
-                if let Some(status) = &mut self.auto_setup_status {
-                    status.stage = AutoSetupStage::Unavailable;
-                    status.detail = match &error {
-                        AutoSetupRejected::Stale => {
-                            "source or accepted definition changed; analyze again".into()
-                        }
-                        AutoSetupRejected::Invalid(message) => message.clone(),
-                        AutoSetupRejected::QueueFull => "query queue is full; raw view kept".into(),
-                    };
+                Err(error) => {
+                    if let Some(status) = &mut self.auto_setup_status {
+                        status.stage = AutoSetupStage::Unavailable;
+                        status.detail = match &error {
+                            AutoSetupRejected::Stale => {
+                                "source or accepted definition changed; analyze again".into()
+                            }
+                            AutoSetupRejected::Invalid(message) => message.clone(),
+                            AutoSetupRejected::QueueFull => {
+                                "query queue is full; raw view kept".into()
+                            }
+                        };
+                    }
+                    Err(error)
                 }
-                Err(error)
-            }
-        }
+            };
+        self.refresh_auto_setup_inspector();
+        result
     }
 
     fn request_auto_setup(&mut self) {
@@ -4605,6 +4654,14 @@ impl App {
         if !self.enqueue_auto_setup_request(request, AutoSetupStage::Sampling) {
             self.action_notice = Some("current log · analysis already queued".into());
         }
+    }
+
+    fn open_auto_setup_status<P: RowProvider>(&mut self, provider: &P) {
+        let Some(status) = self.auto_setup_status.clone() else {
+            self.action_notice = Some("current log · no automatic setup status yet".into());
+            return;
+        };
+        self.push_layer(Open::AutoSetupStatus(status), provider);
     }
 
     fn revert_auto_setup(&mut self) {
@@ -4639,11 +4696,14 @@ impl App {
                 Some("current view · revert queue is full; Enhanced view kept".into());
             return;
         }
-        self.auto_setup_status = Some(AutoSetupStatus {
+        let session_id =
+            self.auto_setup_session_for_identity(&receipt.source_id, &receipt.origin_view_id);
+        self.replace_auto_setup_status(AutoSetupStatus {
             source_id: receipt.source_id,
             origin_view_id: receipt.origin_view_id,
             object_name: receipt.generated_view_name,
             stage: AutoSetupStage::Applying,
+            session_id,
             detail: "removing Enhanced view; raw capture preserved".into(),
         });
     }
@@ -5610,6 +5670,7 @@ impl App {
                 status.stage = AutoSetupStage::Unavailable;
                 status.detail = format!("{message}; raw view kept");
             }
+            self.refresh_auto_setup_inspector();
         }
         discarded
     }
@@ -5694,11 +5755,14 @@ impl App {
                 .map_or(installed.name.clone(), |source| {
                     format!("{} / {}", source.name, installed.name)
                 });
-            self.auto_setup_status = Some(AutoSetupStatus {
+            let session_id = self
+                .auto_setup_session_for_identity(&installed.source_id, &installed.origin_view_id);
+            self.replace_auto_setup_status(AutoSetupStatus {
                 source_id: installed.source_id,
                 origin_view_id: installed.origin_view_id,
                 object_name,
                 stage: AutoSetupStage::Applied,
+                session_id,
                 detail: if select {
                     "Enhanced view selected".into()
                 } else {
@@ -6116,11 +6180,14 @@ impl App {
             view_id: view_id.to_owned(),
         });
         if let Some(receipt) = removed_auto_setup {
-            self.auto_setup_status = Some(AutoSetupStatus {
+            let session_id =
+                self.auto_setup_session_for_identity(&receipt.source_id, &receipt.origin_view_id);
+            self.replace_auto_setup_status(AutoSetupStatus {
                 source_id: receipt.source_id,
                 origin_view_id: receipt.origin_view_id,
                 object_name: receipt.generated_view_name,
                 stage: AutoSetupStage::Applied,
+                session_id,
                 detail: "automatic setup removed; raw capture preserved".into(),
             });
         }
@@ -7830,6 +7897,7 @@ impl App {
         );
         match open {
             Open::Storage => layers.storage.open((), &mut ctx),
+            Open::AutoSetupStatus(status) => layers.auto_setup_status.open(status, &mut ctx),
             Open::Time => layers.time.open((), &mut ctx),
             Open::Help => layers.help.open((), &mut ctx),
             Open::Settings => layers.settings.open((), &mut ctx),
@@ -7991,6 +8059,12 @@ impl App {
             LayerId::Storage => {
                 dispatch_raw(&mut layers.storage, event, rendered_surface, &mut ctx)
             }
+            LayerId::AutoSetupStatus => dispatch_raw(
+                &mut layers.auto_setup_status,
+                event,
+                rendered_surface,
+                &mut ctx,
+            ),
             LayerId::Time => dispatch_raw(&mut layers.time, event, rendered_surface, &mut ctx),
             LayerId::Help => dispatch_raw(&mut layers.help, event, rendered_surface, &mut ctx),
             LayerId::Settings => {
@@ -8079,6 +8153,7 @@ impl App {
         );
         match top {
             LayerId::Storage => layers.storage.action_labels(&ctx),
+            LayerId::AutoSetupStatus => layers.auto_setup_status.action_labels(&ctx),
             LayerId::Time => layers.time.action_labels(&ctx),
             LayerId::Help => layers.help.action_labels(&ctx),
             LayerId::Settings => layers.settings.action_labels(&ctx),
@@ -8113,6 +8188,7 @@ impl App {
         let layers = &self.layers;
         match top {
             LayerId::Storage => layers.storage.text_focus(),
+            LayerId::AutoSetupStatus => layers.auto_setup_status.text_focus(),
             LayerId::Time => layers.time.text_focus(),
             LayerId::Help => layers.help.text_focus(),
             LayerId::Settings => layers.settings.text_focus(),
@@ -8167,6 +8243,9 @@ impl App {
         );
         let outcome = match layer {
             LayerId::Storage => layers.storage.handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::AutoSetupStatus => layers
+                .auto_setup_status
+                .handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Time => layers.time.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Help => layers.help.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Settings => layers
@@ -8244,6 +8323,9 @@ impl App {
             let outcome = match id {
                 LayerId::Storage => layers
                     .storage
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::AutoSetupStatus => layers
+                    .auto_setup_status
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Time => layers
                     .time
@@ -8911,6 +8993,7 @@ impl App {
                     }
                 }
             }
+            Action::OpenAutoSetupStatus => self.open_auto_setup_status(provider),
             Action::AnalyzeAutoSetup => self.request_auto_setup(),
             Action::RevertAutoSetup => self.revert_auto_setup(),
             Action::StopCapture | Action::RestartCapture => {

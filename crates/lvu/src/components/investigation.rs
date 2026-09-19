@@ -150,6 +150,34 @@ impl InvestigationDialog {
         self.state.as_ref()
     }
 
+    /// The visible action row, shared by paint, mnemonic dispatch and mouse
+    /// activation. The question owns bare text; Alt reaches these buttons
+    /// from every stage that exposes them.
+    fn actions_for(dialog: &InvestigationDialogState) -> Vec<(&'static str, InvestigationControl)> {
+        use InvestigationControl as C;
+        use InvestigationStage as S;
+        let editable = matches!(dialog.stage, S::Input | S::Conversation | S::Error);
+        let saved_mode = dialog.saved_mode && !dialog.items.is_empty();
+        if !editable {
+            return Vec::new();
+        }
+        let primary = if dialog.stage == S::Conversation {
+            "&Send"
+        } else if dialog.input.trim().is_empty() && !dialog.items.is_empty() {
+            "&Resume"
+        } else {
+            "&Start"
+        };
+        let mut actions = vec![(primary, C::Submit)];
+        if saved_mode {
+            actions.push(("&Open", C::Open));
+        }
+        if dialog.investigation_id.is_some() || dialog.session_id.is_some() {
+            actions.push(("New s&napshot", C::New));
+        }
+        actions
+    }
+
     /// Whether a remote turn is in flight, for the activity indicator (§7.8).
     pub fn is_working(&self) -> bool {
         self.state.as_ref().is_some_and(|dialog| {
@@ -661,6 +689,35 @@ impl Component for InvestigationDialog {
         }
     }
 
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        self.state
+            .as_ref()
+            .map(Self::actions_for)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect()
+    }
+
+    fn press_action(&mut self, index: usize, _ctx: &mut Ctx<'_>) -> Outcome {
+        let Some(control) = self.state.as_ref().and_then(|dialog| {
+            Self::actions_for(dialog)
+                .get(index)
+                .map(|(_, control)| *control)
+        }) else {
+            return Outcome::Ignored;
+        };
+        self.focus_control(control);
+        if matches!(
+            control,
+            InvestigationControl::Submit | InvestigationControl::Open | InvestigationControl::New
+        ) {
+            self.activate()
+        } else {
+            Outcome::Consumed
+        }
+    }
+
     /// §4.3: three catalog rows the layer takes over while it can serve them.
     /// Their availability used to be computed in `terminal.rs` from a peek at
     /// `App::investigation_dialog`; the layer answers for itself now, which is
@@ -813,7 +870,7 @@ fn investigation_spec_for(area: Rect) -> DialogSpec {
     // Stable maximum action labels across stages so the band never moves as
     // the primary relabels or Open/New-snapshot appear. Display width via
     // button_width, capped at two rows.
-    let max_labels = ["New snapshot", "Resume", "Open"];
+    let max_labels = ["New &snapshot", "&Resume", "&Open"];
     let (policy_w, _) = policy_size(area, PresentationKind::LongContent);
     let estimate = policy_w.saturating_sub(4).max(1);
     let action_rows = stable_action_rows(estimate, &max_labels).clamp(1, 2);
@@ -914,23 +971,7 @@ fn draw(
         (None, None) => None,
     };
 
-    let primary = if dialog.stage == Stage::Conversation {
-        "Send"
-    } else if dialog.input.trim().is_empty() && !dialog.items.is_empty() {
-        "Resume"
-    } else {
-        "Start"
-    };
-    let mut actions: Vec<(&str, C)> = Vec::new();
-    if editable {
-        actions.push((primary, C::Submit));
-        if saved_mode {
-            actions.push(("Open", C::Open));
-        }
-        if dialog.investigation_id.is_some() || dialog.session_id.is_some() {
-            actions.push(("New snapshot", C::New));
-        }
-    }
+    let actions = InvestigationDialog::actions_for(&dialog);
     let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
 
     // Stable LongContent budgets: outer size is policy-only, never transcript

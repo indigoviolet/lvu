@@ -516,7 +516,7 @@ fn discovery_groups_types_sorts_recent_activity_and_expands_old_unavailable() {
     let older = collapsed.find("older.log").unwrap();
     assert!(service < projects && projects < newer && newer < older);
 
-    key_with(&mut app, KeyCode::Char('o'), KeyModifiers::ALT);
+    key_with(&mut app, KeyCode::Char('u'), KeyModifiers::ALT);
     let expanded = screen(&draw(&mut app, 90, 32));
     assert!(expanded.contains("retired-worker"), "{expanded}");
     assert!(

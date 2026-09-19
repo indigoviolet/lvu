@@ -833,7 +833,7 @@ impl SettingsDialog {
 fn settings_spec_for(area: Rect, save_label: &str, with_more: bool) -> DialogSpec {
     let mut labels = vec![save_label];
     if with_more {
-        labels.push("More");
+        labels.push("&More");
     }
     let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
     let estimate = policy_w.saturating_sub(4).max(1);
@@ -922,6 +922,26 @@ impl Component for SettingsDialog {
                 Outcome::Ignored
             }
         }
+    }
+
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        let Some(dialog) = &self.state else {
+            return Vec::new();
+        };
+        let mut labels = vec![if dialog.saving { "&Saving…" } else { "&Save" }];
+        if dialog.details_scroll_limit > 0 {
+            labels.push("&More");
+        }
+        labels
+    }
+
+    fn press_action(&mut self, index: usize, _ctx: &mut Ctx<'_>) -> Outcome {
+        match index {
+            0 => self.save(),
+            1 => self.focus_control(SettingsControl::More),
+            _ => return Outcome::Ignored,
+        }
+        Outcome::Consumed
     }
 
     fn surface(&self) -> Surface {
@@ -1014,7 +1034,7 @@ impl Component for SettingsDialog {
         };
         let natural_body = form_count.saturating_add(u16::try_from(details.len()).unwrap_or(0));
 
-        let save_label = if dialog.saving { "Saving…" } else { "Save" };
+        let save_label = if dialog.saving { "&Saving…" } else { "&Save" };
         // §3: the anatomy has a help row, and this is the one thing about
         // Settings a user cannot discover from the form itself.
         let help = "Choose the detected System timezone, UTC, or search IANA zones such as Europe/Berlin for daylight saving. Display only: captured/event instants never change.";
@@ -1026,7 +1046,7 @@ impl Component for SettingsDialog {
             area,
             &spec_max,
             natural_usize,
-            &[save_label, "More"],
+            &[save_label, "&More"],
             Some(0),
             None,
         )
@@ -1035,7 +1055,7 @@ impl Component for SettingsDialog {
         let overflows_estimate = natural_usize > usize::from(viewport_estimate.height);
         let with_more = overflows_estimate;
         let actual_labels: Vec<&str> = if with_more {
-            vec![save_label, "More"]
+            vec![save_label, "&More"]
         } else {
             vec![save_label]
         };
@@ -1613,7 +1633,7 @@ impl Component for SettingsDialog {
         // filled Save default, same rects for paint/mouse. No independent rows.
         let mut controls = vec![(Control::Save, save_label)];
         if overflows {
-            controls.push((Control::More, "More"));
+            controls.push((Control::More, "&More"));
         }
         let labels: Vec<&str> = controls.iter().map(|(_, label)| *label).collect();
         let focused = controls

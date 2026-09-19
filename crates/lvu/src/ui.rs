@@ -300,6 +300,9 @@ fn render_layers<P: RowProvider>(
             ctx.active = is_top;
             let surface = match id {
                 crate::component::LayerId::Storage => layers.storage.render(frame, area, &ctx),
+                crate::component::LayerId::AutoSetupStatus => {
+                    layers.auto_setup_status.render(frame, area, &ctx)
+                }
                 crate::component::LayerId::Time => layers.time.render(frame, area, &ctx),
                 crate::component::LayerId::Help => layers.help.render(frame, area, &ctx),
                 crate::component::LayerId::Settings => layers.settings.render(frame, area, &ctx),
@@ -360,6 +363,12 @@ fn sidebar_view_regions(app: &App, area: Option<Rect>) -> Vec<(Rect, usize)> {
     let mut regions = Vec::new();
     for source in &app.sources {
         y = y.saturating_add(2);
+        if app
+            .auto_setup_status()
+            .is_some_and(|status| status.source_id == source.id)
+        {
+            y = y.saturating_add(1);
+        }
         for (index, _) in app
             .views()
             .iter()
@@ -806,6 +815,12 @@ fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme, r
             ),
         ])));
         items.push(ListItem::new(format!("  {}", source.health)));
+        if let Some(status) = app
+            .auto_setup_status()
+            .filter(|status| status.source_id == source.id)
+        {
+            items.push(ListItem::new(format!("  Setup: {}", status.summary())));
+        }
         for (index, view) in app
             .views()
             .iter()

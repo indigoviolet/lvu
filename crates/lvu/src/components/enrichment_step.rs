@@ -778,7 +778,7 @@ fn step_spec(area: Rect) -> DialogSpec {
 
 /// The stable maximum action set, so the budget never moves between adding
 /// (Save alone) and editing (Save + Remove).
-const STEP_MAX_LABELS: [&str; 2] = ["Save", "Remove"];
+const STEP_MAX_LABELS: [&str; 2] = ["&Save", "Re&move"];
 fn render_enrichment_step(
     this: &mut EnrichmentStepLayer,
     frame: &mut Frame<'_>,
@@ -837,9 +837,9 @@ fn render_enrichment_step(
         "Enrichment › New step".to_owned()
     };
     let labels: Vec<&str> = if editing_index.is_some() {
-        vec!["Save", "Remove"]
+        vec!["&Save", "Re&move"]
     } else {
-        vec!["Save"]
+        vec!["&Save"]
     };
     let controls: Vec<Control> = if editing_index.is_some() {
         vec![Control::Save, Control::Remove]

@@ -531,14 +531,26 @@ impl Component for StorageDialog {
         }]
     }
 
-    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
-        self.buttons().to_vec()
+    fn action_labels(&self, ctx: &Ctx<'_>) -> Vec<&'static str> {
+        let mut labels = self.buttons().to_vec();
+        if self.more_rect().is_some() {
+            labels.push(if ctx.ascii {
+                "&More v"
+            } else {
+                "&More \u{25be}"
+            });
+        }
+        labels
     }
 
     fn press_action(&mut self, index: usize, _ctx: &mut Ctx<'_>) -> Outcome {
         match index {
             0 => self.refresh(),
             1 => self.clear(),
+            2 => {
+                self.menu_open = !self.menu_open;
+                self.menu_selected = 0;
+            }
             _ => return Outcome::Ignored,
         }
         Outcome::Consumed
@@ -1041,7 +1053,7 @@ impl Component for StorageDialog {
         if !action_geom.overflow.is_empty()
             && let Some(more_rect) = action_geom.more
         {
-            let more_label = if ascii { "More v" } else { "More \u{25be}" };
+            let more_label = if ascii { "&More v" } else { "&More \u{25be}" };
             render_role_button(
                 frame,
                 more_rect,

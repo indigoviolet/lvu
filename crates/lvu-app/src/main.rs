@@ -2221,7 +2221,7 @@ impl Composition {
                         if start.auto_setup.is_some()
                             && let Some(mut status) = app.auto_setup_status().cloned()
                         {
-                            status.detail = format!("Paseo: {session_id}");
+                            status.session_id = Some(session_id.clone());
                             app.set_auto_setup_status(status);
                         }
                         self.begin_proposal(
@@ -2307,8 +2307,7 @@ impl Composition {
                         if let Some(mut status) = app.auto_setup_status().cloned()
                             && status.stage == lvu::AutoSetupStage::Unavailable
                         {
-                            status.detail =
-                                format!("{} · Paseo: {paseo_session_id}", status.detail);
+                            status.session_id = Some(paseo_session_id.clone());
                             app.set_auto_setup_status(status);
                         }
                         // The bridge detaches this completed one-shot operation
@@ -2632,7 +2631,7 @@ impl Composition {
                         memory_notice(app, format!("automatic setup receipt: {error}"));
                     }
                     if let Some(mut status) = app.auto_setup_status().cloned() {
-                        status.detail = format!("Paseo: {paseo_session_id}");
+                        status.session_id = Some(paseo_session_id);
                         app.set_auto_setup_status(status);
                     }
                 }
@@ -2668,7 +2667,8 @@ impl Composition {
                         memory_notice(app, format!("automatic setup receipt: {error}"));
                     }
                     if let Some(mut status) = app.auto_setup_status().cloned() {
-                        status.detail = format!("no useful setup · Paseo: {paseo_session_id}");
+                        status.detail = "no useful automatic setup found; raw view kept".into();
+                        status.session_id = Some(paseo_session_id);
                         app.set_auto_setup_status(status);
                     }
                 }
@@ -2705,7 +2705,7 @@ impl Composition {
                     if let Some(paseo_session_id) = paseo_session_id
                         && let Some(mut status) = app.auto_setup_status().cloned()
                     {
-                        status.detail = format!("{} · Paseo: {paseo_session_id}", status.detail);
+                        status.session_id = Some(paseo_session_id);
                         app.set_auto_setup_status(status);
                     }
                 }

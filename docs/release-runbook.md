@@ -12,7 +12,7 @@ Homebrew renderer require this three-target set. Historical four-archive
 releases remain immutable; `--with-intel-darwin` is available only when
 re-rendering a historical formula.
 
-**State: `v0.1.15` is the latest published release, with the supported
+**State: `v0.1.16` is the latest published release, with the supported
 three-archive target set. `v0.1.7` is an immutable draft with a known restore
 defect and must never be published, retagged or have its assets replaced.
 `v0.1.9` is an immutable failed publication tag: its archive verifier did not
@@ -289,10 +289,10 @@ brew install uv node     # or: mise use -g uv node
 
 ## 5. Cutting the next version
 
-`v0.1.15` is published. `v0.1.7` remains an immutable unpublished draft because
+`v0.1.16` is published. `v0.1.7` remains an immutable unpublished draft because
 its restore defect was confirmed after archive creation. `v0.1.9` is an
 immutable failed publication tag and remains unpublished. The next release must
-use a new normal version; never move or reuse `v0.1.7` through `v0.1.15`, and
+use a new normal version; never move or reuse `v0.1.7` through `v0.1.16`, and
 do not replace or publish the v0.1.7 draft assets.
 
 Every next release requires verified Linux x86_64, Linux arm64 and Apple-silicon

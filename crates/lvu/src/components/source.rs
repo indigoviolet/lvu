@@ -589,6 +589,24 @@ impl SourceDialog {
         self.field().is_some()
     }
 
+    /// The one visible action row for every source-dialog mode. Kept separate
+    /// from rendering so the same underlined labels reach the shell mnemonic
+    /// resolver; Add source does not have mouse-only submit buttons.
+    fn action_labels_for_state(&self) -> Vec<&'static str> {
+        use SourceAiStage as A;
+        use SourceDialogMode as M;
+        match self.state.mode {
+            M::Existing => vec!["&Add source", "&Restart", "Re&move"],
+            M::Manual => vec!["&Open"],
+            M::Discovery => vec!["&Open", "&Rescan"],
+            M::Ai => vec![match self.state.ai.stage {
+                A::Input | A::Error => "Request &proposal",
+                A::Proposal => "Start &reviewed source",
+                A::Preparing | A::Starting | A::Proposing | A::Applying => "Wor&king…",
+            }],
+        }
+    }
+
     fn value_of(&self, field: SourceField) -> &str {
         match field {
             SourceField::Manual => &self.state.draft,
@@ -1444,7 +1462,7 @@ impl SourceDialog {
         match key.code {
             KeyCode::Char('d') if control => self.toggle_discovery(),
             KeyCode::Char('r') if control => self.start_discovery_scan(),
-            KeyCode::Char('o') if alt && self.state.mode == SourceDialogMode::Discovery => {
+            KeyCode::Char('u') if alt && self.state.mode == SourceDialogMode::Discovery => {
                 self.toggle_older_unavailable()
             }
             KeyCode::Char('f') if alt => self.select_kind(SourceKind::File),
@@ -1709,26 +1727,48 @@ impl Component for SourceDialog {
         self.surface
     }
 
+    fn text_focus(&self) -> bool {
+        // Source creation may switch into Discover and receive a typing burst
+        // before a fresh frame publishes its surface. Read the live field
+        // state so `o` remains input there instead of firing Open.
+        SourceDialog::text_focus(self)
+    }
+
     fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
-        if self.state.mode == SourceDialogMode::Existing {
-            vec!["Add source", "Restart", "Remove"]
-        } else {
-            Vec::new()
-        }
+        self.action_labels_for_state()
     }
 
     fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
-        if self.state.mode != SourceDialogMode::Existing {
+        let control = match self.state.mode {
+            SourceDialogMode::Existing => match index {
+                0 => Some(SourceControl::Add),
+                1 => Some(SourceControl::Restart),
+                2 => Some(SourceControl::Remove),
+                _ => None,
+            },
+            SourceDialogMode::Manual => (index == 0).then_some(SourceControl::Input),
+            SourceDialogMode::Discovery => match index {
+                0 => Some(SourceControl::Input),
+                1 => Some(SourceControl::Refresh),
+                _ => None,
+            },
+            SourceDialogMode::Ai => (index == 0).then_some(SourceControl::Input),
+        };
+        let Some(control) = control else {
             return Outcome::Ignored;
-        }
-        match index {
-            0 => {
+        };
+        match control {
+            SourceControl::Add => {
                 self.state.return_to_existing = !ctx.sources.is_empty();
                 self.set_mode(SourceDialogMode::Manual);
             }
-            1 => self.submit_management(false, ctx),
-            2 => self.submit_management(true, ctx),
-            _ => return Outcome::Ignored,
+            SourceControl::Restart => self.submit_management(false, ctx),
+            SourceControl::Remove => self.submit_management(true, ctx),
+            control => {
+                self.state.control = control;
+                self.state.controls_focused = control != SourceControl::Input;
+                self.activate(ctx);
+            }
         }
         Outcome::Consumed
     }
@@ -1917,41 +1957,32 @@ fn render_source(
     };
     let help = "";
 
-    // A batch applies every listed source at once, so its action says how
-    // many. A single reviewed source keeps the established label.
+    // A batch keeps its count in the painted primary button while retaining
+    // the same `r` mnemonic as the singular reviewed-source action.
     let multi_start = match dialog.mode {
-        Mode::Ai if dialog.ai.stage == SourceAiStage::Proposal => {
-            let count = dialog
-                .ai
-                .preview
-                .as_ref()
-                .map_or(0, |preview| preview.sources.len());
-            (count > 1).then(|| format!("Start {count} reviewed sources"))
-        }
+        Mode::Ai if dialog.ai.stage == SourceAiStage::Proposal => dialog
+            .ai
+            .preview
+            .as_ref()
+            .map(|preview| preview.sources.len())
+            .filter(|count| *count > 1)
+            .map(|count| format!("Start {count} &reviewed sources")),
         _ => None,
     };
-    let primary = match dialog.mode {
-        Mode::Existing => "Restart",
-        Mode::Ai => match dialog.ai.stage {
-            SourceAiStage::Input | SourceAiStage::Error => "Request proposal",
-            SourceAiStage::Proposal => multi_start.as_deref().unwrap_or("Start reviewed source"),
-            _ => "Working…",
-        },
-        _ => "Open",
-    };
+    let mut action_labels = this.action_labels_for_state();
+    if let Some(label) = multi_start.as_deref()
+        && let Some(primary) = action_labels.first_mut()
+    {
+        *primary = label;
+    }
     let mut action_controls = if dialog.mode == Mode::Existing {
-        vec![
-            (Control::Add, "Add source"),
-            (Control::Restart, "Restart"),
-            (Control::Remove, "Remove"),
-        ]
+        vec![Control::Add, Control::Restart, Control::Remove]
     } else {
-        vec![(Control::Input, primary)]
+        vec![Control::Input]
     };
     if dialog.mode == Mode::Discovery {
-        action_controls.push((Control::Refresh, "Rescan"));
+        action_controls.push(Control::Refresh);
     }
-    let action_labels: Vec<&str> = action_controls.iter().map(|(_, label)| *label).collect();
 
     // Stable LongContent budgets: outer size is policy-only, never async
     // counts. The Add source dialog has one header row for its
@@ -2499,9 +2530,9 @@ fn render_source(
                         }
                         DiscoveryDisplayRow::OlderUnavailable(hidden) => {
                             let label = if hidden == 0 {
-                                "Hide older unavailable sources · Alt-O".to_owned()
+                                "Hide older unavailable sources · Alt-U".to_owned()
                             } else {
-                                format!("Show {hidden} older unavailable sources · Alt-O")
+                                format!("Show {hidden} older unavailable sources · Alt-U")
                             };
                             frame.render_widget(
                                 Paragraph::new(truncated(&label, usize::from(row.width)))
@@ -2704,7 +2735,7 @@ fn render_source(
     // on the focused control; hidden actions keep original indices.
     let focused_action = action_controls
         .iter()
-        .position(|(control, _)| *control == dialog.control);
+        .position(|control| *control == dialog.control);
     let destructive = [2usize];
     let action_row = ActionRow {
         labels: &action_labels,
@@ -2726,7 +2757,7 @@ fn render_source(
             focused_action == Some(index),
             theme,
         );
-        if let Some((control, _)) = action_controls.get(index) {
+        if let Some(control) = action_controls.get(index) {
             geometry.controls.push((rect, *control));
         }
     }

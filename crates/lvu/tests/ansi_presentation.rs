@@ -84,3 +84,44 @@ fn ansi_wrapped_json_is_clean_but_does_not_invent_a_navigable_tree() {
     assert!(app.details_rows(&provider).is_empty());
     assert_eq!(screen(&mut app, &provider), before);
 }
+
+#[test]
+fn details_sanitizes_raw_fields_and_presentation_metadata() {
+    let provider = WrappedJson(DisplayRow {
+        id: RowId::new("source", 1),
+        timestamp: "now".into(),
+        captured_at_unix_nanos: None,
+        level: "INFO".into(),
+        // Deliberately not JSON: this exercises Details' raw line plus its
+        // flat derived-field route rather than the structured-tree route.
+        text: "request \u{1b}[31mERROR\u{1b}[0m".into(),
+        details: vec![("command.status".into(), "\u{1b}[32mapplied\u{1b}[0m".into())],
+        fields: vec![("derived.level".into(), "\u{1b}[33mWARN\u{1b}[0m".into())],
+    });
+    let mut app = App::new(
+        vec![SourceItem {
+            id: "source".into(),
+            name: "source".into(),
+            health: "ok".into(),
+        }],
+        vec![ViewItem {
+            id: "view".into(),
+            source_id: "source".into(),
+            name: "view".into(),
+        }],
+        false,
+    );
+    app.sync_provider(&provider, 8);
+    app.handle(Action::ToggleDetails, &provider);
+    let rendered = screen(&mut app, &provider);
+    assert!(rendered.contains("request ERROR"), "{rendered}");
+    assert!(rendered.contains("derived.level: WARN"), "{rendered}");
+    assert!(rendered.contains("command.status: applied"), "{rendered}");
+    assert!(
+        !rendered.contains("[31m")
+            && !rendered.contains("[32m")
+            && !rendered.contains("[33m")
+            && !rendered.contains("[0m"),
+        "Details must use the same presentation-boundary ANSI removal as the log:\n{rendered}"
+    );
+}

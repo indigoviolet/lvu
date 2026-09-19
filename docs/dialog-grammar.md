@@ -167,12 +167,15 @@ It never adds fields to Add source and never delays raw display.
 5. A successful locally validated proposal atomically creates an ordinary
    derived `Enhanced` view. `All events` remains raw.
 6. The generated setup receipt becomes an existing child object of that view.
-7. The applied state names the retained Paseo session; inspecting that
-   conversation is outside the mutation flow and changes no view state.
+7. `Current log -> Setup status` is an inspector: it names the existing log,
+   then automatic-setup state, Paseo session (or creating), then diagnostic.
+   Its optional `Analyze again` action queues a new bounded request; inspection
+   itself changes no view state.
 
 Manual operations follow the same grammar:
 
 - `View · All events -> Analyze again -> optional parameters -> Submit`
+- `View · All events -> Setup status -> Analyze again or Close`
 - `View · Enhanced -> Automatic setup receipt -> Revert -> exact removal
   preview -> Confirm`
 

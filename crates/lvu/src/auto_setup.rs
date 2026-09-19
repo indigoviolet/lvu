@@ -47,10 +47,26 @@ pub struct AutoSetupStatus {
     /// grammar): `payments · automatic setup: analyzing`.
     pub object_name: String,
     pub stage: AutoSetupStage,
+    /// The local Paseo conversation once the bridge has created it. Kept
+    /// separately from prose so a narrow inspector never has to parse it.
+    pub session_id: Option<String>,
     pub detail: String,
 }
 
 impl AutoSetupStatus {
+    /// Short, high-priority progress for the base status line. The full
+    /// source-qualified summary remains available to inspectors, but a manual
+    /// Analyze action must never look inert because optional status segments
+    /// were crowded out.
+    pub fn notice(&self) -> String {
+        let mut value = format!("setup: {}", self.stage.label());
+        if !self.detail.is_empty() {
+            value.push_str(" · ");
+            value.push_str(&self.detail);
+        }
+        value
+    }
+
     pub fn summary(&self) -> String {
         let mut value = format!(
             "{} · automatic setup: {}",
@@ -60,6 +76,10 @@ impl AutoSetupStatus {
         if !self.detail.is_empty() {
             value.push_str(" · ");
             value.push_str(&self.detail);
+        }
+        if let Some(session_id) = &self.session_id {
+            value.push_str(" · Paseo session: ");
+            value.push_str(session_id);
         }
         if self.stage == AutoSetupStage::Unavailable {
             value.push_str(" · retry: Ctrl-P → Current log › Analyze again");
@@ -355,6 +375,7 @@ mod tests {
             origin_view_id: "raw".into(),
             object_name: "payments / All events".into(),
             stage: AutoSetupStage::Analyzing,
+            session_id: None,
             detail: "bounded sample".into(),
         };
         assert_eq!(
@@ -370,6 +391,7 @@ mod tests {
             origin_view_id: "view".into(),
             object_name: "payments / All events".into(),
             stage: AutoSetupStage::Unavailable,
+            session_id: None,
             detail: "agent service unavailable".into(),
         };
         let summary = status.summary();
@@ -380,6 +402,24 @@ mod tests {
         assert!(
             summary.contains("Ctrl-P → Current log › Analyze again"),
             "{summary}"
+        );
+    }
+
+    #[test]
+    fn session_is_structured_and_named_in_the_full_summary() {
+        let status = AutoSetupStatus {
+            source_id: "source".into(),
+            origin_view_id: "raw".into(),
+            object_name: "payments / All events".into(),
+            stage: AutoSetupStage::Analyzing,
+            session_id: Some("paseo-auto-42".into()),
+            detail: "bounded sample sent".into(),
+        };
+        assert!(status.summary().contains("Paseo session: paseo-auto-42"));
+        assert!(status.notice().contains("setup: analyzing"));
+        assert!(
+            !status.notice().contains("paseo-auto-42"),
+            "the compact acknowledgement must not hide its state behind a long id"
         );
     }
 }

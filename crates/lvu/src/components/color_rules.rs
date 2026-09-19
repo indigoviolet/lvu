@@ -675,10 +675,22 @@ impl Component for ColorRulesDialog {
     }
 
     fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
-        COLOR_RULES_BUTTONS.to_vec()
+        let mut labels = COLOR_RULES_BUTTONS.to_vec();
+        if self.geometry.more_button.is_some() {
+            labels.push(crate::dialog_controls::MORE_LABEL);
+        }
+        labels
     }
 
     fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        if index == COLOR_RULES_BUTTONS.len() {
+            if self.more_open {
+                self.more_open = false;
+            } else {
+                self.open_more(None);
+            }
+            return Outcome::Consumed;
+        }
         // Any press dismisses the transient overflow menu first — including
         // the menu's own items, which arrive here with original indices (0
         // Add, 1 Edit, 2 Remove, 3 Apply) and run exactly what their buttons would.

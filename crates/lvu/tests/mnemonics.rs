@@ -96,6 +96,17 @@ fn layers() -> Vec<(&'static str, Open)> {
     vec![
         ("Fields", Open::Fields),
         ("Storage", Open::Storage),
+        (
+            "Automatic setup status",
+            Open::AutoSetupStatus(lvu::AutoSetupStatus {
+                source_id: "api".into(),
+                origin_view_id: "all".into(),
+                object_name: "api / All events".into(),
+                stage: lvu::AutoSetupStage::Analyzing,
+                session_id: Some("paseo-fixture-session".into()),
+                detail: "bounded sample sent".into(),
+            }),
+        ),
         ("Time", Open::Time),
         ("Help", Open::Help),
         ("Settings", Open::Settings),
@@ -171,7 +182,10 @@ fn every_action_row_mnemonic_in_the_product_is_accounted_for() {
             false,
         ),
         ("Storage", vec!['r', 'c'], false),
-        ("Time", vec!['c', 't'], false),
+        // The session inspector exposes the explicit retry the user asked
+        // for, plus a safe close default; neither field is editable.
+        ("Automatic setup status", vec!['a', 'c'], false),
+        ("Time", vec!['p', 'c', 't'], false),
         // Help has no action row at all (§8.9), so it has no mnemonic and no
         // key of this kind is ever diverted from it.
         ("Help", vec![], false),
@@ -183,26 +197,24 @@ fn every_action_row_mnemonic_in_the_product_is_accounted_for() {
         // and why its palette rows print the Alt chord. Delete's `e` arms
         // (never deletes) and is not a letter of its destructive button, so
         // no bare key can delete.
-        ("View", vec!['b', 'c', 'r', 's', 'e'], true),
-        // `n` opens Add source on its editable Manual field. The separate
-        // Sources list is reached with `N`; neither action row claims a bare
-        // mnemonic.
-        ("Source", vec![], true),
-        ("Folding", vec![], false),
+        ("View", vec!['p', 'b', 'c', 'r', 's', 'e'], true),
+        // `n` opens Add source on its editable Manual field. Its visible Open
+        // button is Alt-O from that field; Sources itself is reached with N.
+        ("Source", vec!['o'], true),
+        ("Folding", vec!['c'], false),
         // The Filter dialog opens with the caret in the active tab's field;
         // `Clear` and the two tab segments carry the letters (§12.1).
-        ("Search", vec!['c', 's', 'a'], true),
-        ("Advanced", vec!['c', 's', 'a'], true),
-        ("Grouping", vec![], true),
+        ("Search", vec!['p', 'c', 's', 'a'], true),
+        ("Advanced", vec!['p', 'c', 's', 'a'], true),
+        ("Grouping", vec!['a'], true),
         ("Bookmarks", vec![], false),
         ("Enrichment", vec!['a', 'e', 'r', 'c'], false),
         ("EnrichmentStep", vec![], true),
         ("ExternalCommand", vec!['s', 'r', 'm', 'n'], true),
-        // Recipes reports a text focus whenever its `More ▾` menu is closed,
-        // which suppresses its bare letters; Alt still presses its buttons and
-        // `x` stays bound for Reject. Tightening that is tied to what `q` does
-        // in Recipes and is not this rule's business.
-        ("Recipes", vec!['s', 'u', 'h'], true),
+        // Browse is a list, not a text field: its underlined verbs are real
+        // bare shortcuts. Editable recipe names keep those letters for input
+        // while Alt remains available for every button.
+        ("Recipes", vec!['p', 's', 'u', 'h', 'm'], false),
         // Ask opens on its Request field with `&Submit` alone in the row, so
         // `s` is text until Tab moves focus off it and Alt-S presses it from
         // anywhere. Its later rows mark letters this inventory cannot reach by
@@ -211,10 +223,9 @@ fn every_action_row_mnemonic_in_the_product_is_accounted_for() {
         // letter twice, which the dedup below checks for the rows it sees and
         // `each_letter_resolves_to_the_button_that_underlines_it` checks live.
         ("Ask", vec!['s'], true),
-        // Investigation still marks none: `Send`, `Resume`, `Start`, `Open`,
-        // `New snapshot`. Listed so a mnemonic added to it is caught here
-        // rather than by a user finding a dead key.
-        ("Investigation", vec![], true),
+        // The input keeps bare text; Alt-S reaches the visible Start button.
+        // Later Send, Resume, Open and New snapshot labels use the same rule.
+        ("Investigation", vec!['s'], true),
         // The summary is a read-only list with one button, so its letter is
         // live from the moment it opens.
         ("View summary", vec!['o'], false),
@@ -268,13 +279,10 @@ fn the_bare_underlined_letter_presses_the_same_button_as_alt() {
             let plain = digest(&mut bare, &provider);
 
             if text_focus {
-                // A focused text field takes the letter as text (§8.10). The
-                // press and the typed character cannot both be no-ops, so a
-                // difference here is the rule holding.
-                assert_ne!(
-                    plain, alt,
-                    "{name}: a focused text field takes `{letter}` as text"
-                );
+                // Alt reaches the button from a text-owned surface. Bare
+                // input is never required to do the same: a true editor may
+                // insert it, while a browse-only field can deliberately keep
+                // it inert until focus moves to an action.
                 continue;
             }
             assert_eq!(

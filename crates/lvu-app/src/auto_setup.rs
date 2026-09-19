@@ -271,6 +271,7 @@ impl AutoSetupCoordinator {
                     origin_view_id: request.origin_view_id,
                     object_name: request.object_name,
                     stage: AutoSetupStage::Unavailable,
+                    session_id: None,
                     detail: "another automatic analysis is active; raw view kept".into(),
                 });
             } else {
@@ -296,6 +297,7 @@ impl AutoSetupCoordinator {
             origin_view_id: request.origin_view_id.clone(),
             object_name: request.object_name.clone(),
             stage: AutoSetupStage::Analyzing,
+            session_id: None,
             detail: "bounded sample sent for typed setup".into(),
         });
         let analysis = AutoSetupAnalysis {

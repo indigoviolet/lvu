@@ -358,7 +358,7 @@ pub fn button_layout(
 
 /// Overflow menu label. Measured with [`button_width`] like every label, so
 /// planning and painting agree on its cells (`More ▾` is width 6 + brackets).
-pub const MORE_LABEL: &str = "More \u{25be}";
+pub const MORE_LABEL: &str = "&More \u{25be}";
 /// Stable maximum action rows (§5.4): wrap to two rows, beyond that `More ▾`.
 pub const MAX_ACTION_ROWS: u16 = 2;
 

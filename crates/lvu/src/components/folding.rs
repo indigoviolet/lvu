@@ -832,6 +832,18 @@ impl Component for FoldingDialog {
         self.surface
     }
 
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        vec!["&Collapse expanded runs"]
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        if index == 0 {
+            self.run_default(ctx)
+        } else {
+            Outcome::Ignored
+        }
+    }
+
     fn hit(&self, point: (u16, u16)) -> Option<FoldingHit> {
         let g = &self.geometry;
         g.choices
@@ -943,7 +955,7 @@ impl Component for FoldingDialog {
              field is replaced."
         };
         let action_controls = [FoldingControl::Collapse];
-        let action_labels = ["Collapse expanded runs"];
+        let action_labels = ["&Collapse expanded runs"];
         let title = match ctx.views.active_item() {
             Some(view) => format!("Folding · {}", view.name),
             None => "Folding".to_owned(),

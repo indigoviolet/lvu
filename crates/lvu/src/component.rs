@@ -53,6 +53,8 @@ impl Default for Appearance {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayerId {
     Storage,
+    /// Read-only automatic-setup lifecycle and Paseo session inspector.
+    AutoSetupStatus,
     Time,
     Help,
     Settings,
@@ -106,6 +108,8 @@ pub enum LayerId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Open {
     Storage,
+    /// The current automatic-setup lifecycle for an existing log.
+    AutoSetupStatus(crate::auto_setup::AutoSetupStatus),
     Time,
     Help,
     Settings,
@@ -191,6 +195,7 @@ impl LayerId {
     pub fn palette_anchor(self) -> CommandId {
         match self {
             LayerId::Storage => CommandId::StoragePreview,
+            LayerId::AutoSetupStatus => CommandId::AutoSetupStatus,
             LayerId::Time => CommandId::TimeWindow,
             LayerId::Help => CommandId::Help,
             LayerId::Settings => CommandId::Settings,
@@ -218,6 +223,7 @@ impl Open {
     pub fn layer(&self) -> LayerId {
         match self {
             Open::Storage => LayerId::Storage,
+            Open::AutoSetupStatus(_) => LayerId::AutoSetupStatus,
             Open::Time => LayerId::Time,
             Open::Help => LayerId::Help,
             Open::Settings => LayerId::Settings,
@@ -277,6 +283,7 @@ impl Open {
             // Recipes opens on an empty workspace too: Browse lists what is
             // saved, and Save/Update check for a view when they submit.
             Open::Storage
+            | Open::AutoSetupStatus(_)
             | Open::Time
             | Open::Help
             | Open::Settings
@@ -311,6 +318,7 @@ impl Open {
 
         match self {
             Open::Storage => &[Inspector],
+            Open::AutoSetupStatus(_) => &[Inspector],
             Open::Time | Open::Settings | Open::Folding => &[Existing],
             Open::Help => &[Informational],
             Open::Fields | Open::FieldColumn { .. } | Open::ViewSummary => &[Inspector],

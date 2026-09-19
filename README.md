@@ -106,7 +106,7 @@ Docker services/containers and previously opened sources, naming every category
 checked and which produced no results. Results are separated by source type and
 sorted by newest established activity within each section. Sources known to be
 unavailable for more than two weeks are collapsed behind an explicit Show row;
-filtering still finds them, and `Alt-O` expands or collapses them. Docker
+filtering still finds them, and `Alt-U` expands or collapses them. Docker
 discovery keeps every individual container source and also offers one
 Compose-service source that follows all replicas when its Compose configuration
 is available locally; it uses the same implicit Docker environment routing as
@@ -188,11 +188,14 @@ to opt out. A successful bounded proposal creates an
 ordinary Enhanced view containing only native enrichments, pins, exact-value
 colour rules, display roles and Run/Filter grouping. It cannot add a filter,
 command, source or time window. `Current log > Analyze again` runs the same
-operation explicitly; `Current view > Revert automatic setup` removes an
+operation explicitly; `Current log > Setup status` opens a full inspector for
+that log before offering another analysis. It names the log, lifecycle state,
+Paseo session (or that one is still being created), and diagnostic; its
+`Analyze again` button is an explicit retry. `Current view > Revert automatic setup` removes an
 unchanged generated view while preserving its source and captured bytes. Once
 you edit that setup manually, lvu refuses the automatic revert so it cannot
 erase your work. While analysis runs, the footer names its current stage without
-blocking raw browsing. Its `Paseo: <session>` result identifies a retained
+blocking raw browsing. Its `Paseo session: <session>` result identifies a retained
 `lvu automatic log setup` conversation in Paseo; these conversations are not
 archived when the one-shot proposal completes.
 

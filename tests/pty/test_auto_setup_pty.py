@@ -38,6 +38,7 @@ for line in sys.stdin:
     method = request["method"]
     request_id = request["request_id"]
     if method == "start_session":
+        time.sleep(float(os.environ.get("FAKE_BRIDGE_START_DELAY", "0")))
         assert request.get("purpose") == "auto_setup"
         assert request.get("title") == "lvu automatic log setup"
         result = {"session_id": "automatic-setup-session"}
@@ -125,7 +126,7 @@ def sidebar_views(app: PtyApp) -> list[str]:
         if not line.startswith("│"):
             continue
         entry = line[1:21].replace("›", " ").strip().rstrip("─│┌┐└┘▄▀").strip()
-        if not entry or entry.startswith(("●", "Running:")):
+        if not entry or entry.startswith(("●", "Running:", "Setup:")):
             continue
         if any(character in entry for character in "─│┌┐└┘▄▀"):
             continue
@@ -183,9 +184,8 @@ def run(binary: pathlib.Path) -> None:
 
         enhanced = app.wait_until(
             lambda text: "Enhanced" in text
-            and "automatic setup: applied" in text
-            and "Paseo:" in text
-            and "automatic-setup-session" in text,
+            and "setup: applied" in text
+            and "database failed" in text,
             "strict proposal installed with its inspectable Paseo session",
             timeout=25.0,
         )

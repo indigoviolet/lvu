@@ -2566,6 +2566,26 @@ stays on screen; help and pads are dropped first (§5.4).
 └──────────────────────────────────────────────────┘
 ```
 
+### 12.23 Automatic setup status — contextual inspector
+
+`Current log > Setup status` opens only when the current source has an
+automatic-setup lifecycle. It is an inspector, not a second editor: the body
+always names the existing log first, then `automatic setup: <state>`, then the
+Paseo session identifier (or `creating a Paseo conversation`), then the current
+diagnostic. This remains available when a narrow sidebar can only show the
+short `Setup:` row.
+
+The action row is `[ Analyze again ] [ Close ]`; its underlined `a` and `c`
+follow §8.10, so Alt-A works from any focus and bare letters work when no text
+field owns input. Analyze again closes the inspector and queues one new bounded
+sample. It never alters the canonical All events view, capture bytes or an
+accepted Enhanced view before a separately reviewed proposal is installed.
+
+The compact base footer is deliberately shorter: `setup: sampling`,
+`setup: analyzing`, `setup: applied`, or `setup: unavailable` plus a practical
+detail. The inspector is the stable place for the full session identity and
+diagnostic; a status update refreshes it while it is open.
+
 ## 13. Implementation notes
 
 Shared primitives (`crates/lvu/src/dialog_layout.rs`; `dialog_controls.rs`

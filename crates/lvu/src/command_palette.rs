@@ -143,6 +143,7 @@ pub enum CommandId {
     Settings,
     SeverityColumnAssistant,
     TimestampColumnAssistant,
+    AutoSetupStatus,
     AnalyzeAutoSetup,
     RevertAutoSetup,
     AskAi,
@@ -236,6 +237,7 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::Settings,
     CommandId::SeverityColumnAssistant,
     CommandId::TimestampColumnAssistant,
+    CommandId::AutoSetupStatus,
     CommandId::AnalyzeAutoSetup,
     CommandId::RevertAutoSetup,
     CommandId::AskAi,
@@ -269,6 +271,9 @@ pub struct PaletteContext {
     /// stream to jump to.
     pub in_raw_view: bool,
     pub auto_setup_revert_available: bool,
+    /// A current automatic-setup lifecycle exists for the selected log, so
+    /// its full diagnostic/session inspector can open.
+    pub auto_setup_status_available: bool,
     /// Entries the converted components declare for themselves (§4.3). The
     /// palette no longer inspects dialog state to decide availability.
     pub layer_commands: Vec<(LayerId, CommandEntry)>,
@@ -283,6 +288,7 @@ impl PaletteContext {
             raw_context_held: false,
             in_raw_view: false,
             auto_setup_revert_available: false,
+            auto_setup_status_available: false,
             layer_commands: Vec::new(),
         }
     }
@@ -1685,6 +1691,15 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
                 crate::components::ask::AskOpen::Task(crate::app::AskTask::TimestampColumn),
             )),
             view_reason,
+        ),
+        command(
+            CommandId::AutoSetupStatus,
+            "Current log › Setup status",
+            "Inspect automatic setup progress, diagnostics and its Paseo session",
+            "Agent",
+            &["automatic setup status", "setup session", "paseo session"],
+            Action::OpenAutoSetupStatus,
+            (!context.auto_setup_status_available).then_some("start or analyze a log first"),
         ),
         command(
             CommandId::AnalyzeAutoSetup,

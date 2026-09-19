@@ -181,7 +181,10 @@ bounded cancellation and cleanup. It uses the distinct `auto_setup` session
 purpose and title `lvu automatic log setup`. A settled proposal releases lvu's
 bounded active slot but leaves the resumable Paseo conversation and its owned
 ledger record intact for inspection. The terminal status exposes its session
-ID.
+ID. `Current log > Setup status` is a read-only inspector whose order is the
+existing log, automatic-setup state, session identity (or creating), then
+diagnostic. Its explicit Analyze again action queues a fresh bounded request;
+it never changes the raw view or capture bytes.
 
 The `auto_setup` proposal is one complete bundle: at most eight unique native
 enrichment expressions, eight unique pins, sixteen exact-value colour rules,

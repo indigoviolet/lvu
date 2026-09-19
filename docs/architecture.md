@@ -1,7 +1,7 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.15` (2026-09-18) is the current public release. In addition to live
+`v0.1.16` (2026-09-19) is the current public release. In addition to live
 unions, shared keys, enrichment-backed colours, automatic shared capture and
 the responsive dialog system, it includes optional raw-first automatic log
 setup with an inspectable retained agent conversation, source-type-grouped
@@ -341,8 +341,10 @@ Automatic setup starts a managed bridge session with purpose `auto_setup` and
 the user-visible title `lvu automatic log setup`. Unlike short-lived Ask work,
 the Paseo conversation is resumable and remains in the owned workspace after
 the proposal settles. The bridge detaches its local observer to free bounded
-session capacity, while lvu keeps the session ID in the non-modal status so the
-conversation can be inspected in Paseo.
+session capacity. The compact footer always acknowledges the current stage;
+`Current log > Setup status` supplies the unclipped inspector for the existing
+log, state, structured Paseo session ID and diagnostic, with explicit Analyze
+again retry. The inspector is read-only until that retry is selected.
 
 Preview033 manifests include deterministic part-relative row offsets,
 evenly spaced across each source, with at most 128/source and 512 total. Applied

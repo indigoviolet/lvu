@@ -2,6 +2,7 @@
 //! owns its state, keymap, geometry and outbox.
 
 pub mod ask;
+pub mod auto_setup_status;
 pub mod bookmarks;
 pub mod color_rules;
 pub mod correlation;
@@ -26,6 +27,7 @@ pub mod view_summary;
 use crate::app::QueryPurpose;
 use crate::component::LayerId;
 use ask::AskDialog;
+use auto_setup_status::AutoSetupStatusDialog;
 use bookmarks::BookmarksDialog;
 use color_rules::{ColorRuleEditorDialog, ColorRulesDialog};
 use correlation::CorrelationDialog;
@@ -52,6 +54,8 @@ use view_summary::ViewSummaryDialog;
 #[derive(Debug)]
 pub struct Layers {
     pub storage: StorageDialog,
+    /// Read-only lifecycle/session inspector for automatic log setup.
+    pub auto_setup_status: AutoSetupStatusDialog,
     pub ask: AskDialog,
     pub investigation: InvestigationDialog,
     pub time: TimeDialog,
@@ -98,6 +102,7 @@ impl Default for Layers {
     fn default() -> Self {
         Self {
             storage: StorageDialog::default(),
+            auto_setup_status: AutoSetupStatusDialog::default(),
             ask: AskDialog::default(),
             investigation: InvestigationDialog::default(),
             time: TimeDialog::default(),

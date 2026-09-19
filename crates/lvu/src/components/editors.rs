@@ -90,15 +90,15 @@ const GROUPING_MODE_LABELS: [&str; 4] = ["Run", "Filter", "Legacy", "Off"];
 /// Everything the Filter dialog lets a mnemonic press, in `action_labels`
 /// order: the two buttons, then the two segments (as View lists its mode
 /// controls beside its buttons).
-const FILTER_MNEMONIC_TARGETS: [&str; 4] = ["Apply", "&Clear", "&Search", "&Advanced"];
+const FILTER_MNEMONIC_TARGETS: [&str; 4] = ["A&pply", "&Clear", "&Search", "&Advanced"];
 
 /// The Filter action row. `Apply` is the default (§8.9) and Enter presses it;
 /// `Clear` empties the active tab's draft and applies that, which is how a
 /// constraint is removed without removing the other tab's.
-const FILTER_ACTIONS: [&str; 2] = ["Apply", "&Clear"];
+const FILTER_ACTIONS: [&str; 2] = ["A&pply", "&Clear"];
 
 /// Grouping draws one button and it carries no mnemonic: Enter is its key.
-const GROUPING_ACTIONS: [&str; 1] = ["Apply"];
+const GROUPING_ACTIONS: [&str; 1] = ["&Apply"];
 
 /// §8.9 roles for the Grouping action row, parallel to [`GROUPING_ACTIONS`].
 const GROUPING_ROLES: [ButtonRole; 1] = [ButtonRole::Default];
@@ -1400,11 +1400,15 @@ impl Component for EditorDialog {
     /// offers its two buttons and its two tabs; Grouping's one button has no
     /// letter, so nothing is ever diverted from its field.
     fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
-        if self.tabbed {
+        let mut labels = if self.tabbed {
             FILTER_MNEMONIC_TARGETS.to_vec()
         } else {
             GROUPING_ACTIONS.to_vec()
+        };
+        if self.geometry.more_button.is_some() {
+            labels.push(crate::dialog_controls::MORE_LABEL);
         }
+        labels
     }
 
     /// Press the button or segment at `index` of `action_labels`, as a click
@@ -1414,6 +1418,15 @@ impl Component for EditorDialog {
     /// which arrive here with original `FILTER_ACTIONS` indices (0 Apply,
     /// 1 Clear) and run exactly what their buttons would.
     fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        let normal_actions = if self.tabbed { 4 } else { 1 };
+        if index == normal_actions && self.geometry.more_button.is_some() {
+            if self.more_open {
+                self.more_open = false;
+            } else {
+                self.open_more(None);
+            }
+            return Outcome::Consumed;
+        }
         self.more_open = false;
         if !self.tabbed {
             return if index == 0 {

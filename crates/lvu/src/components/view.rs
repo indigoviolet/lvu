@@ -540,11 +540,11 @@ const VIEW_TABS_FULL_WIDTH: u16 = 37;
 /// before an explicit focus move.
 fn view_apply_label(mode: ViewDialogMode) -> &'static str {
     if mode == ViewDialogMode::Sources {
-        "Apply membership"
+        "A&pply membership"
     } else if mode == ViewDialogMode::Delete {
-        "Delete view"
+        "&Delete view"
     } else {
-        "Apply"
+        "A&pply"
     }
 }
 

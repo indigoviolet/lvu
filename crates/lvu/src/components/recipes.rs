@@ -803,15 +803,18 @@ impl RecipesDialog {
         use RecipeDialogMode as M;
         let dialog = &self.state;
         let primary = match dialog.mode {
-            M::Save | M::Update => "Save revision",
-            M::Import => "Review import",
-            M::Export => "Export revision",
-            M::History => "Apply revision",
-            M::Browse => "Apply",
+            // These avoid Recipes' durable Alt-S/I/E/H mode chords. A
+            // mnemonic must perform the button it underlines, never capture
+            // a chord whose historical job is to enter another mode.
+            M::Save | M::Update => "Sa&ve revision",
+            M::Import => "Re&view import",
+            M::Export => "E&xport revision",
+            M::History => "Appl&y revision",
+            M::Browse => "A&pply",
         };
         let mut actions: Vec<(&'static str, C)> = vec![(primary, C::Apply)];
         if dialog.mode.is_editable() {
-            actions.push(("Cancel", C::Cancel));
+            actions.push(("&Cancel", C::Cancel));
             return actions;
         }
         let suggested = dialog.items.get(dialog.selected).is_some_and(|item| {
@@ -828,7 +831,7 @@ impl RecipesDialog {
                 ("&Save", C::Save),
                 ("&Update", C::Update),
                 ("&History", C::History),
-                (if ascii { "More v" } else { "More ▾" }, C::More),
+                (if ascii { "&More v" } else { "&More ▾" }, C::More),
             ]);
         }
         actions
@@ -878,12 +881,14 @@ impl RecipesDialog {
         Outcome::Consumed
     }
 
-    /// Whether the name field is taking characters. Also the `q`-dismissal
-    /// rule: outside an editable mode the old key table mapped every bare
-    /// character to `Action::RecipeInput`, which a non-editable mode dropped,
-    /// so `q` never closed the dialog.
+    /// Whether the actual name/path input owns bare characters. Browse and
+    /// History are list surfaces, so their visible action mnemonics are bare
+    /// shortcuts and `q` dismisses them; Save/Import/Export/Update keep every
+    /// ordinary character for the name/path field.
     fn editing(&self) -> bool {
         !self.state.menu_open
+            && self.state.mode.is_editable()
+            && self.state.control == RecipeDialogControl::Input
     }
 
     fn edit_name(&mut self, command: EditCommand<'_>) {
@@ -1083,9 +1088,9 @@ fn recipes_spec_for(area: Rect, ascii: bool) -> DialogSpec {
     // Stable maximum first-row labels (Browse with suggestions) so Browse
     // and History share one budget across Replace and no async arrival
     // moves the tail. Display width via button_width, capped at two rows.
-    let more = if ascii { "More v" } else { "More \u{25be}" };
+    let more = if ascii { "&More v" } else { "&More \u{25be}" };
     let max_labels = [
-        "Apply", "&Adapt", "&Reject", "&Save", "&Update", "&History", more,
+        "A&pply", "&Adapt", "&Reject", "&Save", "&Update", "&History", more,
     ];
     let (policy_w, _) = crate::dialog_layout::policy_size(area, PresentationKind::LongContent);
     let estimate = policy_w.saturating_sub(4).max(1);
@@ -1225,6 +1230,13 @@ impl Component for RecipesDialog {
 
     fn surface(&self) -> Surface {
         self.surface
+    }
+
+    fn text_focus(&self) -> bool {
+        // A keyboard burst may switch Save → Import and type a path before the
+        // next frame. Use the live control state so `c` in `recipe.toml`
+        // cannot be mistaken for the visible Cancel mnemonic.
+        self.editing()
     }
 
     fn hit(&self, point: (u16, u16)) -> Option<RecipeHit> {
@@ -1705,7 +1717,7 @@ impl Component for RecipesDialog {
             render_role_button(
                 frame,
                 more_rect,
-                if ascii { "More v" } else { "More \u{25be}" },
+                if ascii { "&More v" } else { "&More \u{25be}" },
                 crate::dialog_controls::ButtonRole::Normal,
                 focused,
                 theme,

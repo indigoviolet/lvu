@@ -1626,7 +1626,7 @@ fn recognize_label(ascii: bool) -> &'static str {
 }
 
 fn action_labels(ascii: bool) -> [&'static str; 3] {
-    ["Apply", "&Clear", recognize_label(ascii)]
+    ["A&pply", "&Clear", recognize_label(ascii)]
 }
 
 const ACTION_VERBS: [TimeAction; 3] =
@@ -2500,10 +2500,22 @@ impl Component for TimeDialog {
     }
 
     fn action_labels(&self, ctx: &Ctx<'_>) -> Vec<&'static str> {
-        action_labels(ctx.ascii).to_vec()
+        let mut labels = action_labels(ctx.ascii).to_vec();
+        if self.geometry.more_button.is_some() {
+            labels.push(crate::dialog_controls::MORE_LABEL);
+        }
+        labels
     }
 
     fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        if index == ACTION_VERBS.len() {
+            if self.more_open {
+                self.more_open = false;
+            } else {
+                self.open_more(None);
+            }
+            return Outcome::Consumed;
+        }
         // Any press dismisses the transient overflow menu first — including
         // the menu's own items, which arrive here with original indices into
         // `ACTION_VERBS` and run exactly what their buttons would.
