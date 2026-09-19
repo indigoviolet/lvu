@@ -109,7 +109,9 @@ def run(binary: pathlib.Path) -> None:
             )
             app.wait_for("Show 1 older unavailable source")
             assert "retired-job" not in app.text()
-            app.send(b"\x1bo")
+            # Alt-O is the visible Open action; the separate older-source
+            # disclosure deliberately moved to Alt-U.
+            app.send(b"\x1bu")
             app.wait_for("retired-job")
             assert "Docker Compose services" in app.text()
             assert "Docker containers" in app.text()

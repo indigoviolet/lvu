@@ -3983,56 +3983,6 @@ while the repository-local copy was moved to trash and remains recoverable.
 Human Apple-silicon macOS and arm64 Linux terminal acceptance remains
 unverified.
 
-### v0.1.16 published and installed — 2026-09-19
-
-Source `4c7cbc6e575f84735c942b54ab1f5b928d5e9d6d`, tree
-`edb2f85592664a2bf32bab2c5ee18a16ae5d1ba6`, and annotated tag object
-`fd1a57bc2082b73529c1014ddefb9165d514b3f8` were published as
-v0.1.16. Release workflow run `35336481330` succeeded with exactly Linux
-x86_64, Linux arm64, Apple-silicon macOS and SHA256SUMS assets. The public
-release is https://github.com/indigoviolet/lvu/releases/tag/v0.1.16. The tap
-commit is `b11b4d8829361cf6aafcf2778ffd12121f383823`; Homebrew and pinned mise
-installation acceptance passed. The checkout-local official archive was
-reverified and `versions/latest` now resolves to v0.1.16. Human Apple-silicon
-macOS and arm64 Linux terminal acceptance remains unverified.
-
-### Next-release working tree — 2026-09-19
-
-The current uncommitted candidate makes automatic setup observable rather than
-depending on an optional footer segment. `Current log > Setup status` opens a
-read-only object-first inspector with the log, lifecycle state, structured
-Paseo session (or creating state), diagnostic, Analyze again and Close. The
-footer remains a high-priority short acknowledgement, so manual Analyze again
-cannot look inert. Session IDs are now structured lifecycle state rather than
-text parsed from a detail sentence. The Details pane has a regression test for
-ANSI removal in raw text, derived fields and presentation metadata; captured
-bytes remain unchanged.
-
-The dialog audit marks and wires normal and narrow-overflow buttons, including
-Source Add/Discover/Agent actions, Recipes' state-aware controls, note save,
-Folding, Investigation and More. Recipes now uses live text focus so a burst
-typing an import path cannot turn its `c` into Cancel. The former Alt-O
-older-unavailable disclosure moved to Alt-U because Alt-O is the visible Open
-button in Discover. Documentation and tests name that route.
-
-Focused evidence is green: all 173 UI-state tests; automatic setup 12/12;
-ANSI presentation 2/2; mnemonic audit 7/7; Bookmarks 14/14; Source 15/15;
-Investigation 9/9; Folding 7/7; Storage 14/14; Editors 19/19; Time 18/18;
-Color Rules 19/19; Recipes 14/14. Actual PTYs passed for raw-first automatic
-setup/restart/revert and for manual Analyze again through pre-session and
-session-backed inspector states. The first manual PTY incorrectly required a
-transient Sampling frame, then the first automatic reruns retained two stale
-sidebar-wording assumptions; each failure is preserved under
-`lvu-build/auto-setup-pty-logs` and followed by the recorded green rerun. Full
-workspace preflight first exposed a real pre-render Source text-focus race:
-Discover treated `o` as its new Open mnemonic before a fresh frame recorded
-that the filter field owned text. The live field ownership now reaches the
-mnemonic resolver; the exact shared-source regression, Source suite and
-mnemonic audit passed. The corrected locked workspace test and all-target
-Clippy with warnings denied passed with logs under
-`lvu-next-preflight-20260919/`. Full immutable-candidate acceptance, versioning
-and publication have not started.
-
 ## 2026-09-18 — v0.1.15 discovery presentation and inspectable automatic setup
 
 Primary integrated the responsive dialog, pane-interaction, Color Rules and
@@ -4123,3 +4073,53 @@ No process used the superseded 0.1.14 installs: Homebrew and mise removed them,
 while the repository-local copy was moved to trash and remains recoverable.
 Human Apple-silicon macOS and arm64 Linux terminal acceptance remains
 unverified.
+
+### v0.1.16 published and installed — 2026-09-19
+
+Source `4c7cbc6e575f84735c942b54ab1f5b928d5e9d6d`, tree
+`edb2f85592664a2bf32bab2c5ee18a16ae5d1ba6`, and annotated tag object
+`fd1a57bc2082b73529c1014ddefb9165d514b3f8` were published as v0.1.16.
+Release workflow run `35336481330` succeeded with exactly Linux x86_64, Linux
+arm64, Apple-silicon macOS and SHA256SUMS assets. The public release is
+https://github.com/indigoviolet/lvu/releases/tag/v0.1.16. The tap commit is
+`b11b4d8829361cf6aafcf2778ffd12121f383823`; Homebrew and pinned mise
+installation acceptance passed. The checkout-local official archive was
+reverified and `versions/latest` now resolves to v0.1.16. Human Apple-silicon
+macOS and arm64 Linux terminal acceptance remains unverified.
+
+### v0.1.17 candidate versioned, acceptance in progress — 2026-09-19
+
+Feature commit `da58931` makes automatic setup observable rather than depending
+on an optional footer segment. `Current log > Setup status` opens a read-only
+object-first inspector with the log, lifecycle state, structured Paseo session
+(or creating state), diagnostic, Analyze again and Close. The footer remains a
+high-priority short acknowledgement, so manual Analyze again cannot look inert.
+Session IDs are structured lifecycle state rather than text parsed from a
+detail sentence. Details has a regression test for ANSI removal in raw text,
+derived fields and presentation metadata; captured bytes remain unchanged.
+
+The dialog audit marks and wires normal and narrow-overflow buttons, including
+Source Add/Discover/Agent actions, Recipes' state-aware controls, note save,
+Folding, Investigation and More. Recipes and Source now report live text focus
+so a typing burst cannot turn `c` into Cancel or `o` into Open. The former Alt-O
+older-unavailable disclosure moved to Alt-U because Alt-O is the visible Open
+button in Discover. Documentation and tests name that route.
+
+Focused evidence is green: UI state 173/173; automatic setup 12/12; ANSI
+presentation 2/2; mnemonic audit 7/7; Bookmarks 14/14; Source 15/15;
+Investigation 9/9; Folding 7/7; Storage 14/14; Editors 19/19; Time 18/18;
+Color Rules 19/19; Recipes 14/14. Actual PTYs passed for raw-first automatic
+setup/restart/revert and for manual Analyze again through pre-session and
+session-backed inspector states. The first manual PTY incorrectly required a
+transient Sampling frame, then automatic reruns retained stale sidebar-wording
+assumptions; each failure is preserved under `lvu-build/auto-setup-pty-logs`
+and followed by a green rerun. Workspace preflight first exposed the Source
+pre-render text-focus race; the exact shared-source regression, Source suite
+and mnemonic audit passed after its live-field fix. The corrected locked
+workspace test and all-target Clippy with warnings denied passed with logs
+under `lvu-next-preflight-20260919/`. Full immutable-candidate acceptance and
+publication have not started. The first fresh 90-suite matrix stopped at 88/90:
+Settings' focus checker assumed mnemonic labels were contiguous terminal bytes,
+and Docker discovery still sent the superseded Alt-O disclosure chord. Both
+targeted PTYs passed after their contract updates; a clean complete matrix is
+still required for this versioned candidate.

@@ -4,6 +4,25 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## v0.1.17 — 2026-09-19
+
+### Features
+
+- Add `Current log > Setup status`: a read-only, object-first inspector for
+  automatic log setup. It shows the lifecycle state, full Paseo session ID (or
+  that it is being created), diagnostic, and an explicit Analyze again action.
+- Give every normal dialog action, including narrow-layout More controls,
+  visible keyboard mnemonics while preserving text-field input. Source
+  discovery retains its older-unavailable disclosure on Alt-U.
+
+### Fixes
+
+- Keep automatic-setup status visible as an immediate footer acknowledgement,
+  refresh an open inspector through every lifecycle transition, and preserve
+  raw browsing while work runs.
+- Strip ANSI control sequences consistently in Details raw text, derived fields
+  and presentation metadata without changing captured bytes.
+
 ## v0.1.16 — 2026-09-18
 
 ### Features

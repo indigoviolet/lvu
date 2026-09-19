@@ -2,6 +2,7 @@
 """Exercise global TOML settings, live theme preview, and restart loading."""
 import pathlib
 import os
+import re
 import sys
 import tempfile
 import tomllib
@@ -10,6 +11,7 @@ from test_lvu_pty import PtyApp
 
 LOVE_DARK_FOCUS = b"\x1b[1m\x1b[38;2;35;20;25;48;2;255;167;151m"
 FRAME_END = b"\x1b[?2026l"
+ANSI_CSI = re.compile(br"\x1b\[[0-?]*[ -/]*[@-~]")
 
 SETTINGS_WITH_AUTOMATIC_SETUP_DISABLED = """\
 schema_version = 1
@@ -135,6 +137,21 @@ def wait_focused_frame(app: PtyApp, label: str, start: int) -> str:
     def complete_and_focused(text: str) -> bool:
         delta = bytes(app.transcript[start:])
         focused = delta.find(LOVE_DARK_FOCUS + label_bytes)
+        if focused < 0:
+            # Button mnemonics underline one character, so the visible text is
+            # split by SGR on/off bytes. Compare the focused frame's terminal
+            # text after removing those presentation bytes rather than treating
+            # the new shortcut styling as a focus loss.
+            offset = 0
+            while True:
+                candidate = delta.find(LOVE_DARK_FOCUS, offset)
+                if candidate < 0:
+                    break
+                frame_end = delta.find(FRAME_END, candidate)
+                if frame_end >= 0 and label_bytes in ANSI_CSI.sub(b"", delta[candidate:frame_end]):
+                    focused = candidate
+                    break
+                offset = candidate + 1
         return (
             focused >= 0
             and delta.find(FRAME_END, focused) >= 0
