@@ -4123,3 +4123,44 @@ Settings' focus checker assumed mnemonic labels were contiguous terminal bytes,
 and Docker discovery still sent the superseded Alt-O disclosure chord. Both
 targeted PTYs passed after their contract updates; a clean complete matrix is
 still required for this versioned candidate.
+
+### v0.1.17 accepted, published and installed — 2026-09-19
+
+Exact source `f665d25b511f6abc4eb0487a42d5555c3e15bdcc`, tree
+`dfeb5b840fbc5889658616c40e9b6acc06735dc5`, passed the immutable candidate
+gate. Its accepted TUI/app SHA-256 values are
+`51834758e38f55cace2c04812040f3333046b0d5ca7090c3cfec7d995c17f4ad` and
+`4615db09ea35b8add83fb1baa51accdbc54cf3a8d4235029ca89edfc14932f06`.
+Evidence covers locked full Rust workspace/doc tests, all-target Clippy with
+warnings denied, bridge typecheck/build and 120/120 tests, **90/90** actual
+PTYs, the matrix's real two-window shared capture plus sequential no-replay
+exercise, and 25/25 remote-union worker tests. The accepted record is
+`lvu-v017-f665d25-acceptance/accepted.json`, SHA-256
+`b6b02b157dd45e8900e45b8164f064ab4c86040a9d7dd0dca281598d2fa41360`.
+The only worktree difference was the protected, pre-existing `mise.toml` tool
+change, captured by its own diff SHA-256; it was never staged or modified.
+
+Annotated tag object `f5e8e9db4f2f29086089af74730df30c9bc7bd21` peels locally
+and remotely to the accepted source. Release workflow `35425937357` succeeded
+on Linux x86_64/arm64 and Apple-silicon macOS, publishing exactly three archives
+and SHA256SUMS. Archive SHA-256 values are Apple-silicon macOS
+`9a860f9224c8594f2fb0fd6d05e419a1669fa60545f4a81ff7bdb2005ce1ba9f`,
+Linux arm64
+`63d2f68dfb90d1f3faa94ec166decc32abfc832987741e4d3f0b68e409f2dbf7`,
+and Linux x86_64
+`6e4e4b77adf19b64a8d5e07cd4c972d00b5a9f3c3f19c61f25a7c232da194b11`.
+Release `391939189` was undrafted at 06:27:32 UTC. Tap commit
+`ef094baf86da5dce316871aed1ba2428b963c435` was rendered solely from downloaded
+draft SHA256SUMS, passed `brew style` and strict named audit, and was pushed
+before undrafting.
+
+Homebrew upgraded and tested v0.1.17. Pinned mise installed v0.1.17 after
+checksum, GitHub artifact-attestation and SLSA-provenance verification. The
+official x86_64 archive is installed at `versions/v0.1.17`; `versions/latest`
+points there, its binary SHA-256 is
+`2c356e058c9910e8e0c55cccf2f2d9a5db885232c3d03cda62f8ab547fef7210`, and it
+resolved bundled resources, compiled a real Polars expression, completed live
+bridge capabilities, and passed installed Docker-discovery and manual
+automatic-setup/session PTYs. The host Docker socket remains inaccessible, so
+the Docker happy path is honestly fixture-backed. Human Apple-silicon macOS and
+arm64 Linux terminal acceptance remains unverified.

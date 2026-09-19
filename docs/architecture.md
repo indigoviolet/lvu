@@ -1,7 +1,7 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.16` (2026-09-19) is the current public release. In addition to live
+`v0.1.17` (2026-09-19) is the current public release. In addition to live
 unions, shared keys, enrichment-backed colours, automatic shared capture and
 the responsive dialog system, it includes optional raw-first automatic log
 setup with an inspectable retained agent conversation, source-type-grouped

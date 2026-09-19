@@ -4,17 +4,17 @@ lvu has one publication scheme: annotated `vX.Y.Z` tags and matching GitHub
 releases. There is no separate preview channel or preview numbering. Every
 version must agree with `crates/lvu-app/Cargo.toml` and `Cargo.lock`.
 
-Current version: **[v0.1.16](https://github.com/indigoviolet/lvu/releases/tag/v0.1.16)**,
-published 2026-09-19 at 01:16:59 UTC from `4c7cbc6`. Release CI built and
+Current version: **[v0.1.17](https://github.com/indigoviolet/lvu/releases/tag/v0.1.17)**,
+published 2026-09-19 at 06:27:32 UTC from `f665d25`. Release CI built and
 executed the three supported native archives. The local installation is the
 official x86_64 Linux musl archive, SHA-256
-`8bc29eff45fdda2858777fa05f811f1596cb34ffa48a010db2270e2e4c3c6adf`;
-its installed binary is `7279cbb09bfe8864092c496d90cb32a176a23fc89b43111550206c5b80ae0dc8`.
+`6e4e4b77adf19b64a8d5e07cd4c972d00b5a9f3c3f19c61f25a7c232da194b11`;
+its installed binary is `2c356e058c9910e8e0c55cccf2f2d9a5db885232c3d03cda62f8ab547fef7210`.
 Bundled helper/bridge execution and the Docker service/container terminal suite
-passed outside the checkout; `versions/latest` points to `v0.1.16`.
+passed outside the checkout; `versions/latest` points to `v0.1.17`.
 
 Exact-source acceptance passed the full Rust workspace, all-target Clippy, bridge
-checks, all 88 PTY suites and the source-bound shared-capture/remote-union
+checks, all 90 PTY suites and the source-bound shared-capture/remote-union
 proofs. Human Apple-silicon macOS and arm64 Linux terminal acceptance remains
 unverified. The volume-backed full soak, cold-query latency and slow-storage
 autosave investigations remain paused and unaccepted. What each version shipped
