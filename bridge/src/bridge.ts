@@ -43,6 +43,25 @@ export class Bridge {
   readonly #pendingCreates = new Set<PendingCreate>();
   readonly #cleanupTasks = new Set<Promise<void>>();
   #workspacePromise: Promise<{ id: string; projectId: string | null; directory: string }> | null = null;
+  #workspacePending = false;
+  // Lease pins span the setup window between acquiring the exclusive lock and
+  // inserting the new work into a tracked set, so a concurrent idle-release
+  // cannot drop the lease mid-setup. All lease transitions run under
+  // #leaseMutex. Startup order establishes no lasting priority: once recovery
+  // settles with nothing live attached, an idle bridge releases even if it
+  // never did managed work, so either of two idle windows can acquire next.
+  // #leaseAcquisition tracks a raw in-flight O_EXCL so
+  // a late win is adopted or released instead of orphaned. The recovery
+  // report set keeps repeated recoveries (one per acquisition) from
+  // re-emitting the same unresolved create.
+  #leasePins = 0;
+  #leaseMutex: Promise<void> = Promise.resolve();
+  #leaseAcquisition: Promise<void> | null = null;
+  #recoveryNeeded = false;
+  #recoveryTask: Promise<void> | null = null;
+  #recoveryReportedUnresolved = new Set<string>();
+  // A bridge owns a distinct ledger instance. Windows share its on-disk root,
+  // never the mutable in-memory ledger/queues/hook (as enforced by CLI wiring).
   constructor(readonly backend: PaseoBackend, readonly emit: Emit, readonly limits: BridgeLimits, readonly ledger: OwnedSessionLedger | null = null) {}
 
   async start(): Promise<void> {
@@ -63,7 +82,29 @@ export class Bridge {
       }
       if (this.ledger !== null) {
         await deadline(this.ledger.initialize(), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
-        await deadline(this.ledger.acquireLease(), this.limits.defaultTimeoutMs, "OWNED_ROOT_BUSY");
+        this.ledger.hooks.onQuiescent = () => { void this.#notifyOwnedIdle().catch(() => {}); };
+        try {
+          await this.#acquireOwnedLease(this.limits.defaultTimeoutMs);
+        } catch (error) {
+          if (errorCode(error) !== "OWNED_ROOT_BUSY") throw error;
+          // A second lvu window shares the same owned root while the first
+          // still holds the exclusive bridge.lock. The lock is the cross-process
+          // mutator guard (per-record queues, activity accounting, workspace
+          // placement and recovery are all per-process), and EEXIST/PID checks
+          // cannot prove it stale, so it is never removed here. Stay open as a
+          // lease-less standby instead of exiting: unmanaged work still runs,
+          // managed requests fail per-request with the same stable
+          // OWNED_ROOT_BUSY marker and exact lock path, and the next managed
+          // request after the owner goes idle or exits retries acquisition.
+          // Recovery stays deferred until the lease is held so standby never
+          // mutates the owner's durable state.
+          if (this.#state !== "starting") {
+            await deadline(this.backend.close(), this.limits.defaultTimeoutMs, "CLOSE_TIMEOUT").catch(() => {});
+            throw coded("BRIDGE_CLOSED", "bridge closed while connecting");
+          }
+          this.#state = "open";
+          return;
+        }
       }
       if (this.#state !== "starting") {
         await deadline(this.backend.close(), this.limits.defaultTimeoutMs, "CLOSE_TIMEOUT").catch(() => {});
@@ -73,6 +114,7 @@ export class Bridge {
       this.#launchRecovery();
     } catch (error) {
       await deadline(this.backend.close(), this.limits.defaultTimeoutMs, "CLOSE_TIMEOUT").catch(() => {});
+      if (this.ledger !== null) this.ledger.hooks.onQuiescent = null;
       await this.ledger?.releaseLease().catch(() => {});
       this.#state = "closed";
       throw error;
@@ -84,6 +126,12 @@ export class Bridge {
     if (this.#closePromise !== null) return this.#closePromise;
     this.#state = "closing";
     this.#closePromise = (async () => {
+      // Bounded wait for pinned owned-setup windows entered before close: their
+      // state checks then bail before further ledger writes. Production CLI
+      // shutdown already settles admitted requests first (JsonlServer.stop),
+      // so this only binds direct-API races; it never waits forever.
+      const pinDeadline = Date.now() + this.limits.remoteCancelTimeoutMs;
+      while (this.#leasePins > 0 && Date.now() < pinDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
       if (this.#pendingCreates.size > 0) {
         this.#event("bridge", "create_reconciliation_unresolved", {
           requests: [...this.#pendingCreates].map(({ requestId, state }) => ({ request_id: requestId, state })),
@@ -112,7 +160,13 @@ export class Bridge {
       try {
         await deadline(Promise.allSettled([...this.#cleanupTasks]).then(() => undefined), this.limits.defaultTimeoutMs, "CLEANUP_TIMEOUT").catch(() => {});
         await deadline(this.backend.close(), this.limits.defaultTimeoutMs, "CLOSE_TIMEOUT");
-      } finally { await this.ledger?.releaseLease().catch(() => {}); this.#state = "closed"; }
+      } finally {
+        this.#state = "closed";
+        // Deadline expiry does not cancel filesystem work. Keep ownership
+        // until queued writes actually settle; their quiescence callback
+        // releases our nonce, even after bounded close has returned.
+        await this.#notifyOwnedIdle().catch(() => {});
+      }
     })();
     return this.#closePromise;
   }
@@ -129,6 +183,7 @@ export class Bridge {
         case "request_proposal": return await this.#proposal(request);
       }
     } catch (error) { this.#error(request.request_id, errorCode(error), errorMessage(error)); }
+    finally { void this.#notifyOwnedIdle().catch(() => {}); }
   }
 
   async #capabilities(requestId: string): Promise<void> {
@@ -162,21 +217,35 @@ export class Bridge {
     let owned: OwnedSessionRecord | null = null;
     let workspaceId: string | undefined;
     let sdkRequestId: string | undefined;
+    // Pins span acquisition through tracking insertion so a concurrent
+    // idle-release cannot drop the lease mid-setup; the tracked PendingCreate
+    // guards everything after. Close during setup bails at the state checks
+    // below before further ledger writes, leaving a pending marker for a
+    // later lease-holder's recovery instead of writing lease-less.
+    let enteredLease = false;
     if (purpose !== undefined) {
       if (this.ledger === null) { this.#sessionReservations--; throw coded("OWNED_ROOT_UNAVAILABLE", "managed assistance requires LVU_PASEO_OWNED_ROOT"); }
-      let placement;
-      try { placement = await deadline(this.#ensureWorkspace(), request.timeout_ms ?? this.limits.defaultTimeoutMs, "TIMEOUT"); }
-      catch (error) { this.#sessionReservations--; throw error; }
-      workspaceId = placement.id;
-      const ids = this.ledger.identifiers();
-      sdkRequestId = ids.requestId;
+      // A standby or idle-released bridge holds no exclusive lock: serialize
+      // managed creation on the lease so only one bridge mutates the owned
+      // ledger. Busy propagates with the stable marker/path and no state is
+      // removed; the next request retries after the owner goes idle or exits.
       try {
+        await this.#enterOwned(request.timeout_ms ?? this.limits.defaultTimeoutMs);
+        enteredLease = true;
+        this.#assertOpenForOwned();
+        const placement = await deadline(this.#ensureWorkspace(), request.timeout_ms ?? this.limits.defaultTimeoutMs, "TIMEOUT");
+        this.#assertOpenForOwned();
+        const ids = this.ledger.identifiers();
+        sdkRequestId = ids.requestId;
+        workspaceId = placement.id;
         owned = await deadline(this.ledger.createPending({ ...ids, protocolRequestId: request.request_id, purpose, lifecycle }), request.timeout_ms ?? this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
         owned = await deadline(this.ledger.update(owned, { workspaceId }), request.timeout_ms ?? this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
-      } catch (error) { this.#sessionReservations--; throw error; }
+        this.#assertOpenForOwned();
+      } catch (error) { this.#sessionReservations--; if (enteredLease) await this.#exitOwned(); throw error; }
     }
     const record: PendingCreate = { requestId: request.request_id, state: "creating", reservationHeld: true, owned };
     this.#pendingCreates.add(record);
+    if (enteredLease) await this.#exitOwned();
     let outcome: Promise<{ ok: true; agent: AgentHandle } | { ok: false; error: unknown }> | null = null;
     let createdAgent: AgentHandle | null = null;
     try {
@@ -250,28 +319,32 @@ export class Bridge {
 
   async #reconcileCreate(record: PendingCreate, outcome: { ok: true; agent: AgentHandle } | { ok: false; error: unknown }): Promise<void> {
     if (!record.reservationHeld) return;
-    if (!outcome.ok) {
-      if (record.owned !== null) record.owned = await deadline(this.ledger!.update(record.owned, { state: "create_failed", lastError: errorMessage(outcome.error).slice(0, 4096) }), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
-      this.#event("bridge", "create_reconciliation_released", { request_id: record.requestId, result: "create_rejected", error: errorMessage(outcome.error).slice(0, 4096) });
-      this.#releaseCreate(record);
-      return;
-    }
-    record.state = "cleaning";
-    if (record.owned !== null) {
-      record.owned = await deadline(this.ledger!.update(record.owned, { state: "pending_cleanup", agentId: outcome.agent.id }), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
-      const snapshot = await deadline(outcome.agent.refresh(), this.limits.remoteCancelTimeoutMs, "RECONCILE_TIMEOUT").catch(() => null);
-      if (snapshot === null || snapshot.running || !isTerminalStatus(snapshot.status)) {
-        record.state = "cleanup_failed";
-        record.owned = await deadline(this.ledger!.update(record.owned, { state: "pending_cleanup", lastError: "late create is not confirmed terminal" }), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
-        this.#event("bridge", "owned_cleanup_deferred", { request_id: record.requestId, agent_id: outcome.agent.id, remote_agent_may_still_be_running: true, activity_path: this.ledger!.activityPath(record.owned) });
+    try {
+      if (!outcome.ok) {
+        if (record.owned !== null) record.owned = await deadline(this.ledger!.update(record.owned, { state: "create_failed", lastError: errorMessage(outcome.error).slice(0, 4096) }), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
+        this.#event("bridge", "create_reconciliation_released", { request_id: record.requestId, result: "create_rejected", error: errorMessage(outcome.error).slice(0, 4096) });
+        this.#releaseCreate(record);
         return;
       }
+      record.state = "cleaning";
+      if (record.owned !== null) {
+        record.owned = await deadline(this.ledger!.update(record.owned, { state: "pending_cleanup", agentId: outcome.agent.id }), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
+        const snapshot = await deadline(outcome.agent.refresh(), this.limits.remoteCancelTimeoutMs, "RECONCILE_TIMEOUT").catch(() => null);
+        if (snapshot === null || snapshot.running || !isTerminalStatus(snapshot.status)) {
+          record.state = "cleanup_failed";
+          record.owned = await deadline(this.ledger!.update(record.owned, { state: "pending_cleanup", lastError: "late create is not confirmed terminal" }), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
+          this.#event("bridge", "owned_cleanup_deferred", { request_id: record.requestId, agent_id: outcome.agent.id, remote_agent_may_still_be_running: true, activity_path: this.ledger!.activityPath(record.owned) });
+          return;
+        }
+      }
+      if (await this.#cleanupOwned(outcome.agent, record.requestId, record.owned)) {
+        if (record.owned !== null) await this.ledger!.releaseMemory(record.owned);
+        this.#event("bridge", "create_reconciliation_released", { request_id: record.requestId, result: "late_agent_archived", agent_id: outcome.agent.id });
+        this.#releaseCreate(record);
+      } else record.state = "cleanup_failed";
+    } finally {
+      void this.#notifyOwnedIdle().catch(() => {});
     }
-    if (await this.#cleanupOwned(outcome.agent, record.requestId, record.owned)) {
-      if (record.owned !== null) await this.ledger!.releaseMemory(record.owned);
-      this.#event("bridge", "create_reconciliation_released", { request_id: record.requestId, result: "late_agent_archived", agent_id: outcome.agent.id });
-      this.#releaseCreate(record);
-    } else record.state = "cleanup_failed";
   }
 
   #releaseCreate(record: PendingCreate): void {
@@ -391,27 +464,56 @@ export class Bridge {
   async #resumeOne(id: string, purpose: SessionPurpose | undefined): Promise<Session> {
     try {
       const agent = this.backend.refAgent(id);
-      const owned = this.ledger === null ? null : await deadline(this.ledger.readByAgent(id), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
-      if (owned !== null) {
+      const initial = this.ledger === null ? null : await deadline(this.ledger.readByAgent(id), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
+      if (initial === null) {
+        // Legacy unowned resume never touches the owned ledger, so it stays
+        // available without the lease.
+        const refreshed = await deadline(agent.refresh(), this.limits.defaultTimeoutMs, "TIMEOUT");
+        if (!refreshed.exists) throw coded("NOT_FOUND", "Paseo session not found");
+        if (refreshed.archivedAt !== null) throw coded("NOT_RESUMABLE", "archived Paseo session cannot be resumed");
+        if (this.#state !== "open") throw coded("BRIDGE_CLOSED", "bridge closed while resuming session");
+        const existing = this.#sessions.get(agent.id);
+        if (existing !== undefined) return existing;
+        const session = this.#attach(agent, null);
+        session.remoteBusy = refreshed.running;
+        session.agentStatus = refreshed.running ? "running" : "idle";
+        session.observing = refreshed.running;
+        this.#sessions.set(agent.id, session);
+        return session;
+      }
+      // Managed resume mutates shared ownership state through later activity
+      // writes, so it serializes on the same exclusive lease as creation.
+      // Pins span acquisition through attach so a concurrent idle-release
+      // cannot drop the lease mid-setup; the attached session guards
+      // everything after.
+      let entered = false;
+      try {
+        await this.#enterOwned(this.limits.defaultTimeoutMs);
+        entered = true;
+        // Re-read (and re-refresh below) after acquisition: the previous owner
+        // may have settled the record while this bridge waited as standby.
+        const owned = await deadline(this.ledger!.readByAgent(id), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT") ?? initial;
         if (owned.lifecycle !== "resumable") throw coded("NOT_RESUMABLE", "managed ephemeral session cannot be resumed");
         if (owned.state === "archived") throw coded("NOT_RESUMABLE", "archived managed session cannot be resumed");
-      }
-      const refreshed = await deadline(agent.refresh(), this.limits.defaultTimeoutMs, "TIMEOUT");
-      if (!refreshed.exists) throw coded("NOT_FOUND", "Paseo session not found");
-      if (refreshed.archivedAt !== null) throw coded("NOT_RESUMABLE", "archived Paseo session cannot be resumed");
-      if (owned !== null) {
+        const refreshed = await deadline(agent.refresh(), this.limits.defaultTimeoutMs, "TIMEOUT");
+        this.#assertOpenForOwned();
+        if (!refreshed.exists) throw coded("NOT_FOUND", "Paseo session not found");
+        if (refreshed.archivedAt !== null) throw coded("NOT_RESUMABLE", "archived Paseo session cannot be resumed");
         const placement = await this.#ensureWorkspace();
+        this.#assertOpenForOwned();
         if (refreshed.workspaceId !== owned.workspaceId || owned.workspaceId !== placement.id || (purpose !== undefined && purpose !== owned.purpose)) throw coded("OWNERSHIP_MISMATCH", "managed session workspace or purpose does not match its ledger");
+        if (this.#state !== "open") throw coded("BRIDGE_CLOSED", "bridge closed while resuming session");
+        const existing = this.#sessions.get(agent.id);
+        if (existing !== undefined) return existing;
+        const session = this.#attach(agent, owned);
+        session.remoteBusy = refreshed.running;
+        session.agentStatus = refreshed.running ? "running" : "idle";
+        session.observing = refreshed.running;
+        this.#sessions.set(agent.id, session);
+        return session;
+      } finally {
+        if (entered) await this.#exitOwned();
       }
-      if (this.#state !== "open") throw coded("BRIDGE_CLOSED", "bridge closed while resuming session");
-      const existing = this.#sessions.get(agent.id);
-      if (existing !== undefined) return existing;
-      const session = this.#attach(agent, owned);
-      session.remoteBusy = refreshed.running;
-      session.agentStatus = refreshed.running ? "running" : "idle";
-      session.observing = refreshed.running;
-      this.#sessions.set(agent.id, session);
-      return session;
     } finally { this.#sessionReservations--; }
   }
 
@@ -502,27 +604,169 @@ export class Bridge {
         }
       })
       .catch((error) => this.#event(session.agent.id, "archive_failed", { request_id: session.owned!.protocolRequestId, error: errorMessage(error).slice(0, 4096), activity_path: this.ledger!.activityPath(session.owned!) }))
-      .finally(() => { session.cleanupScheduled = false; this.#cleanupTasks.delete(task); });
+      .finally(() => { session.cleanupScheduled = false; this.#cleanupTasks.delete(task); void this.#notifyOwnedIdle().catch(() => {}); });
     this.#cleanupTasks.add(task);
   }
   async #ensureWorkspace(): Promise<{ id: string; projectId: string | null; directory: string }> {
     if (this.ledger === null) throw new Error("owned session ledger unavailable");
-    if (this.#workspacePromise === null) this.#workspacePromise = (async () => {
+    if (this.#workspacePromise === null) {
+      this.#workspacePending = true;
+      this.#workspacePromise = (async () => {
       const stored = await this.ledger!.readWorkspace();
       const placement = await this.backend.ensureWorkspace(this.ledger!.root, stored?.workspaceId);
+      if (!this.ledger!.ownsLease || this.#state === "closed") throw coded("BRIDGE_CLOSED", "bridge closed while preparing owned workspace");
       if (stored !== null && (placement.id !== stored.workspaceId || placement.directory !== stored.directory || placement.projectId !== stored.projectId)) throw new Error("stored lvu workspace identity changed");
       await this.ledger!.writeWorkspace({ version: 1, workspaceId: placement.id, projectId: placement.projectId, directory: placement.directory });
       return placement;
-    })().catch((error) => { this.#workspacePromise = null; throw error; });
+      })().catch((error) => { this.#workspacePromise = null; throw error; })
+        .finally(() => { this.#workspacePending = false; void this.#notifyOwnedIdle().catch(() => {}); });
+    }
     return this.#workspacePromise;
   }
-  #launchRecovery(): void {
-    if (this.ledger === null) return;
+  #launchRecovery(): Promise<void> {
+    if (this.#recoveryTask !== null) return this.#recoveryTask;
+    if (this.ledger === null || !this.ledger.ownsLease || !this.#recoveryNeeded) return Promise.resolve();
+    this.#recoveryNeeded = false;
     let task!: Promise<void>;
     task = this.#recoverOwned(this.limits.remoteCancelTimeoutMs)
       .catch((error) => this.#event("bridge", "owned_recovery_deferred", { error: errorMessage(error).slice(0, 4096) }))
-      .finally(() => this.#cleanupTasks.delete(task));
+      .finally(() => {
+        this.#cleanupTasks.delete(task);
+        if (this.#recoveryTask === task) this.#recoveryTask = null;
+        void this.#notifyOwnedIdle().catch(() => {});
+      });
+    this.#recoveryTask = task;
     this.#cleanupTasks.add(task);
+    return task;
+  }
+  // One mutator, many windows: the exclusive bridge.lock serializes ledger
+  // mutation across processes, while #leaseMutex serializes this bridge's own
+  // lease transitions (acquire vs idle-release) and #leasePins spans each
+  // setup window between acquisition and tracking insertion. A busy result
+  // keeps the same stable OWNED_ROOT_BUSY marker and exact lock path the
+  // startup path emits (never a deletion), and the bridge stays open so the
+  // next request retries after the owner goes idle or exits. Recovery runs on
+  // every fresh acquisition, while still held, with unresolved-create reports
+  // deduplicated below.
+  async #guarded<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#leaseMutex;
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.#leaseMutex = current;
+    await previous;
+    try { return await operation(); }
+    finally { release(); }
+  }
+  async #enterOwned(timeoutMs: number): Promise<void> {
+    if (this.ledger === null) throw coded("OWNED_ROOT_UNAVAILABLE", "managed assistance requires LVU_PASEO_OWNED_ROOT");
+    const deadlineAt = Date.now() + timeoutMs;
+    let recovery = Promise.resolve();
+    await this.#guarded(async () => {
+      if (this.#state !== "open") throw coded("BRIDGE_CLOSED", "bridge closed while acquiring owned lease");
+      if (!this.ledger!.ownsLease) {
+        await this.#acquireOwnedLease(remaining(deadlineAt));
+        if (this.#state !== "open") {
+          // Close raced a successful acquisition: release the just-won
+          // nonce-guarded lease so no stale lock leaks, and report closure.
+          // Foreign locks are never unlinked (release only removes its nonce).
+          await this.#releaseIfIdleUnderGuard();
+          throw coded("BRIDGE_CLOSED", "bridge closed while acquiring owned lease");
+        }
+      }
+      this.#leasePins++;
+      recovery = this.#launchRecovery();
+    });
+    try {
+      // Recovery may archive old ephemeral sessions. It must finish before
+      // a new marker/agent is created, including startup's existing recovery.
+      await deadline(recovery, remaining(deadlineAt), "RECOVERY_TIMEOUT");
+      this.#assertOpenForOwned();
+    } catch (error) {
+      await this.#exitOwned();
+      throw error;
+    }
+  }
+
+  async #acquireOwnedLease(timeoutMs: number): Promise<void> {
+    if (this.#leaseAcquisition === null) {
+      const raw = this.ledger!.acquireLease().then(() => { this.#recoveryNeeded = true; });
+      this.#leaseAcquisition = raw;
+      void raw.finally(() => {
+        if (this.#leaseAcquisition === raw) this.#leaseAcquisition = null;
+      }).catch(() => {});
+    }
+    const raw = this.#leaseAcquisition;
+    try { await deadline(raw, timeoutMs, "OWNED_ROOT_BUSY"); }
+    catch (error) {
+      // Arm cleanup before any close-state early return. A public deadline
+      // cannot cancel O_EXCL/write/fsync, including the startup acquisition.
+      void raw.then(() => this.#adoptLateAcquisition(), () => {}).catch(() => {});
+      if (this.#state !== "open" && this.#state !== "starting" && errorCode(error) === "OWNED_ROOT_BUSY") {
+        throw coded("BRIDGE_CLOSED", "bridge closed while acquiring owned lease");
+      }
+      throw error;
+    }
+  }
+  // Settles a previously timed-out acquisition that eventually won: adopt it
+  // (with the recovery the win skipped) while open, or release its nonce
+  // while closing/closed, so a live bridge never leaks a stale lock. Only a
+  // win after process exit still needs the dead-process stale-lock guidance.
+  // Never throws.
+  async #adoptLateAcquisition(): Promise<void> {
+    await this.#guarded(async () => {
+      try {
+        if (this.ledger === null || !this.ledger.ownsLease) return;
+        if (this.#state !== "open") {
+          await this.#releaseIfIdleUnderGuard();
+          return;
+        }
+        this.#launchRecovery();
+      } catch { /* opportunistic; close and later requests reconcile */ }
+    });
+  }
+  async #exitOwned(): Promise<void> {
+    await this.#guarded(async () => {
+      if (this.#leasePins > 0) this.#leasePins--;
+      await this.#releaseIfIdleUnderGuard();
+    });
+  }
+  #notifyOwnedIdle(): Promise<void> {
+    if (this.ledger === null) return Promise.resolve();
+    return this.#guarded(() => this.#releaseIfIdleUnderGuard());
+  }
+  // Caller must hold #leaseMutex. Releases the lease once nothing remains
+  // that could write to the ledger: no pins, no owned sessions (unmanaged
+  // sessions never touch the ledger), no creates/resumes/cleanups/recovery in
+  // flight, and no unsettled ledger queues. Detached auto_setup activity is
+  // covered because its listeners are removed at detach (no new writes) and
+  // its queued writes keep hasUnsettledWork true until they settle, at which
+  // point the ledger hook re-triggers this check. A bridge whose startup
+  // recovery settles with no live work releases even if it never did a
+  // managed request, so idle windows never squat the lease. Never throws.
+  async #releaseIfIdleUnderGuard(): Promise<void> {
+    try {
+      if (this.#state === "new" || this.#state === "starting") return;
+      if (this.ledger === null) return;
+      if (!this.ledger.ownsLease) {
+        if (this.#state === "closed" && this.#leaseAcquisition === null
+          && !this.#workspacePending && !this.ledger.hasUnsettledWork) this.ledger.hooks.onQuiescent = null;
+        return;
+      }
+      if (this.#leasePins !== 0) return;
+      if (this.#leaseAcquisition !== null || this.#workspacePending) return;
+      if (this.#state === "open" && this.#recoveryNeeded) return;
+      for (const session of this.#sessions.values()) if (session.owned !== null) return;
+      if (this.#pendingCreates.size !== 0 || this.#cleanupTasks.size !== 0 || this.#resumePending.size !== 0) return;
+      if (this.ledger.hasUnsettledWork) return;
+      await this.ledger.releaseLease().catch(() => {});
+      // Reload on next acquisition: re-read and re-verify workspace identity
+      // instead of trusting the memo across another bridge's tenure.
+      this.#workspacePromise = null;
+      if (this.#state === "closed") this.ledger.hooks.onQuiescent = null;
+    } catch { /* idle release is opportunistic; the next request retries */ }
+  }
+  #assertOpenForOwned(): void {
+    if (this.#state !== "open") throw coded("BRIDGE_CLOSED", "bridge closed while preparing owned session");
   }
   async #recoverOwned(budgetMs: number): Promise<void> {
     if (this.ledger === null) return;
@@ -534,7 +778,15 @@ export class Bridge {
       if (Date.now() >= deadlineAt) return;
       if (record.lifecycle === "resumable") continue;
       if (record.agentId === undefined) {
-        this.#event("bridge", "owned_create_unresolved", { request_id: record.protocolRequestId, ownership_id: record.ownershipId, state: record.state });
+        // Agentless markers persist (nothing can resolve them), so repeated
+        // recoveries across idle-release cycles report each one only once per
+        // bridge lifetime. Bounded: one entry per distinct pending id, reset
+        // once past twice the pending-marker limit.
+        if (!this.#recoveryReportedUnresolved.has(record.ownershipId)) {
+          if (this.#recoveryReportedUnresolved.size >= 2 * 1024) this.#recoveryReportedUnresolved.clear();
+          this.#recoveryReportedUnresolved.add(record.ownershipId);
+          this.#event("bridge", "owned_create_unresolved", { request_id: record.protocolRequestId, ownership_id: record.ownershipId, state: record.state });
+        }
         continue;
       }
       const agent = this.backend.refAgent(record.agentId!);

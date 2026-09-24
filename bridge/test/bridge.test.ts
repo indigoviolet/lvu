@@ -104,19 +104,31 @@ describe("Bridge lifecycle", () => {
     await expect(timeout.bridge.start()).rejects.toMatchObject({ code: "DAEMON_TIMEOUT" });
   });
 
-  it("propagates an owned-root busy lease with its exact path", async () => {
+  it("stays open as standby on a busy lease and retries managed work per request", async () => {
     const root = await mkdtemp(join(tmpdir(), "lvu-owned-start-"));
     try {
       const firstLedger = new OwnedSessionLedger(root); await firstLedger.initialize(); await firstLedger.acquireLease();
       const backend = new FakeBackend();
       const output: Array<Record<string, unknown>> = [];
       const bridge = new Bridge(backend, (message) => output.push(message), limits, new OwnedSessionLedger(root));
-      const failure = await bridge.start().catch((error: unknown) => error);
-      expect((failure as { code?: unknown }).code).toBe("OWNED_ROOT_BUSY");
-      expect(String(failure)).toContain("OWNED_ROOT_BUSY");
-      expect(String(failure)).toContain(JSON.stringify(join(root, "bridge.lock")));
+      // A second window no longer exits: it stays open without the exclusive
+      // lock so unmanaged work continues and managed work can retry.
+      await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "cap", method: "capabilities" }));
+      expect(response(output, "cap")).toMatchObject({ ok: true });
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "plain", method: "start_session", provider: "fake", cwd: "/tmp" }));
+      expect(response(output, "plain")).toMatchObject({ ok: true });
+      // Managed creation serializes on the lease: per-request busy with the
+      // stable marker and exact lock path, never a deletion, bridge stays open.
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "busy", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "ask" }));
+      expect(response(output, "busy")).toMatchObject({ error: { code: "OWNED_ROOT_BUSY" } });
+      expect(String((response(output, "busy") as { error: { message: string } }).error.message)).toContain(JSON.stringify(join(root, "bridge.lock")));
+      expect(await readFile(join(root, "bridge.lock"), "utf8")).not.toBe("");
+      // After the owner releases, the next managed request acquires and runs.
       await firstLedger.releaseLease();
-      await bridge.close().catch(() => {});
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "retry", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "ask" }));
+      expect(response(output, "retry")).toMatchObject({ ok: true });
+      await bridge.close();
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

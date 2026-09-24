@@ -34,9 +34,12 @@ export class OwnedSessionLedger {
   readonly #activityAdmission = new Map<string, { bytes: number; count: number; truncationQueued: boolean }>();
   #workspaceQueue: Promise<unknown> = Promise.resolve();
   #pendingQueue: Promise<unknown> = Promise.resolve();
+  #workspaceDepth = 0;
+  #pendingDepth = 0;
+  #recoveryDepth = 0;
   #lease: { handle: Awaited<ReturnType<typeof open>>; nonce: string } | null = null;
 
-  constructor(root: string, readonly hooks: { beforeActivityWrite?: () => Promise<void> } = {}) { if (!isAbsolute(root)) throw new Error("LVU_PASEO_OWNED_ROOT must be an absolute path"); this.root = root; }
+  constructor(root: string, readonly hooks: { beforeActivityWrite?: () => Promise<void>; onQuiescent?: (() => void) | null } = {}) { if (!isAbsolute(root)) throw new Error("LVU_PASEO_OWNED_ROOT must be an absolute path"); this.root = root; }
 
   async initialize(): Promise<void> {
     for (const directory of [this.root, this.#sessionsDir(), this.#activityDir(), this.#agentsDir(), this.#pendingDir()]) await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -46,8 +49,14 @@ export class OwnedSessionLedger {
   identifiers(): { ownershipId: string; requestId: string } { return { ownershipId: randomUUID(), requestId: randomUUID() }; }
   async readWorkspace(): Promise<OwnedWorkspaceRecord | null> { return this.#readValidated(join(this.root, "workspace.json"), workspaceSchema); }
   writeWorkspace(record: OwnedWorkspaceRecord): Promise<void> {
+    this.#workspaceDepth++;
     const next = this.#workspaceQueue.then(() => this.#atomicJson(join(this.root, "workspace.json"), workspaceSchema.parse(record)));
-    this.#workspaceQueue = next.catch(() => {}); return next;
+    this.#workspaceQueue = next.catch(() => {});
+    void next.then(
+      () => { this.#workspaceDepth--; this.#notifyQuiescent(); },
+      () => { this.#workspaceDepth--; this.#notifyQuiescent(); },
+    );
+    return next;
   }
 
   createPending(input: Pick<OwnedSessionRecord, "ownershipId" | "requestId" | "protocolRequestId" | "purpose" | "lifecycle">): Promise<OwnedSessionRecord> {
@@ -132,8 +141,21 @@ export class OwnedSessionLedger {
   }
   get residentActivityRecords(): number { return this.#activityAdmission.size; }
   activityPath(record: OwnedSessionRecord): string { return join(this.#activityDir(), `${safeId(record.ownershipId)}.jsonl`); }
+  // True once every queued per-record, pending-marker and workspace write has
+  // settled. A bridge uses this (with its own session/task guards) to decide
+  // the exclusive lease may be released; settling work already registered can
+  // never be missed because registration is synchronous.
+  get hasUnsettledWork(): boolean {
+    return this.#queues.size > 0 || this.#pendingDepth > 0 || this.#workspaceDepth > 0 || this.#recoveryDepth > 0;
+  }
+  #notifyQuiescent(): void {
+    if (this.hasUnsettledWork) return;
+    try { this.hooks.onQuiescent?.(); } catch { /* observer-only; never fail ledger work */ }
+  }
 
   async recoveryBatch(limit: number): Promise<OwnedSessionRecord[]> {
+    this.#recoveryDepth++;
+    try {
     await this.#pendingQueue.catch(() => {});
     const names: string[] = []; const directory = await opendir(this.#pendingDir());
     try { for await (const entry of directory) { if (!entry.isFile() || !entry.name.endsWith(".pending")) continue; if (names.length >= MAX_PENDING_RECORDS) throw new Error("owned pending-session limit exceeded"); names.push(entry.name.slice(0, -8)); } }
@@ -148,6 +170,7 @@ export class OwnedSessionLedger {
     const records: OwnedSessionRecord[] = [];
     for (const ownershipId of ordered) { const record = await this.read(ownershipId); if (record !== null) records.push(record); }
     return records;
+    } finally { this.#recoveryDepth--; this.#notifyQuiescent(); }
   }
 
   async acquireLease(): Promise<void> {
@@ -162,10 +185,10 @@ export class OwnedSessionLedger {
         // across races or PID reuse, so automatic stale-lock removal is
         // intentionally refused. The stable OWNED_ROOT_BUSY marker lets the
         // host classify without parsing wrapper prose, and the exact lock path
-        // lets it give safe recovery guidance. The path is JSON-quoted so
+        // is diagnostic evidence, never an instruction to remove it. The path is JSON-quoted so
         // roots containing spaces (or quotes) survive intact; the host
         // JSON-decodes it back to the exact bytes.
-        throw coded("OWNED_ROOT_BUSY", `OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at ${JSON.stringify(path)}; close competing lvu windows for this capture root, or remove only that exact bridge.lock after verifying no lvu/bridge process owns it; automatic stale-lock removal is intentionally refused`);
+        throw coded("OWNED_ROOT_BUSY", `OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at ${JSON.stringify(path)}; wait for the other window's assistance to finish, then retry; the path is diagnostic evidence, not permission to delete locks or state`);
       }
       throw error;
     }
@@ -173,6 +196,8 @@ export class OwnedSessionLedger {
     catch (error) { await handle.close().catch(() => {}); await rm(path, { force: true }).catch(() => {}); throw error; }
     this.#lease = { handle, nonce };
   }
+  get ownsLease(): boolean { return this.#lease !== null; }
+
   async releaseLease(): Promise<void> {
     if (this.#lease === null) return;
     const lease = this.#lease; this.#lease = null; await lease.handle.close();
@@ -187,14 +212,23 @@ export class OwnedSessionLedger {
     await this.#atomicJson(join(this.#pendingDir(), `${safeId(ownershipId)}.pending`), { ownershipId });
   }
   async #removePendingMarker(ownershipId: string): Promise<void> { await rm(join(this.#pendingDir(), `${safeId(ownershipId)}.pending`), { force: true }); await syncDirectory(this.#pendingDir()); }
-  #pendingMutation<T>(operation: () => Promise<T>): Promise<T> { const next = this.#pendingQueue.catch(() => {}).then(operation); this.#pendingQueue = next.catch(() => {}); return next; }
+  #pendingMutation<T>(operation: () => Promise<T>): Promise<T> {
+    this.#pendingDepth++;
+    const next = this.#pendingQueue.catch(() => {}).then(operation);
+    this.#pendingQueue = next.catch(() => {});
+    void next.then(
+      () => { this.#pendingDepth--; this.#notifyQuiescent(); },
+      () => { this.#pendingDepth--; this.#notifyQuiescent(); },
+    );
+    return next;
+  }
 
   #enqueue<T>(ownershipId: string, operation: () => Promise<T>): Promise<T> {
     safeId(ownershipId); const previous = this.#queues.get(ownershipId) ?? Promise.resolve();
     const operationResult = previous.catch(() => {}).then(operation);
     const next = operationResult.catch((error) => { this.#failures.set(ownershipId, error); throw error; });
     this.#queues.set(ownershipId, next);
-    void next.finally(() => { if (this.#queues.get(ownershipId) === next) this.#queues.delete(ownershipId); }).catch(() => {}); return next;
+    void next.finally(() => { if (this.#queues.get(ownershipId) === next) this.#queues.delete(ownershipId); this.#notifyQuiescent(); }).catch(() => {}); return next;
   }
   async #afterQueued<T>(ownershipId: string, operation: () => Promise<T>): Promise<T> { await (this.#queues.get(ownershipId) ?? Promise.resolve()).catch(() => {}); return operation(); }
   async #requireRecord(ownershipId: string): Promise<OwnedSessionRecord> { const record = await this.#readValidated(this.#recordPath(ownershipId), sessionSchema); if (record === null) throw new Error("owned session record is missing"); return record; }

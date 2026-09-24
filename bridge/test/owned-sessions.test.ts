@@ -150,4 +150,21 @@ describe("owned session ledger", () => {
       expect(ledger.residentActivityRecords).toBe(0);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
+
+  it("reports unsettled work while a gated activity write is in flight and notifies once quiescent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-ledger-")); const gate = deferred<void>();
+    try {
+      const ledger = new OwnedSessionLedger(root, { beforeActivityWrite: () => gate.promise }); await ledger.initialize();
+      expect(ledger.hasUnsettledWork).toBe(false);
+      const ids = ledger.identifiers(); const record = await ledger.createPending({ ...ids, protocolRequestId: "quiescent", purpose: "ask", lifecycle: "ephemeral" });
+      expect(ledger.hasUnsettledWork).toBe(false);
+      let notifications = 0;
+      ledger.hooks.onQuiescent = () => { notifications++; };
+      ledger.recordActivity(record, "stream", { delta: "gated" });
+      expect(ledger.hasUnsettledWork).toBe(true);
+      gate.resolve(); await ledger.flush(record);
+      expect(ledger.hasUnsettledWork).toBe(false);
+      expect(notifications).toBe(1);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
 });
