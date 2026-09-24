@@ -2581,8 +2581,16 @@ field owns input. Analyze again closes the inspector and queues one new bounded
 sample. It never alters the canonical All events view, capture bytes or an
 accepted Enhanced view before a separately reviewed proposal is installed.
 
+When a nonempty proposal reaches `review`, the body additionally shows every
+expression, pin, colour rule, grouping choice and display role. It wraps and
+scrolls without truncating the proposal or diagnostic. The action row becomes
+`[ Analyze again ] [ Apply ] [ Close ]`, with `p` as Apply's mnemonic. Close
+remains the safe default: Enter or Escape closes without applying or discarding
+the pending proposal. Apply is available only for the displayed pending review;
+the runtime checks source and definition revisions again before native evaluation.
+
 The compact base footer is deliberately shorter: `setup: sampling`,
-`setup: analyzing`, `setup: applied`, or `setup: unavailable` plus a practical
+`setup: analyzing`, `setup: review`, `setup: applied`, or `setup: unavailable` plus a practical
 detail. The inspector is the stable place for the full session identity and
 diagnostic; a status update refreshes it while it is open.
 

@@ -2125,6 +2125,8 @@ pub enum Action {
     OpenAutoSetupStatus,
     /// Existing object first in the palette: current log, then Analyze again.
     AnalyzeAutoSetup,
+    /// Apply only the proposal shown by the automatic-setup review inspector.
+    ApplyAutoSetup,
     /// Existing generated view first in the palette, then Revert.
     RevertAutoSetup,
     Quit,
@@ -2730,6 +2732,9 @@ impl Views {
         applied.color_rules = proposal.color_rules;
         applied.severity_column = proposal.severity_column;
         applied.timestamp_column = proposal.timestamp_column;
+        if applied.timestamp_column.is_some() {
+            applied.recipe.time_basis = TimeBasis::Selected;
+        }
         let edit = ForkEdit::AutoSetup {
             config: Box::new(applied),
             before: Box::new(before),
@@ -2878,6 +2883,19 @@ impl Views {
             || state.color_rules.clone(),
             |(config, _)| config.color_rules.clone(),
         );
+        // The reviewed timestamp role and its event-time basis settle in the
+        // same native transaction. Polars reads both RFC3339 string outputs
+        // and its timezone-aware datetime display cast through this explicit
+        // format; the renderer never parses or guesses an event timestamp.
+        let automatic_time_field = auto
+            .as_ref()
+            .and_then(|(config, _)| config.timestamp_column.as_deref())
+            .map(role_time_token);
+        let time_basis = if automatic_time_field.is_some() {
+            TimeBasis::Selected
+        } else {
+            recipe_time_basis(config.time_basis)
+        };
         let constraints = QueryConstraints {
             text: nonempty_text(&config.search),
             exact_field: state.exact_field.clone(),
@@ -2888,12 +2906,12 @@ impl Views {
                 config.enrichments.clone()
             },
             enrichment: None,
-            time_field: None,
+            time_field: automatic_time_field,
             capture_time: resolved_capture_time,
             // A recipe carries no field token, so a `Selected` basis it cannot
             // describe degrades to capture time rather than silently reading
             // an undeclared field.
-            time_basis: recipe_time_basis(config.time_basis),
+            time_basis,
             grouping: nonempty(&config.grouping),
             // A recipe describes a definition, not a palette: the view keeps
             // the colour rules the user gave it.
@@ -2901,7 +2919,7 @@ impl Views {
         };
         state.desired_constraints = constraints;
         state.desired_capture_time_policy = policy;
-        state.desired_time_basis = recipe_time_basis(config.time_basis);
+        state.desired_time_basis = time_basis;
         let Some(revision) = self.enqueue_value(&view_id, QueryPurpose::Advanced, None) else {
             let state = self.states.get_mut(&view_id).expect("view state");
             state.desired_constraints = applied_constraints(state);
@@ -2919,7 +2937,7 @@ impl Views {
             revision,
             value: resolved_capture_time,
             policy,
-            basis: config.time_basis,
+            basis: time_basis,
         });
         state.pending_recipe = Some(PendingRecipe {
             revision,
@@ -2927,7 +2945,7 @@ impl Views {
             pinned_columns: pins,
             color_field: color,
             capture_time_policy: policy,
-            time_basis: config.time_basis,
+            time_basis,
             suggestion: None,
             auto: auto.map(|(_, pending)| pending),
         });
@@ -3958,6 +3976,8 @@ pub struct App {
     /// ordinary interaction stay available while this changes.
     auto_setup_status: Option<AutoSetupStatus>,
     auto_setup_requests: VecDeque<AutoSetupRequest>,
+    pending_auto_setup: Option<(AutoSetupRequest, AutoSetupProposal)>,
+    auto_setup_apply_requests: VecDeque<AutoSetupRequest>,
     auto_setup_events: VecDeque<AutoSetupEvent>,
     /// Session mirror of durable receipts.  The executable replaces/populates
     /// it from the receipt store on integration; keeping it here makes palette
@@ -4057,6 +4077,8 @@ impl App {
             action_notice: None,
             auto_setup_status: None,
             auto_setup_requests: VecDeque::new(),
+            pending_auto_setup: None,
+            auto_setup_apply_requests: VecDeque::new(),
             auto_setup_events: VecDeque::new(),
             auto_setup_receipts: HashMap::new(),
             appearance: Appearance::default(),
@@ -4441,15 +4463,33 @@ impl App {
     fn replace_auto_setup_status(&mut self, status: AutoSetupStatus) {
         self.layers.auto_setup_status.update(status.clone());
         self.auto_setup_status = Some(status);
+        self.refresh_auto_setup_review();
     }
 
     fn refresh_auto_setup_inspector(&mut self) {
         if let Some(status) = self.auto_setup_status.clone() {
             self.layers.auto_setup_status.update(status);
         }
+        self.refresh_auto_setup_review();
+    }
+
+    fn refresh_auto_setup_review(&mut self) {
+        let summary = self
+            .pending_auto_setup
+            .as_ref()
+            .map(|(_, proposal)| crate::auto_setup::format_proposal_summary(proposal));
+        self.layers.auto_setup_status.set_proposal_summary(summary);
     }
 
     pub fn automatic_setup_unavailable(&mut self, request: &AutoSetupRequest, diagnostic: String) {
+        if self
+            .pending_auto_setup
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == request)
+        {
+            self.pending_auto_setup = None;
+            self.auto_setup_apply_requests.clear();
+        }
         self.replace_auto_setup_status(AutoSetupStatus {
             source_id: request.source_id.clone(),
             origin_view_id: request.origin_view_id.clone(),
@@ -4525,6 +4565,8 @@ impl App {
         if !self.auto_setup_requests.is_empty() {
             return false;
         }
+        self.pending_auto_setup = None;
+        self.auto_setup_apply_requests.clear();
         self.replace_auto_setup_status(AutoSetupStatus {
             source_id: request.source_id.clone(),
             origin_view_id: request.origin_view_id.clone(),
@@ -4628,6 +4670,81 @@ impl App {
         result
     }
 
+    /// Keep the bounded proposal separate from applied views until an explicit
+    /// review action. Native evaluation still runs through the existing atomic
+    /// candidate path after acceptance; receiving model output never runs it.
+    pub fn queue_auto_setup_proposal(
+        &mut self,
+        request: &AutoSetupRequest,
+        proposal: AutoSetupProposal,
+    ) -> Result<String, AutoSetupRejected> {
+        self.views.validate_auto_setup_request(request)?;
+        validate_auto_setup_proposal(&proposal)?;
+        self.pending_auto_setup = None;
+        self.auto_setup_apply_requests.clear();
+        if proposal == AutoSetupProposal::default() {
+            return self.apply_auto_setup_proposal(request, proposal);
+        }
+        self.pending_auto_setup = Some((request.clone(), proposal));
+        self.replace_auto_setup_status(AutoSetupStatus {
+            source_id: request.source_id.clone(),
+            origin_view_id: request.origin_view_id.clone(),
+            object_name: request.object_name.clone(),
+            stage: AutoSetupStage::Review,
+            session_id: self.auto_setup_session_for(request),
+            detail: "proposal ready; open Setup status to review and Apply".into(),
+        });
+        if let Some(status) = &self.auto_setup_status {
+            self.action_notice = Some(status.notice());
+        }
+        Ok(request.origin_view_id.clone())
+    }
+
+    fn request_auto_setup_apply(&mut self) {
+        if !self
+            .auto_setup_status
+            .as_ref()
+            .is_some_and(|status| status.stage == AutoSetupStage::Review)
+            || !self.auto_setup_apply_requests.is_empty()
+        {
+            return;
+        }
+        if let Some((request, _)) = &self.pending_auto_setup {
+            self.auto_setup_apply_requests.push_back(request.clone());
+            if let Some(status) = &mut self.auto_setup_status {
+                status.stage = AutoSetupStage::Validating;
+                status.detail = "checking reviewed proposal and source revisions".into();
+            }
+            self.refresh_auto_setup_inspector();
+        }
+    }
+
+    pub fn take_auto_setup_apply_requests(&mut self) -> Vec<AutoSetupRequest> {
+        self.auto_setup_apply_requests.drain(..).collect()
+    }
+
+    /// The executable has rechecked the source acquisition generation. Check
+    /// the exact reviewed request and accepted configuration again before
+    /// consuming the candidate, including retries and edits during review.
+    pub fn apply_reviewed_auto_setup_proposal(
+        &mut self,
+        request: &AutoSetupRequest,
+    ) -> Result<String, AutoSetupRejected> {
+        if !self
+            .pending_auto_setup
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == request)
+        {
+            return Err(AutoSetupRejected::Stale);
+        }
+        self.views.validate_auto_setup_request(request)?;
+        let (_, proposal) = self
+            .pending_auto_setup
+            .take()
+            .expect("reviewed proposal exists");
+        self.apply_auto_setup_proposal(request, proposal)
+    }
+
     fn request_auto_setup(&mut self) {
         if !self.auto_setup_requests.is_empty() {
             self.action_notice = Some("current log · analysis already queued".into());
@@ -4662,6 +4779,7 @@ impl App {
             return;
         };
         self.push_layer(Open::AutoSetupStatus(status), provider);
+        self.refresh_auto_setup_review();
     }
 
     fn revert_auto_setup(&mut self) {
@@ -4677,7 +4795,16 @@ impl App {
             self.action_notice = Some("current view · accepted configuration unavailable".into());
             return;
         };
-        if current != receipt.applied {
+        let role_basis_edited = receipt
+            .applied
+            .timestamp_column
+            .as_deref()
+            .is_some_and(|column| {
+                self.views.states.get(&view_id).is_none_or(|state| {
+                    state.applied_time_field.as_deref() != Some(role_time_token(column).as_str())
+                })
+            });
+        if current != receipt.applied || role_basis_edited {
             self.action_notice = Some(
                 "current view · automatic setup was edited; revert refused to preserve changes"
                     .into(),
@@ -7495,7 +7622,7 @@ impl App {
                     }
                     state.applied_capture_time_policy = pending.capture_time_policy;
                     state.applied_time_basis = pending.time_basis;
-                    state.applied_time_field = None;
+                    state.applied_time_field = constraints.time_field.clone();
                     if pending.interaction_revision == state.user_interaction_revision
                         || auto.is_some()
                     {
@@ -8995,6 +9122,7 @@ impl App {
             }
             Action::OpenAutoSetupStatus => self.open_auto_setup_status(provider),
             Action::AnalyzeAutoSetup => self.request_auto_setup(),
+            Action::ApplyAutoSetup => self.request_auto_setup_apply(),
             Action::RevertAutoSetup => self.revert_auto_setup(),
             Action::StopCapture | Action::RestartCapture => {
                 let source_id = matches!(self.focus, Focus::Logs | Focus::Selector)

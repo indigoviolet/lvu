@@ -574,9 +574,23 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         let protected_width =
             UnicodeWidthStr::width(format!(" {protected}{STATUS_DOORS}").as_str());
         let high_priority_width = width.saturating_sub(protected_width);
+        // A review is durable interaction state for this window, not a
+        // one-action notice: dismissing its inspector must not hide the
+        // pending decision while the same source stays selected.
+        let review_notice = app
+            .auto_setup_status()
+            .filter(|status| {
+                status.stage == crate::auto_setup::AutoSetupStage::Review
+                    && app
+                        .views
+                        .active_item()
+                        .is_some_and(|view| view.source_id == status.source_id)
+            })
+            .map(crate::auto_setup::AutoSetupStatus::notice);
         let action = app
             .action_notice
             .as_ref()
+            .or(review_notice.as_ref())
             .map_or_else(String::new, |notice| {
                 let available = high_priority_width.saturating_sub(3);
                 let first_clause = notice

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Automatic log setup stays raw-first and persists one reviewed result.
+"""Automatic log setup stays raw-first and requires explicit review.
 
 The real application talks to a deliberately slow fake bridge.  While the
 proposal is in flight the canonical rows remain visible and interactive; once
-the strict composite proposal arrives, lvu installs the native Enhanced view.
-Reopening the same capture proves that the durable receipt suppresses a second
-agent request, and the ordinary command-palette revert removes only the
-generated view while leaving the captured rows intact.
+the strict composite proposal arrives, lvu waits in `setup: review` with its
+full bounded inspector summary (expressions, pins, colours, grouping/roles)
+and installs the native Enhanced view only after the explicit Setup status
+review Apply (Alt-P mnemonic or click).  Close (and Esc) preserves the pending
+proposal across reopen.  Reopening the same capture proves that the durable
+receipt suppresses a second agent request, and the ordinary command-palette
+revert removes only the generated view while leaving the captured rows intact.
 """
 
 import json
@@ -144,6 +147,14 @@ def start_app(binary: pathlib.Path, source: pathlib.Path, root: pathlib.Path, en
     )
 
 
+def choose(app: PtyApp, query: bytes, expected: str) -> None:
+    app.send(b"\x10")
+    app.wait_for("Command palette", timeout=5.0)
+    app.send(query)
+    app.wait_until(lambda text: expected in text, f"palette selects {expected}", timeout=8.0)
+    app.send(b"\r")
+
+
 def run(binary: pathlib.Path) -> None:
     root = scratch_root()
     source = root / "service.log"
@@ -182,11 +193,65 @@ def run(binary: pathlib.Path) -> None:
         )
         assert "Enhanced" not in raw, raw
 
+        # Review-before-apply: the validated proposal waits for explicit
+        # review instead of installing Enhanced on its own.
+        review = app.wait_until(
+            lambda text: "setup: review" in text and "database failed" in text,
+            "validated proposal waits for explicit review",
+            timeout=25.0,
+        )
+        assert "Enhanced" not in review, review
+        time.sleep(2.0)  # longer than the old direct-apply path would need
+        assert "Enhanced" not in app.text(), "proposal auto-applied without review"
+        assert proposal_count(archive) == 1, archive.read_text()
+
+        # The Setup status inspector shows the full bounded candidate and the
+        # explicit Apply action; nothing is installed by opening it.
+        choose(app, b"Setup status", "Current log › Setup status")
+        inspector = app.wait_until(
+            lambda text: "Automatic setup status" in text
+            and "automatic setup: review" in text
+            and "Proposed Enhanced view" in text
+            and "severity" in text
+            and "Apply" in text
+            and "Close" in text
+            and "Paseo session: automatic-setup-session" in text,
+            "inspector shows the full review summary with explicit Apply",
+            timeout=8.0,
+        )
+        assert "Enhanced" not in sidebar_views(app), inspector
+        assert "No log definition changes until you review" in inspector, inspector
+
+        # Close is the safe default: it preserves the pending proposal.
+        app.send(b"\x1b")
+        app.wait_until(
+            lambda text: "Automatic setup status" not in text,
+            "inspector closes without applying",
+            timeout=5.0,
+        )
+        closed = app.text()
+        assert "Enhanced" not in closed, closed
+        assert "setup: review" in closed, closed
+
+        # Reopening shows the same candidate; nothing was discarded.
+        choose(app, b"Setup status", "Current log › Setup status")
+        reopened_inspector = app.wait_until(
+            lambda text: "Automatic setup status" in text
+            and "Proposed Enhanced view" in text
+            and "severity" in text
+            and "Apply" in text,
+            "Close/reopen preserves the pending proposal",
+            timeout=8.0,
+        )
+        assert "Enhanced" not in sidebar_views(app), reopened_inspector
+
+        # Explicit review acceptance: Alt-P presses A&pply from the inspector.
+        app.send(b"\x1bp")
         enhanced = app.wait_until(
             lambda text: "Enhanced" in text
             and "setup: applied" in text
             and "database failed" in text,
-            "strict proposal installed with its inspectable Paseo session",
+            "review Apply installs the strict proposal with its Paseo session",
             timeout=25.0,
         )
         assert "All events" in enhanced and "database failed" in enhanced, enhanced
@@ -257,4 +322,4 @@ def run(binary: pathlib.Path) -> None:
 
 if __name__ == "__main__":
     run(pathlib.Path(sys.argv[1]).resolve())
-    print("Automatic setup PTY passed: raw-first, one durable proposal, exact revert")
+    print("Automatic setup PTY passed: raw-first, review-before-apply, one durable proposal, exact revert")

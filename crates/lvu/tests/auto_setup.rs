@@ -89,6 +89,177 @@ fn install_enhanced(app: &mut App, provider: &lvu::fixture::FixtureProvider) -> 
 }
 
 #[test]
+fn proposal_waits_for_explicit_review_and_close_keeps_it_pending() {
+    let (mut app, provider) = app_with_raw();
+    let analysis = request(&mut app, &provider);
+    app.queue_auto_setup_proposal(&analysis, proposal())
+        .unwrap();
+    assert_eq!(
+        app.auto_setup_status().unwrap().stage,
+        AutoSetupStage::Review
+    );
+    assert_eq!(app.views().len(), 1);
+    assert!(app.take_view_fork_requests().is_empty());
+    assert!(app.take_query_requests().is_empty());
+    app.handle(Action::OpenAutoSetupStatus, &provider);
+    let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+    terminal
+        .draw(|frame| lvu::ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(screen.contains("level = pl.col"), "{screen}");
+    assert!(screen.contains("Apply"), "{screen}");
+    app.handle(
+        Action::Raw(lvu::component::RawEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ))),
+        &provider,
+    );
+    assert_eq!(app.views().len(), 1);
+    assert!(app.take_auto_setup_apply_requests().is_empty());
+    app.handle(Action::OpenAutoSetupStatus, &provider);
+    app.handle(Action::ApplyAutoSetup, &provider);
+    app.handle(Action::ApplyAutoSetup, &provider);
+    let requests = app.take_auto_setup_apply_requests();
+    assert_eq!(
+        requests,
+        vec![analysis.clone()],
+        "Apply is admitted only once"
+    );
+    assert!(
+        app.take_view_fork_requests().is_empty(),
+        "runtime source fence precedes evaluation"
+    );
+    let candidate = app.apply_reviewed_auto_setup_proposal(&analysis).unwrap();
+    settle_candidate(&mut app, &candidate, true);
+    assert!(app.install_fork(&candidate));
+    assert_eq!(app.views().len(), 2);
+}
+
+#[test]
+fn narrow_review_scrolls_full_unicode_summary_without_applying() {
+    let (mut app, provider) = app_with_raw();
+    let analysis = request(&mut app, &provider);
+    let mut candidate = proposal();
+    candidate.enrichments[0].source = format!("level = pl.lit('{}')", "界e\u{301}".repeat(120));
+    app.queue_auto_setup_proposal(&analysis, candidate).unwrap();
+    app.handle(Action::OpenAutoSetupStatus, &provider);
+    let mut terminal = Terminal::new(TestBackend::new(42, 16)).unwrap();
+    terminal
+        .draw(|frame| lvu::ui::render(frame, &mut app, &provider))
+        .unwrap();
+    for _ in 0..200 {
+        app.handle(
+            Action::Raw(lvu::component::RawEvent::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            ))),
+            &provider,
+        );
+    }
+    terminal
+        .draw(|frame| lvu::ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        screen.contains("Enhanced."),
+        "the final summary line must be reachable: {screen}"
+    );
+    assert!(
+        screen.contains("Apply") && screen.contains("Close"),
+        "{screen}"
+    );
+    assert!(app.take_view_fork_requests().is_empty());
+    assert!(app.take_auto_setup_apply_requests().is_empty());
+}
+
+#[test]
+fn timestamp_setup_publishes_one_basis_and_revert_preserves_a_later_basis_edit() {
+    let (mut app, provider) = app_with_raw();
+    let analysis = request(&mut app, &provider);
+    let mut candidate = proposal();
+    candidate.enrichments.push(EnrichmentDefinition::expression(
+        "event-time",
+        "timestamp_utc = pl.col('ts')",
+    ));
+    candidate.timestamp_column = Some("timestamp_utc".into());
+    let id = app.apply_auto_setup_proposal(&analysis, candidate).unwrap();
+    assert_eq!(app.take_view_fork_requests().len(), 1);
+    assert!(app.begin_fork_query(&id));
+    let query = app.take_query_requests().pop().unwrap();
+    assert_eq!(query.constraints.time_basis, lvu::TimeBasis::Selected);
+    assert_eq!(
+        query.constraints.time_field.as_deref(),
+        Some("column:timestamp_utc|text|reject|-|%+")
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: query.view_id,
+        generation: query.generation,
+        revision: query.revision,
+        purpose: query.purpose,
+        result: Ok(()),
+    }));
+    assert!(app.install_fork(&id));
+    let state = app.view_state().unwrap();
+    assert_eq!(state.applied_time_basis, lvu::TimeBasis::Selected);
+    assert_eq!(
+        state.applied_time_field.as_deref(),
+        Some("column:timestamp_utc|text|reject|-|%+")
+    );
+    app.views.active_mut().unwrap().applied_time_field =
+        Some("column:manual_time|text|reject|-|%+".into());
+    app.handle(Action::RevertAutoSetup, &provider);
+    assert!(app.layers.view.outbox.take().is_empty());
+    assert!(
+        app.action_notice
+            .as_deref()
+            .unwrap()
+            .contains("revert refused")
+    );
+}
+
+#[test]
+fn retry_discards_pending_review_and_stale_review_cannot_apply() {
+    let (mut app, provider) = app_with_raw();
+    let analysis = request(&mut app, &provider);
+    app.queue_auto_setup_proposal(&analysis, proposal())
+        .unwrap();
+    app.handle(Action::ApplyAutoSetup, &provider);
+    app.handle(Action::AnalyzeAutoSetup, &provider);
+    assert!(app.take_auto_setup_apply_requests().is_empty());
+    assert_eq!(
+        app.apply_reviewed_auto_setup_proposal(&analysis),
+        Err(lvu::AutoSetupRejected::Stale)
+    );
+    let next = app.take_auto_setup_requests().pop().unwrap();
+    app.queue_auto_setup_proposal(&next, proposal()).unwrap();
+    app.views
+        .active_mut()
+        .unwrap()
+        .pinned_columns
+        .push("manual edit".into());
+    assert_eq!(
+        app.apply_reviewed_auto_setup_proposal(&next),
+        Err(lvu::AutoSetupRejected::Stale)
+    );
+    assert!(app.take_view_fork_requests().is_empty());
+    assert_eq!(app.views().len(), 1);
+}
+
+#[test]
 fn raw_first_atomic_success_and_native_editor_state() {
     let (mut app, provider) = app_with_raw();
     let analysis = request(&mut app, &provider);

@@ -2547,6 +2547,7 @@ impl Composition {
                 lvu::AutoSetupStage::WaitingForRows
                     | lvu::AutoSetupStage::Sampling
                     | lvu::AutoSetupStage::Analyzing
+                    | lvu::AutoSetupStage::Review
                     | lvu::AutoSetupStage::Validating
                     | lvu::AutoSetupStage::Applying
             )
@@ -2573,9 +2574,38 @@ impl Composition {
     }
 
     fn handle_auto_setup_events(&mut self, app: &mut App) -> bool {
+        let apply_requests = app.take_auto_setup_apply_requests();
+        let reviewed = !apply_requests.is_empty();
+        for request in apply_requests {
+            // A review can remain open across a source restart. Recheck the
+            // acquisition fence here, where source generations are owned,
+            // before the UI submits the ordinary native candidate transaction.
+            let evidence = Uuid::parse_str(&request.source_id)
+                .ok()
+                .and_then(|id| self.auto_setup_evidence.get(&SourceId(id)));
+            let current = self.auto_setup_data_revision(&request.source_id);
+            let valid = evidence.is_some_and(|evidence| {
+                evidence.definition_revision == request.definition_revision
+                    && current
+                        .as_deref()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        == Some(evidence.source_generation)
+            });
+            if !valid {
+                app.automatic_setup_unavailable(
+                    &request,
+                    "source or proposal changed during review; Analyze again".into(),
+                );
+            } else if let Err(error) = app.apply_reviewed_auto_setup_proposal(&request) {
+                app.automatic_setup_unavailable(
+                    &request,
+                    format!("reviewed setup refused: {error:?}; Analyze again"),
+                );
+            }
+        }
         let events = app.take_auto_setup_events();
         if events.is_empty() {
-            return false;
+            return reviewed;
         }
         for event in events {
             match event {

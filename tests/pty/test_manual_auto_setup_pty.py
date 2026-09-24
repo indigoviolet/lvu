@@ -13,7 +13,7 @@ import shutil
 import sys
 import time
 
-from test_auto_setup_pty import BRIDGE, FAILURE_LOGDIR, SETTINGS, proposal_count, stop
+from test_auto_setup_pty import BRIDGE, FAILURE_LOGDIR, SETTINGS, proposal_count, sidebar_views, stop
 from test_lvu_pty import PtyApp, isolated_environment, release_scratch, scratch_root
 
 
@@ -92,6 +92,9 @@ def run(binary: pathlib.Path) -> None:
         )
         assert "Log: manual.log / All events" in waiting, waiting
         assert "Analyze again" in waiting and "Close" in waiting, waiting
+        # Review-before-apply gate: no proposal is pending yet, so no Apply.
+        assert "Apply" not in waiting, waiting
+        assert "Enhanced" not in sidebar_views(app), waiting
 
         running = app.wait_until(
             lambda text: "Paseo session: automatic-setup-session" in text,
@@ -99,6 +102,10 @@ def run(binary: pathlib.Path) -> None:
             timeout=12.0,
         )
         assert "automatic setup: analyzing" in running, running
+        # Still analyzing (proposal in flight): Apply stays hidden until the
+        # lifecycle reaches review with its full bounded summary.
+        assert "Apply" not in running, running
+        assert "Enhanced" not in sidebar_views(app), running
         assert proposal_count(archive) == 1, archive.read_text()
         requests = [json.loads(line) for line in archive.read_text().splitlines()]
         assert next(item for item in requests if item["method"] == "start_session")["purpose"] == "auto_setup"

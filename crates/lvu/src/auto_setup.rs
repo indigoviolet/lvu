@@ -19,6 +19,11 @@ pub enum AutoSetupStage {
     Sampling,
     Analyzing,
     Validating,
+    /// A schema-checked proposal is waiting for explicit review. Nothing is
+    /// applied while a proposal sits in this stage; the inspector shows the
+    /// full bounded summary and only its Apply action installs the Enhanced
+    /// view. Close (the safe default) preserves the pending proposal.
+    Review,
     Applying,
     Unavailable,
     Applied,
@@ -31,6 +36,7 @@ impl AutoSetupStage {
             Self::Sampling => "sampling",
             Self::Analyzing => "analyzing",
             Self::Validating => "validating",
+            Self::Review => "review",
             Self::Applying => "applying",
             Self::Unavailable => "unavailable",
             Self::Applied => "applied",
@@ -113,6 +119,79 @@ pub struct AutoSetupProposal {
     pub grouping: String,
     pub severity_column: Option<String>,
     pub timestamp_column: Option<String>,
+}
+
+/// Full bounded review text for one schema-checked proposal.
+///
+/// Lists every enrichment expression, pin, colour rule, the grouping and the
+/// severity/timestamp roles in proposal order, so the inspector can show the
+/// complete candidate before anything is applied. Bounds come from the wire
+/// proposal (at most eight enrichments, eight pins, sixteen colour rules and
+/// one grouping); this function adds no truncation of its own. Wrapping and
+/// scrolling are presentation-only folding in the inspector (AGENTS.md: the
+/// query engine computes, the app names and presents).
+pub fn format_proposal_summary(proposal: &AutoSetupProposal) -> String {
+    let mut lines = Vec::new();
+    lines.push(
+        "Proposed Enhanced view — nothing applied yet. Review every line, then Apply.".to_owned(),
+    );
+    if proposal.enrichments.is_empty()
+        && proposal.pinned_columns.is_empty()
+        && proposal.color_rules.is_empty()
+        && proposal.grouping.is_empty()
+        && proposal.severity_column.is_none()
+        && proposal.timestamp_column.is_none()
+    {
+        lines.push("No changes proposed; the raw view is kept.".to_owned());
+        return lines.join("\n");
+    }
+    lines.push(format!("Enrichments ({})", proposal.enrichments.len()));
+    if proposal.enrichments.is_empty() {
+        lines.push("- none".to_owned());
+    } else {
+        for step in &proposal.enrichments {
+            lines.push(format!("- {}: {}", step.id.0, step.source));
+        }
+    }
+    if proposal.pinned_columns.is_empty() {
+        lines.push("Pins (0): none".to_owned());
+    } else {
+        lines.push(format!(
+            "Pins ({}) {}",
+            proposal.pinned_columns.len(),
+            proposal.pinned_columns.join(", ")
+        ));
+    }
+    lines.push(format!("Colours ({})", proposal.color_rules.len()));
+    if proposal.color_rules.is_empty() {
+        lines.push("- none".to_owned());
+    } else {
+        for rule in &proposal.color_rules {
+            lines.push(format!("- {} -> {}", rule.summary(), rule.color.label()));
+        }
+    }
+    lines.push(format!(
+        "Grouping: {}",
+        describe_grouping(&proposal.grouping)
+    ));
+    let severity = proposal.severity_column.as_deref().unwrap_or("none");
+    let timestamp = proposal.timestamp_column.as_deref().unwrap_or("none");
+    lines.push(format!("Roles: severity={severity}; timestamp={timestamp}"));
+    lines.push("Close keeps this proposal; Apply installs it as Enhanced.".to_owned());
+    lines.join("\n")
+}
+
+fn describe_grouping(grouping: &str) -> String {
+    if grouping.is_empty() {
+        return "off".to_owned();
+    }
+    match crate::grouping::parse_grouping(grouping) {
+        Ok(crate::grouping::GroupingSpec::Run { column }) => format!("run on {column}"),
+        Ok(crate::grouping::GroupingSpec::Filter { column }) => format!("filter on {column}"),
+        Ok(crate::grouping::GroupingSpec::Auto) => "auto".to_owned(),
+        Ok(crate::grouping::GroupingSpec::Custom(rule)) => format!("custom {rule}"),
+        Err(_) => grouping.to_owned(),
+    }
 }
 
 /// Complete accepted configuration needed for exact edit-aware revert.
@@ -421,5 +500,71 @@ mod tests {
             !status.notice().contains("paseo-auto-42"),
             "the compact acknowledgement must not hide its state behind a long id"
         );
+    }
+
+    #[test]
+    fn review_stage_names_the_pending_review() {
+        assert_eq!(AutoSetupStage::Review.label(), "review");
+        let status = AutoSetupStatus {
+            source_id: "source".into(),
+            origin_view_id: "raw".into(),
+            object_name: "payments / All events".into(),
+            stage: AutoSetupStage::Review,
+            session_id: Some("paseo-auto-42".into()),
+            detail: "proposal ready for review".into(),
+        };
+        assert!(
+            status.summary().contains("automatic setup: review"),
+            "{}",
+            status.summary()
+        );
+        assert!(
+            status.notice().contains("setup: review"),
+            "{}",
+            status.notice()
+        );
+    }
+
+    #[test]
+    fn proposal_summary_lists_every_bounded_section() {
+        let proposal = AutoSetupProposal {
+            enrichments: vec![EnrichmentDefinition::expression(
+                "severity-stage",
+                "severity = pl.col('raw').str.extract(r'level=([A-Z]+)', 1)",
+            )],
+            pinned_columns: vec!["severity".into()],
+            color_rules: vec![
+                ColorRule::column_rule("severity".into(), "ERROR".into(), RuleColor::Red),
+                ColorRule::column_rule("severity".into(), "WARN".into(), RuleColor::Yellow),
+            ],
+            grouping: crate::grouping::run_rule("severity"),
+            severity_column: Some("severity".into()),
+            timestamp_column: None,
+        };
+        let summary = format_proposal_summary(&proposal);
+        assert!(summary.contains("nothing applied yet"), "{summary}");
+        assert!(
+            summary.contains("severity-stage") && summary.contains("severity = pl.col('raw')"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Pins (1)") && summary.contains("severity"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("severity = ERROR -> red")
+                && summary.contains("severity = WARN -> yellow"),
+            "{summary}"
+        );
+        assert!(summary.contains("run on severity"), "{summary}");
+        assert!(summary.contains("severity=severity"), "{summary}");
+        assert!(summary.contains("Close keeps this proposal"), "{summary}");
+    }
+
+    #[test]
+    fn empty_proposal_summary_keeps_raw_without_apply_language() {
+        let summary = format_proposal_summary(&AutoSetupProposal::default());
+        assert!(summary.contains("No changes proposed"), "{summary}");
+        assert!(!summary.contains("Apply installs it"), "{summary}");
     }
 }

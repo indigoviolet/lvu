@@ -308,8 +308,9 @@ impl AutoSetupCoordinator {
         Some(analysis)
     }
 
-    /// Validate/apply the active proposal through lvu's native composite query
-    /// transaction. JSON-schema validity at the bridge is not enough.
+    /// Queue the active proposal for explicit review. The reviewed candidate
+    /// later uses lvu's native composite query transaction; JSON-schema
+    /// validity at the bridge is not enough to publish or evaluate it.
     pub fn complete(
         &mut self,
         app: &mut App,
@@ -335,7 +336,7 @@ impl AutoSetupCoordinator {
                 Ok(None)
             }
             Ok(proposal) => app
-                .apply_auto_setup_proposal(request, proposal)
+                .queue_auto_setup_proposal(request, proposal)
                 .map(Some)
                 .map_err(|error| format!("automatic setup refused: {error:?}")),
         }
@@ -593,6 +594,32 @@ mod tests {
             app.auto_setup_status().map(|status| status.stage),
             Some(AutoSetupStage::Analyzing)
         );
+    }
+
+    #[test]
+    fn completed_proposal_waits_for_review_without_starting_native_work() {
+        let mut app = app();
+        let (provider, _, _) = lvu::fixture::FixtureProvider::demo();
+        app.handle(Action::AnalyzeAutoSetup, &provider);
+        let mut coordinator = AutoSetupCoordinator::default();
+        coordinator.sync(&mut app);
+        let analysis = coordinator.take_analysis(&mut app, "1".into()).unwrap();
+        let proposal = decode_auto_setup_proposal(&envelope(definition())).unwrap();
+        assert_eq!(
+            coordinator
+                .complete(&mut app, &analysis, "1", Ok(proposal))
+                .unwrap(),
+            Some("raw".into())
+        );
+        assert!(coordinator.is_idle());
+        assert_eq!(
+            app.auto_setup_status().unwrap().stage,
+            AutoSetupStage::Review
+        );
+        assert_eq!(app.active_view_id(), Some("raw"));
+        assert_eq!(app.views().len(), 1);
+        assert!(app.take_query_requests().is_empty());
+        assert!(app.take_view_fork_requests().is_empty());
     }
 
     #[test]
