@@ -108,6 +108,9 @@ pub struct AutoSetupRequest {
     /// Complete accepted definition. Proposal application compares this with
     /// the current native configuration; a hash is never overwrite authority.
     pub accepted_config: Box<AutoSetupViewConfig>,
+    /// Bounded native validation feedback for an explicit retry on this log.
+    /// Environment/transport diagnostics are never sent as model context.
+    pub previous_failure: Option<String>,
 }
 
 /// The only operations the host may accept from an automatic setup proposal.

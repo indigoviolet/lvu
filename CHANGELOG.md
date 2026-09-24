@@ -4,6 +4,31 @@ User-facing changes per version. Only `vX.Y.Z` versions are releases; there is
 no preview channel. Unfinished and proposed work lives in [TODO.md](TODO.md);
 validation evidence lives in the [work ledger](docs/work-ledger.md).
 
+## v0.1.18 — 2026-09-24
+
+### Fixes
+
+- Let open windows share assistance safely: idle windows release ownership,
+  busy windows remain connected for Analyze again, and recovery settles before
+  new sessions start. No recovery path recommends deleting locks or state.
+- Give the first expression compilation a bounded startup allowance while
+  retaining the shorter warm limit. Timeout status names the phase, budget and
+  helper diagnostic; retry starts a fresh helper.
+- Include bounded native rejection feedback in Analyze again and name the
+  pinned Polars APIs, so a retry can repair an invalid generated expression.
+- Make `q` quit from the startup splash and clear lvu's alternate screen before
+  restoring the shell. Keep editor input and layered dismissal intact.
+- Prevent late workspace restoration from erasing freshly typed editor drafts.
+- Require explicit Apply in Setup status before automatic setup evaluates a
+  proposal or creates Enhanced. Close retains the proposal; full expressions
+  and diagnostics remain scrollable, and source revisions are checked again.
+- Let automatic setup recognize useful severity presentation from existing
+  structured fields and extraction patterns from raw-only samples.
+- Display native datetime enrichment outputs instead of rejecting an otherwise
+  valid setup proposal; retain their native type, nulls and record alignment.
+- Publish automatic timestamp roles with their selected event-time basis so
+  the gutter shows the recognized time. Preserve later manual basis edits.
+
 ## v0.1.17 — 2026-09-19
 
 ### Features

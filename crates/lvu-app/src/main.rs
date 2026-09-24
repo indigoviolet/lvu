@@ -2471,7 +2471,7 @@ impl Composition {
             view_id: analysis.request.origin_view_id.clone(),
             definition_revision: analysis.request.definition_revision,
             kind: AskAiKind::Enrichment,
-            instruction: "Inspect this bounded typed log sample and propose only useful native enrichments, pinned enrichment outputs, value-based colour rules, and run/filter grouping. Prefer a small setup; return an empty setup when no transformation is justified. Never propose commands, filters, source changes, or time windows.".into(),
+            instruction: auto_setup::proposal_instruction(&analysis.request),
             provider: settings.provider.clone(),
             mode: settings.mode.clone(),
             thinking: settings.thinking.clone(),
@@ -2754,6 +2754,7 @@ impl Composition {
                                     .auto_setup_config(&origin_view_id)
                                     .unwrap_or_default(),
                             ),
+                            previous_failure: None,
                         };
                         app.automatic_setup_unavailable(&request, message.clone());
                     }

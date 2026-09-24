@@ -15,6 +15,8 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 
 | Status | Work |
 | --- | --- |
+| **Working** | Fix real automatic setup: multiwindow assistance ownership, cold compiler startup and actionable retry, temporal output display, and explicit proposal review; validate with a real provider and installed resources before exact release acceptance. |
+| **Working** | Reproduce and fix `q`/screen cleanup while preserving editor input and layered dismissal; prove normal/failure restoration in real PTYs. |
 | **Paused** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. Long-running validation is paused; the full volume-backed test remains unaccepted. |
 | **Paused** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. Existing fixes and evidence are preserved; long-running validation is paused. |
 | **Paused** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no causal explanation or full performance acceptance is claimed. |

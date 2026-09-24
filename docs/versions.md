@@ -4,6 +4,10 @@ lvu has one publication scheme: annotated `vX.Y.Z` tags and matching GitHub
 releases. There is no separate preview channel or preview numbering. Every
 version must agree with `crates/lvu-app/Cargo.toml` and `Cargo.lock`.
 
+Candidate **v0.1.18** fixes automatic setup, assistance ownership and quit/input
+lifecycle. It is undergoing exact-source acceptance and is not published yet;
+the current installed/public release below remains authoritative.
+
 Current version: **[v0.1.17](https://github.com/indigoviolet/lvu/releases/tag/v0.1.17)**,
 published 2026-09-19 at 06:27:32 UTC from `f665d25`. Release CI built and
 executed the three supported native archives. The local installation is the

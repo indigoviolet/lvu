@@ -74,6 +74,15 @@ for line in sys.stdin:
             "explanation": "fixture setup for severity presentation",
             "originating_revision": request["originating_revision"],
         }
+        if os.environ.get("FAKE_SETUP_REQUIRE_REPAIR"):
+            count = sum(json.loads(line).get("method") == "request_proposal"
+                        for line in archive.read_text().splitlines())
+            if count == 1:
+                proposal["definition"]["enrichments"][0]["expression"] += ".str.to_upper()"
+            else:
+                assert "previous proposal was rejected by native validation" in request["instruction"]
+                assert "to_upper" in request["instruction"]
+                proposal["definition"]["enrichments"][0]["expression"] += ".str.to_uppercase()"
         result = {"proposal": proposal}
     elif method == "cancel":
         result = {"cancelled": True, "remote_cancelled": True,

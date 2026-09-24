@@ -12,6 +12,10 @@ distinct assistance route/daemon diagnostics. The unified Sources dialog keeps
 stopped/error sources selectable, shows full health, and restarts or durably
 removes them by stable identity.
 Releases use only the vX.Y.Z scheme.
+The working v0.1.18 candidate adds explicit automatic-setup review, native
+temporal output display, safe idle assistance-lease handoff, a separate compiler
+startup allowance, and quit/input restoration fixes. Exact release acceptance
+and publication are still pending; see the current work ledger.
 Historical build numbers below date when behavior arrived; they are not a separate
 release channel.
 
@@ -327,8 +331,13 @@ must name an output from that same proposal. Commands, filters, sources, time
 windows and hidden record selection are rejected at the bridge, wire-lowering
 and native application boundaries. Definition/data revisions fence stale work.
 
-Native validation applies the complete bundle atomically as an ordinary derived
-Enhanced view; All events and its capture are unchanged. An empty bundle records
+The working implementation retains a nonempty bundle as a bounded pending
+proposal. `Setup status` presents all expressions and presentation choices,
+with an explicit Apply action and a safe Close default. The executable rechecks
+the source acquisition generation after review; the UI rechecks the accepted
+definition before submitting native validation. Validation applies the complete
+bundle atomically as an ordinary derived Enhanced view; All events and its
+capture are unchanged. An empty bundle records
 a durable no-change receipt instead of retrying on every launch. An applied
 receipt stores the proposal digest, generated view ID, applied-configuration
 digest and frozen revision evidence in workspace SQLite. Restart reattaches only
@@ -624,14 +633,21 @@ Managed assistance uses a stable workspace under the absolute assistance root.
 Ask and source helpers use fresh ephemeral sessions; investigations remain
 resumable. Ownership and bounded activity are durable before confirmed archive.
 Archive acknowledgements have a separate bounded host queue; saturation faults
-explicitly and retains ownership for recovery. Normal EOF shutdown releases the
-nonce-owned bridge lease and reaps its process group. Existing stale leases are
+explicitly and retains ownership for recovery. Normal EOF shutdown drains tracked
+work, releases the nonce-owned bridge lease and reaps its process group. Existing stale leases are
 conservatively refused, not automatically removed: startup connects to the
 daemon first (`LVU_PASEO_URL`, default `ws://127.0.0.1:6767/ws`), then acquires
-`<owned-root>/bridge.lock` exclusively. Contention fails with stable
-`OWNED_ROOT_BUSY` and the exact lock path (`EEXIST` alone cannot prove stale;
+`<owned-root>/bridge.lock` exclusively. A busy bridge stays connected in standby;
+managed requests report `OWNED_ROOT_BUSY` and the lock path while the other
+owner is active. Idle bridges release their own nonce only after sessions,
+recovery, workspace preparation and ledger writes settle. A later request
+reacquires ownership and reloads workspace identity; recovery finishes before
+new sessions are created. A filesystem deadline does not permit release while
+an operation can still write. (`EEXIST` alone cannot prove stale;
 PID checks cannot prove ownership); daemon failures fail with
 `DAEMON_UNREACHABLE`/`DAEMON_TIMEOUT`. The host classifies by those markers —
 the generic `bridge connection failed` wrapper never implies a daemon — and
-reports owned busy with close-all-windows plus exact-lock-only recovery, and
-daemon failures with localhost-is-the-lvu-machine topology guidance.
+reports owned busy with the lock path as diagnostic evidence, and daemon
+failures with localhost-is-the-lvu-machine topology guidance. Removing locks,
+assistance state or captures is not a user recovery instruction. Real-provider
+and two-window acceptance evidence is recorded in the current work ledger.

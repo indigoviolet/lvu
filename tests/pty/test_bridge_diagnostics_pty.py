@@ -230,11 +230,10 @@ def unusable_provider_is_reported(binary: pathlib.Path, root: pathlib.Path,
          "unusable provider")
 
 
-# A bridge that fails at startup holding the owned assistance lease. The real
-# ledger path needs a reachable daemon before it is attempted (Bridge.start
-# connects first), so the daemon's absence would mask it here; the startup
-# stderr below is byte-for-byte the new bridge's OWNED_ROOT_BUSY line, with
-# the exact lock path taken from LVU_PASEO_OWNED_ROOT like the real ledger.
+# A legacy bridge that fails at startup holding the owned assistance lease.
+# Current bridges stay connected and return busy per request (also tested
+# below); the host must continue to classify older coded startup stderr.
+# The exact lock path comes from LVU_PASEO_OWNED_ROOT like the real ledger.
 # The whole Rust path — EOF, stderr capture, classifier, wording — still runs
 # for real, and must never report this as daemon unreachable.
 STUB_OWNED_BUSY_BRIDGE = """
@@ -254,10 +253,28 @@ def owned_root_busy_is_reported(binary: pathlib.Path, root: pathlib.Path,
     (stub / "dist").mkdir(parents=True, exist_ok=True)
     (stub / "dist" / "cli.js").write_text(STUB_OWNED_BUSY_BRIDGE)
     message = case(binary, root, source, {"LVU_BRIDGE_DIR": str(stub)},
-         ["owned assistance", "bridge.lock", "close all", "remove only"],
+         ["owned assistance", "bridge.lock", "wait for", "Analyze again", "never delete"],
          "owned root busy")
     assert "could not reach the Paseo daemon" not in message, message
     assert "machine/container running lvu" not in message, message
+    assert "remove only" not in message and "close all" not in message, message
+
+
+def owned_root_busy_request_is_reported(binary: pathlib.Path, root: pathlib.Path,
+                                        source: pathlib.Path) -> None:
+    """A live standby bridge reports safe retry advice for the managed request."""
+    stub = root / "stub-owned-standby"
+    (stub / "dist").mkdir(parents=True, exist_ok=True)
+    (stub / "dist/cli.js").write_text(
+        'const PROVIDER_MESSAGE = "OWNED_ROOT_BUSY: owned assistance root is busy or contains a stale bridge.lock at " + '
+        'JSON.stringify((process.env.LVU_PASEO_OWNED_ROOT ?? "owned") + "/bridge.lock");\n'
+        + STUB_BRIDGE.replace('"PROVIDER_UNKNOWN"', '"OWNED_ROOT_BUSY"')
+    )
+    message = case(binary, root, source, {"LVU_BRIDGE_DIR": str(stub)},
+                   ["owned assistance", "bridge.lock", "wait for", "Analyze again", "never delete"],
+                   "owned request busy")
+    assert "remove only" not in message and "close all" not in message, message
+    assert "could not reach the Paseo daemon" not in message, message
 
 
 def run(binary: pathlib.Path) -> None:
@@ -271,6 +288,7 @@ def run(binary: pathlib.Path) -> None:
         missing_bridge_is_reported_at_startup(binary, root, source)
         unusable_provider_is_reported(binary, root, source)
         owned_root_busy_is_reported(binary, root, source)
+        owned_root_busy_request_is_reported(binary, root, source)
         if (bridge / "dist" / "cli.js").exists():
             missing_node_is_reported(binary, root, source, bridge)
             unreachable_daemon_is_reported(binary, root, source, bridge)

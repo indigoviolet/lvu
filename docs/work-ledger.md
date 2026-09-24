@@ -4164,3 +4164,189 @@ bridge capabilities, and passed installed Docker-discovery and manual
 automatic-setup/session PTYs. The host Docker socket remains inaccessible, so
 the Docker happy path is honestly fixture-backed. Human Apple-silicon macOS and
 arm64 Linux terminal acceptance remains unverified.
+
+## 2026-09-24 — new primary: real automatic setup and quit diagnosis
+
+The new primary verified source `d01a21b21e99e421bf75b434015a1d0d913cfcc4`,
+tree `5538a480e7e9147ca57ce38e83c110d3e6610ec0` on the integration branch.
+Only the protected foreign `mise.toml` tool bumps were present. Four isolated
+Muse Spark implementation assignments cover bridge ownership, compiler
+startup/failures, quit lifecycle, and explicit setup review. Primary owns
+integration and actual provider acceptance; no independent reviewer was created.
+
+Following explicit user reauthorization, heartbeat `293347b7` targets new
+supervisor session `8fca0011-e4a1-46b6-bf70-3caf8574e3d0` every fifteen minutes
+UTC. The persisted record confirms one heartbeat for that session. The old
+supervisor's deleted heartbeat was not recreated.
+
+Installed v0.1.17 ran in actual kernel PTYs with isolated controlled three-row
+fixtures and the local bridge/provider. Structured-level and raw-text probes
+with `codex/gpt-6-luna` returned empty proposals. The raw probe incorrectly
+treated absent structured schema as a reason not to extract the visible raw
+timestamp/severity pattern. With `codex/gpt-6-sol`, the raw fixture produced
+a nonempty timestamp/severity proposal, then failed display projection with
+`unsupported enrichment output type Datetime('μs', 'UTC')`. This is an observed
+additional defect, not proof of the user's compiler-timeout cause. Primary's
+temporal projection change is awaiting tests. Clarifying the setup prompt's
+raw-only extraction and structured-field presentation rules produced an actual
+Enhanced view using Luna and the installed binary with the development bridge
+override. That mixed-resource result is diagnosis evidence, not release acceptance.
+
+The first installed probe exited on `q` with status 0 and restored termios;
+screen-cleanup and dialog cases remain under investigation. Code inspection
+found proposals directly created Enhanced despite the inspector promising
+review before changes; explicit review is now being implemented. Existing
+fake-bridge PTYs and historical release checks do not prove these failures fixed.
+Evidence is under `lvu-build/primary-v018-real-diagnosis` on the large volume,
+including retained controlled fixture locations, scripts, screens and transcripts.
+
+Build space rose from 7.7 GiB to 16 GiB after `cargo clean --profile dev` on
+exactly four idle completed responsive-UI targets: dialog-shell,
+live-workspaces, context-editors and enrichment-stack. Their branches were
+contained in primary HEAD and no build held their target locks. Releases,
+proof archives, capture data and worktree sources were preserved.
+Diagnosis, implementation, real-terminal acceptance and publication/installation
+remain incomplete. No new version or tag has been created.
+
+Primary commit `fc36f594` clarifies useful raw/structured setup proposals;
+13/13 prompt tests and the mixed-resource real-provider probe passed. Commit
+`eac0e19` lets native temporal enrichment columns render through Polars' own
+string cast. Its actual Python-to-Rust test passed for offset conversion,
+nulls, stable record alignment and one-row/whole-batch equivalence. The first
+test run incorrectly expected an empty diagnostic list instead of the normal
+Ready diagnostic; the failed and corrected logs are both retained. Explicit
+review integration now holds a separate pending proposal and rechecks acquisition
+and accepted-definition revisions on Apply; combined compilation and PTYs are
+still pending the component integration.
+
+The combined explicit-review path passes 15/15 UI integration tests (including
+Ratatui narrow Unicode scrolling and stale/replace/close behavior), 9/9 app
+coordinator/lowering tests, and actual automatic/manual setup PTYs. The first
+PTY found that dismissing the inspector cleared the one-action footer notice;
+pending review now remains visible for the selected source. The rerun passed
+review-before-apply, persisted restart and exact revert. A first live-proof
+script failed its incomplete settings fixture; the next incorrectly included
+asynchronous canonical-view persistence in its pre-review publication count.
+SQLite contained only canonical All events. The corrected proof counts derived
+views and is being rerun; neither script failure establishes a product failure.
+All failed evidence is retained alongside the corrected runs.
+
+Primary review commit `617627f` also fixes the newly observed blank event-time
+gutter: automatic timestamp roles and their explicit selected basis now publish
+in one native transaction. A later manual basis edit blocks automatic revert.
+The corrected raw-timestamp live probe passed with actual Paseo/Sol, explicit
+Apply, visible event times, retained session, restart and identical capture
+journals (`integrated-raw-single-4/result.json`). This remains a single-window
+development-binary result, not immutable release acceptance.
+
+Compiler commit `214418c` integrates Muse `3592cd9`: fresh helpers get 24 seconds
+by default, warmed requests keep three seconds, and timeout diagnostics include
+phase/budget/elapsed and bounded stderr. Primary concurrent host-failure tests
+passed 9/9. The first implementer run failed a process-wide thread count because
+other concurrent tests owned live helper threads; the corrected leak proof runs
+in an isolated child process and the normal concurrent suite passes. No threshold
+was enlarged. Measured packaged-helper warm and isolated-cold startup were about
+0.5 and 2.0 seconds here, both below three seconds; the user's exact timeout cause
+remains unproven, and the reported session was not found on this local daemon.
+
+Muse quit commit `06408dc` reproduces the sourceless splash swallowing `q`.
+Primary integrated its routing and added clearing/resetting the owned alternate
+surface before leaving it, without clearing the restored shell screen. The
+first three quit stories pass, as do actual panic and startup-failure restoration.
+Strengthening the editor story from a pre-existing `q` substring to the unique
+draft `qzz` exposed real loss of the first character (`zz` remained). That failure
+is being diagnosed without timing sleeps; no complete quit acceptance is claimed.
+Five inherited layered-real failure transcripts were copied to the volume under
+`primary-v018-real-diagnosis/layered-real-failures` and retained.
+
+The real provider/compiler failure-and-retry probe now passes
+(`real-timeout-retry-1/result.json`): an owned copy of the bundled Python helper
+was delayed behind an explicit test marker, the actual app reported its cold
+startup timeout with retained Paseo session and no derived publication, then
+Analyze again in the same open window compiled through the real helper after
+only that injected marker was removed. Timestamp/severity output, visible event
+times, restart suppression and identical raw journal bytes passed. This is a
+deterministic injected timeout with real surrounding integration, not a natural
+reproduction of the user's old timeout or multiwindow acceptance.
+
+Implementation is integrated in `4d2a187` (multiwindow assistance) and `f54476f`
+(quit/terminal and late-restore draft fencing). The strengthened five-story quit
+PTY now passes with no timing sleeps. Its lost-first-character root cause was
+the memory load's ID mismatch: missing per-view fences fell back to the current
+interaction revision, making the guard vacuous. Requests now fence live view IDs
+before loading, and previously unseen IDs restore only untouched state.
+
+Bridge typecheck plus 130/130 tests pass. Primary review added recovery-before-
+creation fencing and tracking of late acquisition/workspace/recovery I/O so a
+public timeout cannot release ownership ahead of a late write. The first close-
+race tests exposed premature state refusal and an assertion racing actual lock
+unlink; the corrected tests wait for the gated acquisition and completed release.
+The real combined proof passes two open windows, injected compiler timeout and
+Analyze again, quitting during a real analysis and retry from the surviving
+window, then restart without new analysis or changed journal bytes
+(`real-combined-1/result.json`, five retained sessions). Initial multiwindow
+probe failures were harness errors: it inspected an older view after focus was
+deliberately preserved, then sent Escape after Apply had already closed the
+inspector. The corrected probe selects the new stable saved view and asserts
+the first process stays alive throughout the second request.
+
+The Docker Compose fixture now passes real discovery/open, actual local provider
+and compiler, reviewed severity/timestamp enrichment with a visible time gutter,
+and retained capture/definition on restart (`real-docker-3/result.json`). Docker
+is honestly simulated: the host socket was rechecked and still returns permission
+denied. The proof requires exactly one Compose log invocation; a remembered
+command remains stopped on reopen and is never silently launched. File-source
+proofs separately verify restored Enhanced rows. Failed Docker attempts retained
+evidence: one used Enter while the discovery filter owned focus; another wrongly
+expected a remembered command to resume automatically.
+
+The complete Rust workspace and all-target Clippy passed preflight after updating
+the temporal-grouping test to expect rejection at the grouping boundary rather
+than the now-supported display boundary. Its previous failure is retained.
+Version 0.1.18 now matches the crate and lockfile; no existing tag or release uses
+that version. Exact immutable acceptance, tagging, publication and installation
+remain pending. The foreign mise diff still hashes to
+`af4838eaa4a312b6e77fe0bacfaa0a57af352db22f198311549b281606ea1747`.
+
+Final working-tree Docker proof `real-docker-3/result.json` passes with the
+explicit Open action and the correct stopped-command restoration expectation.
+The saved Enhanced definition and journal remain unchanged, no extra session
+appears, and the controlled Docker executable is invoked for logs exactly once.
+The public release remains v0.1.17 until the v0.1.18 candidate passes its complete
+gate and the three native archives are verified and published.
+
+The first immutable v0.1.18 candidate, `de85e65d082f6408dc5f3c6162675d3151a958c2`
+(tree `ab5bdb1952f67130f0653da5a2a9b35c4a98a6ea`), passed full Rust/Clippy,
+25 remote-union tests and 130 bridge tests, but stopped at **90/91** PTYs.
+`test_bridge_diagnostics_pty.py` still required the retired close-all/remove-lock
+instructions. It now requires safe retry guidance and forbids deletion advice,
+covering both legacy startup errors and the current live standby response.
+The corrected focused suite passed. Failed gate evidence is retained under
+`lvu-v018-de85e65-acceptance`; the source is retained by local evidence branch
+`evidence/v0.1.18-de85e65`. No tag or accepted record was created.
+
+Pre-publication compatibility review also restricted the new timestamp-basis
+revert guard to receipts that actually selected that basis. Unchanged older
+receipts that assigned only a timestamp role remain revertible; the regression
+test passes alongside protection of later manual basis edits. The corrected
+candidate requires a complete new immutable gate.
+
+Candidate `897f30a59006b5470170fd6a3e1c02b685dcfaf9` passed full Rust/Clippy,
+25 remote-union tests, 130 bridge tests and **91/91** PTYs. The subsequent real
+provider gate correctly failed: its second-window proposal called nonexistent
+Polars `.str.to_upper()`. Native validation rejected it; no tag or accepted
+record was created. Evidence remains in `lvu-v018-897f30a-acceptance`, with
+source retained by `evidence/v0.1.18-897f30a`. This is a model/API compatibility
+failure, not a provider-connectivity blocker or the user's historical timeout.
+
+The prompt now states Python Polars 1.44.1 and its actual `.str.to_uppercase()` /
+`.str.to_lowercase()` methods, avoids unnecessary conversion, and excludes
+unsupported temporal grouping keys. Analyze again carries up to 512 characters
+of same-log native definition rejection as quoted diagnostic data; environment,
+transport and timeout stderr are not sent to the model. Ten app setup tests and
+13 prompt tests pass. A new actual-app PTY deliberately returns `.str.to_upper()`,
+observes native rejection without publication, requires that feedback on the
+next bridge request, then applies `.str.to_uppercase()` through the real Python
+helper/Rust engine after explicit review. Its raw journal hashes remain equal.
+The real-provider gate now stops immediately on native rejection and saves the
+full inspector instead of waiting for an Applied state that cannot arrive.

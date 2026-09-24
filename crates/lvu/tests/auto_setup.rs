@@ -229,6 +229,18 @@ fn timestamp_setup_publishes_one_basis_and_revert_preserves_a_later_basis_edit()
             .unwrap()
             .contains("revert refused")
     );
+    // Older receipts assigned a timestamp role without selecting its basis.
+    // That unchanged legacy configuration must remain revertible after upgrade.
+    let mut legacy = app.auto_setup_receipt(&id).unwrap().clone();
+    legacy.applied.recipe.time_basis = lvu::TimeBasis::Capture;
+    let state = app.views.active_mut().unwrap();
+    state.applied_time_basis = lvu::TimeBasis::Capture;
+    state.applied_time_field = None;
+    assert!(app.restore_auto_setup_receipt(legacy));
+    app.handle(Action::RevertAutoSetup, &provider);
+    let requests = app.layers.view.outbox.take();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].mode, ViewDialogMode::Delete);
 }
 
 #[test]

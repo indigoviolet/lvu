@@ -2079,8 +2079,8 @@ async fn run_grouping_on_temporal_output_rolls_back() {
         good_ids()
     );
 
-    // Real datetimes never get that far: display projection refuses them at
-    // the enrichment seam, still with last-good intact.
+    // Datetime outputs now have native display projection, but grouping still
+    // refuses their unsupported exact-key type and preserves the last-good view.
     let mut dated = request("view", 3, 3, 1, None, None);
     dated.purpose = QueryPurpose::Grouping;
     dated.base_constraints = grouped.constraints.clone();
@@ -2096,8 +2096,11 @@ async fn run_grouping_on_temporal_output_rolls_back() {
     adapter.submit(dated).unwrap();
     let failure = wait_completion(&mut adapter, 3).await;
     let error = failure.result.unwrap_err();
-    assert_eq!(error.purpose, QueryPurpose::Enrichment, "{error:?}");
-    assert!(error.message.contains("unsupported"), "{error:?}");
+    assert_eq!(error.purpose, QueryPurpose::Grouping, "{error:?}");
+    assert!(
+        error.message.contains("exact") && error.message.contains("Datetime"),
+        "{error:?}"
+    );
     let kept = wait_page(&mut adapter, 2).await;
     assert_eq!(
         kept.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),

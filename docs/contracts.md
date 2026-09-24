@@ -192,6 +192,9 @@ submits them for native validation. Close preserves the pending proposal and
 Analyze again replaces it. Source acquisition and accepted-definition fences
 are rechecked after review. Merely receiving or inspecting a proposal never
 creates a derived view or evaluates its expressions.
+An explicit retry on the same log may include bounded feedback from native
+definition rejection. Environment/transport diagnostics and helper stderr are
+excluded from model feedback, and the new proposal still requires review.
 
 The `auto_setup` proposal is one complete bundle: at most eight unique native
 enrichment expressions, eight unique pins, sixteen exact-value colour rules,

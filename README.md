@@ -41,7 +41,7 @@ except that works offline.
 - **Assistance optional, offline core.** Plain-language filter, enrichment,
   and timestamp drafting plus resumable snapshot investigations through
   your own local agent CLI. Automatic log setup opens raw data
-  first, then builds a reversible Enhanced view from a bounded sample;
+  first, then proposes a reversible Enhanced view for review from a bounded sample;
   everything else works offline (`uv` only for Polars expressions, `node`
   only for the bridge).
 
@@ -184,14 +184,16 @@ subject to that provider's terms.
 
 Automatic log setup runs for each newly opened source by default, after its raw
 All events view is already usable. Set `Automatic log setup > Run` to `Disabled`
-to opt out. A successful bounded proposal creates an
-ordinary Enhanced view containing only native enrichments, pins, exact-value
+to opt out. A bounded proposal waits in `Current log > Setup status` for review.
+Its Apply button validates and creates an ordinary Enhanced view containing
+only native enrichments, pins, exact-value
 colour rules, display roles and Run/Filter grouping. It cannot add a filter,
 command, source or time window. `Current log > Analyze again` runs the same
 operation explicitly; `Current log > Setup status` opens a full inspector for
 that log before offering another analysis. It names the log, lifecycle state,
 Paseo session (or that one is still being created), and diagnostic; its
-`Analyze again` button is an explicit retry. `Current view > Revert automatic setup` removes an
+`Analyze again` button is an explicit retry. Close keeps a pending proposal
+without applying it. `Current view > Revert automatic setup` removes an
 unchanged generated view while preserving its source and captured bytes. Once
 you edit that setup manually, lvu refuses the automatic revert so it cannot
 erase your work. While analysis runs, the footer names its current stage without
@@ -200,10 +202,10 @@ blocking raw browsing. Its `Paseo session: <session>` result identifies a retain
 archived when the one-shot proposal completes.
 
 Two assistance failures look similar but have different remedies. An owned-route
-busy report names the exact `bridge.lock` under the capture's `assistance`
-directory: close all lvu windows using that capture root first; only when none
-remain, verify no lvu or bridge process still owns it, then remove only that
-exact lock file — never the assistance root or capture data. A daemon-unreachable
+busy report means another window owns the shared assistance route. Let its
+request finish, then use Analyze again. The reported `bridge.lock` path is
+diagnostic information; deleting locks or local state is not a recovery step.
+A daemon-unreachable
 report means the machine/container running lvu has no Paseo daemon at
 `LVU_PASEO_URL` (default `ws://127.0.0.1:6767/ws`): establish topology
 (Desktop-managed, standalone, or Docker) and check `paseo daemon status --json`.

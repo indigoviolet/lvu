@@ -4551,6 +4551,28 @@ impl App {
             object_name,
             definition_revision: self.view_definition_revision(origin_view_id)?,
             accepted_config: Box::new(config),
+            previous_failure: self
+                .auto_setup_status
+                .as_ref()
+                .filter(|status| {
+                    status.source_id == item.source_id
+                        && status.origin_view_id == origin_view_id
+                        && status.stage == AutoSetupStage::Unavailable
+                })
+                .and_then(|status| {
+                    // Diagnostic context only, never a second query evaluator.
+                    // Restrict it to generated-definition failures; helper stderr
+                    // and service/transport details can contain environment data.
+                    [
+                        "compiler rejected expression",
+                        "native expression validation failed",
+                        "unsupported enrichment output type",
+                        "grouping keys need",
+                    ]
+                    .iter()
+                    .any(|prefix| status.detail.starts_with(prefix))
+                    .then(|| status.detail.chars().take(512).collect())
+                }),
         })
     }
 
@@ -4795,15 +4817,17 @@ impl App {
             self.action_notice = Some("current view · accepted configuration unavailable".into());
             return;
         };
-        let role_basis_edited = receipt
-            .applied
-            .timestamp_column
-            .as_deref()
-            .is_some_and(|column| {
-                self.views.states.get(&view_id).is_none_or(|state| {
-                    state.applied_time_field.as_deref() != Some(role_time_token(column).as_str())
-                })
-            });
+        let role_basis_edited = receipt.applied.recipe.time_basis == TimeBasis::Selected
+            && receipt
+                .applied
+                .timestamp_column
+                .as_deref()
+                .is_some_and(|column| {
+                    self.views.states.get(&view_id).is_none_or(|state| {
+                        state.applied_time_field.as_deref()
+                            != Some(role_time_token(column).as_str())
+                    })
+                });
         if current != receipt.applied || role_basis_edited {
             self.action_notice = Some(
                 "current view · automatic setup was edited; revert refused to preserve changes"
