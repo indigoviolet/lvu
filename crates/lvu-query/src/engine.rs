@@ -450,8 +450,9 @@ pub struct BatchResult {
 /// One canonical text form is shared with native colour equality: float
 /// cells render through the same Polars cast the engine compares, so a
 /// value copied from display (`1.0`, `-0.0`) always matches the rule it
-/// names, while Rust display (`1`, `-0`) would silently miss. Integers,
-/// booleans and strings already agree between the two spellings.
+/// names, while Rust display (`1`, `-0`) would silently miss. Temporal
+/// outputs use that same native cast, retaining units and timezone in the
+/// underlying typed column. Integers, booleans and strings already agree.
 pub fn scalar_projection(
     frame: &DataFrame,
     name: &str,
@@ -467,7 +468,13 @@ pub fn scalar_projection(
     let mut casted: Option<Column> = None;
     if matches!(
         column.dtype(),
-        DataType::Float16 | DataType::Float32 | DataType::Float64
+        DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Date
+            | DataType::Datetime(_, _)
+            | DataType::Duration(_)
+            | DataType::Time
     ) {
         casted = Some(
             column

@@ -307,6 +307,94 @@ fn scalar_projection_preserves_strings_and_formats_only_supported_scalars() {
 }
 
 #[test]
+fn python_temporal_enrichment_projects_without_losing_type_or_identity() {
+    let mut host = python_compiler();
+    let timestamp = host
+        .compile(
+            "pl.col('ts').str.to_datetime(format='%+', strict=False).dt.convert_time_zone('UTC')",
+            ExpressionKind::Enrichment,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let source = SourceId::new();
+    let input = records_to_batch(&[
+        record(
+            source,
+            9,
+            b"ts=2026-09-24T09:00:00.123456+02:00",
+            ChunkPosition::Complete,
+        ),
+        record(source, 10, b"ts=invalid", ChunkPosition::Complete),
+        record(
+            source,
+            11,
+            b"ts=2026-09-24T07:00:02Z",
+            ChunkPosition::Complete,
+        ),
+    ])
+    .unwrap()
+    .frame;
+    let stages = [EnrichmentStage {
+        name: "timestamp_utc".into(),
+        definition: timestamp,
+    }];
+    let run = |frame: &DataFrame| {
+        execute_batch(
+            frame,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &stages,
+                filter: None,
+                text_search: None,
+                colors: &[],
+                column_colors: &[],
+            },
+        )
+    };
+    let output = run(&input);
+    assert_eq!(
+        output.validity,
+        BatchValidity::Valid,
+        "{:?}",
+        output.diagnostics
+    );
+    assert_eq!(
+        output
+            .enriched_rows
+            .column("timestamp_utc")
+            .unwrap()
+            .dtype(),
+        &DataType::Datetime(TimeUnit::Microseconds, Some(TimeZone::UTC))
+    );
+    let values = scalar_projection(&output.enriched_rows, "timestamp_utc", 128).unwrap();
+    assert_eq!(
+        values.iter().map(|(id, _)| id.sequence).collect::<Vec<_>>(),
+        vec![9, 10, 11]
+    );
+    assert_eq!(
+        values[0].1.as_deref(),
+        Some("2026-09-24 07:00:00.123456+00:00")
+    );
+    assert_eq!(values[1].1, None);
+    assert_eq!(
+        values[2].1.as_deref(),
+        Some("2026-09-24 07:00:02.000000+00:00")
+    );
+    let partitioned = (0..input.height())
+        .flat_map(|index| {
+            scalar_projection(
+                &run(&input.slice(index as i64, 1)).enriched_rows,
+                "timestamp_utc",
+                128,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, partitioned);
+}
+
+#[test]
 fn malformed_and_mixed_records_preserve_exact_bytes_ids_and_chunks() {
     let source = SourceId::new();
     let records = vec![
