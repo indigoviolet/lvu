@@ -98,6 +98,8 @@ function proposalKindInstructions(kind: ProposalRequest["kind"]): string[] {
     case "auto_setup": return [
       "Propose one complete, reversible automatic setup bundle. An empty bundle is valid when the evidence does not justify any setup.",
       `Every enrichment has {id, output, expression}; expression must be ${expressionDefinition}. ${expressionSafety}`,
+      "Raw-only rows are valid extraction evidence: when schemas/values are empty but samples contain raw text with a consistent timestamp or severity pattern, extract it from pl.col('raw'); a projection/type conflict is not required when the structured field is absent. Explain the observed pattern and preserve unmatched rows as null.",
+      "Useful presentation also counts as setup. A usable structured severity field can be copied or normalized into a proposed output, pinned and given exact-value colour rules; it need not contain novel information. Prefer this over re-parsing raw text. Do not return an empty bundle solely because useful source fields already exist.",
       temporal,
       "Use at most eight enrichment expressions and give each a unique stable id and unique output. Do not place `output =` inside expression; the host constructs that existing enrichment form after validation. Never propose commands, executable steps, filters, sources, time windows, hidden record selection, or fields outside this schema.",
       "Pinned columns, exact-value colour-rule columns, and Run/Filter grouping columns must name outputs in this same proposal. Colour rules only classify exact values of accepted enrichment outputs and only affect presentation.",
