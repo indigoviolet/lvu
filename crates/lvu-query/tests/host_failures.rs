@@ -40,13 +40,16 @@ for line in sys.stdin:
     )
     .unwrap();
     let mut host = CompilerHost::new(config(&script, Duration::from_millis(100), 1024));
+    // A freshly spawned helper gets the cold-start budget (8x steady here),
+    // so the detail must name the cold start and the retry.
     assert!(matches!(
         host.compile(
             "pl.col('x')",
             ExpressionKind::Enrichment,
             &AtomicBool::new(false)
         ),
-        Err(HostError::Timeout)
+        Err(HostError::Timeout(detail))
+            if detail.contains("cold start") && detail.contains("retry the action")
     ));
     let pid = fs::read_to_string(&pid_file).unwrap();
     assert!(
@@ -59,8 +62,55 @@ for line in sys.stdin:
             ExpressionKind::Enrichment,
             &AtomicBool::new(false)
         ),
-        Err(HostError::Timeout)
+        Err(HostError::Timeout(_))
     ));
+}
+
+#[test]
+fn fresh_child_gets_cold_budget_but_warmed_child_uses_steady_timeout() {
+    // A slow first answer within the cold-start budget succeeds on a fresh
+    // helper; the same slowness on the warmed helper exhausts the steady
+    // budget. This is the installed-helper shape: uv/Python/Polars startup is
+    // paid once, never per request.
+    let temp = TempDir::new().unwrap();
+    let script = temp.path().join("slow_first.py");
+    fs::write(
+        &script,
+        r#"import json,sys,time
+for index,line in enumerate(sys.stdin):
+ r=json.loads(line)
+ if index==0: time.sleep(0.3)
+ else: time.sleep(60)
+ print(json.dumps({'schema_version':1,'request_id':r['request_id'],'ok':False,'error':{'code':'slow','message':'slow'}}),flush=True)
+"#,
+    )
+    .unwrap();
+    let mut host = CompilerHost::new(config(&script, Duration::from_millis(100), 1024));
+    assert!(matches!(
+        host.compile(
+            "pl.col('x')",
+            ExpressionKind::Enrichment,
+            &AtomicBool::new(false)
+        ),
+        Err(HostError::Rejected { code, .. }) if code == "slow"
+    ));
+    let started = Instant::now();
+    assert!(matches!(
+        host.compile(
+            "pl.col('x')",
+            ExpressionKind::Enrichment,
+            &AtomicBool::new(false)
+        ),
+        Err(HostError::Timeout(detail))
+            if detail.contains("already running helper")
+                && detail.contains("budget 0.1s")
+                && detail.contains("retry the action")
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "warmed-helper timeout must use the steady budget, not the cold one: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -184,10 +234,13 @@ fn timeout_covers_blocked_large_stdin_write() {
             ExpressionKind::Filter,
             &AtomicBool::new(false)
         ),
-        Err(HostError::Timeout)
+        Err(HostError::Timeout(_))
     ));
+    // A blocked stdin write on a freshly spawned helper waits out the
+    // cold-start budget (8x the 100 ms steady timeout here), never the steady
+    // one alone, and stays bounded regardless.
     assert!(
-        started.elapsed() < Duration::from_millis(800),
+        started.elapsed() < Duration::from_secs(5),
         "blocked write exceeded wall timeout: {:?}",
         started.elapsed()
     );
@@ -236,8 +289,35 @@ for line in sys.stdin:
     );
 }
 
+/// Probe flag: when set, this test measures in an isolated child process
+/// instead of asserting in the shared harness process.
+const LEAK_PROBE_ENV: &str = "LVU_HOST_LEAK_PROBE";
+
 #[test]
 fn repeated_restarts_do_not_accumulate_threads() {
+    // The harness runs this binary's tests on concurrent threads, so a
+    // thread count taken here also sees the other tests' live compiler hosts
+    // (each owns three workers). Re-exec this same test binary as an isolated
+    // probe child that runs only this measurement: no threshold inflation,
+    // no serialization of the suite, and the count proves exactly the twelve
+    // restarts' own workers.
+    if std::env::var_os(LEAK_PROBE_ENV).is_none() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("repeated_restarts_do_not_accumulate_threads")
+            .arg("--nocapture")
+            .env(LEAK_PROBE_ENV, "1")
+            .output()
+            .expect("leak probe child");
+        assert!(
+            output.status.success(),
+            "isolated leak probe failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
     let before = fs::read_dir("/proc/self/task").unwrap().count();
     let temp = TempDir::new().unwrap();
     let script = temp.path().join("bad.py");
@@ -260,8 +340,8 @@ fn repeated_restarts_do_not_accumulate_threads() {
     drop(host);
     thread::sleep(Duration::from_millis(150));
     let after = fs::read_dir("/proc/self/task").unwrap().count();
-    // Other tests in this binary run concurrently, so allow their three host
-    // workers; twelve restarts must not add another twelve persistent workers.
+    // Twelve restarts must not leave twelve persistent workers behind. The
+    // allowance covers only harness/worker noise inside the isolated probe.
     assert!(
         after <= before + 3,
         "threads leaked across restarts: before={before} after={after}"

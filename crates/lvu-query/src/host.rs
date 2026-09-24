@@ -16,6 +16,26 @@ use std::{
 use thiserror::Error;
 const SCHEMA_VERSION: u32 = 1;
 
+/// First-request allowance on a freshly spawned helper, as a multiple of the
+/// steady per-request `timeout`, capped to stay bounded.
+///
+/// Observed with the installed helper argv (`env PYTHONPATH=… uv run
+/// --no-project … python -m lvu_expr_helper`): a warm helper answers a
+/// trivial compile in ~0.5 s, and an isolated-cold cache that must fetch the
+/// 55 MiB Polars runtime takes ~2.0 s — both inside the 3 s steady budget.
+/// Hypothesis: the same 3 s budget must also cover Python provisioning,
+/// slower disks and capture-time CPU contention, and under colder/slower
+/// conditions the first compile can exceed it; the timeout then kills the
+/// still-starting child so a retry starts cold again. That exact user cause
+/// is unproven — no natural >3 s cold start was reproduced here, and the
+/// primary's local real-provider probe compiled warm without a timeout.
+/// The cold/warm timeout tests prove the budget lifecycle (fresh gets
+/// headroom, warmed stays exact), not the user's exact failure.
+const STARTUP_TIMEOUT_MULTIPLIER: u32 = 8;
+const STARTUP_TIMEOUT_CAP: Duration = Duration::from_secs(60);
+/// Bounded helper-stderr evidence carried in a timeout diagnostic.
+const TIMEOUT_STDERR_TAIL_BYTES: usize = 200;
+
 #[derive(Clone, Debug)]
 pub struct CompilerHostConfig {
     pub executable: String,
@@ -43,8 +63,13 @@ pub enum HostError {
     Io(#[from] std::io::Error),
     #[error("compiler request exceeds configured limit")]
     RequestTooLarge,
-    #[error("compiler timed out")]
-    Timeout,
+    /// Bounded detail names the elapsed time, which budget applied (cold start
+    /// vs warmed helper), the expression kind/size and the helper's stderr
+    /// tail, plus the retry. Callers surface it with `to_string()` (the view
+    /// worker reports that text as the candidate diagnostic), so this payload
+    /// is the actionable diagnostic — no separate accessor to wire.
+    #[error("compiler timed out: {0}")]
+    Timeout(String),
     #[error("compiler request cancelled")]
     Cancelled,
     #[error("compiler exited or closed stdout")]
@@ -140,11 +165,19 @@ impl CompilerHost {
         if bytes.len() > self.config.request_limit {
             return Err(HostError::RequestTooLarge);
         }
-        let deadline = Instant::now() + self.config.timeout;
-        self.ensure_child()?;
+        let started = Instant::now();
+        let fresh = self.ensure_child()?;
+        // The cold-start allowance applies only to the first request on a
+        // freshly spawned helper. Warmed requests keep exactly `timeout` so a
+        // hung helper can never inflate every request into a cold wait.
+        let budget = if fresh {
+            startup_budget(self.config.timeout)
+        } else {
+            self.config.timeout
+        };
+        let deadline = started + budget;
         if Instant::now() >= deadline {
-            self.restart();
-            return Err(HostError::Timeout);
+            return Err(self.timeout(started, budget, fresh, source, kind));
         }
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         if self
@@ -165,8 +198,7 @@ impl CompilerHost {
                 return Err(HostError::Cancelled);
             }
             if Instant::now() >= deadline {
-                self.restart();
-                return Err(HostError::Timeout);
+                return Err(self.timeout(started, budget, fresh, source, kind));
             }
             if !wrote {
                 match ack_rx.try_recv() {
@@ -289,7 +321,9 @@ impl CompilerHost {
             })
             .unwrap_or_else(|| self.last_stderr.clone())
     }
-    fn ensure_child(&mut self) -> Result<(), HostError> {
+    /// Returns true when this call (re)spawned the helper, so the caller can
+    /// apply the cold-start budget to exactly that first request.
+    fn ensure_child(&mut self) -> Result<bool, HostError> {
         if self
             .child
             .as_mut()
@@ -298,7 +332,7 @@ impl CompilerHost {
             self.restart()
         };
         if self.child.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         let mut command = Command::new(&self.config.executable);
         command
@@ -345,7 +379,31 @@ impl CompilerHost {
             stderr,
             threads: vec![writer_thread, stdout_thread, stderr_thread],
         });
-        Ok(())
+        Ok(true)
+    }
+    /// Kills the hung child and reports which budget it exhausted. Elapsed is
+    /// captured before teardown so joining the reaped child does not inflate
+    /// the reported wait. The raw view is never touched here — the caller
+    /// surfaces this text as the candidate diagnostic and keeps last-good
+    /// state — but the remedy names the explicit retry.
+    fn timeout(
+        &mut self,
+        started: Instant,
+        budget: Duration,
+        fresh: bool,
+        source: &str,
+        kind: ExpressionKind,
+    ) -> HostError {
+        let elapsed = started.elapsed();
+        self.restart();
+        HostError::Timeout(timeout_detail(
+            elapsed,
+            budget,
+            fresh,
+            source,
+            kind,
+            &self.last_stderr,
+        ))
     }
     fn restart(&mut self) {
         if let Some(running) = self.child.take() {
@@ -380,6 +438,53 @@ impl Drop for CompilerHost {
         self.restart()
     }
 }
+/// Cold-start budget for the first request on a freshly spawned helper.
+/// Warmed requests keep exactly `timeout`. The multiple is fixed and the
+/// scaled value is capped at 60 s, never below the steady budget itself, so a
+/// configured steady budget cannot balloon into an unbounded wait: the
+/// default 3 s steady budget allows 24 s cold. Cancellation still interrupts
+/// either wait within milliseconds.
+fn startup_budget(timeout: Duration) -> Duration {
+    let scaled = timeout
+        .checked_mul(STARTUP_TIMEOUT_MULTIPLIER)
+        .unwrap_or(STARTUP_TIMEOUT_CAP);
+    scaled.min(STARTUP_TIMEOUT_CAP).max(timeout)
+}
+
+/// Bounded one-line timeout detail: elapsed, which budget applied, expression
+/// kind/size, the helper's stderr tail and the retry. Never carries the full
+/// expression or unbounded stderr.
+fn timeout_detail(
+    elapsed: Duration,
+    budget: Duration,
+    fresh: bool,
+    source: &str,
+    kind: ExpressionKind,
+    last_stderr: &[u8],
+) -> String {
+    let phase = if fresh {
+        "first request to a freshly started helper (cold start)"
+    } else {
+        "already running helper"
+    };
+    let start = last_stderr.len().saturating_sub(TIMEOUT_STDERR_TAIL_BYTES);
+    let stderr = String::from_utf8_lossy(&last_stderr[start..]);
+    let flat = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut flat: String = flat.chars().take(TIMEOUT_STDERR_TAIL_BYTES).collect();
+    if flat.is_empty() {
+        flat = "empty".into();
+    }
+    format!(
+        "after {:.1}s ({}, budget {:.1}s, kind {}, {} chars); helper stderr: {}; retry the action",
+        elapsed.as_secs_f64(),
+        phase,
+        budget.as_secs_f64(),
+        format!("{kind:?}").to_lowercase(),
+        source.chars().count(),
+        flat,
+    )
+}
+
 fn writer_loop(mut stdin: impl Write, rx: mpsc::Receiver<WriteRequest>) {
     for request in rx {
         let result = stdin
@@ -438,5 +543,34 @@ fn drain_stderr(mut input: impl Read, target: Arc<Mutex<VecDeque<u8>>>, limit: u
         while bytes.len() > limit {
             bytes.pop_front();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bound table the cold-start budget promises: scaled by a fixed
+    /// multiple, capped at 60 s, never below the steady budget. The 3 s
+    /// default allows 24 s cold — headroom over the measured ~2 s
+    /// isolated-cold helper start, still bounded and cancellable.
+    #[test]
+    fn cold_budget_scales_caps_and_never_drops_below_steady() {
+        assert_eq!(
+            startup_budget(Duration::from_secs(3)),
+            Duration::from_secs(24)
+        );
+        assert_eq!(
+            startup_budget(Duration::from_millis(100)),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            startup_budget(Duration::from_secs(10)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            startup_budget(Duration::from_secs(120)),
+            Duration::from_secs(120)
+        );
     }
 }

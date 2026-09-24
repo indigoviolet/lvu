@@ -1554,8 +1554,11 @@ pub fn diagnose(error: &HostError) -> String {
                 .to_owned()
         }
         HostError::Timeout => {
-            "the agent bridge did not answer within its deadline; the request was \
-             abandoned and the bridge restarts on the next 🧠 request"
+            // Names the bridge explicitly: a native expression-compiler stall
+            // reports "compiler timed out" from lvu-query, never this line, so
+            // the two stalls cannot be mistaken for each other.
+            "the agent bridge timed out without answering within its deadline; \
+             the request was abandoned. Reopen lvu to reconnect to local assistance"
                 .to_owned()
         }
         HostError::Protocol(message) => {
@@ -1609,15 +1612,15 @@ fn not_running_message(reason: &str) -> String {
     if looks_like_owned_root_busy(text) {
         // EEXIST alone cannot prove the lock is stale versus a live competing
         // bridge, and PID existence cannot prove ownership across races or PID
-        // reuse, so never unlink automatically. Instruct safe exact-path
-        // recovery instead, and never recommend deleting the assistance root
-        // or capture data.
+        // reuse, so the lock is never removed — by lvu or by the user. It
+        // names the competing route for diagnostics only. Serialize instead:
+        // wait for the other window's assistance to finish, then retry.
         let lock = owned_lock_path(text).unwrap_or_else(|| "the reported bridge.lock".into());
         return format!(
-            "the owned assistance route is busy — another lvu window already holds the 🧠 assistance lease ({}); \
-             close all lvu windows using this capture root and wait for any agent request to finish. \
-             If no lvu window remains, verify no lvu or bridge process still owns it, then remove only the exact lock file at {} — never delete the assistance root or capture data. \
-             EEXIST alone cannot prove the lock is stale. Capture, search and native filtering stay usable",
+            "the owned assistance route is busy — another lvu window currently holds the 🧠 assistance lease ({}); \
+             wait for that window's request to finish, then try again (Analyze again for automatic setup). \
+             The lock at {} names the competing route for diagnostics only — never delete it, the assistance root, or capture data. \
+             Capture, search and native filtering stay usable",
             tail(detail, 400),
             lock,
         );
@@ -1633,7 +1636,7 @@ fn not_running_message(reason: &str) -> String {
         );
     }
     format!(
-        "the agent bridge is not available ({}); it restarts on the next 🧠 request",
+        "the agent bridge is not available ({}); reopen lvu to reconnect to local assistance",
         tail(detail, 400)
     )
 }
@@ -1679,9 +1682,11 @@ fn looks_like_owned_root_busy(text: &str) -> bool {
         || text.contains("assistance lease")
 }
 
-/// Bounded extraction of the exact reported `bridge.lock` path for safe
-/// recovery guidance. Returns the path characters only, without surrounding
-/// quotes or trailing punctuation, capped so the diagnostic stays bounded.
+/// Bounded extraction of the exact reported `bridge.lock` path so the busy
+/// diagnostic can name the competing route. The path is diagnostics only —
+/// nothing advises removing it. Returns the path characters only, without
+/// surrounding quotes or trailing punctuation, capped so the diagnostic stays
+/// bounded.
 // The engine computes; the app names and presents. This hand-rolled scan is
 // presentation-only folding of an already-reported path (raw-bytes/stable
 // identity invariant): Polars cannot express it.
@@ -1843,8 +1848,8 @@ fn bridge_failure_message(failure: &BridgeFailure) -> String {
             failure.message
         ),
         "OWNED_ROOT_UNAVAILABLE" | "OWNED_ROOT_BUSY" => format!(
-            "{}; another lvu window may already hold the 🧠 assistance lease — close all lvu windows for this capture root; \
-             if none remain, remove only the exact reported bridge.lock after verifying no lvu/bridge process owns it, never the assistance root",
+            "{}; another lvu window currently holds the 🧠 assistance lease — wait for its request to finish, then try again \
+             (Analyze again for automatic setup); never delete the lock, the assistance root, or capture data",
             failure.message
         ),
         "LIMIT_EXCEEDED" => format!(
@@ -1979,7 +1984,7 @@ done
             ("DAEMON_UNREACHABLE", "start Paseo"),
             ("PROVIDER_UNAVAILABLE", "authenticate a provider in Paseo"),
             ("PROVIDER_UNKNOWN", "authenticate a provider in Paseo"),
-            ("OWNED_ROOT_BUSY", "already hold the 🧠 assistance lease"),
+            ("OWNED_ROOT_BUSY", "holds the 🧠 assistance lease"),
         ] {
             let message = diagnose(&HostError::Bridge(BridgeFailure {
                 code: code.to_owned(),
@@ -2030,13 +2035,15 @@ done
                 "owned cause lost in: {message}"
             );
             assert!(
-                message.contains("close all lvu windows"),
-                "missing competing-window guidance in: {message}"
+                message.contains("wait for that window's request to finish")
+                    && message.contains("Analyze again"),
+                "missing safe serialization guidance in: {message}"
             );
+            // The lock path stays as diagnostics, but nothing may advise
+            // deleting locks or state.
             assert!(
-                message.contains("remove only")
-                    && (message.contains("bridge.lock") || message.contains("exact lock")),
-                "missing safe exact-path recovery in: {message}"
+                !message.contains("remove only"),
+                "busy guidance must never advise removing the lock in: {message}"
             );
             // The daemon classifier must not win: its distinctive topology
             // guidance belongs only to daemon failures, even when the input
