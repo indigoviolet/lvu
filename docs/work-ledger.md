@@ -4350,3 +4350,58 @@ next bridge request, then applies `.str.to_uppercase()` through the real Python
 helper/Rust engine after explicit review. Its raw journal hashes remain equal.
 The real-provider gate now stops immediately on native rejection and saves the
 full inspector instead of waiting for an Applied state that cannot arrive.
+
+### v0.1.18 exact acceptance passed; archives building — 2026-09-24
+
+Exact source `2ac6b64f1172a007818b9e6f0cde5fcfa1ad3e6a`, tree
+`5178bccfc9af14eed1b359df28f0d30b7e7cf18e`, passed the complete gate: full
+Rust workspace/doc tests and all-target Clippy, 130 bridge tests, **92/92**
+actual PTY suites, 25 remote-union tests and shared-capture/no-replay proofs.
+The same frozen binaries passed the real local-provider combined timeout/retry,
+two-window, quit-during-analysis and restart proof, plus actual Docker discovery
+through the labeled controlled executable with real assistance and compilation.
+The accepted record is `lvu-v018-2ac6b64-acceptance/accepted.json`, SHA-256
+`591ffa5ef5ff7507c1f237892bb56c1d13a0663f7a438e3a457350ca3982ec78`.
+
+Annotated tag object `69073206f732765fc8e6d1ca34b8e9008d5878bd` peels locally
+and on origin to that accepted source. Release workflow `35985076249` is building
+and executing the Linux x86_64, Linux arm64 and Apple-silicon macOS archives.
+No public release or local default installation has changed yet. The native
+Docker socket remains permission-denied; the configured matrix excludes its
+environment-dependent SSH suite, and human macOS/arm64 Linux terminal acceptance
+is not claimed. The session-owned supervisor heartbeat remains active through
+publication and installation.
+
+### v0.1.18 published and installed — 2026-09-24
+
+Published https://github.com/indigoviolet/lvu/releases/tag/v0.1.18 at
+10:25:47 UTC (release `395560281`). Immutable tag `69073206` still peels to
+accepted source `2ac6b64`; workflow `35985076249` succeeded for all three native
+targets. All downloaded archives matched SHA256SUMS. Homebrew formula commit
+`87f898a2c71b2a7e564f690b82ef2c1b6e299930` was rendered from those checksums,
+passed style and strict named-formula audit, and was pushed before undrafting.
+
+The Linux release archive passed five quit lifecycle PTYs and real-provider
+combined timeout/retry, two-window, quit-during-analysis and reopen acceptance
+outside the checkout. The official installed archive additionally passed Docker
+fixture discovery/enrichment with real provider/compiler. All 944 payload files
+remained unchanged. mise verified checksums, GitHub attestations and SLSA
+provenance; Homebrew upgraded to 0.1.18 and its formula test passed. Both installed
+executables report 0.1.18 and resolve their own Python/bridge resources outside
+the checkout. `versions/latest` now selects v0.1.18; the superseded v0.1.17 local
+archive was removed only after checking no process used it. Small records,
+proofs, captures and tags remain preserved.
+
+Publication/install receipts are in `lvu-v018-2ac6b64-acceptance`, including
+`public-release.json`, `installation-record.json`, `retention.json`,
+`brew-install.log`, `archive-real-combined/result.json` and
+`installed-real-docker/result.json`. `versions/records/v0.1.18.json` records all
+three archive hashes and the exact acceptance hash. Post-tag edits are release
+documentation only; the source tag is unchanged. The foreign mise.toml diff
+remains byte-for-byte unchanged. Remaining environmental limits above still
+apply; no claim is made that the original historical timeout was reproduced.
+
+The session-owned heartbeat `293347b7` was deleted after completion and its
+schedule file was verified absent. Final remote checks confirm v0.1.18 is the
+latest public release with exactly three archives plus SHA256SUMS, and the
+annotated tag object/source are unchanged. All four named stages are complete.

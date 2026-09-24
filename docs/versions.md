@@ -4,22 +4,24 @@ lvu has one publication scheme: annotated `vX.Y.Z` tags and matching GitHub
 releases. There is no separate preview channel or preview numbering. Every
 version must agree with `crates/lvu-app/Cargo.toml` and `Cargo.lock`.
 
-Candidate **v0.1.18** fixes automatic setup, assistance ownership and quit/input
-lifecycle. It is undergoing exact-source acceptance and is not published yet;
-the current installed/public release below remains authoritative.
+Current version: **[v0.1.18](https://github.com/indigoviolet/lvu/releases/tag/v0.1.18)**,
+published 2026-09-24 at 10:25:47 UTC from `2ac6b64`. It fixes automatic setup,
+assistance ownership and quit/input lifecycle. Release CI built and executed the
+three supported native archives. The official local x86_64 Linux musl archive is
+SHA-256 `3eb5d030da433cb709b87ce82041845f63be90f7b56f489a532d38804d48463c`;
+its binary is `2ec979035b7acff548e31784773d33ed80347dfe80407dbdfef48b0001721322`.
+`versions/latest`, the global mise installation and Homebrew now use v0.1.18.
 
-Current version: **[v0.1.17](https://github.com/indigoviolet/lvu/releases/tag/v0.1.17)**,
-published 2026-09-19 at 06:27:32 UTC from `f665d25`. Release CI built and
-executed the three supported native archives. The local installation is the
-official x86_64 Linux musl archive, SHA-256
-`6e4e4b77adf19b64a8d5e07cd4c972d00b5a9f3c3f19c61f25a7c232da194b11`;
-its installed binary is `2c356e058c9910e8e0c55cccf2f2d9a5db885232c3d03cda62f8ab547fef7210`.
-Bundled helper/bridge execution and the Docker service/container terminal suite
-passed outside the checkout; `versions/latest` points to `v0.1.17`.
+Exact-source acceptance passed full Rust workspace/doc tests, all-target Clippy,
+130 bridge tests, all 92 actual PTY suites and shared-capture/remote-union proofs.
+The release archive passed real local-provider review/apply, compiler timeout/retry,
+two-window, quit-during-analysis and reopen checks outside the checkout. Installed
+Docker discovery/enrichment used a controlled Docker executable because the host
+socket is permission-denied; the provider, bridge and compiler were real. The
+installed payload remained unchanged. The user's exact historical timeout was
+not naturally reproduced; controlled timeout recovery was verified.
 
-Exact-source acceptance passed the full Rust workspace, all-target Clippy, bridge
-checks, all 90 PTY suites and the source-bound shared-capture/remote-union
-proofs. Human Apple-silicon macOS and arm64 Linux terminal acceptance remains
+Human Apple-silicon macOS and arm64 Linux terminal acceptance remains
 unverified. The volume-backed full soak, cold-query latency and slow-storage
 autosave investigations remain paused and unaccepted. What each version shipped
 is recorded in [CHANGELOG.md](../CHANGELOG.md).
