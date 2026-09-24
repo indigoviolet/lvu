@@ -5171,6 +5171,22 @@ impl Composition {
             .view_interaction_revision(&view_id(definition.id))
             .unwrap_or_default();
         self.memory_load_fences.insert(memory_id, interaction);
+        // Loaded carries each stored view's stable ID, not necessarily the
+        // requested working-view ID above. Fence every live source view now,
+        // before asynchronous loading can race with its next editor input.
+        let source_id = definition.id.0.to_string();
+        for view in app
+            .views()
+            .iter()
+            .filter(|view| view.source_id == source_id)
+        {
+            if let Ok(id) = Uuid::parse_str(&view.id) {
+                self.memory_load_fences.insert(
+                    lvu_core::ViewId(id),
+                    app.view_interaction_revision(&view.id).unwrap_or_default(),
+                );
+            }
+        }
         self.memory.load(definition, memory_id)
     }
 
@@ -5243,13 +5259,15 @@ impl Composition {
                         } else {
                             value.presentation.source_ids.clone()
                         };
-                        let fence =
-                            self.memory_load_fences
-                                .get(&id)
-                                .copied()
-                                .unwrap_or_else(|| {
-                                    app.view_interaction_revision(&ui_id).unwrap_or_default()
-                                });
+                        // A previously unseen stored ID can restore only an
+                        // untouched view. Taking the *current* interaction
+                        // revision here made this check tautological and
+                        // silently erased keys typed while loading.
+                        let fence = self
+                            .memory_load_fences
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_default();
                         if app
                             .view_interaction_revision(&ui_id)
                             .is_some_and(|current| current != fence)
@@ -5336,13 +5354,11 @@ impl Composition {
                             memory_notice(app, format!("restore source membership: {error}"));
                             continue;
                         }
-                        let fence =
-                            self.memory_load_fences
-                                .get(&id)
-                                .copied()
-                                .unwrap_or_else(|| {
-                                    app.view_interaction_revision(&ui_id).unwrap_or_default()
-                                });
+                        let fence = self
+                            .memory_load_fences
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_default();
                         self.memory_load_fences.insert(id, fence);
                         let restored = memory::restored(value);
                         if app.restore_persistent_view_if_unmodified(&ui_id, fence, restored) {

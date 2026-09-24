@@ -7,14 +7,17 @@ use std::{
 };
 
 use crossterm::{
+    cursor::{MoveTo, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
+    style::{Attribute, ResetColor, SetAttribute},
     terminal::{
-        BeginSynchronizedUpdate, DisableLineWrap, EnableLineWrap, EndSynchronizedUpdate,
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        BeginSynchronizedUpdate, Clear, ClearType, DisableLineWrap, EnableLineWrap,
+        EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
     },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -287,6 +290,16 @@ impl TerminalGuard {
             self.mouse = false;
         }
         if self.alternate {
+            // Clear only the surface lvu owns, before restoring the shell's
+            // saved screen. This also leaves a clean display for terminals
+            // which retain alternate-screen cells after switching buffers.
+            let _ = execute!(
+                self.stdout,
+                ResetColor,
+                SetAttribute(Attribute::Reset),
+                Show
+            );
+            let _ = execute!(self.stdout, Clear(ClearType::All), MoveTo(0, 0));
             let _ = execute!(self.stdout, LeaveAlternateScreen);
             self.alternate = false;
         }
@@ -679,20 +692,17 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
 
         if startup_visible {
             match event {
-                Event::Key(key)
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c') =>
-                {
-                    app.handle(Action::Quit, provider);
-                }
-                Event::Key(key)
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                {
-                    startup.observe_input();
-                    startup_visible = false;
-                    dirty = true;
-                }
+                Event::Key(key) => match startup_key_action(key) {
+                    StartupAction::Quit => {
+                        app.handle(Action::Quit, provider);
+                    }
+                    StartupAction::Enter => {
+                        startup.observe_input();
+                        startup_visible = false;
+                        dirty = true;
+                    }
+                    StartupAction::Ignore => {}
+                },
                 Event::Resize(width, height) => {
                     app.handle(Action::Resize(width, height), provider);
                     dirty = true;
@@ -802,6 +812,37 @@ fn tput_colors() -> Option<u32> {
         .trim()
         .parse()
         .ok()
+}
+
+/// What a keypress means while the startup title is visible.
+///
+/// The splash takes no text, so no key is ever input here. Bare `q` quits
+/// exactly as it quits from the workspace (Ctrl-C keeps quitting), while Esc
+/// and every other key enter the app. Without the `q` arm the splash consumes
+/// the first `q` and the Add-source field the app then opens consumes every
+/// later one as a path character, so `q` can never quit an empty launch.
+/// Esc must keep entering: the title workflow pins dismissal-to-Add-source,
+/// and quitting from the splash runs the same bounded shutdown (and the same
+/// terminal restoration) as quitting from the workspace, so no capture,
+/// workspace state or mode is left behind either way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupAction {
+    Quit,
+    Enter,
+    Ignore,
+}
+
+fn startup_key_action(key: crossterm::event::KeyEvent) -> StartupAction {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return StartupAction::Ignore;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return StartupAction::Quit;
+    }
+    if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
+        return StartupAction::Quit;
+    }
+    StartupAction::Enter
 }
 
 fn is_layer_dismissal_key(event: &Event) -> bool {
@@ -945,5 +986,82 @@ mod dismissal_key_tests {
             KeyCode::Char('x'),
             KeyModifiers::NONE,
         ))));
+    }
+}
+
+#[cfg(test)]
+mod startup_key_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn bare_q_and_ctrl_c_quit_from_the_splash() {
+        assert_eq!(
+            startup_key_action(press(KeyCode::Char('q'), KeyModifiers::NONE)),
+            StartupAction::Quit
+        );
+        assert_eq!(
+            startup_key_action(press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            StartupAction::Quit
+        );
+    }
+
+    #[test]
+    fn esc_and_ordinary_keys_enter_from_the_splash() {
+        for (code, modifiers) in [
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('x'), KeyModifiers::NONE),
+            (KeyCode::Char(' '), KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            assert_eq!(
+                startup_key_action(press(code, modifiers)),
+                StartupAction::Enter,
+                "{code:?} must enter the app, not quit it"
+            );
+        }
+    }
+
+    #[test]
+    fn modified_q_is_not_a_splash_quit() {
+        // Shifted, controlled and Alt-modified `q` stay entry keys: only the
+        // exact bare `q` the workspace quits on quits here, so a key the
+        // terminal reports differently can never bypass the splash by accident
+        // and quitting stays symmetric with the base screen.
+        for modifiers in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+        ] {
+            assert_eq!(
+                startup_key_action(press(KeyCode::Char('q'), modifiers)),
+                StartupAction::Enter,
+                "{modifiers:?}+q must not quit from the splash"
+            );
+        }
+        assert_eq!(
+            startup_key_action(press(KeyCode::Char('Q'), KeyModifiers::SHIFT)),
+            StartupAction::Enter
+        );
+    }
+
+    #[test]
+    fn releases_are_ignored_on_the_splash() {
+        let release = KeyEvent {
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        };
+        assert_eq!(startup_key_action(release), StartupAction::Ignore);
     }
 }
